@@ -6,12 +6,16 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 import { scanRouter } from './routes/scan.js';
 import { settingsRouter } from './routes/settings.js';
 import { filesRouter } from './routes/files.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// 加载项目根目录下的 .env 文件
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const app = express();
 const PORT = 3001;
