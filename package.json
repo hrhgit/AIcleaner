@@ -1,0 +1,24 @@
+{
+    "name": "aicleaner",
+    "version": "1.0.0",
+    "description": "AI-driven space cleaning agent using dust CLI",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "server": "node server/index.js",
+        "start": "concurrently \"npm run server\" \"npm run dev\"",
+        "build": "vite build",
+        "postinstall": "node scripts/download-dust.js"
+    },
+    "dependencies": {
+        "concurrently": "^9.1.0",
+        "cors": "^2.8.5",
+        "dotenv": "^17.3.1",
+        "express": "^4.21.0",
+        "node-fetch": "^3.3.2",
+        "openai": "^4.77.0"
+    },
+    "devDependencies": {
+        "vite": "^6.0.0"
+    }
+}
