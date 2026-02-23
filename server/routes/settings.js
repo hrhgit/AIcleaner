@@ -12,15 +12,15 @@ const DATA_DIR = join(__dirname, '..', 'data');
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
-    apiEndpoint: 'https://api.openai.com/v1',
-    apiKey: '',
-    model: 'gpt-4o-mini',
+    apiEndpoint: process.env.VITE_API_ENDPOINT || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    apiKey: process.env.VITE_API_KEY || process.env.OPENAI_API_KEY || '',
+    model: process.env.VITE_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
     scanPath: '',
     targetSizeGB: 1,
     maxDepth: 5,
     lastScanTime: null,
     enableWebSearch: false,
-    tavilyApiKey: '',
+    tavilyApiKey: process.env.TAVILY_API_KEY || '',
 };
 
 export function loadSettings() {
