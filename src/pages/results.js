@@ -6,6 +6,7 @@ import * as storage from '../utils/storage.js';
 import { formatSize } from '../utils/storage.js';
 import { openFileLocation, deleteFiles } from '../utils/api.js';
 import { showToast } from '../main.js';
+import { t } from '../utils/i18n.js';
 
 let sortField = 'size';
 let sortDir = 'desc';
@@ -17,26 +18,26 @@ export function renderResults(container) {
 
   container.innerHTML = `
     <div class="page-header animate-in">
-      <h1 class="page-title">📋 分析结果</h1>
-      <p class="page-subtitle">AI 建议的可清理文件与文件夹</p>
+      <h1 class="page-title">${t('results.title')}</h1>
+      <p class="page-subtitle">${t('results.subtitle')}</p>
     </div>
 
     <!-- Summary -->
     <div class="stats-grid animate-in" style="animation-delay: 0.05s">
       <div class="stat-card">
-        <span class="stat-label">可删除项目</span>
+        <span class="stat-label">${t('results.safe_to_clean')}</span>
         <span class="stat-value accent" id="res-count">${currentData.length}</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">可清理总空间</span>
+        <span class="stat-label">${t('results.space_freed')}</span>
         <span class="stat-value success" id="res-size">${formatSize(currentData.reduce((s, i) => s + (i.size || 0), 0))}</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">低风险项</span>
+        <span class="stat-label">${t('results.risk_safe')}</span>
         <span class="stat-value" id="res-low" style="color: var(--accent-success);">${currentData.filter(i => i.risk === 'low').length}</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">中/高风险项</span>
+        <span class="stat-label">${t('results.risk_danger')}</span>
         <span class="stat-value warning" id="res-high">${currentData.filter(i => i.risk !== 'low').length}</span>
       </div>
     </div>
@@ -45,17 +46,17 @@ export function renderResults(container) {
     <div class="card animate-in mb-24" style="animation-delay: 0.1s; padding: 14px 20px;">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-16">
-          <button class="btn btn-ghost filter-btn active" data-filter="all">全部</button>
-          <button class="btn btn-ghost filter-btn" data-filter="low">🟢 低风险</button>
-          <button class="btn btn-ghost filter-btn" data-filter="medium">🟡 中风险</button>
-          <button class="btn btn-ghost filter-btn" data-filter="high">🔴 高风险</button>
+          <button class="btn btn-ghost filter-btn active" data-filter="all">${t('results.filter_all')}</button>
+          <button class="btn btn-ghost filter-btn" data-filter="low">🟢 ${t('results.filter_safe')}</button>
+          <button class="btn btn-ghost filter-btn" data-filter="medium">🟡 ${t('results.filter_warning')}</button>
+          <button class="btn btn-ghost filter-btn" data-filter="high">🔴 ${t('results.filter_danger')}</button>
           <div style="width: 1px; height: 24px; background: rgba(255,255,255,0.1); margin: 0 8px;"></div>
           <button id="batch-delete-btn" class="btn btn-danger" style="display: none;">
-            🗑️ 删除选中项 (<span id="selected-count">0</span>)
+            ${t('results.clean_selected')} (<span id="selected-count">0</span>)
           </button>
         </div>
         <div style="font-size: 0.8rem; color: var(--text-muted);">
-          ${lastScan?.lastScanTime ? `上次扫描: ${new Date(lastScan.lastScanTime).toLocaleString('zh-CN')}` : ''}
+          ${lastScan?.lastScanTime ? `Last Scan: ${new Date(lastScan.lastScanTime).toLocaleString('zh-CN')}` : ''}
         </div>
       </div>
     </div>
@@ -69,12 +70,12 @@ export function renderResults(container) {
               <th style="width: 40px; text-align: center;">
                 <input type="checkbox" id="select-all-cb" />
               </th>
-              <th data-sort="name" style="width: 20%;">文件名 ↕</th>
-              <th data-sort="size" class="sorted" style="width: 10%;">大小 ↓</th>
-              <th data-sort="risk" style="width: 8%;">风险</th>
-              <th style="width: 20%;">功能推测</th>
-              <th style="width: 25%;">删除理由</th>
-              <th style="width: 10%; text-align: center;">操作</th>
+              <th data-sort="name" style="width: 20%;">${t('results.table_path')} ↕</th>
+              <th data-sort="size" class="sorted" style="width: 10%;">${t('results.table_size')} ↓</th>
+              <th data-sort="risk" style="width: 8%;">${t('results.risk_warning')}</th>
+              <th style="width: 20%;">${t('results.table_reason')}</th>
+              <th style="width: 25%;">${t('results.table_reason')}</th>
+              <th style="width: 10%; text-align: center;">${t('results.table_action')}</th>
             </tr>
           </thead>
           <tbody id="results-body">
@@ -83,8 +84,8 @@ export function renderResults(container) {
       </div>
       <div id="results-empty" class="empty-state" style="display: none;">
         <div class="empty-state-icon">📭</div>
-        <div class="empty-state-text">暂无分析结果</div>
-        <div class="empty-state-hint">请先在扫描页面启动一次扫描</div>
+        <div class="empty-state-text">${t('results.scan_not_started')}</div>
+        <div class="empty-state-hint">${t('results.go_scan')}</div>
       </div>
     </div>
   `;
@@ -137,14 +138,14 @@ export function renderResults(container) {
       const selectedPaths = Array.from(document.querySelectorAll('.row-cb:checked')).map(cb => cb.dataset.path);
       if (selectedPaths.length === 0) return;
 
-      if (confirm(`确定要删除选中的 ${selectedPaths.length} 个项目吗？此操作无法撤销！`)) {
+      if (confirm(`${t('results.clean_selected')}?`)) {
         try {
           batchDeleteBtn.disabled = true;
-          batchDeleteBtn.innerHTML = '<span class="spinner"></span> 删除中...';
+          batchDeleteBtn.innerHTML = `<span class="spinner"></span> ${t('results.cleaning')}`;
 
           const res = await deleteFiles(selectedPaths);
           if (res.success) {
-            showToast(`成功删除 ${res.results.deleted.length} 个项目`, 'success');
+            showToast(t('results.cleaned_success').replace('{count}', res.results.deleted.length), 'success');
 
             // Update UI data state
             currentData = currentData.filter(item => !res.results.deleted.includes(item.path));
@@ -159,13 +160,13 @@ export function renderResults(container) {
             renderTable(getFilteredData());
             updateBatchDeleteBtn();
           } else {
-            showToast('删除失败: ' + res.error, 'error');
+            showToast(t('results.toast_clean_failed') + res.error, 'error');
           }
         } catch (err) {
-          showToast('删除失败: ' + err.message, 'error');
+          showToast(t('results.toast_clean_failed') + err.message, 'error');
         } finally {
           batchDeleteBtn.disabled = false;
-          batchDeleteBtn.innerHTML = `🗑️ 删除选中项 (<span id="selected-count">0</span>)`;
+          batchDeleteBtn.innerHTML = `${t('results.clean_selected')} (<span id="selected-count">0</span>)`;
           updateBatchDeleteBtn();
         }
       }
@@ -253,7 +254,7 @@ function renderTable(data) {
         <div class="file-purpose">${escapeHtml(item.reason || '—')}</div>
       </td>
       <td style="text-align: center;">
-        <button class="btn btn-ghost open-loc-btn" data-path="${escapeHtml(item.path || '')}" style="padding: 4px; font-size: 1.1rem;" title="打开文件位置">
+        <button class="btn btn-ghost open-loc-btn" data-path="${escapeHtml(item.path || '')}" style="padding: 4px; font-size: 1.1rem;" title="${t('results.open_folder')}">
           📂
         </button>
       </td>
@@ -276,10 +277,10 @@ function renderTable(data) {
         const path = btn.dataset.path;
         const res = await openFileLocation(path);
         if (!res.success) {
-          showToast('无法打开文件位置: ' + res.error, 'error');
+          showToast(t('results.toast_open_failed') + res.error, 'error');
         }
       } catch (err) {
-        showToast('无法打开文件位置: ' + err.message, 'error');
+        showToast(t('results.toast_open_failed') + err.message, 'error');
       } finally {
         btn.innerHTML = btnOriginalHtml;
         btn.disabled = false;
@@ -296,7 +297,7 @@ function riskBadge(risk) {
 }
 
 function riskLabel(risk) {
-  return risk === 'low' ? '低风险' : risk === 'high' ? '高风险' : '中风险';
+  return risk === 'low' ? t('results.risk_safe') : risk === 'high' ? t('results.risk_danger') : t('results.risk_warning');
 }
 
 function escapeHtml(str) {
