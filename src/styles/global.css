@@ -115,6 +115,7 @@ a {
   width: var(--sidebar-width);
   min-height: 100vh;
   background: var(--bg-card);
+  -webkit-backdrop-filter: blur(24px);
   backdrop-filter: blur(24px);
   border-right: 1px solid var(--bg-glass-border);
   display: flex;
@@ -220,6 +221,10 @@ a {
   padding: 12px 20px;
   border-top: 1px solid var(--bg-glass-border);
   margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
 }
 
 .version {

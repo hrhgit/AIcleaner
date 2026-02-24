@@ -5,6 +5,7 @@
 import { renderSettings } from './pages/settings.js';
 import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
+import { t, toggleLang, emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
 
 const pages = {
     settings: renderSettings,
@@ -33,12 +34,16 @@ function navigate(pageName) {
 
     const renderer = pages[pageName];
     if (renderer) {
+        // Re-render immediately when language changes
+        registerLangChangeHandler(() => {
+            if (currentPage === pageName) renderer(container); // Refresh active page
+        });
         renderer(container);
     } else {
         container.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon">🔍</div>
-        <div class="empty-state-text">页面未找到</div>
+        <div class="empty-state-text" data-i18n="page.not_found">页面未找到</div>
       </div>
     `;
     }
@@ -63,6 +68,25 @@ document.addEventListener('DOMContentLoaded', () => {
             window.location.hash = `#/${page}`;
         });
     });
+
+    // Language switch
+    function updateLangUI() {
+        const currentLang = getLang();
+        document.querySelectorAll('.lang-opt').forEach(opt => {
+            opt.classList.toggle('active', opt.dataset.lang === currentLang);
+        });
+    }
+
+    document.querySelectorAll('.lang-opt').forEach(opt => {
+        opt.addEventListener('click', () => {
+            setLang(opt.dataset.lang);
+            emitLangChange();
+            updateLangUI();
+        });
+    });
+
+    // Initial lang UI state
+    updateLangUI();
 
     // Initial page
     navigate(getPageFromHash());

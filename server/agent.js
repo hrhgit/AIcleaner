@@ -33,12 +33,14 @@ function getClient() {
  */
 export async function analyzeEntries(entries, parentPath) {
     const { client, model } = getClient();
+    const settings = loadSettings();
+    const isWebSearchEnabled = !!(settings.enableWebSearch && settings.tavilyApiKey);
 
     const entrySummary = entries.map((e, i) =>
         `${i + 1}. [${e.type}] "${e.name}" — ${formatSize(e.size)}`
     ).join('\n');
 
-    const systemPrompt = `你是一个资深的操作系统与磁盘空间清理专家。你需要分析目标文件或目录，判断它们是否可以被安全删除。
+    const systemPrompt = isWebSearchEnabled ? `你是一个资深的操作系统与磁盘空间清理专家。你需要分析目标文件或目录，判断它们是否可以被安全删除。
 你的内部推理过程请使用中文，以便于日志审查。
 
 🚨 【核心规则】：
@@ -57,6 +59,25 @@ JSON 数组中的每个对象必须严格包含以下字段（Key 必须为英�
   "classification": "safe_to_delete" | "suspicious" | "keep" | "needs_search", // ⚠️ 必须是这四个英文字符串之一
   "purpose": "<简短的中文描述，说明这个文件/文件夹大概是做什么用的>",
   "reason": "<详细的中文理由，解释为什么它可以/不能被删除（或需要搜索的原因）>",
+  "risk": "low" | "medium" | "high" // ⚠️ 必须是这三个英文字符串之一，分别代表低、中、高风险
+}` : `你是一个资深的操作系统与磁盘空间清理专家。你需要分析目标文件或目录，判断它们是否可以被安全删除。
+你的内部推理过程请使用中文，以便于日志审查。
+
+🚨 【核心规则】：
+- 系统文件（Windows, Program Files, 驱动, Registry/注册表相关） → 必须判定为 "keep"
+- 用户文档、照片、重要的个人数据 → 必须判定为 "keep"
+- 缓存(Cache)、临时文件(Temp)、构建产物(Build artifacts)、日志(Logs)、旧下载内容 → 通常为 "safe_to_delete"
+- 当你不确定某个文件或软件的作用时，宁可判定为 "suspicious"，也不要判定为 "safe_to_delete"
+
+💻 【输出格式要求】：
+你必须且只能返回一个合法的 JSON 数组，不要返回任何其他的 Markdown 文本。
+JSON 数组中的每个对象必须严格包含以下字段（Key 必须为英文，枚举值必须严格一致，但描述性内容请使用中文）：
+{
+  "index": <数字，与输入对应>,
+  "name": "<文件名>",
+  "classification": "safe_to_delete" | "suspicious" | "keep", // ⚠️ 必须是这三个英文字符串之一
+  "purpose": "<简短的中文描述，说明这个文件/文件夹大概是做什么用的>",
+  "reason": "<详细的中文理由，解释为什么它可以/不能被删除>",
   "risk": "low" | "medium" | "high" // ⚠️ 必须是这三个英文字符串之一，分别代表低、中、高风险
 }`;
 
@@ -100,13 +121,11 @@ ${entrySummary}
         const parsed = JSON.parse(cleanContent);
         let results = Array.isArray(parsed) ? parsed : (parsed.results || parsed.items || parsed.analysis || [parsed]);
 
-        const settings = loadSettings();
-
         let needSearchItems = results.filter(r => r.classification === 'needs_search');
 
         // Follow-up PASS for needs_search
         if (needSearchItems.length > 0) {
-            if (settings.enableWebSearch && settings.tavilyApiKey) {
+            if (isWebSearchEnabled) {
                 // Fetch search context (Run serially to not bomb API immediately)
                 let searchPrompts = [];
                 for (let r of needSearchItems) {

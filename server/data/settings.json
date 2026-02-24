@@ -1,11 +1,11 @@
 {
   "apiEndpoint": "https://api.deepseek.com",
   "apiKey": "sk-a62ad3fb9bc94bc3b0a38f619c443a86",
-  "model": "deepseek-reasoner",
-  "scanPath": "D:\\",
-  "targetSizeGB": 7.9,
-  "maxDepth": 6,
+  "model": "deepseek-chat",
+  "scanPath": "C:\\Users\\32858\\AppData",
+  "targetSizeGB": 5,
+  "maxDepth": 8,
   "lastScanTime": null,
-  "enableWebSearch": true,
+  "enableWebSearch": false,
   "tavilyApiKey": "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"
 }

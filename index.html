@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="AIcleaner — AI 驱动的智能磁盘空间清理工具" />
-  <title>AIcleaner — 智能空间清理</title>
+  <title data-i18n="app.title">AIcleaner</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -41,13 +41,13 @@
               <path
                 d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
             </svg>
-            <span>设置</span>
+            <span data-i18n="nav.settings">设置</span>
           </a></li>
         <li><a href="#/scanner" data-page="scanner" class="nav-link">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
             </svg>
-            <span>扫描</span>
+            <span data-i18n="nav.scanner">扫描</span>
           </a></li>
         <li><a href="#/results" data-page="results" class="nav-link">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -56,11 +56,16 @@
               <line x1="16" y1="13" x2="8" y2="13" />
               <line x1="16" y1="17" x2="8" y2="17" />
             </svg>
-            <span>结果</span>
+            <span data-i18n="nav.results">结果</span>
           </a></li>
       </ul>
       <div class="sidebar-footer">
         <span class="version">v1.0.0</span>
+        <div class="lang-switch-container">
+          <span class="lang-opt" data-lang="zh">中</span>
+          <span class="lang-divider">/</span>
+          <span class="lang-opt" data-lang="en">EN</span>
+        </div>
       </div>
     </nav>
 

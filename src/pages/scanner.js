@@ -6,6 +6,7 @@ import { getSettings, startScan, stopScan, connectScanStream, getActiveScan } fr
 import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
+import { t } from '../utils/i18n.js';
 
 let activeTaskId = null;
 let activeEventSource = null;
@@ -17,22 +18,22 @@ export async function renderScanner(container) {
 
   container.innerHTML = `
     <div class="page-header animate-in">
-      <h1 class="page-title">🔬 扫描控制</h1>
-      <p class="page-subtitle">使用 dust + AI 分层下探分析磁盘占用</p>
+      <h1 class="page-title">${t('scanner.title')}</h1>
+      <p class="page-subtitle">${t('scanner.subtitle')}</p>
     </div>
 
     <!-- Stats Dashboard -->
     <div class="stats-grid animate-in" style="animation-delay: 0.05s">
       <div class="stat-card">
-        <span class="stat-label">扫描状态</span>
-        <span class="stat-value accent" id="stat-status">就绪</span>
+        <span class="stat-label">${t('scanner.progress_scan')}</span>
+        <span class="stat-value accent" id="stat-status">${t('scanner.not_set')}</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">已扫描文件</span>
+        <span class="stat-label">${t('results.files_count')}</span>
         <span class="stat-value" id="stat-scanned">0</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">可清理空间</span>
+        <span class="stat-label">${t('results.safe_to_clean')}</span>
         <span class="stat-value success" id="stat-cleanable">0 B</span>
       </div>
       <div class="stat-card">
@@ -44,7 +45,7 @@ export async function renderScanner(container) {
     <!-- Progress -->
     <div class="card animate-in mb-24" style="animation-delay: 0.1s">
       <div class="card-header">
-        <h2 class="card-title">📊 扫描进度</h2>
+        <h2 class="card-title">${t('scanner.progress_scan')}</h2>
         <div style="display: flex; gap: 8px; align-items: center;">
           <span id="progress-pct" class="badge badge-info">0.0%</span>
         </div>
@@ -56,16 +57,16 @@ export async function renderScanner(container) {
         <span class="log-icon">📍</span>
         <span id="breadcrumb-path" class="crumb">—</span>
         <span class="separator">|</span>
-        <span id="breadcrumb-depth">深度 0</span>
+        <span id="breadcrumb-depth">${t('scanner.not_set')}</span>
       </div>
     </div>
 
     <!-- Activity Log -->
     <div class="card animate-in mb-24" style="animation-delay: 0.15s">
       <div class="card-header">
-        <h2 class="card-title">📋 活动日志</h2>
+        <h2 class="card-title">${t('scanner.activity_log')}</h2>
         <button id="clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">
-          清空
+          Clear/清空
         </button>
       </div>
       <div class="scan-activity" id="scan-activity-hidden" style="display: none;">
@@ -73,8 +74,8 @@ export async function renderScanner(container) {
       </div>
       <div id="scan-empty" class="empty-state" style="padding: 30px;">
         <div class="empty-state-icon">🧹</div>
-        <div class="empty-state-text">等待扫描启动…</div>
-        <div class="empty-state-hint">点击下方按钮开始智能清理分析</div>
+        <div class="empty-state-text">${t('scanner.prepare')}</div>
+        <div class="empty-state-hint">${t('scanner.not_set')}</div>
       </div>
     </div>
 
@@ -85,10 +86,10 @@ export async function renderScanner(container) {
       </div>
       <div class="flex gap-16">
         <button id="stop-btn" class="btn btn-danger" style="display: none;">
-          ⏹ 停止扫描
+          ${t('scanner.stop')}
         </button>
         <button id="start-btn" class="btn btn-primary btn-lg">
-          🚀 开始扫描
+          ${t('scanner.start')}
         </button>
       </div>
     </div>
@@ -101,7 +102,7 @@ export async function renderScanner(container) {
     if (settings.scanPath) {
       pathDisplay.textContent = `目标: ${settings.scanPath}`;
     } else {
-      pathDisplay.innerHTML = '⚠️ <a href="#/settings" style="color: var(--accent-warning);">请先配置扫描路径</a>';
+      pathDisplay.innerHTML = `⚠️ <a href="#/settings" style="color: var(--accent-warning);">${t('scanner.path_not_configured')}</a>`;
     }
   } catch { }
 
@@ -181,12 +182,12 @@ function restoreActiveState() {
     const pathEl = document.getElementById('breadcrumb-path');
     const depthEl = document.getElementById('breadcrumb-depth');
     if (pathEl && lastScan.currentPath) pathEl.textContent = lastScan.currentPath;
-    if (depthEl) depthEl.textContent = `深度 ${lastScan.currentDepth || 0}`;
+    if (depthEl) depthEl.textContent = `Depth ${lastScan.currentDepth || 0}`;
     // Restore status text
     const statusEl = document.getElementById('stat-status');
     if (statusEl) {
-      const statusMap = { scanning: '扫描中', analyzing: '分析中', idle: '就绪', done: '完成', stopped: '已停止', error: '错误' };
-      statusEl.textContent = statusMap[lastScan.status] || lastScan.status || '扫描中';
+      const statusMap = { scanning: t('scanner.scanning'), analyzing: t('scanner.analyzing'), idle: t('scanner.not_set'), done: t('scanner.completed').split('!')[0], stopped: t('scanner.stopped'), error: t('toast.error') };
+      statusEl.textContent = statusMap[lastScan.status] || lastScan.status || t('scanner.scanning');
     }
     // Restore progress bar
     const scanPct = lastScan.totalEntries > 0
@@ -221,16 +222,16 @@ async function handleStart() {
   try {
     const settings = await getSettings();
     if (!settings.scanPath) {
-      showToast('请先在设置中配置扫描路径', 'error');
+      showToast(t('scanner.path_not_configured'), 'error');
       return;
     }
     if (!settings.apiKey) {
-      showToast('请先在设置中配置 API Key', 'error');
+      showToast(t('settings.api_key_placeholder'), 'error');
       return;
     }
 
     startBtn.disabled = true;
-    startBtn.innerHTML = '<span class="spinner"></span> 启动中...';
+    startBtn.innerHTML = `<span class="spinner"></span> ${t('scanner.prepare')}`;
 
     const result = await startScan({
       targetPath: settings.scanPath,
@@ -248,7 +249,7 @@ async function handleStart() {
     startBtn.style.display = 'none';
     stopBtn.style.display = '';
 
-    addLog('scanning', `⏱ 扫描任务已启动 [${activeTaskId}]`);
+    addLog('scanning', `${t('scanner.log_start')} [${activeTaskId}]`);
 
     // Connect SSE
     activeEventSource = connectScanStream(activeTaskId, {
@@ -262,9 +263,9 @@ async function handleStart() {
     });
 
   } catch (err) {
-    showToast('启动失败: ' + err.message, 'error');
+    showToast(t('scanner.toast_start_failed') + err.message, 'error');
     startBtn.disabled = false;
-    startBtn.innerHTML = '🚀 开始扫描';
+    startBtn.innerHTML = t('scanner.start');
   }
 }
 
@@ -272,9 +273,9 @@ async function handleStop() {
   if (!activeTaskId) return;
   try {
     await stopScan(activeTaskId);
-    showToast('扫描已停止', 'info');
+    showToast(t('scanner.stopped'), 'info');
   } catch (err) {
-    showToast('停止失败: ' + err.message, 'error');
+    showToast(t('scanner.toast_stop_failed') + err.message, 'error');
   }
 }
 
@@ -289,7 +290,7 @@ function handleProgress(data) {
     pathEl.textContent = data.currentPath;
   }
   if (depthEl) {
-    depthEl.textContent = `深度 ${data.currentDepth || 0}`;
+    depthEl.textContent = `Depth ${data.currentDepth || 0}`;
   }
 
   // Update status text
@@ -316,14 +317,14 @@ function handleProgress(data) {
   if (label) label.textContent = `${scanPct.toFixed(1)}%`;
 
   if (data.status === 'analyzing') {
-    addLog('analyzing', `🧠 正在分析: ${data.currentPath}`);
+    addLog('analyzing', `🧠 ${t('scanner.analyzing')}: ${data.currentPath}`);
   } else if (data.status === 'scanning') {
-    addLog('scanning', `🔍 正在扫描: ${data.currentPath}`);
+    addLog('scanning', `🔍 ${t('scanner.scanning')}: ${data.currentPath}`);
   }
 }
 
 function handleFound(item) {
-  addLog('found', `✅ 可删除: ${item.name} (${formatSize(item.size)}) — ${item.reason}`);
+  addLog('found', `✅ ${t('results.safe_to_clean')}: ${item.name} (${formatSize(item.size)}) — ${item.reason}`);
 }
 
 function handleDone(data) {
@@ -341,14 +342,14 @@ function handleDone(data) {
   const statusEl = document.getElementById('stat-status');
   if (statusEl) statusEl.textContent = '完成';
 
-  addLog('found', `🎉 扫描完成！发现 ${data.deletableCount} 个可删除项，共 ${formatSize(data.totalCleanable)}`);
-  showToast(`扫描完成，可清理 ${formatSize(data.totalCleanable)}`, 'success');
+  addLog('found', t('scanner.completed').replace('{count}', data.deletableCount));
+  showToast(t('scanner.completed').replace('{count}', data.deletableCount), 'success');
 }
 
 function handleError(err) {
   resetButtons();
-  addLog('analyzing', `❌ 错误: ${err.message || '未知错误'}`);
-  showToast('扫描出错', 'error');
+  addLog('analyzing', `❌ ${t('toast.error')}: ${err.message || t('toast.error')}`);
+  showToast(t('toast.error'), 'error');
 }
 
 function handleStopped(data) {
@@ -356,7 +357,7 @@ function handleStopped(data) {
   storage.set('lastScan', data);
   storage.set('scanResults', data.deletable);
   resetButtons();
-  addLog('scanning', `⏹ 扫描已停止`);
+  addLog('scanning', `⏹ ${t('scanner.stopped')}`);
 }
 
 function resetButtons() {
@@ -365,7 +366,7 @@ function resetButtons() {
   if (startBtn) {
     startBtn.style.display = '';
     startBtn.disabled = false;
-    startBtn.innerHTML = '🚀 开始扫描';
+    startBtn.innerHTML = t('scanner.start');
   }
   if (stopBtn) stopBtn.style.display = 'none';
   activeTaskId = null;
