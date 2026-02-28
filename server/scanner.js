@@ -12,26 +12,6 @@ import { analyzeEntries, verifyDirectoryDelete } from './agent.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DUST_BIN = join(__dirname, '..', 'bin', 'dust.exe');
 
-// Protected paths that should never be scanned or recommended for deletion
-const PROTECTED_PATTERNS = [
-    /^windows$/i,
-    /^program files/i,
-    /^programdata$/i,
-    /^\$recycle\.bin$/i,
-    /^system volume information$/i,
-    /^recovery$/i,
-    /^boot$/i,
-    /^users$/i,
-    /^documents and settings$/i,
-    /^pagefile\.sys$/i,
-    /^hiberfil\.sys$/i,
-    /^swapfile\.sys$/i,
-];
-
-function isProtected(name) {
-    return PROTECTED_PATTERNS.some(p => p.test(name));
-}
-
 /**
  * Determine if a dust entry is a directory.
  * dust outputs "children": [] for BOTH files and directories when using -j,
@@ -203,22 +183,20 @@ export class ScanTask extends EventEmitter {
         const rawEntries = runDust(dirPath, 1);
         const entries = normalizeDustEntries(rawEntries, dirPath);
 
-        // Filter out protected entries
-        const safeEntries = entries.filter(e => !isProtected(e.name));
-        this.scannedCount += safeEntries.length;
-        this.totalEntries += safeEntries.length;
-        console.log(`[Scanner] Found ${safeEntries.length} entries in ${dirPath}`);
+        this.scannedCount += entries.length;
+        this.totalEntries += entries.length;
+        console.log(`[Scanner] Found ${entries.length} entries in ${dirPath}`);
 
-        if (safeEntries.length === 0) return;
+        if (entries.length === 0) return;
 
         // Step 2: Batch analyze with LLM (max 50 per batch)
         this.status = 'analyzing';
         this.emit('progress', this._snapshot());
 
         const batchSize = 50;
-        for (let i = 0; i < safeEntries.length; i += batchSize) {
+        for (let i = 0; i < entries.length; i += batchSize) {
             if (this.stopped) return;
-            const batch = safeEntries.slice(i, i + batchSize);
+            const batch = entries.slice(i, i + batchSize);
 
             console.log(`[Scanner] Sending batch of ${batch.length} to LLM (${dirPath})...`);
 

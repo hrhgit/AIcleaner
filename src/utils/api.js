@@ -30,6 +30,14 @@ export function browseFolder() {
     return fetchJSON('/settings/browse-folder', { method: 'POST' });
 }
 
+export function getPrivilegeStatus() {
+    return fetchJSON('/system/privilege');
+}
+
+export function requestElevation() {
+    return fetchJSON('/system/request-elevation', { method: 'POST' });
+}
+
 export function getActiveScan() {
     return fetchJSON('/scan/active');
 }

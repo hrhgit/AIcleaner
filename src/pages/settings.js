@@ -2,7 +2,7 @@
  * src/pages/settings.js
  * 设置页面 — API 配置、${t('settings.scan_path')}、清理目标
  */
-import { getSettings, saveSettings, browseFolder } from '../utils/api.js';
+import { getSettings, saveSettings, browseFolder, getPrivilegeStatus, requestElevation } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -163,6 +163,20 @@ export async function renderSettings(container) {
       </div>
     </div>
 
+    <div class="card animate-in mb-24" style="animation-delay: 0.2s">
+      <div class="card-header">
+        <h2 class="card-title">${t('settings.privilege_config')}</h2>
+        <span class="badge badge-warning">${t('settings.privilege_required')}</span>
+      </div>
+      <div class="form-group" style="display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;">
+        <span id="admin-status" class="form-hint" style="margin-top: 0;"></span>
+        <button type="button" id="request-elevation-btn" class="btn btn-secondary">
+          ${t('settings.request_elevation')}
+        </button>
+      </div>
+      <div class="form-hint">${t('settings.privilege_hint')}</div>
+    </div>
+
     <div class="flex items-center justify-between animate-in" style="animation-delay: 0.15s">
       <span id="save-status" class="form-hint"></span>
       <button id="save-btn" class="btn btn-primary btn-lg">
@@ -204,6 +218,62 @@ export async function renderSettings(container) {
     } catch (err) {
         console.warn('Failed to load settings:', err);
     }
+
+    const adminStatusEl = document.getElementById('admin-status');
+    const elevationBtn = document.getElementById('request-elevation-btn');
+
+    async function refreshPrivilegeStatus() {
+        if (!adminStatusEl || !elevationBtn) return;
+        adminStatusEl.textContent = t('settings.privilege_checking');
+        adminStatusEl.style.color = 'var(--text-muted)';
+        elevationBtn.disabled = true;
+
+        try {
+            const data = await getPrivilegeStatus();
+            if (data.platform !== 'win32') {
+                adminStatusEl.textContent = t('settings.admin_status_unsupported');
+                adminStatusEl.style.color = 'var(--accent-warning)';
+                elevationBtn.textContent = t('settings.request_elevation');
+                return;
+            }
+
+            if (data.isAdmin) {
+                adminStatusEl.textContent = t('settings.admin_status_on');
+                adminStatusEl.style.color = 'var(--accent-success)';
+                elevationBtn.textContent = t('settings.admin_already');
+                return;
+            }
+
+            adminStatusEl.textContent = t('settings.admin_status_off');
+            adminStatusEl.style.color = 'var(--accent-warning)';
+            elevationBtn.disabled = false;
+            elevationBtn.textContent = t('settings.request_elevation');
+        } catch (err) {
+            adminStatusEl.textContent = t('settings.privilege_check_failed') + err.message;
+            adminStatusEl.style.color = 'var(--accent-danger)';
+            elevationBtn.textContent = t('settings.request_elevation');
+        }
+    }
+
+    elevationBtn?.addEventListener('click', async () => {
+        if (!confirm(t('settings.elevation_confirm'))) return;
+        elevationBtn.disabled = true;
+        elevationBtn.innerHTML = `<span class="spinner"></span> ${t('settings.requesting_elevation')}`;
+
+        try {
+            await requestElevation();
+            showToast(t('settings.elevation_uac_prompt'), 'info');
+            adminStatusEl.textContent = t('settings.elevation_restarting');
+            adminStatusEl.style.color = 'var(--accent-info)';
+        } catch (err) {
+            showToast(t('settings.elevation_failed') + err.message, 'error');
+            elevationBtn.disabled = false;
+            elevationBtn.textContent = t('settings.request_elevation');
+            await refreshPrivilegeStatus();
+        }
+    });
+
+    await refreshPrivilegeStatus();
 
     // Web search toggle logic
     const searchToggle = document.getElementById('enable-web-search');

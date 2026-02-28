@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import { scanRouter } from './routes/scan.js';
 import { settingsRouter } from './routes/settings.js';
 import { filesRouter } from './routes/files.js';
+import { systemRouter } from './routes/system.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,6 +27,7 @@ app.use(express.json());
 app.use('/api/scan', scanRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/files', filesRouter);
+app.use('/api/system', systemRouter);
 
 // 托管构建后的 Vite 前端资源
 app.use(express.static(path.join(__dirname, '../dist')));
