@@ -8,9 +8,13 @@ import fetch from 'node-fetch';
  * Perform a search using Tavily API and return a summarized description.
  * @param {string} query - The search query (e.g. folder name)
  * @param {string} apiKey - Tavily API Key
+ * @param {object} [options]
+ * @param {boolean} [options.throwOnError=false] - Throw retryable/transient errors to caller
  * @returns {Promise<string|null>} - Summary text or null if failed
  */
-export async function performTavilySearch(query, apiKey) {
+export async function performTavilySearch(query, apiKey, options = {}) {
+    const throwOnError = !!options.throwOnError;
+
     if (!apiKey) {
         console.warn('[Search] Tavily search aborted: No API Key provided by user.');
         return null;
@@ -35,6 +39,11 @@ export async function performTavilySearch(query, apiKey) {
         if (!response.ok) {
             const errBody = await response.text();
             console.error(`[Search] Tavily API Error (${response.status}):`, errBody);
+            if (throwOnError && (response.status === 408 || response.status === 429 || response.status >= 500)) {
+                const err = new Error(`Tavily API Error ${response.status}: ${errBody}`);
+                err.status = response.status;
+                throw err;
+            }
             return null;
         }
 
@@ -55,6 +64,9 @@ export async function performTavilySearch(query, apiKey) {
 
     } catch (error) {
         console.error('[Search] Failed to connect to Tavily:', error.message);
+        if (throwOnError) {
+            throw error;
+        }
         return null;
     }
 }
