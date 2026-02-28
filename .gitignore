@@ -5,3 +5,5 @@ release/
 *.exe
 .env
 .DS_Store
+.codex-candidates.json
+.encoding-policy.json
