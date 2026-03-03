@@ -5,12 +5,14 @@
 import { renderSettings } from './pages/settings.js';
 import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
+import { renderOrganizer } from './pages/organizer.js';
 import { t, toggleLang, emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
 
 const pages = {
     settings: renderSettings,
     scanner: renderScanner,
     results: renderResults,
+    organizer: renderOrganizer,
 };
 
 let currentPage = null;

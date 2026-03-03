@@ -127,3 +127,90 @@ export function openFileLocation(path) {
 export function deleteFiles(paths) {
     return fetchJSON('/files/delete', { method: 'POST', body: { paths } });
 }
+
+export function suggestOrganizeCategories(params) {
+    return fetchJSON('/organize/suggest-categories', { method: 'POST', body: params });
+}
+
+export function getOrganizeCapability() {
+    return fetchJSON('/organize/capability');
+}
+
+export function startOrganize(params) {
+    return fetchJSON('/organize/start', { method: 'POST', body: params });
+}
+
+export function stopOrganize(taskId) {
+    return fetchJSON(`/organize/stop/${taskId}`, { method: 'POST' });
+}
+
+export function getOrganizeResult(taskId) {
+    return fetchJSON(`/organize/result/${taskId}`);
+}
+
+export function applyOrganize(taskId) {
+    return fetchJSON(`/organize/apply/${taskId}`, { method: 'POST' });
+}
+
+export function rollbackOrganize(jobId) {
+    return fetchJSON(`/organize/rollback/${jobId}`, { method: 'POST' });
+}
+
+/**
+ * Connect to organize SSE stream.
+ * @param {string} taskId
+ * @param {object} handlers - { onProgress, onFileDone, onDone, onStopped, onError }
+ * @returns {EventSource}
+ */
+export function connectOrganizeStream(taskId, handlers) {
+    const es = new EventSource(`${BASE}/organize/status/${taskId}`);
+
+    es.onmessage = (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onProgress?.(data);
+        } catch { /* ignore */ }
+    };
+
+    es.addEventListener('progress', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onProgress?.(data);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener('file_done', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onFileDone?.(data);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener('done', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onDone?.(data);
+        } catch { /* ignore */ }
+        es.close();
+    });
+
+    es.addEventListener('stopped', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onStopped?.(data);
+        } catch { /* ignore */ }
+        es.close();
+    });
+
+    es.addEventListener('error', (e) => {
+        if (e.data) {
+            try {
+                const data = JSON.parse(e.data);
+                handlers.onError?.(data);
+            } catch { /* ignore */ }
+        }
+        es.close();
+    });
+
+    return es;
+}

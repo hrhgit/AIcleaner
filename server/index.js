@@ -11,6 +11,7 @@ import { scanRouter } from './routes/scan.js';
 import { settingsRouter } from './routes/settings.js';
 import { filesRouter } from './routes/files.js';
 import { systemRouter } from './routes/system.js';
+import { organizeRouter } from './routes/organize.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,6 +29,7 @@ app.use('/api/scan', scanRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/system', systemRouter);
+app.use('/api/organize', organizeRouter);
 
 // 托管构建后的 Vite 前端资源
 app.use(express.static(path.join(__dirname, '../dist')));
