@@ -22,7 +22,14 @@ organizeRouter.get('/capability', (req, res) => {
 });
 
 organizeRouter.post('/suggest-categories', async (req, res) => {
-    const { rootPath, recursive = true, excludedPatterns = [], manualCategories = [] } = req.body || {};
+    const {
+        rootPath,
+        recursive = true,
+        excludedPatterns = [],
+        manualCategories = [],
+        modelRouting = null,
+        modelSelection = null,
+    } = req.body || {};
 
     if (!rootPath) {
         return res.status(400).json({ error: 'rootPath is required' });
@@ -34,6 +41,8 @@ organizeRouter.post('/suggest-categories', async (req, res) => {
             recursive,
             excludedPatterns,
             manualCategories,
+            modelRouting,
+            modelSelection,
         });
 
         return res.json(data);
@@ -52,8 +61,11 @@ organizeRouter.post('/start', (req, res) => {
         recursive = true,
         mode = 'fast',
         categories = DEFAULT_CATEGORY_LIST,
+        allowNewCategories = true,
         excludedPatterns = DEFAULT_EXCLUDED_PATTERNS,
         parallelism = 5,
+        modelRouting = null,
+        modelSelection = null,
     } = req.body || {};
 
     if (!rootPath) {
@@ -65,8 +77,11 @@ organizeRouter.post('/start', (req, res) => {
         recursive,
         mode,
         categories,
+        allowNewCategories,
         excludedPatterns,
         parallelism,
+        modelRouting,
+        modelSelection,
     });
 
     activeTasks.set(task.id, task);
@@ -86,6 +101,8 @@ organizeRouter.post('/start', (req, res) => {
     res.json({
         taskId: task.id,
         selectedModel: task.selectedModel,
+        selectedModels: task.selectedModels,
+        selectedProviders: task.selectedProviders,
         supportsMultimodal: task.modelSupportsMultimodal,
     });
 });

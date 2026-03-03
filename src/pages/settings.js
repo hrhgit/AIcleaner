@@ -2,7 +2,7 @@
  * src/pages/settings.js
  * 设置页面 — API 配置、${t('settings.scan_path')}、清理目标
  */
-import { getSettings, saveSettings, browseFolder, getPrivilegeStatus, requestElevation } from '../utils/api.js';
+import { getSettings, saveSettings, browseFolder, getProviderModels, getPrivilegeStatus, requestElevation } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -185,36 +185,94 @@ export async function renderSettings(container) {
     </div>
   `;
 
-    // Dropdown logic function
-    function updateModelsDropdown(selectedValue) {
+    const remoteModelsCache = new Map();
+    let modelsRequestToken = 0;
+
+    function normalizeModels(models) {
+        const seen = new Set();
+        const normalized = [];
+        for (const item of models || []) {
+            if (!item?.value) continue;
+            const value = String(item.value).trim();
+            if (!value || seen.has(value)) continue;
+            seen.add(value);
+            normalized.push({
+                value,
+                label: String(item.label || value),
+            });
+        }
+        return normalized;
+    }
+
+    function renderModelOptions(models, selectedValue) {
         const modelSelect = document.getElementById('api-model');
-        const models = PROVIDER_MODELS[document.getElementById('api-endpoint').value] || PROVIDER_MODELS["https://api.deepseek.com"];
         modelSelect.innerHTML = models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
 
         if (selectedValue) {
-            // Check if selected value exists in options, otherwise append it
-            let exists = Array.from(modelSelect.options).some(opt => opt.value === selectedValue);
+            const exists = Array.from(modelSelect.options).some(opt => opt.value === selectedValue);
             if (!exists) {
-                const newOption = new Option(selectedValue, selectedValue);
-                modelSelect.add(newOption);
+                modelSelect.add(new Option(selectedValue, selectedValue));
             }
             modelSelect.value = selectedValue;
+        } else if (modelSelect.options.length > 0) {
+            modelSelect.value = modelSelect.options[0].value;
         }
     }
 
-    // Bind event for endpoint change
+    async function updateModelsDropdown(selectedValue) {
+        const endpoint = document.getElementById('api-endpoint').value.trim();
+        const apiKey = document.getElementById('api-key').value.trim();
+        const modelSelect = document.getElementById('api-model');
+        const requestToken = ++modelsRequestToken;
+
+        modelSelect.disabled = true;
+        modelSelect.innerHTML = `<option value="">Loading models...</option>`;
+
+        let models = [];
+        const cacheKey = `${endpoint}|${apiKey}`;
+
+        try {
+            if (endpoint) {
+                if (remoteModelsCache.has(cacheKey)) {
+                    models = remoteModelsCache.get(cacheKey);
+                } else {
+                    const resp = await getProviderModels(endpoint, apiKey);
+                    models = normalizeModels(resp?.models || []);
+                    remoteModelsCache.set(cacheKey, models);
+                }
+            }
+        } catch (err) {
+            console.warn('Failed to load provider models:', err.message);
+        }
+
+        if (!models.length) {
+            models = normalizeModels(PROVIDER_MODELS[endpoint] || PROVIDER_MODELS["https://api.deepseek.com"]);
+        }
+        if (!models.length) {
+            models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
+        }
+
+        if (requestToken !== modelsRequestToken) return;
+        renderModelOptions(models, selectedValue);
+        modelSelect.disabled = false;
+    }
+
     const endpointSelect = document.getElementById('api-endpoint');
     endpointSelect.addEventListener('change', () => {
         updateModelsDropdown();
     });
 
-    // Initialize dropdowns with default
-    updateModelsDropdown();
+    const apiKeyInput = document.getElementById('api-key');
+    apiKeyInput.addEventListener('blur', () => {
+        updateModelsDropdown(document.getElementById('api-model').value.trim());
+    });
+
+    await updateModelsDropdown();
 
     // Load existing settings
     try {
         const settings = await getSettings();
-        fillForm(settings);
+        await fillForm(settings);
     } catch (err) {
         console.warn('Failed to load settings:', err);
     }
@@ -362,7 +420,7 @@ export async function renderSettings(container) {
         }
     });
 
-    function fillForm(s) {
+    async function fillForm(s) {
         const el = (id) => document.getElementById(id);
         if (s.apiEndpoint) {
             let endpointEl = el('api-endpoint');
@@ -375,9 +433,9 @@ export async function renderSettings(container) {
         }
         if (s.apiKey) el('api-key').value = s.apiKey;
         if (s.model) {
-            updateModelsDropdown(s.model);
+            await updateModelsDropdown(s.model);
         } else {
-            updateModelsDropdown();
+            await updateModelsDropdown();
         }
         if (s.scanPath) el('scan-path').value = s.scanPath;
         if (s.targetSizeGB != null) {

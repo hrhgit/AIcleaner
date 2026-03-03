@@ -10,6 +10,8 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.m4v']);
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma', '.opus']);
 const OFFICE_EXTENSIONS = new Set(['.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp', '.pdf', '.rtf']);
 
 let officeParserModulePromise = null;
@@ -103,6 +105,8 @@ function toDataUrl(buffer, ext) {
 export function fileTypeOf(filePath) {
     const ext = extname(filePath).toLowerCase();
     if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+    if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+    if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
     if (OFFICE_EXTENSIONS.has(ext)) return 'office';
     if (TEXT_EXTENSIONS.has(ext)) return 'text';
     return 'binary';

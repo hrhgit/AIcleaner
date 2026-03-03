@@ -2,8 +2,10 @@
   applyOrganize,
   browseFolder,
   connectOrganizeStream,
+  getProviderModels,
   getOrganizeCapability,
   getOrganizeResult,
+  getSettings,
   rollbackOrganize,
   startOrganize,
   stopOrganize,
@@ -16,9 +18,12 @@ const PERSIST_KEYS = {
   rootPath: 'wipeout.organizer.global.root_path.v1',
   recursive: 'wipeout.organizer.global.recursive.v1',
   mode: 'wipeout.organizer.global.mode.v1',
+  allowNewCategories: 'wipeout.organizer.global.allow_new_categories.v1',
   categories: 'wipeout.organizer.global.categories.v1',
   exclusions: 'wipeout.organizer.global.exclusions.v1',
   parallelism: 'wipeout.organizer.global.parallelism.v1',
+  modelRouting: 'wipeout.organizer.global.model_routing.v1',
+  modelSelection: 'wipeout.organizer.global.model_selection.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
 };
 
@@ -43,10 +48,74 @@ const DEFAULT_EXCLUSIONS = [
   'Program Files (x86)',
 ];
 
+const MODEL_SELECT_IDS = {
+  text: 'org-model-text',
+  image: 'org-model-image',
+  video: 'org-model-video',
+  audio: 'org-model-audio',
+};
+
+const PROVIDER_SELECT_IDS = {
+  text: 'org-provider-text',
+  image: 'org-provider-image',
+  video: 'org-provider-video',
+  audio: 'org-provider-audio',
+};
+
+const API_KEY_INPUT_IDS = {
+  text: 'org-api-key-text',
+  image: 'org-api-key-image',
+  video: 'org-api-key-video',
+  audio: 'org-api-key-audio',
+};
+const COPY_TEXT_ROUTE_BTN_ID = 'org-copy-text-route-btn';
+
+const PROVIDER_OPTIONS = [
+  { value: 'https://api.deepseek.com', label: 'DeepSeek' },
+  { value: 'https://api.openai.com/v1', label: 'OpenAI' },
+  { value: 'https://generativelanguage.googleapis.com/v1beta/openai/', label: 'Google Gemini' },
+  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: 'Qwen (DashScope)' },
+  { value: 'https://open.bigmodel.cn/api/paas/v4', label: 'GLM (BigModel)' },
+  { value: 'https://api.moonshot.cn/v1', label: 'Kimi (Moonshot)' },
+];
+
+const PROVIDER_MODELS = {
+  'https://api.openai.com/v1': [
+    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
+    { value: 'gpt-4o', label: 'gpt-4o' },
+    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
+  ],
+  'https://api.deepseek.com': [
+    { value: 'deepseek-chat', label: 'deepseek-chat' },
+    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
+  ],
+  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
+    { value: 'qwen-plus', label: 'qwen-plus' },
+    { value: 'qwen-turbo', label: 'qwen-turbo' },
+    { value: 'qwen-max', label: 'qwen-max' },
+  ],
+  'https://open.bigmodel.cn/api/paas/v4': [
+    { value: 'glm-4-flash', label: 'glm-4-flash' },
+    { value: 'glm-4', label: 'glm-4' },
+  ],
+  'https://api.moonshot.cn/v1': [
+    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
+    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
+  ],
+  'https://generativelanguage.googleapis.com/v1beta/openai/': [
+    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+  ],
+};
+
 let activeTaskId = null;
 let activeEventSource = null;
 let latestSnapshot = null;
 let latestCapability = null;
+const remoteModelsCache = new Map();
+const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
 
 function getPersisted(key, fallback) {
   try {
@@ -74,21 +143,71 @@ function parseListInput(text) {
     .filter((x, idx, arr) => arr.indexOf(x) === idx);
 }
 
+function normalizeRemoteModels(models) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of models || []) {
+    if (!item?.value) continue;
+    const value = String(item.value).trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push({ value, label: String(item.label || value) });
+  }
+  return normalized;
+}
+
+function ensureProviderOptionExists(select, endpoint) {
+  if (!select || !endpoint) return;
+  const exists = Array.from(select.options).some((opt) => opt.value === endpoint);
+  if (!exists) {
+    select.add(new Option(endpoint, endpoint));
+  }
+}
+
+function readModelRoutingFromDOM() {
+  return {
+    text: {
+      endpoint: document.getElementById(PROVIDER_SELECT_IDS.text)?.value?.trim() || '',
+      apiKey: document.getElementById(API_KEY_INPUT_IDS.text)?.value?.trim() || '',
+      model: document.getElementById(MODEL_SELECT_IDS.text)?.value?.trim() || '',
+    },
+    image: {
+      endpoint: document.getElementById(PROVIDER_SELECT_IDS.image)?.value?.trim() || '',
+      apiKey: document.getElementById(API_KEY_INPUT_IDS.image)?.value?.trim() || '',
+      model: document.getElementById(MODEL_SELECT_IDS.image)?.value?.trim() || '',
+    },
+    video: {
+      endpoint: document.getElementById(PROVIDER_SELECT_IDS.video)?.value?.trim() || '',
+      apiKey: document.getElementById(API_KEY_INPUT_IDS.video)?.value?.trim() || '',
+      model: document.getElementById(MODEL_SELECT_IDS.video)?.value?.trim() || '',
+    },
+    audio: {
+      endpoint: document.getElementById(PROVIDER_SELECT_IDS.audio)?.value?.trim() || '',
+      apiKey: document.getElementById(API_KEY_INPUT_IDS.audio)?.value?.trim() || '',
+      model: document.getElementById(MODEL_SELECT_IDS.audio)?.value?.trim() || '',
+    },
+  };
+}
+
 function collectForm() {
   const rootPath = document.getElementById('org-root-path')?.value?.trim() || '';
   const recursive = !!document.getElementById('org-recursive')?.checked;
   const mode = document.getElementById('org-mode')?.value || 'fast';
+  const allowNewCategories = !!document.getElementById('org-allow-new-categories')?.checked;
   const categories = parseListInput(document.getElementById('org-categories')?.value || '');
   const excludedPatterns = parseListInput(document.getElementById('org-exclusions')?.value || '');
   const parallelism = Number(document.getElementById('org-parallelism')?.value || 5);
+  const modelRouting = readModelRoutingFromDOM();
 
   return {
     rootPath,
     recursive,
     mode,
+    allowNewCategories,
     categories: categories.length ? categories : [...DEFAULT_CATEGORIES],
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
     parallelism: Number.isFinite(parallelism) ? Math.max(1, Math.min(20, Math.floor(parallelism))) : 5,
+    modelRouting,
   };
 }
 
@@ -96,19 +215,33 @@ function persistForm(data) {
   setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
   setPersisted(PERSIST_KEYS.recursive, data.recursive);
   setPersisted(PERSIST_KEYS.mode, data.mode);
+  setPersisted(PERSIST_KEYS.allowNewCategories, data.allowNewCategories);
   setPersisted(PERSIST_KEYS.categories, data.categories);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
   setPersisted(PERSIST_KEYS.parallelism, data.parallelism);
+  setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
 }
 
 function restoreDefaults() {
+  const legacyModelSelection = getPersisted(PERSIST_KEYS.modelSelection, {});
+  const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
+
+  const fallbackRouting = {
+    text: { endpoint: '', apiKey: '', model: legacyModelSelection?.text || '' },
+    image: { endpoint: '', apiKey: '', model: legacyModelSelection?.image || '' },
+    video: { endpoint: '', apiKey: '', model: legacyModelSelection?.video || '' },
+    audio: { endpoint: '', apiKey: '', model: legacyModelSelection?.audio || '' },
+  };
+
   return {
     rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
     recursive: getPersisted(PERSIST_KEYS.recursive, true),
     mode: getPersisted(PERSIST_KEYS.mode, 'fast'),
+    allowNewCategories: getPersisted(PERSIST_KEYS.allowNewCategories, true),
     categories: getPersisted(PERSIST_KEYS.categories, DEFAULT_CATEGORIES),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
     parallelism: getPersisted(PERSIST_KEYS.parallelism, 5),
+    modelRouting: modelRouting || fallbackRouting,
   };
 }
 
@@ -145,7 +278,22 @@ function renderCapability(snapshot) {
   const mmEl = document.getElementById('org-mm-badge');
   if (!modelEl || !mmEl) return;
 
-  const model = snapshot?.selectedModel || latestCapability?.selectedModel || '-';
+  const selectedModels = snapshot?.selectedModels || latestCapability?.selectedModels;
+  const selectedProviders = snapshot?.selectedProviders || latestCapability?.selectedProviders;
+  const fallbackModel = snapshot?.selectedModel || latestCapability?.selectedModel || '-';
+  const labelByEndpoint = new Map(PROVIDER_OPTIONS.map((item) => [item.value, item.label]));
+  const renderCell = (modality) => {
+    const endpoint = selectedProviders?.[modality] || '';
+    const providerLabel = labelByEndpoint.get(endpoint) || endpoint || 'N/A';
+    const modelName = selectedModels?.[modality] || fallbackModel;
+    return `${providerLabel}/${modelName}`;
+  };
+  const model = [
+    `${t('organizer.model_text')}:${renderCell('text')}`,
+    `${t('organizer.model_image')}:${renderCell('image')}`,
+    `${t('organizer.model_video')}:${renderCell('video')}`,
+    `${t('organizer.model_audio')}:${renderCell('audio')}`,
+  ].join(' | ');
   const supports = typeof snapshot?.supportsMultimodal === 'boolean'
     ? snapshot.supportsMultimodal
     : latestCapability?.supportsMultimodal;
@@ -164,6 +312,133 @@ function renderCapability(snapshot) {
     mmEl.classList.add('badge-danger');
   }
 }
+
+function renderModelSelectOptions(select, models, selectedValue) {
+  if (!select) return;
+  select.innerHTML = '';
+  for (const model of models) {
+    select.add(new Option(String(model.label || model.value), String(model.value)));
+  }
+  if (selectedValue) {
+    const exists = Array.from(select.options).some((opt) => opt.value === selectedValue);
+    if (!exists) {
+      select.add(new Option(selectedValue, selectedValue));
+    }
+    select.value = selectedValue;
+  } else if (select.options.length > 0) {
+    select.value = select.options[0].value;
+  }
+}
+
+async function initModelSelectors(defaultSelection = {}) {
+  const modality = defaultSelection?.modality;
+  if (!modality || !MODEL_SELECT_IDS[modality]) return;
+
+  const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
+  const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
+  const modelSelect = document.getElementById(MODEL_SELECT_IDS[modality]);
+  if (!providerSelect || !apiKeyInput || !modelSelect) return;
+
+  const endpoint = String(providerSelect.value || '').trim();
+  const apiKey = String(apiKeyInput.value || '').trim();
+  const selectedModel = String(defaultSelection?.model || modelSelect.value || '').trim();
+  const requestToken = ++modelsRequestToken[modality];
+
+  modelSelect.disabled = true;
+  modelSelect.innerHTML = `<option value="">${t('organizer.model_loading')}</option>`;
+
+  const cacheKey = `${endpoint}|${apiKey}`;
+  let models = [];
+  try {
+    if (endpoint) {
+      if (remoteModelsCache.has(cacheKey)) {
+        models = remoteModelsCache.get(cacheKey);
+      } else {
+        const resp = await getProviderModels(endpoint, apiKey);
+        models = normalizeRemoteModels(resp?.models || []);
+        remoteModelsCache.set(cacheKey, models);
+      }
+    }
+  } catch {
+    models = [];
+  }
+
+  if (!models.length) {
+    models = normalizeRemoteModels(PROVIDER_MODELS[endpoint] || PROVIDER_MODELS['https://api.deepseek.com']);
+  }
+  if (!models.length) {
+    models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
+  }
+
+  if (requestToken !== modelsRequestToken[modality]) return;
+  renderModelSelectOptions(modelSelect, models, selectedModel || models[0]?.value);
+  modelSelect.disabled = false;
+}
+
+async function initModelRoutingFields(defaultRouting = {}) {
+  let settings = null;
+  try {
+    settings = await getSettings();
+  } catch {
+    settings = null;
+  }
+
+  const baseEndpoint = String(settings?.apiEndpoint || 'https://api.deepseek.com').trim();
+  const baseApiKey = String(settings?.apiKey || '').trim();
+  const baseModel = String(settings?.model || 'deepseek-chat').trim();
+
+  for (const option of PROVIDER_OPTIONS) {
+    for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+      const select = document.getElementById(PROVIDER_SELECT_IDS[modality]);
+      if (!select) continue;
+      const exists = Array.from(select.options).some((x) => x.value === option.value);
+      if (!exists) select.add(new Option(option.label, option.value));
+    }
+  }
+
+  for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+    const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
+    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
+    const route = defaultRouting?.[modality] || {};
+    const endpoint = String(route.endpoint || baseEndpoint).trim();
+    const apiKey = String(route.apiKey || baseApiKey).trim();
+    const model = String(route.model || baseModel).trim();
+
+    ensureProviderOptionExists(providerSelect, endpoint);
+    if (providerSelect) providerSelect.value = endpoint;
+    if (apiKeyInput) apiKeyInput.value = apiKey;
+
+    await initModelSelectors({ modality, model });
+  }
+}
+
+async function applyTextRouteToOtherModalities() {
+  const routing = readModelRoutingFromDOM();
+  const textRoute = routing?.text || {};
+  const targetModalities = ['image', 'video', 'audio'];
+
+  for (const modality of targetModalities) {
+    const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
+    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
+    const endpoint = String(textRoute.endpoint || '').trim();
+    const apiKey = String(textRoute.apiKey || '').trim();
+
+    ensureProviderOptionExists(providerSelect, endpoint);
+    if (providerSelect && endpoint) {
+      providerSelect.value = endpoint;
+    }
+    if (apiKeyInput) {
+      apiKeyInput.value = apiKey;
+    }
+  }
+
+  for (const modality of targetModalities) {
+    await initModelSelectors({ modality, model: String(textRoute.model || '').trim() });
+  }
+
+  persistForm(collectForm());
+}
+
 function renderPreview(snapshot) {
   const tbody = document.getElementById('org-preview-body');
   const empty = document.getElementById('org-preview-empty');
@@ -278,8 +553,37 @@ function updateButtons(snapshot) {
   }
 }
 
+function syncCategoryInput(snapshot) {
+  const next = Array.isArray(snapshot?.categories) ? snapshot.categories : [];
+  if (!next.length) return;
+
+  const textArea = document.getElementById('org-categories');
+  if (!textArea) return;
+
+  const current = parseListInput(textArea.value || '');
+  const unchanged =
+    current.length === next.length &&
+    current.every((value, index) => value === next[index]);
+
+  if (unchanged) return;
+
+  textArea.value = next.join('\n');
+  const form = collectForm();
+  persistForm({ ...form, categories: next });
+}
+
+function syncAllowNewCategoriesInput(snapshot) {
+  if (!snapshot || typeof snapshot.allowNewCategories !== 'boolean') return;
+  const checkbox = document.getElementById('org-allow-new-categories');
+  if (!checkbox) return;
+  if (checkbox.checked === snapshot.allowNewCategories) return;
+  checkbox.checked = snapshot.allowNewCategories;
+}
+
 function refreshView(snapshot) {
   latestSnapshot = snapshot || null;
+  syncAllowNewCategoriesInput(snapshot);
+  syncCategoryInput(snapshot);
   setStatusText(snapshot);
   renderCapability(snapshot);
   updateStats(snapshot);
@@ -358,6 +662,7 @@ async function handleSuggest() {
       recursive: form.recursive,
       excludedPatterns: form.excludedPatterns,
       manualCategories: form.categories,
+      modelRouting: form.modelRouting,
     });
 
     const categories = resp?.suggestedCategories || form.categories;
@@ -402,6 +707,8 @@ async function handleStart() {
     activeTaskId = result.taskId;
     latestCapability = {
       selectedModel: result.selectedModel,
+      selectedModels: result.selectedModels,
+      selectedProviders: result.selectedProviders,
       supportsMultimodal: result.supportsMultimodal,
     };
     renderCapability();
@@ -527,15 +834,84 @@ async function handleRollback() {
   }
 }
 
+async function handleCopyTextRoute() {
+  const btn = document.getElementById(COPY_TEXT_ROUTE_BTN_ID);
+  if (btn) {
+    btn.disabled = true;
+  }
+
+  try {
+    await applyTextRouteToOtherModalities();
+    showToast(t('organizer.toast_route_copied'), 'success');
+  } catch (err) {
+    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+    }
+  }
+}
+
 function bindPersistenceListeners() {
-  ['org-root-path', 'org-recursive', 'org-mode', 'org-categories', 'org-exclusions', 'org-parallelism'].forEach((id) => {
+  [
+    'org-root-path',
+    'org-recursive',
+    'org-mode',
+    'org-allow-new-categories',
+    'org-categories',
+    'org-exclusions',
+    'org-parallelism',
+    PROVIDER_SELECT_IDS.text,
+    PROVIDER_SELECT_IDS.image,
+    PROVIDER_SELECT_IDS.video,
+    PROVIDER_SELECT_IDS.audio,
+    API_KEY_INPUT_IDS.text,
+    API_KEY_INPUT_IDS.image,
+    API_KEY_INPUT_IDS.video,
+    API_KEY_INPUT_IDS.audio,
+    MODEL_SELECT_IDS.text,
+    MODEL_SELECT_IDS.image,
+    MODEL_SELECT_IDS.video,
+    MODEL_SELECT_IDS.audio,
+  ].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
-    const eventName = id === 'org-recursive' ? 'change' : 'input';
+    const eventName = [
+      'org-recursive',
+      'org-allow-new-categories',
+      'org-mode',
+      PROVIDER_SELECT_IDS.text,
+      PROVIDER_SELECT_IDS.image,
+      PROVIDER_SELECT_IDS.video,
+      PROVIDER_SELECT_IDS.audio,
+      MODEL_SELECT_IDS.text,
+      MODEL_SELECT_IDS.image,
+      MODEL_SELECT_IDS.video,
+      MODEL_SELECT_IDS.audio,
+    ].includes(id)
+      ? 'change'
+      : 'input';
     el.addEventListener(eventName, () => {
       persistForm(collectForm());
     });
   });
+}
+
+function bindModelRoutingListeners() {
+  for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+    const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
+    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
+
+    providerSelect?.addEventListener('change', async () => {
+      await initModelSelectors({ modality });
+      persistForm(collectForm());
+    });
+
+    apiKeyInput?.addEventListener('blur', async () => {
+      await initModelSelectors({ modality });
+      persistForm(collectForm());
+    });
+  }
 }
 
 export async function renderOrganizer(container) {
@@ -590,6 +966,52 @@ export async function renderOrganizer(container) {
         </div>
       </div>
 
+      <div class="form-group">
+        <label class="form-label">${t('organizer.model_routing')}</label>
+        <div class="grid-2">
+          <div class="form-group">
+            <label class="form-label">${t('organizer.model_text')}</label>
+            <select id="${PROVIDER_SELECT_IDS.text}" class="form-input"></select>
+            <div class="form-hint">${t('settings.provider')}</div>
+            <input id="${API_KEY_INPUT_IDS.text}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
+            <div class="form-hint">${t('settings.api_key')}</div>
+            <select id="${MODEL_SELECT_IDS.text}" class="form-input"></select>
+            <div class="form-hint">${t('settings.model')}</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">${t('organizer.model_image')}</label>
+            <select id="${PROVIDER_SELECT_IDS.image}" class="form-input"></select>
+            <div class="form-hint">${t('settings.provider')}</div>
+            <input id="${API_KEY_INPUT_IDS.image}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
+            <div class="form-hint">${t('settings.api_key')}</div>
+            <select id="${MODEL_SELECT_IDS.image}" class="form-input"></select>
+            <div class="form-hint">${t('settings.model')}</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">${t('organizer.model_video')}</label>
+            <select id="${PROVIDER_SELECT_IDS.video}" class="form-input"></select>
+            <div class="form-hint">${t('settings.provider')}</div>
+            <input id="${API_KEY_INPUT_IDS.video}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
+            <div class="form-hint">${t('settings.api_key')}</div>
+            <select id="${MODEL_SELECT_IDS.video}" class="form-input"></select>
+            <div class="form-hint">${t('settings.model')}</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">${t('organizer.model_audio')}</label>
+            <select id="${PROVIDER_SELECT_IDS.audio}" class="form-input"></select>
+            <div class="form-hint">${t('settings.provider')}</div>
+            <input id="${API_KEY_INPUT_IDS.audio}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
+            <div class="form-hint">${t('settings.api_key')}</div>
+            <select id="${MODEL_SELECT_IDS.audio}" class="form-input"></select>
+            <div class="form-hint">${t('settings.model')}</div>
+          </div>
+        </div>
+        <div class="form-hint">${t('organizer.model_routing_hint')}</div>
+        <div class="flex items-center gap-8" style="margin-top:8px;">
+          <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
+        </div>
+      </div>
+
       <div class="grid-2">
         <div class="form-group">
           <label class="form-label">${t('organizer.current_model')}</label>
@@ -606,6 +1028,11 @@ export async function renderOrganizer(container) {
           <label class="form-label">${t('organizer.categories')}</label>
           <textarea id="org-categories" class="form-input" rows="8">${escapeHtml((defaults.categories || []).join('\n'))}</textarea>
           <div class="form-hint">${t('organizer.categories_hint')}</div>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+            <input id="org-allow-new-categories" type="checkbox" ${defaults.allowNewCategories ? 'checked' : ''} />
+            <span>${t('organizer.allow_new_categories')}</span>
+          </label>
+          <div class="form-hint">${t('organizer.allow_new_categories_hint')}</div>
         </div>
         <div class="form-group">
           <label class="form-label">${t('organizer.exclusions')}</label>
@@ -702,7 +1129,10 @@ export async function renderOrganizer(container) {
   document.getElementById('org-stop-btn')?.addEventListener('click', handleStop);
   document.getElementById('org-apply-btn')?.addEventListener('click', handleApply);
   document.getElementById('org-rollback-btn')?.addEventListener('click', handleRollback);
+  document.getElementById(COPY_TEXT_ROUTE_BTN_ID)?.addEventListener('click', handleCopyTextRoute);
 
+  await initModelRoutingFields(defaults.modelRouting);
+  bindModelRoutingListeners();
   bindPersistenceListeners();
 
   try {

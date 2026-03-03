@@ -59,6 +59,77 @@ settingsRouter.post('/', (req, res) => {
     }
 });
 
+settingsRouter.post('/models', async (req, res) => {
+    const endpoint = String(req.body?.endpoint || '').trim();
+    const apiKey = String(req.body?.apiKey || '').trim();
+
+    if (!endpoint) {
+        return res.status(400).json({ success: false, error: 'Missing endpoint' });
+    }
+
+    let modelsUrl;
+    try {
+        modelsUrl = new URL(`${endpoint.replace(/\/+$/, '')}/models`);
+    } catch {
+        return res.status(400).json({ success: false, error: 'Invalid endpoint URL' });
+    }
+
+    const headers = { Accept: 'application/json' };
+    if (apiKey) {
+        headers.Authorization = `Bearer ${apiKey}`;
+        headers['x-api-key'] = apiKey;
+        headers['api-key'] = apiKey;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+        const resp = await fetch(modelsUrl, {
+            method: 'GET',
+            headers,
+            signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => '');
+            return res.status(502).json({
+                success: false,
+                error: `Failed to fetch models (${resp.status})`,
+                detail: text.slice(0, 300),
+            });
+        }
+
+        const payload = await resp.json().catch(() => ({}));
+        const rawModels = Array.isArray(payload?.data)
+            ? payload.data
+            : Array.isArray(payload?.models)
+                ? payload.models
+                : [];
+
+        const seen = new Set();
+        const models = [];
+
+        for (const item of rawModels) {
+            const id = typeof item === 'string'
+                ? item.trim()
+                : String(item?.id || item?.name || item?.model || '').trim();
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            models.push({ value: id, label: id });
+        }
+
+        res.json({ success: true, models });
+    } catch (err) {
+        clearTimeout(timeout);
+        res.status(502).json({
+            success: false,
+            error: err.name === 'AbortError' ? 'Fetch models timeout' : err.message,
+        });
+    }
+});
+
 /**
  * POST /api/settings/browse-folder
  * Opens native folder selection dialog and returns the chosen path.

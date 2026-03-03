@@ -30,6 +30,13 @@ export function browseFolder() {
     return fetchJSON('/settings/browse-folder', { method: 'POST' });
 }
 
+export function getProviderModels(endpoint, apiKey) {
+    return fetchJSON('/settings/models', {
+        method: 'POST',
+        body: { endpoint, apiKey },
+    });
+}
+
 export function getPrivilegeStatus() {
     return fetchJSON('/system/privilege');
 }

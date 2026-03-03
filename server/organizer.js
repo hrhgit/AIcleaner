@@ -42,6 +42,9 @@ export const DEFAULT_EXCLUDED_PATTERNS = [
     'program files (x86)',
 ];
 
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.wmv', '.flv', '.webm', '.m4v']);
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.wma', '.opus']);
+
 function ensureJobDir() {
     if (!existsSync(JOBS_DIR)) {
         mkdirSync(JOBS_DIR, { recursive: true });
@@ -123,20 +126,83 @@ function fallbackCategoryFromFilename(name = '', categories = []) {
     return '其他待定';
 }
 
-function pickFastModel(settings) {
-    const endpoint = String(settings.apiEndpoint || '').toLowerCase();
-    if (endpoint.includes('openai.com')) return 'gpt-4o-mini';
-    if (endpoint.includes('deepseek.com')) return 'deepseek-chat';
-    if (endpoint.includes('generativelanguage.googleapis.com')) return 'gemini-2.5-flash';
-    if (endpoint.includes('dashscope.aliyuncs.com')) return 'qwen-turbo';
-    if (endpoint.includes('bigmodel.cn')) return 'glm-4-flash';
-    if (endpoint.includes('moonshot.cn')) return 'moonshot-v1-8k';
-    return settings.model || 'gpt-4o-mini';
+function normalizeModelName(value) {
+    const text = String(value || '').trim();
+    return text || '';
 }
 
-function supportsMultimodal(settings, model) {
-    const endpoint = String(settings.apiEndpoint || '').toLowerCase();
-    const value = `${endpoint}|${String(model || '').toLowerCase()}`;
+function pickFastModelByEndpoint(endpoint, fallbackModel = 'gpt-4o-mini') {
+    const value = String(endpoint || '').toLowerCase();
+    if (value.includes('openai.com')) return 'gpt-4o-mini';
+    if (value.includes('deepseek.com')) return 'deepseek-chat';
+    if (value.includes('generativelanguage.googleapis.com')) return 'gemini-2.5-flash';
+    if (value.includes('dashscope.aliyuncs.com')) return 'qwen-turbo';
+    if (value.includes('bigmodel.cn')) return 'glm-4-flash';
+    if (value.includes('moonshot.cn')) return 'moonshot-v1-8k';
+    return normalizeModelName(fallbackModel) || 'gpt-4o-mini';
+}
+
+function pickFastModel(settings) {
+    return pickFastModelByEndpoint(settings?.apiEndpoint, settings?.model);
+}
+
+function normalizeEndpointValue(value, fallbackValue = 'https://api.openai.com/v1') {
+    const endpoint = String(value || '').trim();
+    return endpoint || String(fallbackValue || 'https://api.openai.com/v1').trim() || 'https://api.openai.com/v1';
+}
+
+function normalizeApiKeyValue(value, fallbackValue = '') {
+    const key = String(value || '').trim();
+    return key || String(fallbackValue || '').trim();
+}
+
+function normalizeRouteConfig(route, fallbackRoute) {
+    const source = route && typeof route === 'object' ? route : {};
+    const fallback = fallbackRoute && typeof fallbackRoute === 'object' ? fallbackRoute : {};
+    const endpoint = normalizeEndpointValue(source.endpoint, fallback.endpoint);
+    const apiKey = normalizeApiKeyValue(source.apiKey, fallback.apiKey);
+    const model = normalizeModelName(source.model)
+        || pickFastModelByEndpoint(endpoint, fallback.model)
+        || 'gpt-4o-mini';
+    return { endpoint, apiKey, model };
+}
+
+function normalizeModelRouting(modelRouting, settings, legacyModelSelection) {
+    const defaultRoute = {
+        endpoint: normalizeEndpointValue(settings?.apiEndpoint, 'https://api.openai.com/v1'),
+        apiKey: normalizeApiKeyValue(settings?.apiKey, ''),
+        model: normalizeModelName(settings?.model) || pickFastModel(settings),
+    };
+    const source = modelRouting && typeof modelRouting === 'object' ? modelRouting : {};
+    const legacy = legacyModelSelection && typeof legacyModelSelection === 'object' ? legacyModelSelection : {};
+    const routing = {};
+
+    for (const modality of ['text', 'image', 'video', 'audio']) {
+        routing[modality] = normalizeRouteConfig(source[modality], defaultRoute);
+        const legacyModel = normalizeModelName(legacy[modality]);
+        if (!normalizeModelName(source?.[modality]?.model) && legacyModel) {
+            routing[modality].model = legacyModel;
+        }
+    }
+    return routing;
+}
+
+function pickInputModalityByPath(filePath) {
+    const ext = extname(String(filePath || '')).toLowerCase();
+    if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+    if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
+    if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(ext)) return 'image';
+    return 'text';
+}
+
+function pickRouteByModality(modality, routing) {
+    const key = ['text', 'image', 'video', 'audio'].includes(modality) ? modality : 'text';
+    const fallback = routing?.text || {};
+    return normalizeRouteConfig(routing?.[key], fallback);
+}
+
+function supportsMultimodalByEndpoint(endpoint, model) {
+    const value = `${String(endpoint || '').toLowerCase()}|${String(model || '').toLowerCase()}`;
     return [
         'gpt-4o',
         'gpt-4.1',
@@ -150,18 +216,33 @@ function supportsMultimodal(settings, model) {
 
 export function getOrganizeCapability() {
     const settings = loadSettings();
-    const selectedModel = pickFastModel(settings);
+    const routing = normalizeModelRouting(null, settings);
+    const selectedModels = {
+        text: routing.text.model,
+        image: routing.image.model,
+        video: routing.video.model,
+        audio: routing.audio.model,
+    };
+    const selectedProviders = {
+        text: routing.text.endpoint,
+        image: routing.image.endpoint,
+        video: routing.video.endpoint,
+        audio: routing.audio.endpoint,
+    };
     return {
-        selectedModel,
-        supportsMultimodal: supportsMultimodal(settings, selectedModel),
+        selectedModel: selectedModels.text,
+        selectedModels,
+        selectedProviders,
+        supportsMultimodal: supportsMultimodalByEndpoint(routing.image.endpoint, routing.image.model),
         apiEndpoint: settings.apiEndpoint || '',
     };
 }
 
-function buildOpenAIClient(settings) {
+function buildOpenAIClient(config) {
+    const endpoint = normalizeEndpointValue(config?.endpoint, config?.apiEndpoint);
     return new OpenAI({
-        apiKey: settings.apiKey || 'sk-placeholder',
-        baseURL: settings.apiEndpoint || 'https://api.openai.com/v1',
+        apiKey: normalizeApiKeyValue(config?.apiKey, '') || 'sk-placeholder',
+        baseURL: endpoint,
     });
 }
 
@@ -255,15 +336,35 @@ async function collectFiles(rootPath, recursive, excludedPatterns, shouldStop = 
     return output;
 }
 
-function normalizeCategoryValue(category, categories) {
-    const value = String(category || '').trim();
-    if (value && categories.includes(value)) {
+function normalizeGeneratedCategory(category) {
+    const raw = String(category || '')
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/^["'`]+|["'`]+$/g, '')
+        .replace(/[\\/:*?"<>|]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!raw) return '';
+    if (raw.length > 24) return '';
+    if (/[{}\[\]]/.test(raw)) return '';
+    return raw;
+}
+
+function normalizeCategoryValue(category, categories, allowNewCategories = false) {
+    const value = normalizeGeneratedCategory(category);
+    if (!value) {
+        return '其他待定';
+    }
+    if (categories.includes(value)) {
+        return value;
+    }
+    if (allowNewCategories) {
         return value;
     }
     return '其他待定';
 }
 
-function parseCategoryFromResponse(content, categories) {
+function parseCategoryFromResponse(content, categories, allowNewCategories = false) {
     const clean = extractJsonText(content);
     const parsed = JSON.parse(clean);
 
@@ -272,25 +373,41 @@ function parseCategoryFromResponse(content, categories) {
         : parsed?.result || parsed?.item || parsed;
 
     const category = candidate?.category || candidate?.classification || candidate?.label;
-    return normalizeCategoryValue(category, categories);
+    const normalizedCategory = normalizeCategoryValue(category, categories, allowNewCategories);
+    return {
+        category: normalizedCategory,
+        createdCategory: normalizedCategory !== '其他待定' && !categories.includes(normalizedCategory),
+    };
 }
 
-function buildSystemPrompt(categories) {
-    return [
+function buildSystemPrompt(categories, allowNewCategories = false) {
+    const lines = [
         'You classify ONE file into ONE category.',
         'Return JSON only. No markdown. No explanation.',
-        'Output schema: {"index":1,"category":"<one_of_categories>"}.',
-        `Allowed categories: ${categories.join(' | ')}`,
-        'If unsure, choose "其他待定".',
-    ].join('\n');
+        'Output schema: {"index":1,"category":"<category_name>"}.',
+        `Current categories (prefer reuse): ${categories.join(' | ')}`,
+    ];
+
+    if (allowNewCategories) {
+        lines.push('If none of the current categories fit, you may create ONE short new category name.');
+        lines.push('Prefer concise Chinese category names and avoid verbose descriptions.');
+    } else {
+        lines.push('You must choose category from the current categories only.');
+    }
+
+    lines.push('If unsure, choose "其他待定".');
+    return lines.join('\n');
 }
 
-function buildUserPrompt({ file, mode, extracted }) {
+function buildUserPrompt({ file, mode, extracted, allowNewCategories = false }) {
     const lines = [
         `mode=${mode}`,
         `name=${file.name}`,
         `relativePath=${file.relativePath}`,
         `size=${file.size}`,
+        allowNewCategories
+            ? 'newCategoryPolicy=prefer_existing_category;create_new_if_no_fit'
+            : 'newCategoryPolicy=existing_categories_only',
     ];
 
     if (extracted?.type) {
@@ -347,12 +464,23 @@ function trimExtractedForRetry(extracted, maxChars = CONTEXT_RETRY_TEXT_CHAR_LIM
     };
 }
 
-async function classifyOneFile({ client, model, settings, file, mode, categories }) {
-    const canUseMultimodal = supportsMultimodal(settings, model);
+async function classifyOneFile({
+    getClientForRoute,
+    modelRouting,
+    file,
+    mode,
+    categories,
+    allowNewCategories = true,
+}) {
+    const modality = pickInputModalityByPath(file.path);
+    const route = pickRouteByModality(modality, modelRouting);
+    const model = route.model;
+    const client = getClientForRoute(route);
+    const canUseMultimodal = supportsMultimodalByEndpoint(route.endpoint, model);
     const extracted = await extractFileContent(file.path, mode, { supportsMultimodal: canUseMultimodal });
 
-    const systemPrompt = buildSystemPrompt(categories);
-    const textPrompt = buildUserPrompt({ file, mode, extracted });
+    const systemPrompt = buildSystemPrompt(categories, allowNewCategories);
+    const textPrompt = buildUserPrompt({ file, mode, extracted, allowNewCategories });
 
     let warnings = [...(extracted.warnings || [])];
     let degraded = !!extracted.degraded;
@@ -408,7 +536,7 @@ async function classifyOneFile({ client, model, settings, file, mode, categories
             warnings.push(`multimodal_failed:${err.message}`);
             const fallbackMessages = [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: buildUserPrompt({ file, mode: 'fast', extracted: { type: extracted.type } }) },
+                { role: 'user', content: buildUserPrompt({ file, mode: 'fast', extracted: { type: extracted.type }, allowNewCategories }) },
             ];
             result = await runRequest(fallbackMessages);
         } else if (isContextLengthError(err) && extracted?.payload?.text) {
@@ -417,7 +545,7 @@ async function classifyOneFile({ client, model, settings, file, mode, categories
             const retryExtracted = trimExtractedForRetry(extracted);
             const fallbackMessages = [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: buildUserPrompt({ file, mode: 'balanced', extracted: retryExtracted }) },
+                { role: 'user', content: buildUserPrompt({ file, mode: 'balanced', extracted: retryExtracted, allowNewCategories }) },
             ];
             result = await runRequest(fallbackMessages);
         } else {
@@ -426,8 +554,11 @@ async function classifyOneFile({ client, model, settings, file, mode, categories
     }
 
     let category = '其他待定';
+    let createdCategory = false;
     try {
-        category = parseCategoryFromResponse(result.content, categories);
+        const parsed = parseCategoryFromResponse(result.content, categories, allowNewCategories);
+        category = parsed.category;
+        createdCategory = parsed.createdCategory;
     } catch (err) {
         degraded = true;
         warnings.push(`parse_failed:${err.message}`);
@@ -435,6 +566,9 @@ async function classifyOneFile({ client, model, settings, file, mode, categories
 
     return {
         category,
+        createdCategory,
+        modality,
+        provider: route.endpoint,
         model,
         degraded,
         warnings,
@@ -481,11 +615,28 @@ export class OrganizeTask extends EventEmitter {
         this.recursive = !!options.recursive;
         this.mode = ['fast', 'balanced', 'deep'].includes(options.mode) ? options.mode : 'fast';
         this.categories = normalizeCategories(options.categories);
+        this.allowNewCategories = options.allowNewCategories !== false;
         this.excludedPatterns = normalizeExcludedPatterns(options.excludedPatterns);
         this.parallelism = normalizeParallelism(options.parallelism || 5);
         this.settings = loadSettings();
-        this.selectedModel = pickFastModel(this.settings);
-        this.modelSupportsMultimodal = supportsMultimodal(this.settings, this.selectedModel);
+        this.modelRouting = normalizeModelRouting(options.modelRouting, this.settings, options.modelSelection);
+        this.selectedModels = {
+            text: this.modelRouting.text.model,
+            image: this.modelRouting.image.model,
+            video: this.modelRouting.video.model,
+            audio: this.modelRouting.audio.model,
+        };
+        this.selectedProviders = {
+            text: this.modelRouting.text.endpoint,
+            image: this.modelRouting.image.endpoint,
+            video: this.modelRouting.video.endpoint,
+            audio: this.modelRouting.audio.endpoint,
+        };
+        this.selectedModel = this.selectedModels.text;
+        this.modelSupportsMultimodal = supportsMultimodalByEndpoint(
+            this.selectedProviders.image,
+            this.selectedModels.image
+        );
 
         this.totalFiles = 0;
         this.processedFiles = 0;
@@ -524,9 +675,12 @@ export class OrganizeTask extends EventEmitter {
             recursive: this.recursive,
             mode: this.mode,
             categories: this.categories,
+            allowNewCategories: this.allowNewCategories,
             excludedPatterns: this.excludedPatterns,
             parallelism: this.parallelism,
             selectedModel: this.selectedModel,
+            selectedModels: this.selectedModels,
+            selectedProviders: this.selectedProviders,
             supportsMultimodal: this.modelSupportsMultimodal,
             totalFiles: this.totalFiles,
             processedFiles: this.processedFiles,
@@ -581,9 +735,14 @@ export class OrganizeTask extends EventEmitter {
         this.status = 'classifying';
         this._emitProgress();
 
-        const settings = this.settings;
-        const model = this.selectedModel;
-        const client = buildOpenAIClient(settings);
+        const clientCache = new Map();
+        const getClientForRoute = (route) => {
+            const key = `${route.endpoint}|${route.apiKey}`;
+            if (!clientCache.has(key)) {
+                clientCache.set(key, buildOpenAIClient(route));
+            }
+            return clientCache.get(key);
+        };
 
         const limiter = pLimit(this.parallelism);
 
@@ -597,13 +756,21 @@ export class OrganizeTask extends EventEmitter {
                     const index = i + 1;
                     try {
                         const classified = await classifyOneFile({
-                            client,
-                            model,
-                            settings,
+                            getClientForRoute,
+                            modelRouting: this.modelRouting,
                             file,
                             mode: this.mode,
                             categories: this.categories,
+                            allowNewCategories: this.allowNewCategories,
                         });
+
+                        if (
+                            this.allowNewCategories &&
+                            classified.category !== '其他待定' &&
+                            !this.categories.includes(classified.category)
+                        ) {
+                            this.categories.push(classified.category);
+                        }
 
                         const row = {
                             index,
@@ -612,8 +779,11 @@ export class OrganizeTask extends EventEmitter {
                             relativePath: file.relativePath,
                             size: file.size,
                             category: classified.category,
+                            createdCategory: classified.createdCategory,
                             degraded: classified.degraded,
                             warnings: classified.warnings,
+                            modality: classified.modality,
+                            provider: classified.provider,
                             model: classified.model,
                         };
 
@@ -625,6 +795,9 @@ export class OrganizeTask extends EventEmitter {
                         this.emit('file_done', row);
                     } catch (err) {
                         const rateLimited = isRateLimitError(err);
+                        const modality = pickInputModalityByPath(file.path);
+                        const route = pickRouteByModality(modality, this.modelRouting);
+                        const model = route.model;
                         const row = {
                             index,
                             name: file.name,
@@ -632,8 +805,11 @@ export class OrganizeTask extends EventEmitter {
                             relativePath: file.relativePath,
                             size: file.size,
                             category: rateLimited ? fallbackCategoryFromFilename(file.name, this.categories) : '其他待定',
+                            createdCategory: false,
                             degraded: true,
                             warnings: [rateLimited ? `rate_limited_fallback:${err.message}` : `classify_failed:${err.message}`],
+                            modality,
+                            provider: route.endpoint,
                             model,
                         };
                         this.results.push(row);
@@ -714,8 +890,10 @@ export async function suggestCategoriesByFilename(options) {
     }
 
     const settings = loadSettings();
-    const model = pickFastModel(settings);
-    const client = buildOpenAIClient(settings);
+    const modelRouting = normalizeModelRouting(options.modelRouting, settings, options.modelSelection);
+    const textRoute = pickRouteByModality('text', modelRouting);
+    const model = textRoute.model;
+    const client = buildOpenAIClient(textRoute);
 
     const sampleText = shortlist
         .map((f, idx) => `${idx + 1}. ${f.relativePath}`)
