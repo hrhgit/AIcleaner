@@ -97,6 +97,63 @@ function resolveProviderSettings(input) {
     };
 }
 
+function resolveSearchSettings(input) {
+    const source = input?.searchApi && typeof input.searchApi === 'object'
+        ? input.searchApi
+        : {};
+    const scopesSource = source?.scopes && typeof source.scopes === 'object'
+        ? source.scopes
+        : {};
+
+    const legacyScan = typeof input?.enableWebSearch === 'boolean'
+        ? input.enableWebSearch
+        : false;
+    const legacyClassify = typeof input?.enableWebSearchClassify === 'boolean'
+        ? input.enableWebSearchClassify
+        : (typeof input?.enableWebSearchOrganizer === 'boolean'
+            ? input.enableWebSearchOrganizer
+            : legacyScan);
+    const legacyOrganizer = typeof input?.enableWebSearchOrganizer === 'boolean'
+        ? input.enableWebSearchOrganizer
+        : legacyScan;
+
+    const scanEnabled = typeof scopesSource.scan === 'boolean'
+        ? scopesSource.scan
+        : legacyScan;
+    const classifyEnabled = typeof scopesSource.classify === 'boolean'
+        ? scopesSource.classify
+        : (typeof scopesSource.organizer === 'boolean'
+            ? scopesSource.organizer
+            : legacyClassify);
+    const organizerEnabled = typeof scopesSource.organizer === 'boolean'
+        ? scopesSource.organizer
+        : classifyEnabled;
+
+    const enabled = typeof source.enabled === 'boolean'
+        ? source.enabled
+        : (scanEnabled || classifyEnabled || organizerEnabled);
+    const apiKey = String(source.apiKey || input?.tavilyApiKey || '').trim();
+
+    const searchApi = {
+        provider: 'tavily',
+        enabled: !!enabled,
+        apiKey,
+        scopes: {
+            scan: !!scanEnabled,
+            classify: !!classifyEnabled,
+            organizer: !!organizerEnabled,
+        },
+    };
+
+    return {
+        searchApi,
+        enableWebSearch: searchApi.enabled && searchApi.scopes.scan,
+        enableWebSearchClassify: searchApi.enabled && searchApi.scopes.classify,
+        enableWebSearchOrganizer: searchApi.enabled && searchApi.scopes.organizer,
+        tavilyApiKey: searchApi.apiKey,
+    };
+}
+
 const DEFAULT_SETTINGS = {
     apiEndpoint: process.env.VITE_API_ENDPOINT || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
     apiKey: process.env.VITE_API_KEY || process.env.OPENAI_API_KEY || '',
@@ -108,7 +165,19 @@ const DEFAULT_SETTINGS = {
     maxDepth: 5,
     lastScanTime: null,
     enableWebSearch: false,
+    enableWebSearchClassify: false,
+    enableWebSearchOrganizer: false,
     tavilyApiKey: process.env.TAVILY_API_KEY || '',
+    searchApi: {
+        provider: 'tavily',
+        enabled: false,
+        apiKey: process.env.TAVILY_API_KEY || '',
+        scopes: {
+            scan: false,
+            classify: false,
+            organizer: false,
+        },
+    },
 };
 
 export function loadSettings() {
@@ -116,12 +185,20 @@ export function loadSettings() {
         if (existsSync(SETTINGS_FILE)) {
             const raw = readFileSync(SETTINGS_FILE, 'utf-8');
             const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-            return { ...merged, ...resolveProviderSettings(merged) };
+            return {
+                ...merged,
+                ...resolveProviderSettings(merged),
+                ...resolveSearchSettings(merged),
+            };
         }
     } catch (err) {
         console.error('[Settings] Failed to load:', err.message);
     }
-    return { ...DEFAULT_SETTINGS, ...resolveProviderSettings(DEFAULT_SETTINGS) };
+    return {
+        ...DEFAULT_SETTINGS,
+        ...resolveProviderSettings(DEFAULT_SETTINGS),
+        ...resolveSearchSettings(DEFAULT_SETTINGS),
+    };
 }
 
 function saveSettings(data) {
@@ -129,7 +206,11 @@ function saveSettings(data) {
         mkdirSync(DATA_DIR, { recursive: true });
     }
     const merged = { ...loadSettings(), ...data };
-    const normalized = { ...merged, ...resolveProviderSettings(merged) };
+    const normalized = {
+        ...merged,
+        ...resolveProviderSettings(merged),
+        ...resolveSearchSettings(merged),
+    };
     writeFileSync(SETTINGS_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
     return normalized;
 }

@@ -47,6 +47,16 @@ const requestTokens = new Map();
 const state = {
   providers: [],
   defaultProviderEndpoint: '',
+  searchApi: {
+    provider: 'tavily',
+    enabled: false,
+    apiKey: '',
+    scopes: {
+      scan: false,
+      classify: false,
+      organizer: false,
+    },
+  },
 };
 
 let modalEl;
@@ -136,6 +146,45 @@ function normalizeProviders(settings) {
   return { providers: merged, defaultProviderEndpoint };
 }
 
+function normalizeSearchApi(settings) {
+  const source = settings?.searchApi && typeof settings.searchApi === 'object'
+    ? settings.searchApi
+    : {};
+  const scopesSource = source?.scopes && typeof source.scopes === 'object'
+    ? source.scopes
+    : {};
+
+  const scanEnabled = typeof scopesSource.scan === 'boolean'
+    ? scopesSource.scan
+    : !!settings?.enableWebSearch;
+  const classifyEnabled = typeof scopesSource.classify === 'boolean'
+    ? scopesSource.classify
+    : (typeof scopesSource.organizer === 'boolean'
+      ? scopesSource.organizer
+      : (settings?.enableWebSearchClassify != null
+        ? !!settings.enableWebSearchClassify
+        : (settings?.enableWebSearchOrganizer != null
+          ? !!settings.enableWebSearchOrganizer
+          : scanEnabled)));
+  const organizerEnabled = typeof scopesSource.organizer === 'boolean'
+    ? scopesSource.organizer
+    : classifyEnabled;
+  const enabled = source?.enabled != null
+    ? !!source.enabled
+    : (scanEnabled || classifyEnabled || organizerEnabled);
+
+  return {
+    provider: 'tavily',
+    enabled,
+    apiKey: String(source?.apiKey || settings?.tavilyApiKey || '').trim(),
+    scopes: {
+      scan: !!scanEnabled,
+      classify: !!classifyEnabled,
+      organizer: !!organizerEnabled,
+    },
+  };
+}
+
 function setSavingState(isSaving) {
   if (!saveBtn) return;
   saveBtn.disabled = isSaving;
@@ -160,7 +209,7 @@ function renderModelOptions(selectEl, models, selected) {
 
 function renderProviderRows() {
   if (!listEl) return;
-  listEl.innerHTML = state.providers.map((provider) => {
+  const providerRowsHtml = state.providers.map((provider) => {
     const endpointKey = encodeURIComponent(provider.endpoint);
     const models = fallbackModelsByEndpoint(provider.endpoint);
     const hasSelected = models.some((item) => item.value === provider.model);
@@ -206,6 +255,36 @@ function renderProviderRows() {
     `;
   }).join('');
 
+  const searchApiRowHtml = `
+    <div class="provider-row provider-search-row">
+      <div class="provider-row-head">
+        <div>
+          <div class="provider-name">${t('provider_modal.search_api_title')}</div>
+          <div class="provider-endpoint mono">Tavily</div>
+        </div>
+      </div>
+      <div class="provider-grid">
+        <div class="form-group">
+          <label class="form-label">${t('provider_modal.search_api_key')}</label>
+          <input
+            id="provider-tavily-api-key"
+            type="password"
+            class="form-input"
+            placeholder="tvly-xxxxxxxxxxxxxxx"
+            value="${escapeHtml(state.searchApi.apiKey || '')}"
+          />
+          <div class="form-hint">
+            <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
+              ${escapeHtml(t('provider_modal.search_api_hint'))}
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  listEl.innerHTML = `${providerRowsHtml}${searchApiRowHtml}`;
+
   for (const row of listEl.querySelectorAll('.provider-row')) {
     const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
     const apiKeyInput = row.querySelector('.provider-api-key');
@@ -235,6 +314,11 @@ function renderProviderRows() {
       loadModelsForProvider(endpoint, true);
     });
   }
+
+  const tavilyApiKeyInput = listEl.querySelector('#provider-tavily-api-key');
+  tavilyApiKeyInput?.addEventListener('input', () => {
+    state.searchApi.apiKey = String(tavilyApiKeyInput.value || '').trim();
+  });
 
   // Auto-fetch available models for each provider row independently.
   for (const provider of state.providers) {
@@ -306,6 +390,7 @@ async function refreshModalData() {
   const normalized = normalizeProviders(settings);
   state.providers = normalized.providers;
   state.defaultProviderEndpoint = normalized.defaultProviderEndpoint;
+  state.searchApi = normalizeSearchApi(settings);
   renderProviderRows();
 }
 
@@ -337,12 +422,34 @@ function collectPayloadFromDOM() {
     model: defaultModelByEndpoint(defaultProviderEndpoint),
   };
 
+  const tavilyApiKey = String(listEl?.querySelector('#provider-tavily-api-key')?.value || state.searchApi.apiKey || '').trim();
+  const searchApi = {
+    provider: 'tavily',
+    enabled: !!(
+      state.searchApi?.enabled
+      || state.searchApi?.scopes?.scan
+      || state.searchApi?.scopes?.classify
+      || state.searchApi?.scopes?.organizer
+    ),
+    apiKey: tavilyApiKey,
+    scopes: {
+      scan: !!state.searchApi?.scopes?.scan,
+      classify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
+      organizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
+    },
+  };
+
   return {
     providerConfigs,
     defaultProviderEndpoint,
     apiEndpoint: defaultProviderEndpoint,
     apiKey: String(activeConfig.apiKey || ''),
     model: String(activeConfig.model || defaultModelByEndpoint(defaultProviderEndpoint)),
+    searchApi,
+    tavilyApiKey,
+    enableWebSearch: searchApi.enabled && searchApi.scopes.scan,
+    enableWebSearchClassify: searchApi.enabled && searchApi.scopes.classify,
+    enableWebSearchOrganizer: searchApi.enabled && searchApi.scopes.organizer,
   };
 }
 

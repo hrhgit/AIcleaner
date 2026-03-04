@@ -27,6 +27,7 @@ organizeRouter.post('/suggest-categories', async (req, res) => {
         recursive = true,
         excludedPatterns = [],
         manualCategories = [],
+        useWebSearch = null,
         modelRouting = null,
         modelSelection = null,
     } = req.body || {};
@@ -41,6 +42,7 @@ organizeRouter.post('/suggest-categories', async (req, res) => {
             recursive,
             excludedPatterns,
             manualCategories,
+            useWebSearch,
             modelRouting,
             modelSelection,
         });
@@ -64,6 +66,7 @@ organizeRouter.post('/start', (req, res) => {
         allowNewCategories = true,
         excludedPatterns = DEFAULT_EXCLUDED_PATTERNS,
         parallelism = 5,
+        useWebSearch = null,
         modelRouting = null,
         modelSelection = null,
     } = req.body || {};
@@ -80,6 +83,7 @@ organizeRouter.post('/start', (req, res) => {
         allowNewCategories,
         excludedPatterns,
         parallelism,
+        useWebSearch,
         modelRouting,
         modelSelection,
     });

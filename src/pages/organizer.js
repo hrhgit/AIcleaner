@@ -6,6 +6,7 @@
   getOrganizeCapability,
   getOrganizeResult,
   getSettings,
+  saveSettings,
   rollbackOrganize,
   startOrganize,
   stopOrganize,
@@ -22,6 +23,7 @@ const PERSIST_KEYS = {
   categories: 'wipeout.organizer.global.categories.v1',
   exclusions: 'wipeout.organizer.global.exclusions.v1',
   parallelism: 'wipeout.organizer.global.parallelism.v1',
+  useWebSearch: 'wipeout.organizer.global.use_web_search.v1',
   modelRouting: 'wipeout.organizer.global.model_routing.v1',
   modelSelection: 'wipeout.organizer.global.model_selection.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
@@ -201,6 +203,7 @@ function collectForm() {
   const categories = parseListInput(document.getElementById('org-categories')?.value || '');
   const excludedPatterns = parseListInput(document.getElementById('org-exclusions')?.value || '');
   const parallelism = Number(document.getElementById('org-parallelism')?.value || 5);
+  const useWebSearch = !!document.getElementById('org-enable-web-search')?.checked;
   const modelRouting = readModelRoutingFromDOM();
 
   return {
@@ -211,6 +214,7 @@ function collectForm() {
     categories: categories.length ? categories : [...DEFAULT_CATEGORIES],
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
     parallelism: Number.isFinite(parallelism) ? Math.max(1, Math.min(20, Math.floor(parallelism))) : 5,
+    useWebSearch,
     modelRouting,
   };
 }
@@ -223,6 +227,7 @@ function persistForm(data) {
   setPersisted(PERSIST_KEYS.categories, data.categories);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
   setPersisted(PERSIST_KEYS.parallelism, data.parallelism);
+  setPersisted(PERSIST_KEYS.useWebSearch, data.useWebSearch);
   setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
 }
 
@@ -245,8 +250,72 @@ function restoreDefaults() {
     categories: getPersisted(PERSIST_KEYS.categories, DEFAULT_CATEGORIES),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
     parallelism: getPersisted(PERSIST_KEYS.parallelism, 5),
+    useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
     modelRouting: modelRouting || fallbackRouting,
   };
+}
+
+function resolveSearchApi(settings) {
+  const source = settings?.searchApi && typeof settings.searchApi === 'object'
+    ? settings.searchApi
+    : {};
+  const scopes = source?.scopes && typeof source.scopes === 'object'
+    ? source.scopes
+    : {};
+
+  const scanEnabled = typeof scopes.scan === 'boolean'
+    ? scopes.scan
+    : !!settings?.enableWebSearch;
+  const classifyEnabled = typeof scopes.classify === 'boolean'
+    ? scopes.classify
+    : (typeof scopes.organizer === 'boolean'
+      ? scopes.organizer
+      : (settings?.enableWebSearchClassify != null
+        ? !!settings.enableWebSearchClassify
+        : (settings?.enableWebSearchOrganizer != null
+          ? !!settings.enableWebSearchOrganizer
+          : scanEnabled)));
+  const organizerEnabled = typeof scopes.organizer === 'boolean'
+    ? scopes.organizer
+    : classifyEnabled;
+  const enabled = typeof source.enabled === 'boolean'
+    ? source.enabled
+    : (scanEnabled || classifyEnabled || organizerEnabled);
+  const apiKey = String(source.apiKey || settings?.tavilyApiKey || '').trim();
+
+  return {
+    provider: 'tavily',
+    enabled: !!enabled,
+    apiKey,
+    scopes: {
+      scan: !!scanEnabled,
+      classify: !!classifyEnabled,
+      organizer: !!organizerEnabled,
+    },
+  };
+}
+
+async function syncClassifyWebSearchToSettings(isEnabled) {
+  const settings = await getSettings();
+  const currentSearchApi = resolveSearchApi(settings);
+  const nextSearchApi = {
+    provider: 'tavily',
+    enabled: !!(currentSearchApi.scopes.scan || isEnabled),
+    apiKey: currentSearchApi.apiKey,
+    scopes: {
+      scan: !!currentSearchApi.scopes.scan,
+      classify: !!isEnabled,
+      organizer: !!isEnabled,
+    },
+  };
+
+  await saveSettings({
+    searchApi: nextSearchApi,
+    enableWebSearch: nextSearchApi.enabled && nextSearchApi.scopes.scan,
+    enableWebSearchClassify: nextSearchApi.enabled && nextSearchApi.scopes.classify,
+    enableWebSearchOrganizer: nextSearchApi.enabled && nextSearchApi.scopes.organizer,
+    tavilyApiKey: nextSearchApi.apiKey,
+  });
 }
 
 function escapeHtml(value) {
@@ -453,6 +522,8 @@ async function initModelRoutingFields(defaultRouting = {}) {
 
     await initModelSelectors({ modality, model });
   }
+
+  return settings;
 }
 
 async function applyTextRouteToOtherModalities() {
@@ -478,34 +549,68 @@ async function applyTextRouteToOtherModalities() {
 }
 
 function renderPreview(snapshot) {
-  const tbody = document.getElementById('org-preview-body');
+  const groupsEl = document.getElementById('org-preview-groups');
   const empty = document.getElementById('org-preview-empty');
-  if (!tbody || !empty) return;
+  if (!groupsEl || !empty) return;
 
   const preview = snapshot?.preview || [];
   const resultsMap = new Map((snapshot?.results || []).map((x) => [x.path, x]));
 
   if (!preview.length) {
-    tbody.innerHTML = '';
+    groupsEl.innerHTML = '';
     empty.style.display = '';
     return;
   }
 
   empty.style.display = 'none';
 
-  tbody.innerHTML = preview.map((item, idx) => {
-    const row = resultsMap.get(item.sourcePath);
-    const degraded = row?.degraded ? `<span class="badge badge-warning">${t('organizer.degraded')}</span>` : '';
+  const groups = new Map();
+  for (const item of preview) {
+    const category = String(item.category || '其他待定').trim() || '其他待定';
+    if (!groups.has(category)) {
+      groups.set(category, []);
+    }
+    groups.get(category).push(item);
+  }
+
+  const sortedGroups = Array.from(groups.entries()).sort(([a], [b]) => String(a).localeCompare(String(b), 'zh-Hans-CN'));
+  groupsEl.innerHTML = sortedGroups.map(([category, items], groupIdx) => {
+    const rows = items.map((item, rowIdx) => {
+      const row = resultsMap.get(item.sourcePath);
+      const degraded = row?.degraded
+        ? `<div style="margin-top:6px;"><span class="badge badge-warning">${t('organizer.degraded')}</span></div>`
+        : '';
+
+      return `
+        <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(rowIdx * 0.01, 0.2)}s both;">
+          <td>
+            <div class="file-name">${escapeHtml(row?.name || '')}</div>
+            <div class="file-path">${escapeHtml(item.sourcePath)}</div>
+            ${degraded}
+          </td>
+          <td><div class="file-path">${escapeHtml(item.targetPath)}</div></td>
+        </tr>
+      `;
+    }).join('');
 
     return `
-      <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(idx * 0.01, 0.3)}s both;">
-        <td>
-          <div class="file-name">${escapeHtml(row?.name || '')}</div>
-          <div class="file-path">${escapeHtml(item.sourcePath)}</div>
-        </td>
-        <td><span class="badge badge-info">${escapeHtml(item.category)}</span>${degraded}</td>
-        <td><div class="file-path">${escapeHtml(item.targetPath)}</div></td>
-      </tr>
+      <section class="preview-group" style="animation: slideUp 0.2s var(--ease-out) ${Math.min(groupIdx * 0.03, 0.4)}s both;">
+        <div class="preview-group-header">
+          <span class="badge badge-info">${escapeHtml(category)}</span>
+          <span class="preview-group-count">${items.length}</span>
+        </div>
+        <div class="preview-group-table-wrap">
+          <table class="data-table preview-group-table">
+            <thead>
+              <tr>
+                <th>${t('organizer.source')}</th>
+                <th>${t('organizer.target')}</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </section>
     `;
   }).join('');
 }
@@ -700,6 +805,7 @@ async function handleSuggest() {
       recursive: form.recursive,
       excludedPatterns: form.excludedPatterns,
       manualCategories: form.categories,
+      useWebSearch: form.useWebSearch,
       modelRouting: form.modelRouting,
     });
 
@@ -896,6 +1002,7 @@ function bindPersistenceListeners() {
     'org-recursive',
     'org-mode',
     'org-allow-new-categories',
+    'org-enable-web-search',
     'org-categories',
     'org-exclusions',
     'org-parallelism',
@@ -913,6 +1020,7 @@ function bindPersistenceListeners() {
     const eventName = [
       'org-recursive',
       'org-allow-new-categories',
+      'org-enable-web-search',
       'org-mode',
       PROVIDER_SELECT_IDS.text,
       PROVIDER_SELECT_IDS.image,
@@ -927,6 +1035,11 @@ function bindPersistenceListeners() {
       : 'input';
     el.addEventListener(eventName, () => {
       persistForm(collectForm());
+      if (id === 'org-enable-web-search') {
+        syncClassifyWebSearchToSettings(!!el.checked).catch((err) => {
+          console.warn('[Organizer] Failed to sync classify web search setting:', err);
+        });
+      }
     });
   });
 }
@@ -1044,6 +1157,14 @@ export async function renderOrganizer(container) {
         </div>
       </div>
 
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input id="org-enable-web-search" type="checkbox" ${defaults.useWebSearch === true ? 'checked' : ''} />
+          <span>${t('organizer.use_web_search')}</span>
+        </label>
+        <div class="form-hint">${t('organizer.use_web_search_hint')}</div>
+      </div>
+
       <div class="grid-2">
         <div class="form-group">
           <label class="form-label">${t('organizer.current_model')}</label>
@@ -1115,17 +1236,7 @@ export async function renderOrganizer(container) {
       <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
         <h2 class="card-title">${t('organizer.preview_title')}</h2>
       </div>
-      <div style="overflow-x:auto;">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>${t('organizer.source')}</th>
-              <th style="width: 180px;">${t('organizer.category')}</th>
-              <th>${t('organizer.target')}</th>
-            </tr>
-          </thead>
-          <tbody id="org-preview-body"></tbody>
-        </table>
+      <div id="org-preview-groups" class="preview-groups">
       </div>
       <div id="org-preview-empty" class="empty-state" style="padding: 32px;">
         <div class="empty-state-icon">📁</div>
@@ -1163,7 +1274,16 @@ export async function renderOrganizer(container) {
   document.getElementById('org-rollback-btn')?.addEventListener('click', handleRollback);
   document.getElementById(COPY_TEXT_ROUTE_BTN_ID)?.addEventListener('click', handleCopyTextRoute);
 
-  await initModelRoutingFields(defaults.modelRouting);
+  const runtimeSettings = await initModelRoutingFields(defaults.modelRouting);
+  if (defaults.useWebSearch == null) {
+    const searchApi = resolveSearchApi(runtimeSettings);
+    const organizerDefault = searchApi.enabled && (searchApi.scopes.classify || searchApi.scopes.organizer);
+    const toggle = document.getElementById('org-enable-web-search');
+    if (toggle) {
+      toggle.checked = organizerDefault;
+    }
+    persistForm(collectForm());
+  }
   bindModelRoutingListeners();
   bindPersistenceListeners();
   renderCapability();

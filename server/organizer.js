@@ -10,11 +10,13 @@ import fsExtra from 'fs-extra';
 import { loadSettings } from './routes/settings.js';
 import { isRateLimitError, retryWithBackoff, withRemoteLimit } from './remote-control.js';
 import { extractFileContent } from './content-extractor.js';
+import { performTavilySearch } from './search.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, 'data');
 const JOBS_DIR = join(DATA_DIR, 'organize-jobs');
 const CONTEXT_RETRY_TEXT_CHAR_LIMIT = 12000;
+const SEARCH_CONTEXT_MAX_CHARS = 2400;
 
 export const DEFAULT_CATEGORY_LIST = [
     '工作学习',
@@ -187,6 +189,67 @@ function normalizeModelRouting(modelRouting, settings, legacyModelSelection) {
     return routing;
 }
 
+function resolveSearchApiSettings(settings) {
+    const source = settings?.searchApi && typeof settings.searchApi === 'object'
+        ? settings.searchApi
+        : {};
+    const scopesSource = source?.scopes && typeof source.scopes === 'object'
+        ? source.scopes
+        : {};
+
+    const legacyScan = typeof settings?.enableWebSearch === 'boolean'
+        ? settings.enableWebSearch
+        : false;
+    const legacyClassify = typeof settings?.enableWebSearchClassify === 'boolean'
+        ? settings.enableWebSearchClassify
+        : (typeof settings?.enableWebSearchOrganizer === 'boolean'
+            ? settings.enableWebSearchOrganizer
+            : legacyScan);
+    const legacyOrganizer = typeof settings?.enableWebSearchOrganizer === 'boolean'
+        ? settings.enableWebSearchOrganizer
+        : legacyScan;
+
+    const scanEnabled = typeof scopesSource.scan === 'boolean'
+        ? scopesSource.scan
+        : legacyScan;
+    const classifyEnabled = typeof scopesSource.classify === 'boolean'
+        ? scopesSource.classify
+        : (typeof scopesSource.organizer === 'boolean'
+            ? scopesSource.organizer
+            : legacyClassify);
+    const organizerEnabled = typeof scopesSource.organizer === 'boolean'
+        ? scopesSource.organizer
+        : classifyEnabled;
+
+    const enabled = typeof source.enabled === 'boolean'
+        ? source.enabled
+        : (scanEnabled || classifyEnabled || organizerEnabled);
+    const apiKey = String(source.apiKey || settings?.tavilyApiKey || '').trim();
+
+    return {
+        enabled: !!enabled,
+        apiKey,
+        scopes: {
+            scan: !!scanEnabled,
+            classify: !!classifyEnabled,
+            organizer: !!organizerEnabled,
+        },
+    };
+}
+
+function resolveOrganizerWebSearch(settings, useWebSearchOption = null) {
+    const searchApi = resolveSearchApiSettings(settings);
+    const requested = typeof useWebSearchOption === 'boolean'
+        ? useWebSearchOption
+        : (searchApi.enabled && (searchApi.scopes.classify || searchApi.scopes.organizer));
+
+    return {
+        requested: !!requested,
+        enabled: !!requested && !!searchApi.apiKey,
+        apiKey: searchApi.apiKey,
+    };
+}
+
 function pickInputModalityByPath(filePath) {
     const ext = extname(String(filePath || '')).toLowerCase();
     if (VIDEO_EXTENSIONS.has(ext)) return 'video';
@@ -217,6 +280,7 @@ function supportsMultimodalByEndpoint(endpoint, model) {
 export function getOrganizeCapability() {
     const settings = loadSettings();
     const routing = normalizeModelRouting(null, settings);
+    const organizerWebSearch = resolveOrganizerWebSearch(settings);
     const selectedModels = {
         text: routing.text.model,
         image: routing.image.model,
@@ -235,6 +299,8 @@ export function getOrganizeCapability() {
         selectedProviders,
         supportsMultimodal: supportsMultimodalByEndpoint(routing.image.endpoint, routing.image.model),
         apiEndpoint: settings.apiEndpoint || '',
+        useWebSearch: organizerWebSearch.requested,
+        webSearchEnabled: organizerWebSearch.enabled,
     };
 }
 
@@ -471,6 +537,7 @@ async function classifyOneFile({
     mode,
     categories,
     allowNewCategories = true,
+    webSearch = null,
 }) {
     const modality = pickInputModalityByPath(file.path);
     const route = pickRouteByModality(modality, modelRouting);
@@ -564,6 +631,51 @@ async function classifyOneFile({
         warnings.push(`parse_failed:${err.message}`);
     }
 
+    const totalTokenUsage = { ...result.tokenUsage };
+    if (category === '其他待定' && webSearch?.enabled) {
+        try {
+            const query = [file.name, file.relativePath].filter(Boolean).join(' ').trim() || file.name;
+            const searchContext = await withRemoteLimit(() =>
+                retryWithBackoff(() =>
+                    performTavilySearch(query, webSearch.apiKey, { throwOnError: true })
+                )
+            );
+            const normalizedSearch = String(searchContext || '').trim();
+
+            if (normalizedSearch) {
+                const secondPassPrompt = [
+                    textPrompt,
+                    'webSearchContextStart',
+                    normalizedSearch.slice(0, SEARCH_CONTEXT_MAX_CHARS),
+                    'webSearchContextEnd',
+                    'Use web search context above to refine the category if needed.',
+                    'Keep output JSON-only with fields index and category.',
+                ].join('\n');
+
+                const secondPass = await runRequest([
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: secondPassPrompt },
+                ]);
+
+                totalTokenUsage.prompt += secondPass.tokenUsage.prompt;
+                totalTokenUsage.completion += secondPass.tokenUsage.completion;
+                totalTokenUsage.total += secondPass.tokenUsage.total;
+
+                const parsed = parseCategoryFromResponse(secondPass.content, categories, allowNewCategories);
+                category = parsed.category;
+                createdCategory = parsed.createdCategory;
+                warnings.push('web_search_refined');
+            } else {
+                warnings.push('web_search_empty');
+            }
+        } catch (err) {
+            degraded = true;
+            warnings.push(`web_search_failed:${err.message}`);
+        }
+    } else if (category === '其他待定' && webSearch?.requested && !webSearch?.enabled) {
+        warnings.push('web_search_not_available');
+    }
+
     return {
         category,
         createdCategory,
@@ -572,7 +684,7 @@ async function classifyOneFile({
         model,
         degraded,
         warnings,
-        tokenUsage: result.tokenUsage,
+        tokenUsage: totalTokenUsage,
     };
 }
 
@@ -619,6 +731,7 @@ export class OrganizeTask extends EventEmitter {
         this.excludedPatterns = normalizeExcludedPatterns(options.excludedPatterns);
         this.parallelism = normalizeParallelism(options.parallelism || 5);
         this.settings = loadSettings();
+        this.webSearch = resolveOrganizerWebSearch(this.settings, options.useWebSearch);
         this.modelRouting = normalizeModelRouting(options.modelRouting, this.settings, options.modelSelection);
         this.selectedModels = {
             text: this.modelRouting.text.model,
@@ -678,6 +791,8 @@ export class OrganizeTask extends EventEmitter {
             allowNewCategories: this.allowNewCategories,
             excludedPatterns: this.excludedPatterns,
             parallelism: this.parallelism,
+            useWebSearch: this.webSearch.requested,
+            webSearchEnabled: this.webSearch.enabled,
             selectedModel: this.selectedModel,
             selectedModels: this.selectedModels,
             selectedProviders: this.selectedProviders,
@@ -762,6 +877,7 @@ export class OrganizeTask extends EventEmitter {
                             mode: this.mode,
                             categories: this.categories,
                             allowNewCategories: this.allowNewCategories,
+                            webSearch: this.webSearch,
                         });
 
                         if (

@@ -2,15 +2,13 @@
  * src/main.js
  * 应用入口 — 路由管理与页面切换
  */
-import { renderSettings } from './pages/settings.js';
 import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
 import { renderOrganizer } from './pages/organizer.js';
-import { t, toggleLang, emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
+import { emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
 
 const pages = {
-    settings: renderSettings,
     scanner: renderScanner,
     results: renderResults,
     organizer: renderOrganizer,
@@ -54,7 +52,7 @@ function navigate(pageName) {
 
 function getPageFromHash() {
     const hash = window.location.hash.replace('#/', '');
-    return pages[hash] ? hash : 'settings';
+    return pages[hash] ? hash : 'scanner';
 }
 
 // Event listeners

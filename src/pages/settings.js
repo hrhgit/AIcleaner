@@ -121,28 +121,30 @@ export async function renderSettings(container) {
         </div>
       </div>
       <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
+
+      <div class="form-group" style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border);">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom: 8px;">
+          <label class="form-label" style="margin:0;">${t('settings.search_config')}</label>
+          <span class="badge badge-warning">${t('settings.expert_feature')}</span>
+        </div>
+        <div class="form-hint" style="margin-bottom: 12px;">${t('settings.search_hint')}</div>
+
+        <div class="grid-2">
+          <div class="form-group" style="margin-bottom: 0;">
+            <label style="display:flex; align-items:center; gap:10px; cursor:pointer; margin-bottom: 8px;">
+              <input type="checkbox" id="enable-web-search" class="toggle-checkbox" style="width: 20px; height: 20px;" />
+              <span class="form-label" style="margin:0;">${t('settings.enable_search_scan')}</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:10px; cursor:pointer;">
+              <input type="checkbox" id="enable-organizer-web-search" class="toggle-checkbox" style="width: 20px; height: 20px;" />
+              <span class="form-label" style="margin:0;">${t('settings.enable_search_organizer')}</span>
+            </label>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="card animate-in mb-24" style="animation-delay: 0.1s">
-      <div class="card-header">
-        <h2 class="card-title">${t('settings.search_config')}</h2>
-        <span class="badge badge-warning">${t('settings.expert_feature')}</span>
-      </div>
-
-      <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
-        <input type="checkbox" id="enable-web-search" class="toggle-checkbox" style="width: 20px; height: 20px;" />
-        <label for="enable-web-search" class="form-label" style="margin-bottom: 0; cursor: pointer;">${t('settings.enable_search')}</label>
-      </div>
-      <div class="form-hint" style="margin-bottom: 16px;">${t('settings.search_hint')}</div>
-
-      <div class="form-group" id="tavily-api-key-group" style="display: none; border-left: 2px solid var(--border); padding-left: 12px; margin-left: 8px;">
-        <label class="form-label">${t('settings.tavily_key')}</label>
-        <input type="password" id="tavily-api-key" class="form-input" placeholder="tvly-xxxxxxxxxxxxxxx" />
-        <div class="form-hint"><a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">${t('settings.tavily_hint')}</a></div>
-      </div>
-    </div>
-
-    <div class="card animate-in mb-24" style="animation-delay: 0.15s">
       <div class="card-header">
         <h2 class="card-title">${t('settings.scan_config')}</h2>
         <span class="badge badge-secondary">${t('settings.scan_params')}</span>
@@ -184,7 +186,7 @@ export async function renderSettings(container) {
       </div>
     </div>
 
-    <div class="card animate-in mb-24" style="animation-delay: 0.2s">
+    <div class="card animate-in mb-24" style="animation-delay: 0.15s">
       <div class="card-header">
         <h2 class="card-title">${t('settings.privilege_config')}</h2>
         <span class="badge badge-warning">${t('settings.privilege_required')}</span>
@@ -198,7 +200,7 @@ export async function renderSettings(container) {
       <div class="form-hint">${t('settings.privilege_hint')}</div>
     </div>
 
-    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
+    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.2s">
       <span id="save-status" class="form-hint"></span>
       <button id="save-btn" class="btn btn-primary btn-lg">${t('settings.save')}</button>
     </div>
@@ -206,6 +208,12 @@ export async function renderSettings(container) {
 
   const remoteModelsCache = new Map();
   const providerApiKeyMap = {};
+  let searchApiSettings = {
+    provider: 'tavily',
+    enabled: false,
+    apiKey: '',
+    scopes: { scan: false, organizer: false },
+  };
   let modelsRequestToken = 0;
 
   const endpointSelect = document.getElementById('api-endpoint');
@@ -322,15 +330,6 @@ export async function renderSettings(container) {
 
   await refreshPrivilegeStatus();
 
-  const searchToggle = document.getElementById('enable-web-search');
-  const tavilyGroup = document.getElementById('tavily-api-key-group');
-
-  function updateTavilyVisibility() {
-    tavilyGroup.style.display = searchToggle.checked ? 'block' : 'none';
-  }
-  searchToggle.addEventListener('change', updateTavilyVisibility);
-  updateTavilyVisibility();
-
   const sizeSlider = document.getElementById('target-size');
   const sizeInput = document.getElementById('target-size-input');
   sizeSlider.addEventListener('input', () => {
@@ -390,7 +389,7 @@ export async function renderSettings(container) {
     btn.innerHTML = `<span class="spinner"></span> ${t('settings.saving')}`;
 
     try {
-      await saveSettings(collectForm(providerApiKeyMap));
+      await saveSettings(collectForm(providerApiKeyMap, searchApiSettings));
       showToast(t('settings.toast_saved'), 'success');
       status.textContent = t('settings.saved');
       status.style.color = 'var(--accent-success)';
@@ -423,21 +422,49 @@ export async function renderSettings(container) {
       el('max-depth').value = s.maxDepth;
       el('max-depth-input').value = s.maxDepth;
     }
-    if (s.enableWebSearch != null) {
-      el('enable-web-search').checked = !!s.enableWebSearch;
-      if (s.enableWebSearch) el('tavily-api-key-group').style.display = 'block';
-    }
-    if (s.tavilyApiKey != null) el('tavily-api-key').value = s.tavilyApiKey;
+    const searchApiEnabled = s?.searchApi?.enabled != null ? !!s.searchApi.enabled : true;
+    const scanWebSearchEnabled = typeof s?.searchApi?.scopes?.scan === 'boolean'
+      ? (searchApiEnabled && !!s.searchApi.scopes.scan)
+      : !!s.enableWebSearch;
+    const organizerWebSearchEnabled = typeof s?.searchApi?.scopes?.organizer === 'boolean'
+      ? (searchApiEnabled && !!s.searchApi.scopes.organizer)
+      : (s.enableWebSearchOrganizer != null ? !!s.enableWebSearchOrganizer : scanWebSearchEnabled);
+    el('enable-web-search').checked = scanWebSearchEnabled;
+    el('enable-organizer-web-search').checked = organizerWebSearchEnabled;
+    searchApiSettings = {
+      provider: 'tavily',
+      enabled: searchApiEnabled,
+      apiKey: String(s?.searchApi?.apiKey || s?.tavilyApiKey || '').trim(),
+      scopes: {
+        scan: !!scanWebSearchEnabled,
+        organizer: !!organizerWebSearchEnabled,
+      },
+    };
   }
 }
 
-function collectForm(providerApiKeyMap) {
+function collectForm(providerApiKeyMap, searchApiSettings = {}) {
   const endpoint = document.getElementById('api-endpoint').value.trim();
   const model = document.getElementById('api-model').value.trim() || 'deepseek-chat';
   const targetSizeInputVal = document.getElementById('target-size-input')?.value;
   const targetSizeVal = targetSizeInputVal || document.getElementById('target-size').value;
   const maxDepthInputVal = document.getElementById('max-depth-input')?.value;
   const maxDepthVal = maxDepthInputVal || document.getElementById('max-depth').value;
+
+  const scanWebSearchEnabled = !!document.getElementById('enable-web-search').checked;
+  const organizerWebSearchEnabled = !!document.getElementById('enable-organizer-web-search').checked;
+  const tavilyApiKey = String(searchApiSettings?.apiKey || '').trim();
+  const searchApi = {
+    provider: 'tavily',
+    enabled: scanWebSearchEnabled || organizerWebSearchEnabled,
+    scopes: {
+      scan: scanWebSearchEnabled,
+      organizer: organizerWebSearchEnabled,
+    },
+  };
+  if (tavilyApiKey) {
+    searchApi.apiKey = tavilyApiKey;
+  }
 
   return {
     apiEndpoint: endpoint,
@@ -446,7 +473,8 @@ function collectForm(providerApiKeyMap) {
     scanPath: document.getElementById('scan-path').value.trim(),
     targetSizeGB: parseFloat(targetSizeVal),
     maxDepth: parseInt(maxDepthVal, 10),
-    enableWebSearch: document.getElementById('enable-web-search').checked,
-    tavilyApiKey: document.getElementById('tavily-api-key').value.trim(),
+    enableWebSearch: scanWebSearchEnabled,
+    enableWebSearchOrganizer: organizerWebSearchEnabled,
+    searchApi,
   };
 }
