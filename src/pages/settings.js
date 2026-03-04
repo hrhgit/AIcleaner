@@ -1,46 +1,79 @@
 /**
  * src/pages/settings.js
- * 设置页面 — API 配置、${t('settings.scan_path')}、清理目标
+ * 设置页面：API 提供商/模型、扫描、联网搜索、权限
  */
-import { getSettings, saveSettings, browseFolder, getProviderModels, getPrivilegeStatus, requestElevation } from '../utils/api.js';
+import {
+  browseFolder,
+  getPrivilegeStatus,
+  getProviderModels,
+  getSettings,
+  requestElevation,
+  saveSettings,
+} from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
 const PROVIDER_MODELS = {
-    "https://api.openai.com/v1": [
-        { value: "gpt-4o-mini", label: "gpt-4o-mini (推荐，性价比高)" },
-        { value: "gpt-4o", label: "gpt-4o (性能最强)" },
-        { value: "gpt-3.5-turbo", label: "gpt-3.5-turbo" }
-    ],
-    "https://api.deepseek.com": [
-        { value: "deepseek-chat", label: "deepseek-chat (DeepSeek V3)" },
-        { value: "deepseek-reasoner", label: "deepseek-reasoner (DeepSeek R1)" }
-    ],
-    "https://dashscope.aliyuncs.com/compatible-mode/v1": [
-        { value: "qwen-plus", label: "qwen-plus" },
-        { value: "qwen-turbo", label: "qwen-turbo" },
-        { value: "qwen-max", label: "qwen-max" }
-    ],
-    "https://open.bigmodel.cn/api/paas/v4": [
-        { value: "glm-4-flash", label: "glm-4-flash (推荐，免费)" },
-        { value: "glm-4", label: "glm-4" }
-    ],
-    "https://api.moonshot.cn/v1": [
-        { value: "moonshot-v1-8k", label: "moonshot-v1-8k" },
-        { value: "moonshot-v1-32k", label: "moonshot-v1-32k" }
-    ],
-    "https://generativelanguage.googleapis.com/v1beta/openai/": [
-        { value: "gemini-2.5-flash", label: "gemini-2.5-flash (推荐)" },
-        { value: "gemini-2.5-pro", label: "gemini-2.5-pro" },
-        { value: "gemini-2.0-flash", label: "gemini-2.0-flash" },
-        { value: "gemini-1.5-pro", label: "gemini-1.5-pro" }
-    ]
+  'https://api.openai.com/v1': [
+    { value: 'gpt-4o-mini', label: 'gpt-4o-mini (推荐)' },
+    { value: 'gpt-4o', label: 'gpt-4o' },
+    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
+  ],
+  'https://api.deepseek.com': [
+    { value: 'deepseek-chat', label: 'deepseek-chat' },
+    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
+  ],
+  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
+    { value: 'qwen-plus', label: 'qwen-plus' },
+    { value: 'qwen-turbo', label: 'qwen-turbo' },
+    { value: 'qwen-max', label: 'qwen-max' },
+  ],
+  'https://open.bigmodel.cn/api/paas/v4': [
+    { value: 'glm-4-flash', label: 'glm-4-flash' },
+    { value: 'glm-4', label: 'glm-4' },
+  ],
+  'https://api.moonshot.cn/v1': [
+    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
+    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
+  ],
+  'https://generativelanguage.googleapis.com/v1beta/openai/': [
+    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+  ],
 };
 
+function normalizeModels(models) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of models || []) {
+    if (!item?.value) continue;
+    const value = String(item.value).trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push({ value, label: String(item.label || value) });
+  }
+  return normalized;
+}
+
+function renderModelOptions(models, selectedValue) {
+  const modelSelect = document.getElementById('api-model');
+  if (!modelSelect) return;
+  modelSelect.innerHTML = models.map((m) => `<option value="${m.value}">${m.label}</option>`).join('');
+
+  if (selectedValue) {
+    const exists = Array.from(modelSelect.options).some((opt) => opt.value === selectedValue);
+    if (!exists) modelSelect.add(new Option(selectedValue, selectedValue));
+    modelSelect.value = selectedValue;
+  } else if (modelSelect.options.length > 0) {
+    modelSelect.value = modelSelect.options[0].value;
+  }
+}
+
 export async function renderSettings(container) {
-    container.innerHTML = `
+  container.innerHTML = `
     <style>
-      /* Force remove spin buttons irrespective of global CSS or cache */
       #target-size-input::-webkit-inner-spin-button,
       #target-size-input::-webkit-outer-spin-button,
       #max-depth-input::-webkit-inner-spin-button,
@@ -56,6 +89,7 @@ export async function renderSettings(container) {
         appearance: textfield !important;
       }
     </style>
+
     <div class="page-header animate-in">
       <h1 class="page-title">${t('settings.title')}</h1>
       <p class="page-subtitle">${t('settings.subtitle')}</p>
@@ -67,33 +101,26 @@ export async function renderSettings(container) {
         <span class="badge badge-info">${t('settings.llm_engine')}</span>
       </div>
 
-      <div class="form-group">
-        <label class="form-label">${t('settings.provider')}</label>
-        <select id="api-endpoint" class="form-input">
-          <option value="https://api.deepseek.com">DeepSeek</option>
-          <option value="https://api.openai.com/v1">OpenAI</option>
-          <option value="https://generativelanguage.googleapis.com/v1beta/openai/">Google Gemini</option>
-          <option value="https://dashscope.aliyuncs.com/compatible-mode/v1">通义千问 (阿里云)</option>
-          <option value="https://open.bigmodel.cn/api/paas/v4">智谱 GLM</option>
-          <option value="https://api.moonshot.cn/v1">Kimi (月之暗面)</option>
-        </select>
-        <div class="form-hint">${t('settings.provider_hint')}</div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">${t('settings.provider')}</label>
+          <select id="api-endpoint" class="form-input">
+            <option value="https://api.deepseek.com">DeepSeek</option>
+            <option value="https://api.openai.com/v1">OpenAI</option>
+            <option value="https://generativelanguage.googleapis.com/v1beta/openai/">Google Gemini</option>
+            <option value="https://dashscope.aliyuncs.com/compatible-mode/v1">通义千问 (阿里云)</option>
+            <option value="https://open.bigmodel.cn/api/paas/v4">智谱 GLM</option>
+            <option value="https://api.moonshot.cn/v1">Kimi (Moonshot)</option>
+          </select>
+          <div class="form-hint">${t('settings.provider_hint')}</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">${t('settings.model')}</label>
+          <select id="api-model" class="form-input"></select>
+          <div class="form-hint">${t('settings.model_hint')}</div>
+        </div>
       </div>
-
-      <div class="form-group">
-        <label class="form-label">${t('settings.api_key')}</label>
-        <input type="password" id="api-key" class="form-input"
-               placeholder="${t('settings.api_key_placeholder')}" />
-        <div class="form-hint">${t('settings.api_key_hint')}</div>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">${t('settings.model')}</label>
-        <select id="api-model" class="form-input">
-          <!-- 这里将根据上面的服务商动态生成 -->
-        </select>
-        <div class="form-hint">${t('settings.model_hint')}</div>
-      </div>
+      <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
     </div>
 
     <div class="card animate-in mb-24" style="animation-delay: 0.1s">
@@ -110,8 +137,7 @@ export async function renderSettings(container) {
 
       <div class="form-group" id="tavily-api-key-group" style="display: none; border-left: 2px solid var(--border); padding-left: 12px; margin-left: 8px;">
         <label class="form-label">${t('settings.tavily_key')}</label>
-        <input type="password" id="tavily-api-key" class="form-input"
-               placeholder="tvly-xxxxxxxxxxxxxxx" />
+        <input type="password" id="tavily-api-key" class="form-input" placeholder="tvly-xxxxxxxxxxxxxxx" />
         <div class="form-hint"><a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">${t('settings.tavily_hint')}</a></div>
       </div>
     </div>
@@ -123,14 +149,11 @@ export async function renderSettings(container) {
       </div>
 
       <div class="form-group">
-        <label class="form-label">扫描路径</label>
+        <label class="form-label">${t('settings.scan_path')}</label>
         <div style="display: flex; gap: 8px; align-items: center;">
-          <input type="text" id="scan-path" class="form-input" style="flex: 1;"
-                 placeholder="C:\\Users\\YourName\\Downloads" />
-          <button type="button" id="browse-folder-btn" class="btn btn-secondary"
-                  style="white-space: nowrap; flex-shrink: 0;"
-                  title="打开文件夹选择对话框">
-            📁 浏览
+          <input type="text" id="scan-path" class="form-input" style="flex: 1;" placeholder="C:\\Users\\YourName\\Downloads" />
+          <button type="button" id="browse-folder-btn" class="btn btn-secondary" style="white-space: nowrap; flex-shrink: 0;">
+            ${t('settings.browse')}
           </button>
         </div>
         <div class="form-hint">${t('settings.browse_hint')}</div>
@@ -139,8 +162,7 @@ export async function renderSettings(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.target_size')}</label>
         <div class="range-container">
-          <input type="range" id="target-size" class="range-slider"
-                 min="0.1" max="100" step="0.1" value="1" />
+          <input type="range" id="target-size" class="range-slider" min="0.1" max="100" step="0.1" value="1" />
           <div style="display: flex; align-items: center; gap: 8px;">
             <input type="number" id="target-size-input" class="form-input no-spin" style="width: 80px; height: 32px; padding: 4px 8px; text-align: center;" min="0.1" max="100" step="0.1" value="1" />
             <span class="range-value" style="min-width: unset;">GB</span>
@@ -152,11 +174,10 @@ export async function renderSettings(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.max_depth')}</label>
         <div class="range-container">
-          <input type="range" id="max-depth" class="range-slider"
-                 min="1" max="10" step="1" value="5" />
+          <input type="range" id="max-depth" class="range-slider" min="1" max="10" step="1" value="5" />
           <div style="display: flex; align-items: center; gap: 8px;">
             <input type="number" id="max-depth-input" class="form-input no-spin" style="width: 80px; height: 32px; padding: 4px 8px; text-align: center;" min="1" max="10" step="1" value="5" />
-            <span class="range-value" style="min-width: unset;">层</span>
+            <span class="range-value" style="min-width: unset;">${t('settings.depth_unit')}</span>
           </div>
         </div>
         <div class="form-hint">${t('settings.max_depth_hint')}</div>
@@ -177,302 +198,255 @@ export async function renderSettings(container) {
       <div class="form-hint">${t('settings.privilege_hint')}</div>
     </div>
 
-    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.15s">
+    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
       <span id="save-status" class="form-hint"></span>
-      <button id="save-btn" class="btn btn-primary btn-lg">
-        ${t('settings.save')}
-      </button>
+      <button id="save-btn" class="btn btn-primary btn-lg">${t('settings.save')}</button>
     </div>
   `;
 
-    const remoteModelsCache = new Map();
-    let modelsRequestToken = 0;
+  const remoteModelsCache = new Map();
+  const providerApiKeyMap = {};
+  let modelsRequestToken = 0;
 
-    function normalizeModels(models) {
-        const seen = new Set();
-        const normalized = [];
-        for (const item of models || []) {
-            if (!item?.value) continue;
-            const value = String(item.value).trim();
-            if (!value || seen.has(value)) continue;
-            seen.add(value);
-            normalized.push({
-                value,
-                label: String(item.label || value),
-            });
-        }
-        return normalized;
-    }
+  const endpointSelect = document.getElementById('api-endpoint');
 
-    function renderModelOptions(models, selectedValue) {
-        const modelSelect = document.getElementById('api-model');
-        modelSelect.innerHTML = models.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+  async function updateModelsDropdown(selectedValue) {
+    const endpoint = String(endpointSelect?.value || '').trim();
+    const apiKey = String(providerApiKeyMap[endpoint] || '').trim();
+    const modelSelect = document.getElementById('api-model');
+    const requestToken = ++modelsRequestToken;
 
-        if (selectedValue) {
-            const exists = Array.from(modelSelect.options).some(opt => opt.value === selectedValue);
-            if (!exists) {
-                modelSelect.add(new Option(selectedValue, selectedValue));
-            }
-            modelSelect.value = selectedValue;
-        } else if (modelSelect.options.length > 0) {
-            modelSelect.value = modelSelect.options[0].value;
-        }
-    }
+    modelSelect.disabled = true;
+    modelSelect.innerHTML = `<option value="">Loading models...</option>`;
 
-    async function updateModelsDropdown(selectedValue) {
-        const endpoint = document.getElementById('api-endpoint').value.trim();
-        const apiKey = document.getElementById('api-key').value.trim();
-        const modelSelect = document.getElementById('api-model');
-        const requestToken = ++modelsRequestToken;
-
-        modelSelect.disabled = true;
-        modelSelect.innerHTML = `<option value="">Loading models...</option>`;
-
-        let models = [];
-        const cacheKey = `${endpoint}|${apiKey}`;
-
-        try {
-            if (endpoint) {
-                if (remoteModelsCache.has(cacheKey)) {
-                    models = remoteModelsCache.get(cacheKey);
-                } else {
-                    const resp = await getProviderModels(endpoint, apiKey);
-                    models = normalizeModels(resp?.models || []);
-                    remoteModelsCache.set(cacheKey, models);
-                }
-            }
-        } catch (err) {
-            console.warn('Failed to load provider models:', err.message);
-        }
-
-        if (!models.length) {
-            models = normalizeModels(PROVIDER_MODELS[endpoint] || PROVIDER_MODELS["https://api.deepseek.com"]);
-        }
-        if (!models.length) {
-            models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
-        }
-
-        if (requestToken !== modelsRequestToken) return;
-        renderModelOptions(models, selectedValue);
-        modelSelect.disabled = false;
-    }
-
-    const endpointSelect = document.getElementById('api-endpoint');
-    endpointSelect.addEventListener('change', () => {
-        updateModelsDropdown();
-    });
-
-    const apiKeyInput = document.getElementById('api-key');
-    apiKeyInput.addEventListener('blur', () => {
-        updateModelsDropdown(document.getElementById('api-model').value.trim());
-    });
-
-    await updateModelsDropdown();
-
-    // Load existing settings
+    let models = [];
+    const cacheKey = `${endpoint}|${apiKey}`;
     try {
-        const settings = await getSettings();
-        await fillForm(settings);
-    } catch (err) {
-        console.warn('Failed to load settings:', err);
-    }
-
-    const adminStatusEl = document.getElementById('admin-status');
-    const elevationBtn = document.getElementById('request-elevation-btn');
-
-    async function refreshPrivilegeStatus() {
-        if (!adminStatusEl || !elevationBtn) return;
-        adminStatusEl.textContent = t('settings.privilege_checking');
-        adminStatusEl.style.color = 'var(--text-muted)';
-        elevationBtn.disabled = true;
-
-        try {
-            const data = await getPrivilegeStatus();
-            if (data.platform !== 'win32') {
-                adminStatusEl.textContent = t('settings.admin_status_unsupported');
-                adminStatusEl.style.color = 'var(--accent-warning)';
-                elevationBtn.textContent = t('settings.request_elevation');
-                return;
-            }
-
-            if (data.isAdmin) {
-                adminStatusEl.textContent = t('settings.admin_status_on');
-                adminStatusEl.style.color = 'var(--accent-success)';
-                elevationBtn.textContent = t('settings.admin_already');
-                return;
-            }
-
-            adminStatusEl.textContent = t('settings.admin_status_off');
-            adminStatusEl.style.color = 'var(--accent-warning)';
-            elevationBtn.disabled = false;
-            elevationBtn.textContent = t('settings.request_elevation');
-        } catch (err) {
-            adminStatusEl.textContent = t('settings.privilege_check_failed') + err.message;
-            adminStatusEl.style.color = 'var(--accent-danger)';
-            elevationBtn.textContent = t('settings.request_elevation');
-        }
-    }
-
-    elevationBtn?.addEventListener('click', async () => {
-        if (!confirm(t('settings.elevation_confirm'))) return;
-        elevationBtn.disabled = true;
-        elevationBtn.innerHTML = `<span class="spinner"></span> ${t('settings.requesting_elevation')}`;
-
-        try {
-            await requestElevation();
-            showToast(t('settings.elevation_uac_prompt'), 'info');
-            adminStatusEl.textContent = t('settings.elevation_restarting');
-            adminStatusEl.style.color = 'var(--accent-info)';
-        } catch (err) {
-            showToast(t('settings.elevation_failed') + err.message, 'error');
-            elevationBtn.disabled = false;
-            elevationBtn.textContent = t('settings.request_elevation');
-            await refreshPrivilegeStatus();
-        }
-    });
-
-    await refreshPrivilegeStatus();
-
-    // Web search toggle logic
-    const searchToggle = document.getElementById('enable-web-search');
-    const tavilyGroup = document.getElementById('tavily-api-key-group');
-
-    function updateTavilyVisibility() {
-        tavilyGroup.style.display = searchToggle.checked ? 'block' : 'none';
-    }
-    searchToggle.addEventListener('change', updateTavilyVisibility);
-    updateTavilyVisibility();
-
-    // Range slider & input live updates
-    const sizeSlider = document.getElementById('target-size');
-    const sizeInput = document.getElementById('target-size-input');
-
-    sizeSlider.addEventListener('input', () => {
-        sizeInput.value = parseFloat(sizeSlider.value).toFixed(1);
-    });
-    sizeInput.addEventListener('input', () => {
-        let val = parseFloat(sizeInput.value);
-        if (!isNaN(val)) sizeSlider.value = val;
-    });
-    sizeInput.addEventListener('blur', () => {
-        let val = parseFloat(sizeInput.value);
-        if (isNaN(val) || val < 0.1) val = 0.1;
-        if (val > 100) val = 100;
-        sizeInput.value = val.toFixed(1);
-        sizeSlider.value = val;
-    });
-
-    const depthSlider = document.getElementById('max-depth');
-    const depthInput = document.getElementById('max-depth-input');
-    depthSlider.addEventListener('input', () => {
-        depthInput.value = parseInt(depthSlider.value, 10);
-    });
-    depthInput.addEventListener('input', () => {
-        let val = parseInt(depthInput.value, 10);
-        if (!isNaN(val)) depthSlider.value = val;
-    });
-    depthInput.addEventListener('blur', () => {
-        let val = parseInt(depthInput.value, 10);
-        if (isNaN(val) || val < 1) val = 1;
-        if (val > 10) val = 10;
-        depthInput.value = val;
-        depthSlider.value = val;
-    });
-
-    // Browse folder button
-    document.getElementById('browse-folder-btn').addEventListener('click', async () => {
-        const btn = document.getElementById('browse-folder-btn');
-        btn.disabled = true;
-        btn.textContent = t('settings.browsing');
-        try {
-            const result = await browseFolder();
-            if (!result.cancelled && result.path) {
-                document.getElementById('scan-path').value = result.path;
-                showToast(t('settings.toast_path_selected') + result.path, 'success');
-            }
-        } catch (err) {
-            showToast(t('settings.toast_browse_failed') + err.message, 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = t('settings.browse');
-        }
-    });
-
-    // Save button
-    document.getElementById('save-btn').addEventListener('click', async () => {
-        const btn = document.getElementById('save-btn');
-        const status = document.getElementById('save-status');
-        btn.disabled = true;
-        btn.innerHTML = `<span class="spinner"></span> ${t('settings.saving')}`;
-
-        try {
-            await saveSettings(collectForm());
-            showToast(t('settings.toast_saved'), 'success');
-            status.textContent = t('settings.saved');
-            status.style.color = 'var(--accent-success)';
-        } catch (err) {
-            showToast(t('settings.toast_save_failed') + err.message, 'error');
-            status.textContent = t('settings.save_failed');
-            status.style.color = 'var(--accent-danger)';
-        } finally {
-            btn.disabled = false;
-            btn.innerHTML = t('settings.save');
-        }
-    });
-
-    async function fillForm(s) {
-        const el = (id) => document.getElementById(id);
-        if (s.apiEndpoint) {
-            let endpointEl = el('api-endpoint');
-            let exists = Array.from(endpointEl.options).some(opt => opt.value === s.apiEndpoint);
-            if (!exists) {
-                const newOption = new Option(s.apiEndpoint, s.apiEndpoint);
-                endpointEl.add(newOption);
-            }
-            endpointEl.value = s.apiEndpoint;
-        }
-        if (s.apiKey) el('api-key').value = s.apiKey;
-        if (s.model) {
-            await updateModelsDropdown(s.model);
+      if (endpoint) {
+        if (remoteModelsCache.has(cacheKey)) {
+          models = remoteModelsCache.get(cacheKey);
         } else {
-            await updateModelsDropdown();
+          const resp = await getProviderModels(endpoint, apiKey);
+          models = normalizeModels(resp?.models || []);
+          remoteModelsCache.set(cacheKey, models);
         }
-        if (s.scanPath) el('scan-path').value = s.scanPath;
-        if (s.targetSizeGB != null) {
-            el('target-size').value = s.targetSizeGB;
-            if (el('target-size-input')) {
-                el('target-size-input').value = parseFloat(s.targetSizeGB).toFixed(1);
-            }
-        }
-        if (s.maxDepth != null) {
-            el('max-depth').value = s.maxDepth;
-            if (el('max-depth-input')) {
-                el('max-depth-input').value = s.maxDepth;
-            }
-        }
-        if (s.enableWebSearch != null) {
-            el('enable-web-search').checked = !!s.enableWebSearch;
-            if (!!s.enableWebSearch) el('tavily-api-key-group').style.display = 'block';
-        }
-        if (s.tavilyApiKey != null) el('tavily-api-key').value = s.tavilyApiKey;
+      }
+    } catch {
+      models = [];
     }
+
+    if (!models.length) {
+      models = normalizeModels(PROVIDER_MODELS[endpoint] || PROVIDER_MODELS['https://api.deepseek.com']);
+    }
+    if (!models.length) {
+      models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
+    }
+
+    if (requestToken !== modelsRequestToken) return;
+    renderModelOptions(models, selectedValue);
+    modelSelect.disabled = false;
+  }
+
+  endpointSelect?.addEventListener('change', () => {
+    updateModelsDropdown();
+  });
+
+  try {
+    const settings = await getSettings();
+    if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+      for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+        providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+      }
+    }
+    if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
+      providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+    }
+    await fillForm(settings);
+  } catch (err) {
+    console.warn('Failed to load settings:', err);
+  }
+
+  const adminStatusEl = document.getElementById('admin-status');
+  const elevationBtn = document.getElementById('request-elevation-btn');
+
+  async function refreshPrivilegeStatus() {
+    if (!adminStatusEl || !elevationBtn) return;
+    adminStatusEl.textContent = t('settings.privilege_checking');
+    adminStatusEl.style.color = 'var(--text-muted)';
+    elevationBtn.disabled = true;
+
+    try {
+      const data = await getPrivilegeStatus();
+      if (data.platform !== 'win32') {
+        adminStatusEl.textContent = t('settings.admin_status_unsupported');
+        adminStatusEl.style.color = 'var(--accent-warning)';
+        elevationBtn.textContent = t('settings.request_elevation');
+        return;
+      }
+
+      if (data.isAdmin) {
+        adminStatusEl.textContent = t('settings.admin_status_on');
+        adminStatusEl.style.color = 'var(--accent-success)';
+        elevationBtn.textContent = t('settings.admin_already');
+        return;
+      }
+
+      adminStatusEl.textContent = t('settings.admin_status_off');
+      adminStatusEl.style.color = 'var(--accent-warning)';
+      elevationBtn.disabled = false;
+      elevationBtn.textContent = t('settings.request_elevation');
+    } catch (err) {
+      adminStatusEl.textContent = t('settings.privilege_check_failed') + err.message;
+      adminStatusEl.style.color = 'var(--accent-danger)';
+      elevationBtn.textContent = t('settings.request_elevation');
+    }
+  }
+
+  elevationBtn?.addEventListener('click', async () => {
+    if (!confirm(t('settings.elevation_confirm'))) return;
+    elevationBtn.disabled = true;
+    elevationBtn.innerHTML = `<span class="spinner"></span> ${t('settings.requesting_elevation')}`;
+
+    try {
+      await requestElevation();
+      showToast(t('settings.elevation_uac_prompt'), 'info');
+      adminStatusEl.textContent = t('settings.elevation_restarting');
+      adminStatusEl.style.color = 'var(--accent-info)';
+    } catch (err) {
+      showToast(t('settings.elevation_failed') + err.message, 'error');
+      elevationBtn.disabled = false;
+      elevationBtn.textContent = t('settings.request_elevation');
+      await refreshPrivilegeStatus();
+    }
+  });
+
+  await refreshPrivilegeStatus();
+
+  const searchToggle = document.getElementById('enable-web-search');
+  const tavilyGroup = document.getElementById('tavily-api-key-group');
+
+  function updateTavilyVisibility() {
+    tavilyGroup.style.display = searchToggle.checked ? 'block' : 'none';
+  }
+  searchToggle.addEventListener('change', updateTavilyVisibility);
+  updateTavilyVisibility();
+
+  const sizeSlider = document.getElementById('target-size');
+  const sizeInput = document.getElementById('target-size-input');
+  sizeSlider.addEventListener('input', () => {
+    sizeInput.value = parseFloat(sizeSlider.value).toFixed(1);
+  });
+  sizeInput.addEventListener('input', () => {
+    const val = parseFloat(sizeInput.value);
+    if (!Number.isNaN(val)) sizeSlider.value = String(val);
+  });
+  sizeInput.addEventListener('blur', () => {
+    let val = parseFloat(sizeInput.value);
+    if (Number.isNaN(val) || val < 0.1) val = 0.1;
+    if (val > 100) val = 100;
+    sizeInput.value = val.toFixed(1);
+    sizeSlider.value = String(val);
+  });
+
+  const depthSlider = document.getElementById('max-depth');
+  const depthInput = document.getElementById('max-depth-input');
+  depthSlider.addEventListener('input', () => {
+    depthInput.value = String(parseInt(depthSlider.value, 10));
+  });
+  depthInput.addEventListener('input', () => {
+    const val = parseInt(depthInput.value, 10);
+    if (!Number.isNaN(val)) depthSlider.value = String(val);
+  });
+  depthInput.addEventListener('blur', () => {
+    let val = parseInt(depthInput.value, 10);
+    if (Number.isNaN(val) || val < 1) val = 1;
+    if (val > 10) val = 10;
+    depthInput.value = String(val);
+    depthSlider.value = String(val);
+  });
+
+  document.getElementById('browse-folder-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('browse-folder-btn');
+    btn.disabled = true;
+    btn.textContent = t('settings.browsing');
+    try {
+      const result = await browseFolder();
+      if (!result.cancelled && result.path) {
+        document.getElementById('scan-path').value = result.path;
+        showToast(t('settings.toast_path_selected') + result.path, 'success');
+      }
+    } catch (err) {
+      showToast(t('settings.toast_browse_failed') + err.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('settings.browse');
+    }
+  });
+
+  document.getElementById('save-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('save-btn');
+    const status = document.getElementById('save-status');
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner"></span> ${t('settings.saving')}`;
+
+    try {
+      await saveSettings(collectForm(providerApiKeyMap));
+      showToast(t('settings.toast_saved'), 'success');
+      status.textContent = t('settings.saved');
+      status.style.color = 'var(--accent-success)';
+    } catch (err) {
+      showToast(t('settings.toast_save_failed') + err.message, 'error');
+      status.textContent = t('settings.save_failed');
+      status.style.color = 'var(--accent-danger)';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t('settings.save');
+    }
+  });
+
+  async function fillForm(s) {
+    const el = (id) => document.getElementById(id);
+    if (s.apiEndpoint) {
+      const endpointEl = el('api-endpoint');
+      const exists = Array.from(endpointEl.options).some((opt) => opt.value === s.apiEndpoint);
+      if (!exists) endpointEl.add(new Option(s.apiEndpoint, s.apiEndpoint));
+      endpointEl.value = s.apiEndpoint;
+    }
+    await updateModelsDropdown(String(s.model || ''));
+
+    if (s.scanPath) el('scan-path').value = s.scanPath;
+    if (s.targetSizeGB != null) {
+      el('target-size').value = s.targetSizeGB;
+      el('target-size-input').value = parseFloat(s.targetSizeGB).toFixed(1);
+    }
+    if (s.maxDepth != null) {
+      el('max-depth').value = s.maxDepth;
+      el('max-depth-input').value = s.maxDepth;
+    }
+    if (s.enableWebSearch != null) {
+      el('enable-web-search').checked = !!s.enableWebSearch;
+      if (s.enableWebSearch) el('tavily-api-key-group').style.display = 'block';
+    }
+    if (s.tavilyApiKey != null) el('tavily-api-key').value = s.tavilyApiKey;
+  }
 }
 
-function collectForm() {
-    const targetSizeInputVal = document.getElementById('target-size-input') ? document.getElementById('target-size-input').value : null;
-    const targetSizeVal = targetSizeInputVal || document.getElementById('target-size').value;
+function collectForm(providerApiKeyMap) {
+  const endpoint = document.getElementById('api-endpoint').value.trim();
+  const model = document.getElementById('api-model').value.trim() || 'deepseek-chat';
+  const targetSizeInputVal = document.getElementById('target-size-input')?.value;
+  const targetSizeVal = targetSizeInputVal || document.getElementById('target-size').value;
+  const maxDepthInputVal = document.getElementById('max-depth-input')?.value;
+  const maxDepthVal = maxDepthInputVal || document.getElementById('max-depth').value;
 
-    const maxDepthInputVal = document.getElementById('max-depth-input') ? document.getElementById('max-depth-input').value : null;
-    const maxDepthVal = maxDepthInputVal || document.getElementById('max-depth').value;
-
-    return {
-        apiEndpoint: document.getElementById('api-endpoint').value.trim(),
-        apiKey: document.getElementById('api-key').value.trim(),
-        model: document.getElementById('api-model').value.trim() || 'deepseek-chat',
-        scanPath: document.getElementById('scan-path').value.trim(),
-        targetSizeGB: parseFloat(targetSizeVal),
-        maxDepth: parseInt(maxDepthVal, 10),
-        enableWebSearch: document.getElementById('enable-web-search').checked,
-        tavilyApiKey: document.getElementById('tavily-api-key').value.trim(),
-    };
+  return {
+    apiEndpoint: endpoint,
+    apiKey: String(providerApiKeyMap?.[endpoint] || '').trim(),
+    model,
+    scanPath: document.getElementById('scan-path').value.trim(),
+    targetSizeGB: parseFloat(targetSizeVal),
+    maxDepth: parseInt(maxDepthVal, 10),
+    enableWebSearch: document.getElementById('enable-web-search').checked,
+    tavilyApiKey: document.getElementById('tavily-api-key').value.trim(),
+  };
 }

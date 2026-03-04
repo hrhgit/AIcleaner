@@ -82,8 +82,33 @@
     </nav>
 
     <main id="content">
+      <header id="topbar" class="topbar">
+        <div class="topbar-title-wrap">
+          <h1 class="topbar-title" data-i18n="topbar.title">工作台</h1>
+          <p class="topbar-subtitle" data-i18n="topbar.subtitle">文件清理与归类</p>
+        </div>
+        <button id="provider-manager-btn" class="btn btn-secondary" data-i18n="topbar.manage_api">服务商 API</button>
+      </header>
       <div id="page-container"></div>
     </main>
+  </div>
+
+  <div id="provider-modal" class="app-modal" aria-hidden="true">
+    <div class="app-modal-overlay" data-modal-close="true"></div>
+    <section class="app-modal-panel card" role="dialog" aria-modal="true" aria-labelledby="provider-modal-title">
+      <div class="app-modal-header">
+        <div>
+          <h2 id="provider-modal-title" class="card-title" data-i18n="provider_modal.title">服务商 API 管理</h2>
+          <p class="form-hint" data-i18n="provider_modal.subtitle">配置各服务商 API Key 与默认模型</p>
+        </div>
+        <button id="provider-modal-close" class="btn btn-ghost" type="button">✕</button>
+      </div>
+      <div id="provider-list" class="provider-list"></div>
+      <div class="app-modal-actions">
+        <button id="provider-modal-cancel" class="btn btn-ghost" type="button" data-i18n="provider_modal.cancel">取消</button>
+        <button id="provider-modal-save" class="btn btn-primary" type="button" data-i18n="provider_modal.save">保存</button>
+      </div>
+    </section>
   </div>
 </body>
 

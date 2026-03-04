@@ -62,12 +62,6 @@ const PROVIDER_SELECT_IDS = {
   audio: 'org-provider-audio',
 };
 
-const API_KEY_INPUT_IDS = {
-  text: 'org-api-key-text',
-  image: 'org-api-key-image',
-  video: 'org-api-key-video',
-  audio: 'org-api-key-audio',
-};
 const COPY_TEXT_ROUTE_BTN_ID = 'org-copy-text-route-btn';
 
 const PROVIDER_OPTIONS = [
@@ -114,6 +108,7 @@ let activeTaskId = null;
 let activeEventSource = null;
 let latestSnapshot = null;
 let latestCapability = null;
+let providerApiKeyMap = {};
 const remoteModelsCache = new Map();
 const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
 
@@ -164,26 +159,35 @@ function ensureProviderOptionExists(select, endpoint) {
   }
 }
 
+function getApiKeyForEndpoint(endpoint) {
+  return String(providerApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+}
+
 function readModelRoutingFromDOM() {
+  const textEndpoint = document.getElementById(PROVIDER_SELECT_IDS.text)?.value?.trim() || '';
+  const imageEndpoint = document.getElementById(PROVIDER_SELECT_IDS.image)?.value?.trim() || '';
+  const videoEndpoint = document.getElementById(PROVIDER_SELECT_IDS.video)?.value?.trim() || '';
+  const audioEndpoint = document.getElementById(PROVIDER_SELECT_IDS.audio)?.value?.trim() || '';
+
   return {
     text: {
-      endpoint: document.getElementById(PROVIDER_SELECT_IDS.text)?.value?.trim() || '',
-      apiKey: document.getElementById(API_KEY_INPUT_IDS.text)?.value?.trim() || '',
+      endpoint: textEndpoint,
+      apiKey: getApiKeyForEndpoint(textEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.text)?.value?.trim() || '',
     },
     image: {
-      endpoint: document.getElementById(PROVIDER_SELECT_IDS.image)?.value?.trim() || '',
-      apiKey: document.getElementById(API_KEY_INPUT_IDS.image)?.value?.trim() || '',
+      endpoint: imageEndpoint,
+      apiKey: getApiKeyForEndpoint(imageEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.image)?.value?.trim() || '',
     },
     video: {
-      endpoint: document.getElementById(PROVIDER_SELECT_IDS.video)?.value?.trim() || '',
-      apiKey: document.getElementById(API_KEY_INPUT_IDS.video)?.value?.trim() || '',
+      endpoint: videoEndpoint,
+      apiKey: getApiKeyForEndpoint(videoEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.video)?.value?.trim() || '',
     },
     audio: {
-      endpoint: document.getElementById(PROVIDER_SELECT_IDS.audio)?.value?.trim() || '',
-      apiKey: document.getElementById(API_KEY_INPUT_IDS.audio)?.value?.trim() || '',
+      endpoint: audioEndpoint,
+      apiKey: getApiKeyForEndpoint(audioEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.audio)?.value?.trim() || '',
     },
   };
@@ -273,14 +277,46 @@ function setStatusText(snapshot) {
   el.textContent = statusMap[snapshot.status] || snapshot.status;
 }
 
+function getSelectionsFromDOM() {
+  const selectedProviders = {};
+  const selectedModels = {};
+  for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+    selectedProviders[modality] = String(document.getElementById(PROVIDER_SELECT_IDS[modality])?.value || '').trim();
+    selectedModels[modality] = String(document.getElementById(MODEL_SELECT_IDS[modality])?.value || '').trim();
+  }
+  const hasSelection = Object.values(selectedProviders).some(Boolean) && Object.values(selectedModels).some(Boolean);
+  return { selectedProviders, selectedModels, hasSelection };
+}
+
+function supportsMultimodalBySelection(selectedProviders, selectedModels) {
+  const endpoint = String(selectedProviders?.image || '').toLowerCase();
+  const model = String(selectedModels?.image || '').toLowerCase();
+  const value = `${endpoint}|${model}`;
+  return [
+    'gpt-4o',
+    'gpt-4.1',
+    'gemini',
+    'qwen-vl',
+    'qvq',
+    'glm-4v',
+    'claude',
+  ].some((token) => value.includes(token));
+}
+
 function renderCapability(snapshot) {
   const modelEl = document.getElementById('org-model-name');
   const mmEl = document.getElementById('org-mm-badge');
   if (!modelEl || !mmEl) return;
 
-  const selectedModels = snapshot?.selectedModels || latestCapability?.selectedModels;
-  const selectedProviders = snapshot?.selectedProviders || latestCapability?.selectedProviders;
-  const fallbackModel = snapshot?.selectedModel || latestCapability?.selectedModel || '-';
+  const domSelections = getSelectionsFromDOM();
+  const useDomSelections = !snapshot && domSelections.hasSelection;
+  const selectedModels = snapshot?.selectedModels
+    || (useDomSelections ? domSelections.selectedModels : latestCapability?.selectedModels);
+  const selectedProviders = snapshot?.selectedProviders
+    || (useDomSelections ? domSelections.selectedProviders : latestCapability?.selectedProviders);
+  const fallbackModel = snapshot?.selectedModel
+    || (useDomSelections ? domSelections.selectedModels?.text : latestCapability?.selectedModel)
+    || '-';
   const labelByEndpoint = new Map(PROVIDER_OPTIONS.map((item) => [item.value, item.label]));
   const renderCell = (modality) => {
     const endpoint = selectedProviders?.[modality] || '';
@@ -296,7 +332,9 @@ function renderCapability(snapshot) {
   ].join(' | ');
   const supports = typeof snapshot?.supportsMultimodal === 'boolean'
     ? snapshot.supportsMultimodal
-    : latestCapability?.supportsMultimodal;
+    : useDomSelections
+      ? supportsMultimodalBySelection(selectedProviders, selectedModels)
+      : latestCapability?.supportsMultimodal;
 
   modelEl.textContent = model;
 
@@ -335,12 +373,11 @@ async function initModelSelectors(defaultSelection = {}) {
   if (!modality || !MODEL_SELECT_IDS[modality]) return;
 
   const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
-  const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
   const modelSelect = document.getElementById(MODEL_SELECT_IDS[modality]);
-  if (!providerSelect || !apiKeyInput || !modelSelect) return;
+  if (!providerSelect || !modelSelect) return;
 
   const endpoint = String(providerSelect.value || '').trim();
-  const apiKey = String(apiKeyInput.value || '').trim();
+  const apiKey = getApiKeyForEndpoint(endpoint);
   const selectedModel = String(defaultSelection?.model || modelSelect.value || '').trim();
   const requestToken = ++modelsRequestToken[modality];
 
@@ -383,8 +420,17 @@ async function initModelRoutingFields(defaultRouting = {}) {
     settings = null;
   }
 
+  providerApiKeyMap = {};
+  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+      providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    }
+  }
+  if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
+    providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+  }
+
   const baseEndpoint = String(settings?.apiEndpoint || 'https://api.deepseek.com').trim();
-  const baseApiKey = String(settings?.apiKey || '').trim();
   const baseModel = String(settings?.model || 'deepseek-chat').trim();
 
   for (const option of PROVIDER_OPTIONS) {
@@ -398,15 +444,12 @@ async function initModelRoutingFields(defaultRouting = {}) {
 
   for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
     const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
-    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
     const route = defaultRouting?.[modality] || {};
     const endpoint = String(route.endpoint || baseEndpoint).trim();
-    const apiKey = String(route.apiKey || baseApiKey).trim();
     const model = String(route.model || baseModel).trim();
 
     ensureProviderOptionExists(providerSelect, endpoint);
     if (providerSelect) providerSelect.value = endpoint;
-    if (apiKeyInput) apiKeyInput.value = apiKey;
 
     await initModelSelectors({ modality, model });
   }
@@ -419,16 +462,11 @@ async function applyTextRouteToOtherModalities() {
 
   for (const modality of targetModalities) {
     const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
-    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
     const endpoint = String(textRoute.endpoint || '').trim();
-    const apiKey = String(textRoute.apiKey || '').trim();
 
     ensureProviderOptionExists(providerSelect, endpoint);
     if (providerSelect && endpoint) {
       providerSelect.value = endpoint;
-    }
-    if (apiKeyInput) {
-      apiKeyInput.value = apiKey;
     }
   }
 
@@ -865,10 +903,6 @@ function bindPersistenceListeners() {
     PROVIDER_SELECT_IDS.image,
     PROVIDER_SELECT_IDS.video,
     PROVIDER_SELECT_IDS.audio,
-    API_KEY_INPUT_IDS.text,
-    API_KEY_INPUT_IDS.image,
-    API_KEY_INPUT_IDS.video,
-    API_KEY_INPUT_IDS.audio,
     MODEL_SELECT_IDS.text,
     MODEL_SELECT_IDS.image,
     MODEL_SELECT_IDS.video,
@@ -900,16 +934,17 @@ function bindPersistenceListeners() {
 function bindModelRoutingListeners() {
   for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
     const providerSelect = document.getElementById(PROVIDER_SELECT_IDS[modality]);
-    const apiKeyInput = document.getElementById(API_KEY_INPUT_IDS[modality]);
+    const modelSelect = document.getElementById(MODEL_SELECT_IDS[modality]);
 
     providerSelect?.addEventListener('change', async () => {
       await initModelSelectors({ modality });
       persistForm(collectForm());
+      renderCapability();
     });
 
-    apiKeyInput?.addEventListener('blur', async () => {
-      await initModelSelectors({ modality });
+    modelSelect?.addEventListener('change', () => {
       persistForm(collectForm());
+      renderCapability();
     });
   }
 }
@@ -971,42 +1006,39 @@ export async function renderOrganizer(container) {
         <div class="grid-2">
           <div class="form-group">
             <label class="form-label">${t('organizer.model_text')}</label>
-            <select id="${PROVIDER_SELECT_IDS.text}" class="form-input"></select>
-            <div class="form-hint">${t('settings.provider')}</div>
-            <input id="${API_KEY_INPUT_IDS.text}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
-            <div class="form-hint">${t('settings.api_key')}</div>
-            <select id="${MODEL_SELECT_IDS.text}" class="form-input"></select>
-            <div class="form-hint">${t('settings.model')}</div>
+            <div class="provider-model-inline">
+              <select id="${PROVIDER_SELECT_IDS.text}" class="form-input"></select>
+              <select id="${MODEL_SELECT_IDS.text}" class="form-input"></select>
+            </div>
+            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
           </div>
           <div class="form-group">
             <label class="form-label">${t('organizer.model_image')}</label>
-            <select id="${PROVIDER_SELECT_IDS.image}" class="form-input"></select>
-            <div class="form-hint">${t('settings.provider')}</div>
-            <input id="${API_KEY_INPUT_IDS.image}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
-            <div class="form-hint">${t('settings.api_key')}</div>
-            <select id="${MODEL_SELECT_IDS.image}" class="form-input"></select>
-            <div class="form-hint">${t('settings.model')}</div>
+            <div class="provider-model-inline">
+              <select id="${PROVIDER_SELECT_IDS.image}" class="form-input"></select>
+              <select id="${MODEL_SELECT_IDS.image}" class="form-input"></select>
+            </div>
+            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
           </div>
           <div class="form-group">
             <label class="form-label">${t('organizer.model_video')}</label>
-            <select id="${PROVIDER_SELECT_IDS.video}" class="form-input"></select>
-            <div class="form-hint">${t('settings.provider')}</div>
-            <input id="${API_KEY_INPUT_IDS.video}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
-            <div class="form-hint">${t('settings.api_key')}</div>
-            <select id="${MODEL_SELECT_IDS.video}" class="form-input"></select>
-            <div class="form-hint">${t('settings.model')}</div>
+            <div class="provider-model-inline">
+              <select id="${PROVIDER_SELECT_IDS.video}" class="form-input"></select>
+              <select id="${MODEL_SELECT_IDS.video}" class="form-input"></select>
+            </div>
+            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
           </div>
           <div class="form-group">
             <label class="form-label">${t('organizer.model_audio')}</label>
-            <select id="${PROVIDER_SELECT_IDS.audio}" class="form-input"></select>
-            <div class="form-hint">${t('settings.provider')}</div>
-            <input id="${API_KEY_INPUT_IDS.audio}" type="password" class="form-input" style="margin-top:8px;" placeholder="${t('settings.api_key_placeholder')}" />
-            <div class="form-hint">${t('settings.api_key')}</div>
-            <select id="${MODEL_SELECT_IDS.audio}" class="form-input"></select>
-            <div class="form-hint">${t('settings.model')}</div>
+            <div class="provider-model-inline">
+              <select id="${PROVIDER_SELECT_IDS.audio}" class="form-input"></select>
+              <select id="${MODEL_SELECT_IDS.audio}" class="form-input"></select>
+            </div>
+            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
           </div>
         </div>
         <div class="form-hint">${t('organizer.model_routing_hint')}</div>
+        <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
         <div class="flex items-center gap-8" style="margin-top:8px;">
           <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
         </div>
@@ -1134,6 +1166,7 @@ export async function renderOrganizer(container) {
   await initModelRoutingFields(defaults.modelRouting);
   bindModelRoutingListeners();
   bindPersistenceListeners();
+  renderCapability();
 
   try {
     latestCapability = await getOrganizeCapability();

@@ -11,10 +11,98 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
 const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
 
+const BUILTIN_PROVIDER_PRESETS = [
+    { name: 'DeepSeek', endpoint: 'https://api.deepseek.com', model: 'deepseek-chat' },
+    { name: 'OpenAI', endpoint: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    { name: 'Google Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/', model: 'gemini-2.5-flash' },
+    { name: 'Qwen', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+    { name: 'GLM', endpoint: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+    { name: 'Moonshot', endpoint: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+];
+
+function normalizeEndpointValue(value) {
+    return String(value || '').trim();
+}
+
+function defaultModelByEndpoint(endpoint) {
+    const value = normalizeEndpointValue(endpoint).toLowerCase();
+    if (value.includes('deepseek.com')) return 'deepseek-chat';
+    if (value.includes('generativelanguage.googleapis.com')) return 'gemini-2.5-flash';
+    if (value.includes('dashscope.aliyuncs.com')) return 'qwen-plus';
+    if (value.includes('bigmodel.cn')) return 'glm-4-flash';
+    if (value.includes('moonshot.cn')) return 'moonshot-v1-8k';
+    return 'gpt-4o-mini';
+}
+
+function resolveProviderSettings(input) {
+    const sourceConfigs = input?.providerConfigs && typeof input.providerConfigs === 'object'
+        ? input.providerConfigs
+        : {};
+    const providerConfigs = {};
+
+    for (const preset of BUILTIN_PROVIDER_PRESETS) {
+        const source = sourceConfigs[preset.endpoint] || {};
+        providerConfigs[preset.endpoint] = {
+            name: String(source?.name || preset.name),
+            endpoint: preset.endpoint,
+            apiKey: String(source?.apiKey || ''),
+            model: String(source?.model || preset.model),
+        };
+    }
+
+    for (const [key, rawConfig] of Object.entries(sourceConfigs)) {
+        const endpoint = normalizeEndpointValue(rawConfig?.endpoint || key);
+        if (!endpoint || providerConfigs[endpoint]) continue;
+        providerConfigs[endpoint] = {
+            name: String(rawConfig?.name || endpoint),
+            endpoint,
+            apiKey: String(rawConfig?.apiKey || ''),
+            model: String(rawConfig?.model || defaultModelByEndpoint(endpoint)),
+        };
+    }
+
+    const legacyEndpoint = normalizeEndpointValue(input?.apiEndpoint)
+        || BUILTIN_PROVIDER_PRESETS[0].endpoint;
+    if (!providerConfigs[legacyEndpoint]) {
+        providerConfigs[legacyEndpoint] = {
+            name: legacyEndpoint,
+            endpoint: legacyEndpoint,
+            apiKey: '',
+            model: defaultModelByEndpoint(legacyEndpoint),
+        };
+    }
+
+    const legacyApiKey = String(input?.apiKey || '').trim();
+    const legacyModel = String(input?.model || '').trim();
+    if (legacyApiKey) providerConfigs[legacyEndpoint].apiKey = legacyApiKey;
+    if (legacyModel) providerConfigs[legacyEndpoint].model = legacyModel;
+
+    let defaultProviderEndpoint = normalizeEndpointValue(input?.defaultProviderEndpoint);
+    if (!providerConfigs[defaultProviderEndpoint]) {
+        defaultProviderEndpoint = legacyEndpoint;
+    }
+
+    const activeConfig = providerConfigs[defaultProviderEndpoint] || {
+        endpoint: defaultProviderEndpoint,
+        apiKey: '',
+        model: defaultModelByEndpoint(defaultProviderEndpoint),
+    };
+
+    return {
+        providerConfigs,
+        defaultProviderEndpoint,
+        apiEndpoint: defaultProviderEndpoint,
+        apiKey: String(activeConfig.apiKey || ''),
+        model: String(activeConfig.model || defaultModelByEndpoint(defaultProviderEndpoint)),
+    };
+}
+
 const DEFAULT_SETTINGS = {
     apiEndpoint: process.env.VITE_API_ENDPOINT || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
     apiKey: process.env.VITE_API_KEY || process.env.OPENAI_API_KEY || '',
     model: process.env.VITE_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    defaultProviderEndpoint: process.env.VITE_API_ENDPOINT || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    providerConfigs: {},
     scanPath: '',
     targetSizeGB: 1,
     maxDepth: 5,
@@ -27,12 +115,13 @@ export function loadSettings() {
     try {
         if (existsSync(SETTINGS_FILE)) {
             const raw = readFileSync(SETTINGS_FILE, 'utf-8');
-            return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+            const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+            return { ...merged, ...resolveProviderSettings(merged) };
         }
     } catch (err) {
         console.error('[Settings] Failed to load:', err.message);
     }
-    return { ...DEFAULT_SETTINGS };
+    return { ...DEFAULT_SETTINGS, ...resolveProviderSettings(DEFAULT_SETTINGS) };
 }
 
 function saveSettings(data) {
@@ -40,8 +129,9 @@ function saveSettings(data) {
         mkdirSync(DATA_DIR, { recursive: true });
     }
     const merged = { ...loadSettings(), ...data };
-    writeFileSync(SETTINGS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
-    return merged;
+    const normalized = { ...merged, ...resolveProviderSettings(merged) };
+    writeFileSync(SETTINGS_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+    return normalized;
 }
 
 export const settingsRouter = Router();

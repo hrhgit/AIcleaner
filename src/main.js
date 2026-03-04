@@ -7,6 +7,7 @@ import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
 import { renderOrganizer } from './pages/organizer.js';
 import { t, toggleLang, emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
+import { initProviderManager } from './components/provider-manager.js';
 
 const pages = {
     settings: renderSettings,
@@ -62,6 +63,8 @@ window.addEventListener('hashchange', () => {
 });
 
 document.addEventListener('DOMContentLoaded', () => {
+    initProviderManager();
+
     // Nav link clicks
     document.querySelectorAll('.nav-link').forEach(link => {
         link.addEventListener('click', (e) => {

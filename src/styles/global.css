@@ -241,6 +241,34 @@ a {
   min-height: 100vh;
 }
 
+#topbar {
+  max-width: 1200px;
+  margin: 0 auto 20px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.topbar-title-wrap {
+  min-width: 0;
+}
+
+.topbar-title {
+  font-size: 1.3rem;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+.topbar-subtitle {
+  margin-top: 4px;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
 #page-container {
   max-width: 1200px;
   margin: 0 auto;
