@@ -1,6 +1,6 @@
 /**
  * server/agent.js
- * LLM analysis engine for file/folder classification with optional web-search second pass.
+ * LLM analysis engine for scan and cleanup decisions.
  */
 import OpenAI from 'openai';
 import { loadSettings } from './routes/settings.js';
@@ -35,9 +35,9 @@ function formatSize(bytes) {
 }
 
 function extractJsonText(content = '') {
-    let clean = content.trim();
+    let clean = String(content || '').trim();
     if (clean.startsWith('```json')) {
-        clean = clean.replace(/^```json/, '').replace(/```$/, '').trim();
+        clean = clean.replace(/^```json/i, '').replace(/```$/, '').trim();
     } else if (clean.startsWith('```')) {
         clean = clean.replace(/^```/, '').replace(/```$/, '').trim();
     }
@@ -68,416 +68,334 @@ function normalizeRisk(value, fallback = 'medium') {
     return fallback;
 }
 
-function normalizeDirectoryReview(parsed, entries, dirName) {
-    const source = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
-    const folderRaw = source.folder && typeof source.folder === 'object' ? source.folder : {};
-    const childRaw = Array.isArray(source.children)
-        ? source.children
-        : Array.isArray(source.entries)
-            ? source.entries
-            : Array.isArray(source.items)
-                ? source.items
-                : [];
-
-    const folder = {
-        name: String(folderRaw.name || dirName || ''),
-        classification: normalizeClassification(folderRaw.classification),
-        purpose: String(folderRaw.purpose || ''),
-        reason: String(folderRaw.reason || ''),
-        risk: normalizeRisk(folderRaw.risk, 'medium'),
-    };
-
-    const children = entries.map((entry, idx) => {
-        const byIndex = childRaw.find((item) => Number(item?.index || 0) === idx + 1);
-        const byName = childRaw.find((item) => String(item?.name || '') === entry.name);
-        const hit = byIndex || byName || {};
-        return {
-            index: idx + 1,
-            name: entry.name,
-            classification: normalizeClassification(hit.classification),
-            purpose: String(hit.purpose || ''),
-            reason: String(hit.reason || ''),
-            risk: normalizeRisk(hit.risk, 'medium'),
-        };
-    });
-
-    return { folder, children };
+function normalizeBoolean(value, fallback = false) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    const raw = String(value || '').trim().toLowerCase();
+    if (['true', 'yes', '1'].includes(raw)) return true;
+    if (['false', 'no', '0'].includes(raw)) return false;
+    return fallback;
 }
 
-function buildSystemPrompt(isWebSearchEnabled) {
+function normalizeNodeReview(parsed, nodeType) {
+    const source = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    const fallbackHasChildren = nodeType === 'directory';
+
+    return {
+        classification: normalizeClassification(source.classification),
+        reason: String(source.reason || '').trim(),
+        risk: normalizeRisk(source.risk, 'medium'),
+        hasPotentialDeletableSubfolders: fallbackHasChildren
+            ? normalizeBoolean(source.hasPotentialDeletableSubfolders, true)
+            : false,
+    };
+}
+
+function buildBatchSystemPrompt(isWebSearchEnabled) {
+    const rules = [
+        '你是磁盘清理安全分析助手。',
+        '任务：判断每个条目是否可删除。',
+        '输出必须是 JSON 数组，不要输出 Markdown，不要输出解释性前缀。',
+        'classification 只能是 safe_to_delete、suspicious、keep。',
+        'risk 只能是 low、medium、high。',
+        '系统关键文件、用户文档、源码、配置、照片视频默认保守，优先 keep 或 suspicious。',
+        '缓存、日志、临时文件、构建产物在证据充分时可判 safe_to_delete。',
+        '不确定时必须判 suspicious，不要冒进判 safe_to_delete。',
+    ];
+
     if (isWebSearchEnabled) {
-        return `你是一个资深的操作系统与磁盘空间清理专家。
-请分析给定文件/目录并返回严格 JSON 数组。
-
-分类规则：
-- 系统关键文件、用户核心文档/照片：keep
-- 缓存、临时文件、构建产物、日志：通常 safe_to_delete
-- 遇到无法判断且名称陌生的项目：needs_search
-- 无法确定时优先 suspicious，不要冒进判 safe_to_delete
-
-输出要求（仅 JSON，不要 Markdown）：
-[
-  {
-    "index": 1,
-    "name": "...",
-    "classification": "safe_to_delete" | "suspicious" | "keep" | "needs_search",
-    "purpose": "中文说明用途",
-    "reason": "中文说明依据",
-    "risk": "low" | "medium" | "high"
-  }
-]`;
+        rules.push('若名称陌生且证据不足，可先输出 needs_search，后续会提供联网补充信息。');
     }
 
-    return `你是一个资深的操作系统与磁盘空间清理专家。
-请分析给定文件/目录并返回严格 JSON 数组。
+    return `${rules.join('\n')}
 
-分类规则：
-- 系统关键文件、用户核心文档/照片：keep
-- 缓存、临时文件、构建产物、日志：通常 safe_to_delete
-- 无法确定时优先 suspicious，不要冒进判 safe_to_delete
-
-输出要求（仅 JSON，不要 Markdown）：
+输出格式：
 [
   {
     "index": 1,
-    "name": "...",
-    "classification": "safe_to_delete" | "suspicious" | "keep",
-    "purpose": "中文说明用途",
-    "reason": "中文说明依据",
-    "risk": "low" | "medium" | "high"
+    "name": "示例",
+    "classification": "${isWebSearchEnabled ? 'safe_to_delete|suspicious|keep|needs_search' : 'safe_to_delete|suspicious|keep'}",
+    "purpose": "中文用途说明",
+    "reason": "中文判断依据",
+    "risk": "low|medium|high"
   }
 ]`;
 }
 
-/**
- * Analyze a batch of file entries with LLM.
- * @param {Array} entries - [{name, size, type, path}]
- * @param {string} parentPath - The directory being scanned
- */
-export async function analyzeEntries(entries, parentPath) {
-    const { client, model } = getClient();
-    const settings = loadSettings();
-    const isWebSearchEnabled = !!(settings.enableWebSearch && settings.tavilyApiKey);
+function buildNodeSystemPrompt(nodeType) {
+    const shared = [
+        '你是磁盘清理安全分析助手。',
+        '只输出 JSON，不要输出 Markdown，不要输出多余解释。',
+        'classification 只能是 safe_to_delete、suspicious、keep。',
+        'risk 只能是 low、medium、high。',
+        '不确定时必须输出 suspicious。',
+        '理由必须简短、具体、中文。',
+    ];
 
+    if (nodeType === 'directory') {
+        return `${shared.join('\n')}
+这是目录级判断。
+如果目录整体明显属于缓存、日志、临时下载、安装残留、构建产物，可判 safe_to_delete。
+如果目录可能包含用户数据、项目源码、配置、工作资料，判 keep 或 suspicious。
+还要判断该目录下是否可能存在值得继续向下检查的可删子文件夹。
+输出格式：
+{
+  "classification": "safe_to_delete|suspicious|keep",
+  "reason": "中文理由",
+  "risk": "low|medium|high",
+  "hasPotentialDeletableSubfolders": true
+}`;
+    }
+
+    return `${shared.join('\n')}
+这是单文件判断。
+只根据文件名判断，不要假设存在额外上下文。
+输出格式：
+{
+  "classification": "safe_to_delete|suspicious|keep",
+  "reason": "中文理由",
+  "risk": "low|medium|high"
+}`;
+}
+
+function buildBatchUserPrompt(entries, parentPath) {
     const entrySummary = entries
-        .map((e, i) => `${i + 1}. [${e.type}] "${e.name}" - ${formatSize(e.size)}`)
+        .map((entry, index) => `${index + 1}. [${entry.type}] "${entry.name}" - ${formatSize(entry.size)}`)
         .join('\n');
 
-    const systemPrompt = buildSystemPrompt(isWebSearchEnabled);
-    const userPrompt = `请分析目录 "${parentPath}" 下的以下项目：\n\n${entrySummary}\n\n请仅返回 JSON 数组。`;
+    return `请分析目录 "${parentPath}" 下的以下条目：
 
-    const startTime = Date.now();
+${entrySummary}
 
-    try {
-        const response = await withRemoteLimit(() =>
-            retryWithBackoff(() =>
-                client.chat.completions.create({
-                    model,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt },
-                    ],
-                    temperature: 0.1,
-                })
-            )
-        );
+只返回 JSON 数组。`;
+}
 
-        const elapsed = Date.now() - startTime;
-        const content = response.choices?.[0]?.message?.content || '';
-        const reasoning = response.choices?.[0]?.message?.reasoning_content || '';
+function buildDirectoryNodeUserPrompt(node, childDirectories) {
+    const childSummary = childDirectories.length > 0
+        ? childDirectories
+            .map((child, index) => `${index + 1}. "${child.name}" - ${formatSize(child.size)}`)
+            .join('\n')
+        : '(没有直接子目录)';
 
-        const tokenUsage = {
+    return `节点类型：directory
+目录名：${node.name}
+目录路径：${node.path}
+目录总大小：${formatSize(node.size)}
+直接子目录列表：
+${childSummary}
+
+请判断：
+1. 该目录整体是否可删除
+2. 风险等级
+3. 该目录下是否可能还存在值得继续检查的可删子文件夹
+
+只返回 JSON。`;
+}
+
+function buildFileNodeUserPrompt(node) {
+    return `节点类型：file
+文件名：${node.name}
+
+请判断该文件是否可删除，并给出风险与理由。
+只返回 JSON。`;
+}
+
+async function runChatCompletion({ model, messages }) {
+    const { client } = getClient();
+    const response = await withRemoteLimit(() =>
+        retryWithBackoff(() =>
+            client.chat.completions.create({
+                model,
+                messages,
+                temperature: 0.1,
+            })
+        )
+    );
+
+    return {
+        content: response.choices?.[0]?.message?.content || '',
+        reasoning: response.choices?.[0]?.message?.reasoning_content || '',
+        tokenUsage: {
             prompt: response.usage?.prompt_tokens || 0,
             completion: response.usage?.completion_tokens || 0,
             total: response.usage?.total_tokens || 0,
-        };
+        },
+    };
+}
 
-        const parsed = JSON.parse(extractJsonText(content));
+export async function analyzeEntries(entries, parentPath) {
+    const { model } = getClient();
+    const settings = loadSettings();
+    const isWebSearchEnabled = !!(settings.enableWebSearch && settings.tavilyApiKey);
+    const systemPrompt = buildBatchSystemPrompt(isWebSearchEnabled);
+    const userPrompt = buildBatchUserPrompt(entries, parentPath);
+    const startTime = Date.now();
+
+    try {
+        const firstPass = await runChatCompletion({
+            model,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+            ],
+        });
+
+        const parsed = JSON.parse(extractJsonText(firstPass.content));
         const results = normalizeResultArray(parsed);
-
-        const needSearchItems = results.filter((r) => r.classification === 'needs_search');
+        const needSearchItems = isWebSearchEnabled
+            ? results.filter((item) => String(item?.classification || '').trim().toLowerCase() === 'needs_search')
+            : [];
+        const tokenUsage = { ...firstPass.tokenUsage };
 
         if (needSearchItems.length > 0) {
-            if (isWebSearchEnabled) {
-                const searchResults = await Promise.allSettled(
-                    needSearchItems.map((item) =>
-                        withRemoteLimit(() =>
-                            retryWithBackoff(() =>
-                                performTavilySearch(item.name, settings.tavilyApiKey, { throwOnError: true })
-                            )
+            const searchResults = await Promise.allSettled(
+                needSearchItems.map((item) =>
+                    withRemoteLimit(() =>
+                        retryWithBackoff(() =>
+                            performTavilySearch(item.name, settings.tavilyApiKey, { throwOnError: true })
                         )
                     )
-                );
+                )
+            );
 
-                const searchPrompts = needSearchItems.map((item, idx) => {
-                    const result = searchResults[idx];
-                    if (result.status === 'fulfilled' && result.value) {
-                        return `- "${item.name}": ${result.value}`;
-                    }
-                    return `- "${item.name}": 搜索结果不足，未获得明确信息`;
-                });
-
-                const secondPassPrompt = `以下是联网搜索补充信息：\n\n${searchPrompts.join('\n')}\n\n请仅对之前判定为 needs_search 的条目给出最终结论，且 classification 只能是 safe_to_delete | suspicious | keep。输出格式仍为 JSON 数组。`;
-
-                const response2 = await withRemoteLimit(() =>
-                    retryWithBackoff(() =>
-                        client.chat.completions.create({
-                            model,
-                            messages: [
-                                { role: 'system', content: systemPrompt },
-                                { role: 'user', content: userPrompt },
-                                { role: 'assistant', content },
-                                { role: 'user', content: secondPassPrompt },
-                            ],
-                            temperature: 0.1,
-                        })
-                    )
-                );
-
-                const parsed2 = JSON.parse(extractJsonText(response2.choices?.[0]?.message?.content || '[]'));
-                const secondaryResults = normalizeResultArray(parsed2);
-
-                for (const sr of secondaryResults) {
-                    const targetIdx = results.findIndex((r) => r.index === sr.index);
-                    if (targetIdx !== -1) {
-                        results[targetIdx] = sr;
-                    }
+            const searchPrompts = needSearchItems.map((item, index) => {
+                const result = searchResults[index];
+                if (result.status === 'fulfilled' && result.value) {
+                    return `- "${item.name}": ${result.value}`;
                 }
+                return `- "${item.name}": 未获得可靠联网信息`;
+            });
 
-                tokenUsage.prompt += response2.usage?.prompt_tokens || 0;
-                tokenUsage.completion += response2.usage?.completion_tokens || 0;
-                tokenUsage.total += response2.usage?.total_tokens || 0;
-            } else {
-                for (const item of needSearchItems) {
+            const secondPassPrompt = `以下是联网补充信息：
+
+${searchPrompts.join('\n')}
+
+请仅对之前标记为 needs_search 的项目给出最终结论。
+classification 只能是 safe_to_delete、suspicious、keep。
+只返回 JSON 数组。`;
+
+            const secondPass = await runChatCompletion({
+                model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                    { role: 'assistant', content: firstPass.content },
+                    { role: 'user', content: secondPassPrompt },
+                ],
+            });
+
+            const parsed2 = JSON.parse(extractJsonText(secondPass.content || '[]'));
+            const refinedResults = normalizeResultArray(parsed2);
+
+            for (const item of refinedResults) {
+                const targetIndex = results.findIndex((row) => row.index === item.index);
+                if (targetIndex !== -1) {
+                    results[targetIndex] = item;
+                }
+            }
+
+            tokenUsage.prompt += secondPass.tokenUsage.prompt;
+            tokenUsage.completion += secondPass.tokenUsage.completion;
+            tokenUsage.total += secondPass.tokenUsage.total;
+        } else {
+            for (const item of results) {
+                if (String(item?.classification || '').trim().toLowerCase() === 'needs_search') {
                     item.classification = 'suspicious';
-                    item.reason = `${item.reason || ''} (Web Search disabled, downgraded to suspicious)`.trim();
+                    item.reason = `${String(item.reason || '').trim()}（未启用联网搜索，已按可疑处理）`.trim();
                 }
             }
         }
 
         return {
-            results,
+            results: results.map((item, index) => ({
+                index: Number(item?.index || index + 1),
+                name: String(item?.name || entries[index]?.name || ''),
+                classification: normalizeClassification(item?.classification),
+                purpose: String(item?.purpose || '').trim(),
+                reason: String(item?.reason || '').trim(),
+                risk: normalizeRisk(item?.risk, 'medium'),
+            })),
             tokenUsage,
             trace: {
                 model,
                 systemPrompt,
                 userPrompt,
-                reasoning,
-                rawContent: content,
-                elapsed,
-                error: null,
-            },
-        };
-    } catch (err) {
-        const elapsed = Date.now() - startTime;
-        console.error('[Agent] LLM analysis failed:', err.message);
-
-        return {
-            results: entries.map((e, i) => ({
-                index: i + 1,
-                name: e.name,
-                classification: 'suspicious',
-                purpose: 'Analysis failed - manual review recommended',
-                reason: err.message,
-                risk: 'high',
-            })),
-            tokenUsage: { prompt: 0, completion: 0, total: 0 },
-            trace: {
-                model,
-                systemPrompt,
-                userPrompt,
-                reasoning: '',
-                rawContent: '',
-                elapsed,
-                error: err.message,
-            },
-        };
-    }
-}
-
-/**
- * Analyze a single directory as a whole, and classify all direct children.
- * Returns one decision for the directory itself and one decision per child entry.
- */
-export async function analyzeDirectoryReview(dirName, dirPath, entries) {
-    const { client, model } = getClient();
-
-    const entrySummary = entries
-        .map((e, i) => `${i + 1}. [${e.type}] "${e.name}" - ${formatSize(e.size)}`)
-        .join('\n');
-
-    const systemPrompt = `你是资深的磁盘清理专家。你将评估一个目录是否可整体删除，并同时评估其直接子项。
-要求：
-1) 如果目录整体可删除，folder.classification 使用 safe_to_delete。
-2) 如果目录整体不可删除，folder.classification 使用 keep 或 suspicious。
-3) children 必须逐项给出结论，classification 只能是 safe_to_delete | keep | suspicious。
-4) 风险 risk 只能是 low | medium | high。
-5) 严格输出 JSON 对象，不要输出 Markdown。`;
-
-    const userPrompt = `请分析目录 "${dirPath}"（目录名: "${dirName}"）。
-直接子项如下：
-${entrySummary || '(空目录)'}
-
-请仅返回 JSON，格式如下：
-{
-  "folder": {
-    "name": "${dirName}",
-    "classification": "safe_to_delete|keep|suspicious",
-    "purpose": "中文说明",
-    "reason": "中文说明",
-    "risk": "low|medium|high"
-  },
-  "children": [
-    {
-      "index": 1,
-      "name": "子项名称",
-      "classification": "safe_to_delete|keep|suspicious",
-      "purpose": "中文说明",
-      "reason": "中文说明",
-      "risk": "low|medium|high"
-    }
-  ]
-}`;
-
-    const startTime = Date.now();
-
-    try {
-        const response = await withRemoteLimit(() =>
-            retryWithBackoff(() =>
-                client.chat.completions.create({
-                    model,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt },
-                    ],
-                    temperature: 0.1,
-                })
-            )
-        );
-
-        const elapsed = Date.now() - startTime;
-        const content = response.choices?.[0]?.message?.content || '';
-        const reasoning = response.choices?.[0]?.message?.reasoning_content || '';
-        const parsed = JSON.parse(extractJsonText(content));
-        const review = normalizeDirectoryReview(parsed, entries, dirName);
-
-        return {
-            ...review,
-            tokenUsage: {
-                prompt: response.usage?.prompt_tokens || 0,
-                completion: response.usage?.completion_tokens || 0,
-                total: response.usage?.total_tokens || 0,
-            },
-            trace: {
-                model,
-                systemPrompt,
-                userPrompt,
-                reasoning,
-                rawContent: content,
-                elapsed,
-                error: null,
-            },
-        };
-    } catch (err) {
-        const elapsed = Date.now() - startTime;
-        console.error('[Agent] Directory review failed:', err.message);
-
-        return {
-            folder: {
-                name: dirName,
-                classification: 'suspicious',
-                purpose: '分析失败，建议人工确认',
-                reason: err.message,
-                risk: 'high',
-            },
-            children: entries.map((entry, index) => ({
-                index: index + 1,
-                name: entry.name,
-                classification: 'suspicious',
-                purpose: '分析失败，建议人工确认',
-                reason: err.message,
-                risk: 'high',
-            })),
-            tokenUsage: { prompt: 0, completion: 0, total: 0 },
-            trace: {
-                model,
-                systemPrompt,
-                userPrompt,
-                reasoning: '',
-                rawContent: '',
-                elapsed,
-                error: err.message,
-            },
-        };
-    }
-}
-
-/**
- * Verifies if a directory is truly safe to delete by examining its contents.
- */
-export async function verifyDirectoryDelete(dirName, entries, parentPath) {
-    const { client, model } = getClient();
-
-    const entrySummary = entries
-        .map((e, i) => `${i + 1}. [${e.type}] "${e.name}" - ${formatSize(e.size)}`)
-        .join('\n');
-
-    const systemPrompt = `你是磁盘清理安全审核员。请对“可删除目录”做二次核查。
-如果目录中可能存在重要文件（系统关键内容、用户文档、源码、配置等），必须判定 safe=false。
-只有当内容明显是缓存/日志/临时产物/空目录时，才可 safe=true。
-输出仅 JSON：
-{
-  "safe": true | false,
-  "reason": "中文说明"
-}`;
-
-    const userPrompt = `请二次确认目录 "${dirName}"（路径："${parentPath}"）是否可整体删除。\n\n内部条目：\n${entrySummary.length > 0 ? entrySummary : '(该目录为空)'}\n\n请仅返回 JSON。`;
-
-    const startTime = Date.now();
-
-    try {
-        const response = await withRemoteLimit(() =>
-            retryWithBackoff(() =>
-                client.chat.completions.create({
-                    model,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt },
-                    ],
-                    temperature: 0.1,
-                })
-            )
-        );
-
-        const content = response.choices?.[0]?.message?.content || '';
-        const reasoning = response.choices?.[0]?.message?.reasoning_content || '';
-        const parsed = JSON.parse(extractJsonText(content));
-
-        return {
-            safe: !!parsed.safe,
-            reason: parsed.reason || '',
-            tokenUsage: {
-                prompt: response.usage?.prompt_tokens || 0,
-                completion: response.usage?.completion_tokens || 0,
-                total: response.usage?.total_tokens || 0,
-            },
-            trace: {
-                model,
-                systemPrompt,
-                userPrompt,
-                reasoning,
-                rawContent: content,
+                reasoning: firstPass.reasoning,
+                rawContent: firstPass.content,
                 elapsed: Date.now() - startTime,
                 error: null,
             },
         };
     } catch (err) {
         const elapsed = Date.now() - startTime;
-        console.error('[Agent] Directory verification failed:', err.message);
+        console.error('[Agent] LLM batch analysis failed:', err.message);
 
         return {
-            safe: false,
-            reason: `验证失败: ${err.message}`,
+            results: entries.map((entry, index) => ({
+                index: index + 1,
+                name: entry.name,
+                classification: 'suspicious',
+                purpose: '',
+                reason: `分析失败，建议人工确认：${err.message}`,
+                risk: 'high',
+            })),
+            tokenUsage: { prompt: 0, completion: 0, total: 0 },
+            trace: {
+                model,
+                systemPrompt,
+                userPrompt,
+                reasoning: '',
+                rawContent: '',
+                elapsed,
+                error: err.message,
+            },
+        };
+    }
+}
+
+export async function analyzeScanNode(node, childDirectories = []) {
+    const { model } = getClient();
+    const normalizedType = node?.type === 'directory' ? 'directory' : 'file';
+    const systemPrompt = buildNodeSystemPrompt(normalizedType);
+    const userPrompt = normalizedType === 'directory'
+        ? buildDirectoryNodeUserPrompt(node, childDirectories)
+        : buildFileNodeUserPrompt(node);
+    const startTime = Date.now();
+
+    try {
+        const response = await runChatCompletion({
+            model,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt },
+            ],
+        });
+
+        const parsed = JSON.parse(extractJsonText(response.content));
+        const normalized = normalizeNodeReview(parsed, normalizedType);
+
+        return {
+            ...normalized,
+            tokenUsage: response.tokenUsage,
+            trace: {
+                model,
+                systemPrompt,
+                userPrompt,
+                reasoning: response.reasoning,
+                rawContent: response.content,
+                elapsed: Date.now() - startTime,
+                error: null,
+            },
+        };
+    } catch (err) {
+        const elapsed = Date.now() - startTime;
+        console.error('[Agent] Node analysis failed:', err.message);
+
+        return {
+            classification: 'suspicious',
+            reason: `分析失败，建议人工确认：${err.message}`,
+            risk: 'high',
+            hasPotentialDeletableSubfolders: normalizedType === 'directory',
             tokenUsage: { prompt: 0, completion: 0, total: 0 },
             trace: {
                 model,

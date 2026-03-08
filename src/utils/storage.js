@@ -3,12 +3,15 @@
  * localStorage 辅助工具 — 前端临时缓存
  */
 
-const PREFIX = 'dust_';
+const PREFIX = 'wipeout_';
 
 export function get(key, fallback = null) {
     try {
         const raw = localStorage.getItem(PREFIX + key);
-        return raw ? JSON.parse(raw) : fallback;
+        if (!raw) {
+            return fallback;
+        }
+        return JSON.parse(raw);
     } catch {
         return fallback;
     }

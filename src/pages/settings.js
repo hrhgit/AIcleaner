@@ -44,6 +44,8 @@ const PROVIDER_MODELS = {
   ],
 };
 
+let providerSettingsUpdatedHandler = null;
+
 function normalizeModels(models) {
   const seen = new Set();
   const normalized = [];
@@ -69,6 +71,22 @@ function renderModelOptions(models, selectedValue) {
   } else if (modelSelect.options.length > 0) {
     modelSelect.value = modelSelect.options[0].value;
   }
+}
+
+function syncProviderApiKeyMap(targetMap, settings = {}) {
+  Object.keys(targetMap).forEach((key) => delete targetMap[key]);
+  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+      targetMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    }
+  }
+  if (settings?.apiEndpoint && !targetMap[settings.apiEndpoint]) {
+    targetMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+  }
+}
+
+function hasConfiguredApiKey(targetMap, endpoint) {
+  return !!String(targetMap?.[String(endpoint || '').trim()] || '').trim();
 }
 
 export async function renderSettings(container) {
@@ -120,7 +138,7 @@ export async function renderSettings(container) {
           <div class="form-hint">${t('settings.model_hint')}</div>
         </div>
       </div>
-      <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
+      <div id="settings-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
 
       <div class="form-group" style="margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border);">
         <div style="display:flex; align-items:center; gap:10px; margin-bottom: 8px;">
@@ -217,6 +235,14 @@ export async function renderSettings(container) {
   let modelsRequestToken = 0;
 
   const endpointSelect = document.getElementById('api-endpoint');
+  const apiConfigHintEl = document.getElementById('settings-api-config-hint');
+
+  function refreshApiConfigHint(endpoint = endpointSelect?.value) {
+    if (!apiConfigHintEl) return;
+    const isHidden = hasConfiguredApiKey(providerApiKeyMap, endpoint);
+    apiConfigHintEl.hidden = isHidden;
+    apiConfigHintEl.style.display = isHidden ? 'none' : 'flex';
+  }
 
   async function updateModelsDropdown(selectedValue) {
     const endpoint = String(endpointSelect?.value || '').trim();
@@ -256,19 +282,13 @@ export async function renderSettings(container) {
   }
 
   endpointSelect?.addEventListener('change', () => {
+    refreshApiConfigHint();
     updateModelsDropdown();
   });
 
   try {
     const settings = await getSettings();
-    if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-      for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-        providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
-      }
-    }
-    if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
-      providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
-    }
+    syncProviderApiKeyMap(providerApiKeyMap, settings);
     await fillForm(settings);
   } catch (err) {
     console.warn('Failed to load settings:', err);
@@ -440,7 +460,25 @@ export async function renderSettings(container) {
         organizer: !!organizerWebSearchEnabled,
       },
     };
+    refreshApiConfigHint(el('api-endpoint')?.value);
   }
+
+  if (providerSettingsUpdatedHandler) {
+    window.removeEventListener('provider-settings-updated', providerSettingsUpdatedHandler);
+  }
+  providerSettingsUpdatedHandler = async (event) => {
+    try {
+      const latestSettings = event?.detail && typeof event.detail === 'object'
+        ? event.detail
+        : await getSettings();
+      syncProviderApiKeyMap(providerApiKeyMap, latestSettings);
+      refreshApiConfigHint();
+      await updateModelsDropdown(String(document.getElementById('api-model')?.value || '').trim());
+    } catch (err) {
+      console.warn('Failed to refresh provider settings in settings page:', err);
+    }
+  };
+  window.addEventListener('provider-settings-updated', providerSettingsUpdatedHandler);
 }
 
 function collectForm(providerApiKeyMap, searchApiSettings = {}) {

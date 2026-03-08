@@ -1,35 +1,14 @@
 import { Router } from 'express';
-import { execFileSync, execFile } from 'child_process';
+import { execFile } from 'child_process';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { isAdmin, isWindows } from '../privilege.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
 export const systemRouter = Router();
-
-function isWindows() {
-    return process.platform === 'win32';
-}
-
-function isAdmin() {
-    if (!isWindows()) return false;
-    try {
-        const out = execFileSync(
-            'powershell.exe',
-            [
-                '-NoProfile',
-                '-Command',
-                '$p=[Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent(); if($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){ "1" } else { "0" }',
-            ],
-            { encoding: 'utf-8', windowsHide: true, timeout: 10000 }
-        ).trim();
-        return out === '1';
-    } catch {
-        return false;
-    }
-}
 
 function resolveStartScript() {
     const candidates = [

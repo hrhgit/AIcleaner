@@ -3,10 +3,10 @@ setlocal
 chcp 65001 >nul
 title 打包 AIcleaner
 echo ===================================
-echo   开始打包 AIcleaner 
+echo   开始打包 AIcleaner
 echo ===================================
 
-echo [1/6] 前端构建 (Vite Build)...
+echo [1/7] 前端构建 (Vite Build)...
 call npm run build
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -15,23 +15,29 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [2/6] 清理旧目录...
+echo [2/7] 清理旧目录...
 if exist release rmdir /s /q release
 mkdir release
 
-echo [3/6] 检查独立的 Node.js 运行环境...
+echo [3/7] 检查独立的 Node.js 运行环境...
 if not exist "bin" mkdir bin
 if not exist "bin\node.exe" (
-    echo   初次打包，正在从服务器下载 node.exe ^(约 40MB^)...
+    echo   首次打包，正在从服务器下载 node.exe ^(约 40MB^)...
     powershell -Command "$ErrorActionPreference = 'Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.11.1/win-x64/node.exe' -OutFile 'bin\node.exe'"
 ) else (
-    echo   发现缓存的 node.exe,跳过下载。
+    echo   发现缓存的 node.exe，跳过下载。
 )
 
-echo [4/6] 迁移核心文件...
+echo [4/7] 检查 Rust 扫描器...
+if not exist "bin\scanner.exe" (
+    echo   Error: bin\scanner.exe not found. Please build native\scanner first.
+    pause
+    exit /b 1
+)
+
+echo [5/7] 迁移核心文件...
 xcopy dist release\dist\ /E /I /Q
 xcopy server release\server\ /E /I /Q
-xcopy scripts release\scripts\ /E /I /Q
 if exist bin xcopy bin release\bin\ /E /I /Q
 
 copy package.json release\ >nul
@@ -39,7 +45,7 @@ copy package-lock.json release\ >nul
 
 if exist release\server\data\settings.json del release\server\data\settings.json
 
-echo [5/6] 安装生产依赖并获取必要组件 (dust)...
+echo [6/7] 安装生产依赖...
 cd release
 call npm install --omit=dev
 if %ERRORLEVEL% neq 0 (
@@ -51,7 +57,7 @@ if %ERRORLEVEL% neq 0 (
 )
 cd ..
 
-echo [6/6] 生成一键启动脚本...
+echo [7/7] 生成一键启动脚本并构建安装包...
 (
 echo @echo off
 echo chcp 65001 ^>nul
@@ -67,8 +73,6 @@ echo echo 服务已退出...
 echo pause
 ) > release\start.bat
 
-echo.
-echo [7/7] Inno Setup...
 set "ISCC=%~d0\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=E:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" (
@@ -76,7 +80,7 @@ if not exist "%ISCC%" (
     goto SKIP_INSTALLER
 )
 if exist AIcleaner_Setup.exe del AIcleaner_Setup.exe
-"%ISCC%" scripts\dust_setup.iss
+"%ISCC%" scripts\scanner_setup.iss
 if %ERRORLEVEL% neq 0 (
     echo.
     echo Error: Inno Setup compile failed.
@@ -90,7 +94,6 @@ echo ===================================
 echo 构建全部完成！
 echo.
 echo 方式A（免安装绿色版）：直接把 "release" 文件夹发给他人，运行 start.bat 即可启动。
-echo 方式B（专业安装包）  ：发给他人根目录的 "AIcleaner_Setup.exe"，双击弹出安装向导，
-echo                         支持选择安装目录、创建快捷方式，并可从控制面板卸载。
+echo 方式B（专业安装包）：发送根目录的 "AIcleaner_Setup.exe"，双击后弹出安装向导。
 echo ===================================
 pause

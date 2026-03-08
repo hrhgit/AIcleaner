@@ -3,9 +3,10 @@
  * 设置持久化路由 — 读写 API 配置和扫描选项
  */
 import { Router } from 'express';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { readJsonFileWithBackup, writeJsonFileAtomic } from '../json-file.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
@@ -182,9 +183,8 @@ const DEFAULT_SETTINGS = {
 
 export function loadSettings() {
     try {
-        if (existsSync(SETTINGS_FILE)) {
-            const raw = readFileSync(SETTINGS_FILE, 'utf-8');
-            const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+        if (existsSync(SETTINGS_FILE) || existsSync(`${SETTINGS_FILE}.bak`)) {
+            const merged = { ...DEFAULT_SETTINGS, ...readJsonFileWithBackup(SETTINGS_FILE) };
             return {
                 ...merged,
                 ...resolveProviderSettings(merged),
@@ -202,16 +202,13 @@ export function loadSettings() {
 }
 
 function saveSettings(data) {
-    if (!existsSync(DATA_DIR)) {
-        mkdirSync(DATA_DIR, { recursive: true });
-    }
     const merged = { ...loadSettings(), ...data };
     const normalized = {
         ...merged,
         ...resolveProviderSettings(merged),
         ...resolveSearchSettings(merged),
     };
-    writeFileSync(SETTINGS_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+    writeJsonFileAtomic(SETTINGS_FILE, normalized);
     return normalized;
 }
 

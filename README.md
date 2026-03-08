@@ -1,12 +1,12 @@
-# AIcleaner ✨
+﻿# AIcleaner ✨
 
 [English Version Below](#english-version)
 
-**AIcleaner** 是一款由人工智能驱动的智能磁盘空间清理工具。它将基于 Rust 的极速目录分析工具 [`dust`](https://github.com/bootandy/dust) 与大语言模型 (LLM) 的分析能力相结合，帮助您深入了解文件系统，精准定位占用空间庞大的文件，并在删除前提供详尽的风险评估，让您彻底告别误删系统文件的担忧。
+**AIcleaner** 是一款由人工智能驱动的智能磁盘空间清理工具。它将基于 Rust 的高性能扫描 sidecar 与大语言模型 (LLM) 的分析能力相结合，帮助您深入了解文件系统，精准定位占用空间庞大的文件，并在删除前提供详尽的风险评估，让您彻底告别误删系统文件的担忧。
 
 ## 🚀 核心功能
 
-- **极速扫描引擎**：底层调用 `dust` 命令行工具，瞬间完成对深层目录树和超大文件的高效分析。
+- **极速扫描引擎**：底层使用 Rust 扫描 sidecar 直接索引文件与目录并写入 SQLite，适合深层目录树、历史任务查询和后续 AI 分析。
 - **AI 安全护航**：在执行删除操作前，AI 将对文件及其所在目录进行智能分类和功能解析，直观展示删除风险，让清理决定有据可依。
 - **现代化 UI 设计**：采用 HTML/CSS/JS 与 Vite 打造响应式玻璃拟态界面（Glassmorphism），提供丝滑的交互体验。
 - **一键打包部署**：内置完善的构建脚本，支持生成绿色免安装版以及专业的 Windows 安装向导 (`.exe`)。
@@ -40,7 +40,7 @@
    npm install
    ```
 
-   *（注：执行 `npm install` 后的 `postinstall` 阶段将自动为您的操作系统下载适配的 `dust` 可执行文件）。*
+   *（注：Windows 发布产物需包含预编译的 `bin/scanner.exe`，开发环境不再依赖额外的扫描器下载步骤。）*
 
 3. 环境变量配置：
    您可以在根目录下创建 `.env` 文件存放环境变量，或者直接通过 UI 界面的“设置”选项填入您的 API Key。
@@ -77,7 +77,7 @@ build.bat
 </div>
 
 ### 2. 执行全局扫描
-配置完毕后，切换到 **📈 扫描** 界面，系统将显示包含“分析中”状态的仪表盘。实时滚动的 **活动日志** 会展示当前正在被 `dust` 引擎扫描和 AI 处理的具体文件路径与耗时。在这个过程中，您可以直观地看到每个被扫描项的 AI 判定理由。
+配置完毕后，切换到 **📈 扫描** 界面，系统将显示包含“分析中”状态的仪表盘。实时滚动的 **活动日志** 会展示当前由 Rust 扫描器索引和 AI 处理的具体文件路径与耗时。在这个过程中，您可以直观地看到每个被扫描项的 AI 判定理由。
 <div align="center">
   <img src="./assets/scan.png" alt="扫描界面" width="80%">
 </div>
@@ -104,11 +104,11 @@ build.bat
 
 <a id="english-version"></a>
 
-**AIcleaner** is an intelligent, AI-driven disk space cleaning tool. It combines the blazing-fast directory scanning of the [`dust`](https://github.com/bootandy/dust) CLI with the analytical power of Large Language Models (LLMs) to help you understand your file system, identify space hogs, and safely delete unnecessary files without the fear of breaking your system.
+**AIcleaner** is an intelligent, AI-driven disk space cleaning tool. It combines a high-performance Rust scanner sidecar with the analytical power of Large Language Models (LLMs) to help you understand your file system, identify space hogs, and safely delete unnecessary files without the fear of breaking your system.
 
 ## 🚀 Features
 
-- **Blazing Fast Scanning**: Utilizes the Rust-based `dust` CLI for high-performance disk usage analysis.
+- **Blazing Fast Scanning**: Uses a Rust scanner sidecar that indexes files and directories directly into SQLite for fast history queries and AI follow-up analysis.
 - **AI-Powered Safety Analysis**: Before you delete anything, AI analyzes the directories and files, categorizing them and explaining their purpose, minimizing the risk of accidentally deleting critical system or application files.
 - **Modern Glassmorphism UI**: A beautiful, responsive, and dynamic user interface built with HTML/CSS/JS and Vite.
 - **Standalone Windows Installer**: Effortlessly package the application into a standalone Windows installer (`.exe`) or a portable version using the provided build scripts.
@@ -142,7 +142,7 @@ build.bat
    npm install
    ```
 
-   *(Note: The `postinstall` script automatically downloads the necessary `dust` CLI executable for your platform).*
+   *(Note: Windows release artifacts should include the prebuilt `bin/scanner.exe`; the app no longer relies on any scanner download step.)*
 
 3. Set up your environment variables:
    Create a `.env` file in the root directory (or use the built-in UI settings) to configure your AI API keys.
@@ -179,7 +179,7 @@ First, open the **⚙️ Settings** interface from the left sidebar. Here, confi
 </div>
 
 ### 2. Execute Global Scan
-After configuration, switch to the **📈 Scan** interface. You will see a dashboard displaying the "Analyzing" status. The real-time **Activity Log** shows the specific file paths and processing times as the `dust` engine scans and the AI evaluates them. You can monitor the AI's reasoning for each item in real-time.
+After configuration, switch to the **📈 Scan** interface. You will see a dashboard displaying the "Analyzing" status. The real-time **Activity Log** shows the specific file paths and processing times as the Rust scanner indexes them and the AI evaluates them. You can monitor the AI's reasoning for each item in real-time.
 <div align="center">
   <img src="./assets/scan.png" alt="Scanning Interface" width="80%">
 </div>
@@ -199,3 +199,4 @@ Contributions, issues, and feature requests are welcome! Feel free to check the 
 ## 📝 License
 
 This project is licensed under the MIT License.
+

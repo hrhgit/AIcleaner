@@ -1,123 +1,183 @@
-﻿/**
+/**
  * server/scanner.js
- * Layered scanning engine with optional auto AI analysis after scan.
+ * Rust sidecar driven scan task with SQLite-backed history and automatic analysis.
  */
-import { execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
-import { join, dirname, basename, resolve } from 'path';
+import { existsSync } from 'fs';
+import { dirname, join, resolve } from 'path';
+import readline from 'readline';
 import { fileURLToPath } from 'url';
-import { existsSync, statSync, readdirSync } from 'fs';
-import { analyzeDirectoryReview } from './agent.js';
+import { analyzeScanNode } from './agent.js';
 import {
-    createDirNode,
+    applyAnalysisDelta,
     createNodeId,
+    getScanDbPath,
+    getTaskSnapshot,
     initScanTaskStore,
     loadDirChildren,
-    loadDirNode,
-    saveDirNode,
+    loadDirNodeByPath,
+    patchTask,
     saveScanSnapshot,
+    upsertScanFinding,
 } from './scan-store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DUST_BIN = join(__dirname, '..', 'bin', 'dust.exe');
+const SIDECAR_BIN = join(__dirname, '..', 'bin', 'scanner.exe');
 
-function dustEntryIsDir(entryPath, dustEntry) {
-    if (dustEntry && Array.isArray(dustEntry.children) && dustEntry.children.length > 0) {
-        return true;
+function ensureScannerBinary() {
+    if (!existsSync(SIDECAR_BIN)) {
+        throw new Error(`scanner.exe is missing at ${SIDECAR_BIN}`);
     }
-
-    const base = basename(entryPath);
-    const dotIndex = base.lastIndexOf('.');
-    if (dotIndex <= 0) return true;
-    return false;
+    return SIDECAR_BIN;
 }
 
-function runDust(targetPath, depth = 1) {
-    try {
-        const dustPath = existsSync(DUST_BIN) ? DUST_BIN : 'dust';
-        const escapedPath = targetPath.replace(/\\$/, '\\\\');
-        const cmd = `"${dustPath}" -d ${depth} -j "${escapedPath}" 2>&1`;
-        const output = execSync(cmd, {
-            encoding: 'utf-8',
-            maxBuffer: 50 * 1024 * 1024,
-            timeout: 60000,
-        });
-
-        const firstBrace = output.indexOf('{');
-        if (firstBrace === -1) return [];
-
-        const parsed = JSON.parse(output.slice(firstBrace));
-        return parsed.children || [];
-    } catch (err) {
-        console.warn('[Scanner] dust failed, falling back to fs scan:', err.message);
-        return fsFallback(targetPath);
-    }
-}
-
-function fsFallback(targetPath) {
-    try {
-        const items = readdirSync(targetPath, { withFileTypes: true });
-        return items.map((item) => {
-            const fullPath = join(targetPath, item.name);
-            try {
-                const st = statSync(fullPath);
-                return {
-                    name: item.name,
-                    size: st.size,
-                    type: item.isDirectory() ? 'directory' : 'file',
-                    path: fullPath,
-                };
-            } catch {
-                return { name: item.name, size: 0, type: 'unknown', path: fullPath };
-            }
-        });
-    } catch (err) {
-        console.error('[Scanner] fs fallback also failed:', err.message);
-        return [];
-    }
-}
-
-function parseDustSize(str) {
-    if (typeof str === 'number') return str;
-    if (!str) return 0;
-
-    const match = str.toString().trim().match(/^([\d.]+)\s*([KMGTP]?B?)$/i);
-    if (!match) return 0;
-
-    const val = parseFloat(match[1]);
-    const unit = match[2].toUpperCase();
-    if (unit.startsWith('K')) return val * 1024;
-    if (unit.startsWith('M')) return val * 1024 * 1024;
-    if (unit.startsWith('G')) return val * 1024 * 1024 * 1024;
-    if (unit.startsWith('T')) return val * 1024 * 1024 * 1024 * 1024;
-    return val;
-}
-
-function normalizeDustEntries(dustEntries, parentPath) {
-    return dustEntries
-        .filter((e) => {
-            const entryPath = e.name || e.path || '';
-            return entryPath !== parentPath && basename(entryPath) !== '';
-        })
-        .map((e) => ({
-            name: basename(e.name || e.path || ''),
-            size: parseDustSize(e.size || e.bytes),
-            type: dustEntryIsDir(e.name || e.path || '', e) ? 'directory' : 'file',
-            path: resolve(e.path || e.name || join(parentPath, e.name || '')),
-        }));
-}
-
-function toFolderEntry(node, children = []) {
-    const estimatedSize = Number.isFinite(node.size)
-        ? node.size
-        : children.reduce((sum, child) => sum + (child.size || 0), 0);
-
+function toFolderEntry(node) {
     return {
         name: node.name,
         path: node.path,
-        size: estimatedSize,
+        size: Number(node.totalSize ?? node.size ?? 0),
         type: 'directory',
         nodeId: node.id,
+    };
+}
+
+function toNodeQueueItem(node) {
+    return {
+        id: node.id || node.nodeId || null,
+        nodeId: node.nodeId || node.id || null,
+        name: node.name,
+        path: node.path,
+        size: Number(node.totalSize ?? node.size ?? 0),
+        type: node.type === 'directory' ? 'directory' : 'file',
+        depth: Number(node.depth || 0),
+        totalSize: Number(node.totalSize ?? node.size ?? 0),
+        childCount: Number(node.childCount || 0),
+    };
+}
+
+function compareQueuedNodes(a, b) {
+    const sizeDiff = Number(b.size || 0) - Number(a.size || 0);
+    if (sizeDiff !== 0) return sizeDiff;
+    return String(a.path || '').localeCompare(String(b.path || ''), undefined, { sensitivity: 'base' });
+}
+
+function nodePathKey(pathValue) {
+    return resolve(String(pathValue || '')).toLowerCase();
+}
+
+async function analyzeTaskNode(taskId, nodeInput, options = {}) {
+    const source = String(options.source || 'scan_analysis');
+    const resolvedPath = resolve(String(nodeInput?.path || nodeInput || ''));
+    const loadedNode = await loadDirNodeByPath(taskId, resolvedPath);
+    if (!loadedNode) {
+        throw new Error(`Node is not in cached scan tree: ${resolvedPath}`);
+    }
+
+    const node = toNodeQueueItem(loadedNode);
+    const childDirectories = node.type === 'directory'
+        ? (await loadDirChildren(taskId, node, { dirsOnly: true })).map(toNodeQueueItem)
+        : [];
+
+    await patchTask(taskId, {
+        status: 'analyzing',
+        currentPath: node.path,
+        currentDepth: node.depth || 0,
+        clearFinishedAt: true,
+    });
+
+    options.onProgress?.({
+        currentPath: node.path,
+        currentDepth: node.depth || 0,
+        status: 'analyzing',
+    });
+
+    options.onAgentCall?.({
+        nodeType: node.type,
+        nodePath: node.path,
+        nodeName: node.name,
+        nodeSize: node.size,
+        childDirectories: childDirectories.map((child) => ({
+            name: child.name,
+            path: child.path,
+            size: child.size,
+        })),
+    });
+
+    if (options.shouldStop?.()) {
+        throw new Error('Task is stopped');
+    }
+
+    const review = await analyzeScanNode(node, childDirectories);
+
+    if (options.shouldStop?.()) {
+        throw new Error('Task is stopped');
+    }
+
+    options.onAgentResponse?.({
+        nodeType: node.type,
+        nodePath: node.path,
+        nodeName: node.name,
+        nodeSize: node.size,
+        model: review.trace.model,
+        elapsed: review.trace.elapsed,
+        reasoning: review.trace.reasoning,
+        rawContent: review.trace.rawContent,
+        userPrompt: review.trace.userPrompt,
+        error: review.trace.error,
+        tokenUsage: review.tokenUsage,
+        classification: review.classification,
+        risk: review.risk,
+        hasPotentialDeletableSubfolders: node.type === 'directory'
+            ? !!review.hasPotentialDeletableSubfolders
+            : false,
+    });
+
+    await upsertScanFinding(taskId, {
+        path: node.path,
+        name: node.name,
+        size: node.size,
+        type: node.type,
+        classification: review.classification,
+        purpose: '',
+        reason: review.reason,
+        risk: review.risk,
+        source,
+    });
+    await applyAnalysisDelta(taskId, {
+        processedEntriesDelta: 1,
+        tokenUsage: review.tokenUsage,
+        currentPath: node.path,
+        currentDepth: node.depth || 0,
+        status: 'analyzing',
+    });
+
+    let safeItem = null;
+    if (review.classification === 'safe_to_delete') {
+        safeItem = node.type === 'directory'
+            ? {
+                ...toFolderEntry(node),
+                reason: review.reason,
+                risk: review.risk,
+            }
+            : {
+                name: node.name,
+                path: node.path,
+                size: node.size,
+                type: 'file',
+                reason: review.reason,
+                risk: review.risk,
+            };
+        options.onFound?.(safeItem);
+    }
+
+    const snapshot = await getTaskSnapshot(taskId);
+    return {
+        snapshot,
+        review,
+        node,
+        childDirectories,
+        safeItem,
     };
 }
 
@@ -130,285 +190,48 @@ export class ScanTask extends EventEmitter {
         this.maxDepth = options.maxDepth || 5;
         this.autoAnalyze = options.autoAnalyze !== false;
         this.rootNodeId = createNodeId(this.targetPath);
-        this.stopped = false;
-
-        this.deletable = [];
-        this.deletablePathSet = new Set();
-        this.totalCleanable = 0;
+        this.status = 'idle';
+        this.currentPath = this.targetPath;
+        this.currentDepth = 0;
         this.scannedCount = 0;
         this.totalEntries = 0;
         this.processedEntries = 0;
+        this.totalCleanable = 0;
+        this.deletable = [];
+        this.permissionDeniedCount = 0;
+        this.permissionDeniedPaths = [];
         this.tokenUsage = { prompt: 0, completion: 0, total: 0 };
-        this.currentPath = this.targetPath;
-        this.currentDepth = 0;
-        this.status = 'idle';
+        this.errorMessage = '';
+        this.stopped = false;
+        this.sidecar = null;
+        this.sidecarFinished = false;
         this.persistQueue = Promise.resolve();
     }
 
-    stop() {
-        if (this.stopped) return;
-        this.stopped = true;
-        this.status = 'stopped';
-        const snap = this._snapshot();
-        this.emit('stopped', snap);
-        this._queueSnapshotPersist(snap);
+    _syncFromSnapshot(snapshot) {
+        if (!snapshot) return;
+        this.status = snapshot.status || this.status;
+        this.currentPath = snapshot.currentPath || this.currentPath;
+        this.currentDepth = Number(snapshot.currentDepth || 0);
+        this.scannedCount = Number(snapshot.scannedCount || 0);
+        this.totalEntries = Number(snapshot.totalEntries || 0);
+        this.processedEntries = Number(snapshot.processedEntries || 0);
+        this.totalCleanable = Number(snapshot.totalCleanable || 0);
+        this.deletable = Array.isArray(snapshot.deletable) ? snapshot.deletable : this.deletable;
+        this.permissionDeniedCount = Number(snapshot.permissionDeniedCount ?? this.permissionDeniedCount);
+        this.permissionDeniedPaths = Array.isArray(snapshot.permissionDeniedPaths)
+            ? snapshot.permissionDeniedPaths
+            : this.permissionDeniedPaths;
+        this.tokenUsage = snapshot.tokenUsage || this.tokenUsage;
+        this.errorMessage = snapshot.errorMessage || this.errorMessage;
     }
 
-    async start() {
-        await initScanTaskStore(this.id, {
-            targetPath: this.targetPath,
-            targetSize: this.targetSize,
-            maxDepth: this.maxDepth,
-        });
-
-        this.status = 'scanning';
-        await this._emitProgress();
-
-        try {
-            await this._buildTree(this.targetPath, 0, null);
-
-            if (!this.stopped) {
-                if (this.autoAnalyze) {
-                    await this.analyzeFolder(this.targetPath);
-                    return;
-                }
-                this.status = 'done';
-                const snap = this._snapshot();
-                this.emit('done', snap);
-                await this._queueSnapshotPersist(snap);
-            }
-        } catch (err) {
-            this.status = 'error';
-            const snap = this._snapshot();
-            this.emit('error', { message: err.message, snapshot: snap });
-            await this._queueSnapshotPersist(snap);
+    async _refreshFromStore() {
+        const snapshot = await getTaskSnapshot(this.id);
+        if (snapshot) {
+            this._syncFromSnapshot(snapshot);
         }
-    }
-
-    async analyzeFolder(folderPath) {
-        if (this.stopped) {
-            throw new Error('Task is stopped');
-        }
-        if (this.status === 'analyzing') {
-            throw new Error('Directory analysis is already running');
-        }
-
-        const resolvedPath = resolve(String(folderPath || ''));
-        const rootNode = await loadDirNode(this.id, createNodeId(resolvedPath));
-        if (!rootNode) {
-            throw new Error(`Folder is not in cached scan tree: ${resolvedPath}`);
-        }
-
-        this.status = 'analyzing';
-        this.currentPath = rootNode.path;
-        this.currentDepth = rootNode.depth || 0;
-        await this._emitProgress();
-
-        const visited = new Set();
-        await this._analyzeFolderRecursive(rootNode, visited);
-
-        if (!this.stopped) {
-            this.status = 'done';
-            const snap = this._snapshot();
-            this.emit('done', snap);
-            await this._queueSnapshotPersist(snap);
-            return snap;
-        }
-
-        return this._snapshot();
-    }
-
-    _hasReachedTarget() {
-        return this.totalCleanable >= this.targetSize;
-    }
-
-    _trackTokenUsage(tokenUsage) {
-        this.tokenUsage.prompt += tokenUsage?.prompt || 0;
-        this.tokenUsage.completion += tokenUsage?.completion || 0;
-        this.tokenUsage.total += tokenUsage?.total || 0;
-    }
-
-    _queueSnapshotPersist(snapshot = this._snapshot()) {
-        this.persistQueue = this.persistQueue
-            .catch(() => null)
-            .then(() => saveScanSnapshot(this.id, snapshot))
-            .catch((err) => {
-                console.error('[Scanner] Failed to persist snapshot:', err.message);
-                return null;
-            });
-        return this.persistQueue;
-    }
-
-    async _emitProgress() {
-        const snap = this._snapshot();
-        this.emit('progress', snap);
-        await this._queueSnapshotPersist(snap);
-    }
-
-    _addDeletable(entry, result) {
-        if (this.stopped || this._hasReachedTarget()) {
-            return false;
-        }
-
-        if (!entry?.path || this.deletablePathSet.has(entry.path)) {
-            return false;
-        }
-
-        const item = {
-            name: entry.name,
-            path: entry.path,
-            size: Number(entry.size || 0),
-            type: entry.type,
-            purpose: result?.purpose || '',
-            reason: result?.reason || '',
-            risk: result?.risk || 'low',
-        };
-
-        this.deletable.push(item);
-        this.deletablePathSet.add(entry.path);
-        this.totalCleanable += item.size;
-        this.emit('found', item);
-        return true;
-    }
-
-    async _buildTree(dirPath, depth, size = null) {
-        if (this.stopped || depth > this.maxDepth) {
-            return;
-        }
-
-        this.currentPath = dirPath;
-        this.currentDepth = depth;
-        this.status = 'scanning';
-        await this._emitProgress();
-
-        const rawEntries = runDust(dirPath, 1);
-        const entries = normalizeDustEntries(rawEntries, dirPath);
-
-        this.scannedCount += entries.length;
-        this.totalEntries += entries.length;
-
-        const node = createDirNode({
-            path: dirPath,
-            depth,
-            size,
-            children: entries.map((entry) => ({
-                name: entry.name,
-                size: entry.size,
-                type: entry.type,
-                path: entry.path,
-                nodeId: entry.type === 'directory' && depth < this.maxDepth
-                    ? createNodeId(entry.path)
-                    : null,
-            })),
-        });
-
-        await saveDirNode(this.id, node);
-        await this._emitProgress();
-
-        if (depth >= this.maxDepth) {
-            return;
-        }
-
-        for (const entry of entries) {
-            if (this.stopped) return;
-            if (entry.type !== 'directory') continue;
-            await this._buildTree(entry.path, depth + 1, entry.size);
-        }
-    }
-
-    async _analyzeFolderRecursive(node, visited) {
-        if (this.stopped || this._hasReachedTarget()) {
-            return;
-        }
-        if (!node || visited.has(node.path)) {
-            return;
-        }
-
-        visited.add(node.path);
-        this.currentPath = node.path;
-        this.currentDepth = node.depth || 0;
-        this.status = 'analyzing';
-        await this._emitProgress();
-
-        const children = await loadDirChildren(this.id, node);
-        const entries = children.map((entry) => ({
-            name: entry.name,
-            size: entry.size,
-            type: entry.type,
-            path: entry.path,
-            nodeId: entry.nodeId || null,
-        }));
-
-        this.emit('agent_call', {
-            batchIndex: `folder:${node.name}`,
-            batchSize: entries.length,
-            dirPath: node.path,
-            entries: entries.map((e) => ({ name: e.name, type: e.type, size: e.size })),
-        });
-
-        const review = await analyzeDirectoryReview(node.name, node.path, entries);
-        if (this.stopped) return;
-
-        this._trackTokenUsage(review.tokenUsage);
-        this.processedEntries += entries.length;
-
-        const childClassifications = review.children.reduce((acc, item) => {
-            acc[item.classification] = (acc[item.classification] || 0) + 1;
-            return acc;
-        }, {});
-
-        this.emit('agent_response', {
-            model: review.trace.model,
-            elapsed: review.trace.elapsed,
-            reasoning: review.trace.reasoning,
-            rawContent: review.trace.rawContent,
-            userPrompt: review.trace.userPrompt,
-            error: review.trace.error,
-            tokenUsage: review.tokenUsage,
-            resultsCount: review.children.length + 1,
-            classifications: {
-                [`folder_${review.folder.classification}`]: 1,
-                ...childClassifications,
-            },
-        });
-
-        if (review.folder.classification === 'safe_to_delete') {
-            const folderEntry = toFolderEntry(node, entries);
-            this._addDeletable(folderEntry, review.folder);
-            await this._emitProgress();
-            return;
-        }
-
-        for (let idx = 0; idx < review.children.length; idx += 1) {
-            if (this.stopped || this._hasReachedTarget()) {
-                return;
-            }
-
-            const result = review.children[idx];
-            const entry = entries[idx];
-            if (!entry) continue;
-
-            if (result.classification === 'safe_to_delete') {
-                this._addDeletable(entry, result);
-            }
-        }
-
-        await this._emitProgress();
-
-        for (let idx = 0; idx < review.children.length; idx += 1) {
-            if (this.stopped || this._hasReachedTarget()) {
-                return;
-            }
-
-            const result = review.children[idx];
-            const entry = entries[idx];
-            if (!entry || entry.type !== 'directory') continue;
-            if (result.classification === 'safe_to_delete') continue;
-
-            const childNode = await loadDirNode(this.id, entry.nodeId || createNodeId(entry.path));
-            if (!childNode) continue;
-            await this._analyzeFolderRecursive(childNode, visited);
-        }
+        return snapshot;
     }
 
     _snapshot() {
@@ -428,6 +251,302 @@ export class ScanTask extends EventEmitter {
             targetSize: this.targetSize,
             tokenUsage: { ...this.tokenUsage },
             deletable: this.deletable,
+            permissionDeniedCount: this.permissionDeniedCount,
+            permissionDeniedPaths: [...this.permissionDeniedPaths],
+            errorMessage: this.errorMessage || '',
         };
+    }
+
+    _recordPermissionDenied(payload = {}) {
+        const path = String(payload.path || '').trim();
+        this.permissionDeniedCount += 1;
+        if (path && !this.permissionDeniedPaths.includes(path)) {
+            this.permissionDeniedPaths = [...this.permissionDeniedPaths, path].slice(-20);
+        }
+        this.emit('warning', {
+            type: 'permission_denied',
+            path,
+            message: payload.message || 'Access is denied.',
+            count: this.permissionDeniedCount,
+        });
+    }
+
+    async _queueSnapshotPersist(snapshot = this._snapshot()) {
+        this.persistQueue = this.persistQueue
+            .catch(() => null)
+            .then(() => saveScanSnapshot(this.id, snapshot))
+            .catch((err) => {
+                console.error('[Scanner] Failed to persist snapshot:', err.message);
+                return null;
+            });
+        return this.persistQueue;
+    }
+
+    async _emitProgress() {
+        const snap = this._snapshot();
+        this.emit('progress', snap);
+        return this._queueSnapshotPersist(snap);
+    }
+
+    stop() {
+        if (this.stopped) return;
+        this.stopped = true;
+        this.status = 'stopped';
+        if (this.sidecar && !this.sidecar.killed) {
+            this.sidecar.kill();
+        }
+        const snap = this._snapshot();
+        this.emit('stopped', snap);
+        this._queueSnapshotPersist({ ...snap, status: 'stopped' });
+        patchTask(this.id, {
+            status: 'stopped',
+            currentPath: this.currentPath,
+            currentDepth: this.currentDepth,
+            errorMessage: null,
+            finishedAt: new Date().toISOString(),
+        }).catch((err) => console.error('[Scanner] Failed to patch stopped task:', err.message));
+    }
+
+    async start() {
+        await initScanTaskStore(this.id, {
+            targetPath: this.targetPath,
+            targetSize: this.targetSize,
+            maxDepth: this.maxDepth,
+            autoAnalyze: this.autoAnalyze,
+        });
+
+        this.status = 'scanning';
+        await this._queueSnapshotPersist();
+        this.emit('progress', this._snapshot());
+
+        try {
+            await this._runSidecarScan();
+            if (this.stopped) {
+                return;
+            }
+
+            if (this.autoAnalyze) {
+                await this._runAutoAnalyze();
+            }
+
+            if (!this.stopped) {
+                await this._refreshFromStore();
+                this.status = 'done';
+                const snap = this._snapshot();
+                this.emit('done', snap);
+                await this._queueSnapshotPersist({ ...snap, status: 'done' });
+                await patchTask(this.id, {
+                    status: 'done',
+                    finishedAt: new Date().toISOString(),
+                    errorMessage: null,
+                });
+            }
+        } catch (err) {
+            if (this.stopped) {
+                return;
+            }
+            this.status = 'error';
+            this.errorMessage = err.message;
+            await patchTask(this.id, {
+                status: 'error',
+                errorMessage: err.message,
+                finishedAt: new Date().toISOString(),
+            });
+            await this._refreshFromStore();
+            const snap = this._snapshot();
+            this.emit('error', { message: err.message, snapshot: snap });
+            await this._queueSnapshotPersist({ ...snap, status: 'error', errorMessage: err.message });
+        }
+    }
+
+    async _runAutoAnalyze() {
+        const queue = [];
+        const queued = new Set();
+        const analyzed = new Set();
+        const rootChildren = await loadDirChildren(this.id, this.rootNodeId);
+
+        this._enqueueNodes(queue, queued, analyzed, rootChildren);
+
+        while (queue.length > 0) {
+            if (this.stopped) {
+                return;
+            }
+            if (this._hasReachedTarget()) {
+                return;
+            }
+
+            const node = queue.shift();
+            const key = nodePathKey(node.path);
+            queued.delete(key);
+
+            if (analyzed.has(key)) {
+                continue;
+            }
+
+            analyzed.add(key);
+            const { review } = await this._analyzeAndRefresh(node, 'priority_queue');
+
+            if (this.stopped) {
+                return;
+            }
+            if (this._hasReachedTarget()) {
+                return;
+            }
+
+            if (
+                node.type === 'directory'
+                && review.classification !== 'safe_to_delete'
+                && review.hasPotentialDeletableSubfolders
+            ) {
+                const children = await loadDirChildren(this.id, node.nodeId || node.id);
+                this._enqueueNodes(queue, queued, analyzed, children);
+            }
+        }
+    }
+
+    _enqueueNodes(queue, queued, analyzed, nodes) {
+        for (const rawNode of nodes) {
+            const node = toNodeQueueItem(rawNode);
+            const key = nodePathKey(node.path);
+            if (!node.path || analyzed.has(key) || queued.has(key)) {
+                continue;
+            }
+            queued.add(key);
+            queue.push(node);
+        }
+        queue.sort(compareQueuedNodes);
+    }
+
+    _hasReachedTarget() {
+        return Number.isFinite(this.targetSize) && this.targetSize > 0 && this.totalCleanable >= this.targetSize;
+    }
+
+    async _analyzeAndRefresh(node, source) {
+        this.status = 'analyzing';
+        await this._emitProgress();
+        const result = await analyzeTaskNode(this.id, node, {
+            source,
+            shouldStop: () => this.stopped,
+            onProgress: (partial) => {
+                this.currentPath = partial.currentPath || this.currentPath;
+                this.currentDepth = partial.currentDepth ?? this.currentDepth;
+                this.status = partial.status || this.status;
+                this.emit('progress', this._snapshot());
+            },
+            onAgentCall: (payload) => this.emit('agent_call', payload),
+            onAgentResponse: (payload) => this.emit('agent_response', payload),
+            onFound: (payload) => this.emit('found', payload),
+        });
+        this._syncFromSnapshot(result.snapshot);
+        await this._emitProgress();
+        return result;
+    }
+
+    async _runSidecarScan() {
+        const scannerBin = ensureScannerBinary();
+        const dbPath = getScanDbPath();
+        const child = spawn(scannerBin, [
+            'scan',
+            '--db', dbPath,
+            '--task-id', this.id,
+            '--root', this.targetPath,
+            '--max-depth', String(this.maxDepth),
+        ], {
+            cwd: join(__dirname, '..'),
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        this.sidecar = child;
+
+        const stdout = readline.createInterface({ input: child.stdout });
+        const stderr = readline.createInterface({ input: child.stderr });
+        let sawCompletion = false;
+        let sidecarErrorMessage = '';
+
+        const applyProgress = async (payload = {}) => {
+            this.status = 'scanning';
+            this.currentPath = payload.current_path || this.currentPath;
+            this.currentDepth = Number(payload.current_depth ?? this.currentDepth);
+            this.scannedCount = Number(payload.scanned_count ?? this.scannedCount);
+            this.totalEntries = Number(payload.total_entries ?? this.scannedCount);
+            await this._refreshFromStore();
+            this.emit('progress', this._snapshot());
+        };
+
+        stdout.on('line', async (line) => {
+            const trimmed = String(line || '').trim();
+            if (!trimmed) return;
+
+            let payload;
+            try {
+                payload = JSON.parse(trimmed);
+            } catch {
+                console.warn('[Scanner] Ignored sidecar line:', trimmed);
+                return;
+            }
+
+            const type = payload.type || '';
+            try {
+                if (type === 'task_started') {
+                    await applyProgress(payload);
+                } else if (type === 'scan_progress') {
+                    await applyProgress(payload);
+                } else if (type === 'scan_completed') {
+                    sawCompletion = true;
+                    this.status = 'scanning';
+                    this.currentPath = payload.current_path || this.targetPath;
+                    this.currentDepth = Number(payload.current_depth ?? 0);
+                    this.scannedCount = Number(payload.scanned_count ?? this.scannedCount);
+                    this.totalEntries = Number(payload.total_entries ?? this.scannedCount);
+                    await patchTask(this.id, {
+                        status: 'scanning',
+                        currentPath: this.currentPath,
+                        currentDepth: this.currentDepth,
+                        scannedCount: this.scannedCount,
+                        totalEntries: this.totalEntries,
+                        clearFinishedAt: true,
+                    });
+                    await this._refreshFromStore();
+                    this.emit('progress', this._snapshot());
+                } else if (type === 'permission_denied') {
+                    this._recordPermissionDenied(payload);
+                } else if (type === 'error') {
+                    sidecarErrorMessage = payload.message || 'scanner sidecar failed';
+                }
+            } catch (err) {
+                sidecarErrorMessage = err.message;
+            }
+        });
+
+        stderr.on('line', (line) => {
+            const trimmed = String(line || '').trim();
+            if (!trimmed) return;
+            sidecarErrorMessage = trimmed;
+            console.warn('[Scanner][sidecar]', trimmed);
+        });
+
+        await new Promise((resolvePromise, rejectPromise) => {
+            child.once('error', (err) => {
+                rejectPromise(err);
+            });
+
+            child.once('close', async (code, signal) => {
+                this.sidecarFinished = true;
+                stdout.close();
+                stderr.close();
+
+                if (this.stopped) {
+                    return resolvePromise();
+                }
+                if (code === 0 && sawCompletion) {
+                    await this._refreshFromStore();
+                    return resolvePromise();
+                }
+
+                const message = sidecarErrorMessage || `scanner.exe exited with code ${code}${signal ? ` (${signal})` : ''}`;
+                rejectPromise(new Error(message));
+            });
+        });
     }
 }

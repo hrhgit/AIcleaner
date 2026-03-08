@@ -1,7 +1,7 @@
 ﻿import { EventEmitter } from 'events';
 import { basename, dirname, extname, join, relative } from 'path';
 import { fileURLToPath } from 'url';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { access, readdir, stat } from 'fs/promises';
 import OpenAI from 'openai';
 import pLimit from 'p-limit';
@@ -11,6 +11,7 @@ import { loadSettings } from './routes/settings.js';
 import { isRateLimitError, retryWithBackoff, withRemoteLimit } from './remote-control.js';
 import { extractFileContent } from './content-extractor.js';
 import { performTavilySearch } from './search.js';
+import { readJsonFileWithBackup, writeJsonFileAtomic } from './json-file.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, 'data');
@@ -1079,15 +1080,15 @@ function manifestPath(jobId) {
 
 function saveManifest(manifest) {
     ensureJobDir();
-    writeFileSync(manifestPath(manifest.jobId), JSON.stringify(manifest, null, 2), 'utf-8');
+    writeJsonFileAtomic(manifestPath(manifest.jobId), manifest);
 }
 
 function loadManifest(jobId) {
     const file = manifestPath(jobId);
-    if (!existsSync(file)) {
+    if (!existsSync(file) && !existsSync(`${file}.bak`)) {
         throw new Error(`job manifest not found: ${jobId}`);
     }
-    return JSON.parse(readFileSync(file, 'utf-8'));
+    return readJsonFileWithBackup(file);
 }
 
 function summarizeManifestEntries(entries) {

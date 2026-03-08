@@ -4,7 +4,7 @@
  */
 import * as storage from '../utils/storage.js';
 import { formatSize } from '../utils/storage.js';
-import { openFileLocation, deleteFiles } from '../utils/api.js';
+import { openFileLocation, deleteFiles, requestElevation } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -145,10 +145,22 @@ export function renderResults(container) {
 
           const res = await deleteFiles(selectedPaths);
           if (res.success) {
-            showToast(t('results.cleaned_success').replace('{count}', res.results.deleted.length), 'success');
+            const handledPaths = Array.isArray(res.results?.handled) ? res.results.handled : res.results?.deleted || [];
+            const handledCount = handledPaths.length;
+            const failedItems = Array.isArray(res.results?.failed) ? res.results.failed : [];
+            const failedCount = failedItems.length;
+            const elevationRequiredItems = failedItems.filter(item => item?.requiresElevation);
+
+            if (handledCount > 0 && failedCount > 0) {
+              showToast(t('results.cleaned_partial', { handled: handledCount, failed: failedCount }), 'warning');
+            } else if (handledCount > 0) {
+              showToast(t('results.cleaned_success', { count: handledCount }), 'success');
+            } else {
+              showToast(t('results.cleaned_none', { count: failedCount || selectedPaths.length }), 'error');
+            }
 
             // Update UI data state
-            currentData = currentData.filter(item => !res.results.deleted.includes(item.path));
+            currentData = currentData.filter(item => !handledPaths.includes(item.path));
             storage.set('scanResults', currentData);
 
             // Refresh display
@@ -159,6 +171,15 @@ export function renderResults(container) {
 
             renderTable(getFilteredData());
             updateBatchDeleteBtn();
+
+            if (elevationRequiredItems.length > 0 && confirm(t('results.elevation_needed_confirm', { count: elevationRequiredItems.length }))) {
+              try {
+                await requestElevation();
+                showToast(t('settings.elevation_uac_prompt'), 'info');
+              } catch (elevationErr) {
+                showToast(t('settings.elevation_failed') + elevationErr.message, 'error');
+              }
+            }
           } else {
             showToast(t('results.toast_clean_failed') + res.error, 'error');
           }

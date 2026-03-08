@@ -363,3 +363,19 @@ a {
 .animate-in {
   animation: slideUp 0.4s var(--ease-out) both;
 }
+
+@media (max-width: 768px) {
+  #content {
+    padding: 24px 16px;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  #provider-manager-btn {
+    width: 100%;
+    justify-content: center;
+  }
+}

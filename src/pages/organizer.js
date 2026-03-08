@@ -113,6 +113,7 @@ let latestCapability = null;
 let providerApiKeyMap = {};
 const remoteModelsCache = new Map();
 const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
+let organizerProviderSettingsUpdatedHandler = null;
 
 function getPersisted(key, fallback) {
   try {
@@ -163,6 +164,30 @@ function ensureProviderOptionExists(select, endpoint) {
 
 function getApiKeyForEndpoint(endpoint) {
   return String(providerApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+}
+
+function syncProviderApiKeys(settings = {}) {
+  providerApiKeyMap = {};
+  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+      providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    }
+  }
+  if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
+    providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+  }
+}
+
+function refreshOrganizerApiConfigHint() {
+  const hintEl = document.getElementById('org-api-config-hint');
+  if (!hintEl) return;
+  const selectedEndpoints = Object.values(PROVIDER_SELECT_IDS)
+    .map((id) => String(document.getElementById(id)?.value || '').trim())
+    .filter(Boolean);
+  const uniqueEndpoints = Array.from(new Set(selectedEndpoints));
+  const hasMissingConfig = uniqueEndpoints.some((endpoint) => !getApiKeyForEndpoint(endpoint));
+  hintEl.hidden = !hasMissingConfig;
+  hintEl.style.display = hasMissingConfig ? 'flex' : 'none';
 }
 
 function readModelRoutingFromDOM() {
@@ -489,15 +514,7 @@ async function initModelRoutingFields(defaultRouting = {}) {
     settings = null;
   }
 
-  providerApiKeyMap = {};
-  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-      providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
-    }
-  }
-  if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
-    providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
-  }
+  syncProviderApiKeys(settings);
 
   const baseEndpoint = String(settings?.apiEndpoint || 'https://api.deepseek.com').trim();
   const baseModel = String(settings?.model || 'deepseek-chat').trim();
@@ -523,6 +540,8 @@ async function initModelRoutingFields(defaultRouting = {}) {
     await initModelSelectors({ modality, model });
   }
 
+  refreshOrganizerApiConfigHint();
+
   return settings;
 }
 
@@ -546,6 +565,7 @@ async function applyTextRouteToOtherModalities() {
   }
 
   persistForm(collectForm());
+  refreshOrganizerApiConfigHint();
 }
 
 function renderPreview(snapshot) {
@@ -1052,6 +1072,7 @@ function bindModelRoutingListeners() {
     providerSelect?.addEventListener('change', async () => {
       await initModelSelectors({ modality });
       persistForm(collectForm());
+      refreshOrganizerApiConfigHint();
       renderCapability();
     });
 
@@ -1151,7 +1172,7 @@ export async function renderOrganizer(container) {
           </div>
         </div>
         <div class="form-hint">${t('organizer.model_routing_hint')}</div>
-        <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
+        <div id="org-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
         <div class="flex items-center gap-8" style="margin-top:8px;">
           <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
         </div>
@@ -1286,7 +1307,32 @@ export async function renderOrganizer(container) {
   }
   bindModelRoutingListeners();
   bindPersistenceListeners();
+  refreshOrganizerApiConfigHint();
   renderCapability();
+
+  if (organizerProviderSettingsUpdatedHandler) {
+    window.removeEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
+  }
+  organizerProviderSettingsUpdatedHandler = async (event) => {
+    try {
+      const settingsSnapshot = event?.detail && typeof event.detail === 'object'
+        ? event.detail
+        : await getSettings();
+      syncProviderApiKeys(settingsSnapshot);
+      const currentRouting = readModelRoutingFromDOM();
+      for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+        await initModelSelectors({
+          modality,
+          model: String(currentRouting?.[modality]?.model || '').trim(),
+        });
+      }
+      refreshOrganizerApiConfigHint();
+      renderCapability();
+    } catch (err) {
+      console.warn('[Organizer] Failed to refresh provider settings:', err);
+    }
+  };
+  window.addEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
 
   try {
     latestCapability = await getOrganizeCapability();

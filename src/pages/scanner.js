@@ -3,14 +3,15 @@
  * Scanner page with merged settings + scan controls.
  */
 import {
-  analyzeScanFolder,
   browseFolder,
   connectScanStream,
+  deleteScanHistory,
   getActiveScan,
   getProviderModels,
+  getScanResult,
   getPrivilegeStatus,
-  getScanTree,
   getSettings,
+  listScanHistory,
   requestElevation,
   saveSettings,
   startScan,
@@ -23,12 +24,17 @@ import { t } from '../utils/i18n.js';
 
 let activeTaskId = null;
 let latestTaskId = null;
+let loadedHistoryTaskId = null;
 let activeEventSource = null;
 let logEntries = [];
+let nextLogEntryId = 0;
 let currentSettings = null;
-let candidateFolders = [];
+let historyTasks = [];
+const expandedDetailLogIds = new Set();
 const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v1';
 const SCANNER_FORM_DRAFT_VERSION = 1;
+const SCAN_LOG_COLLAPSED_KEY = 'wipeout.scanner.log.collapsed.v1';
+const SCAN_RECORD_GROUP_COLLAPSED_KEY = 'wipeout.scanner.record-group.collapsed.v1';
 const PROVIDER_OPTIONS = [
   { value: 'https://api.deepseek.com', label: 'DeepSeek' },
   { value: 'https://api.openai.com/v1', label: 'OpenAI' },
@@ -70,6 +76,7 @@ const PROVIDER_MODELS = {
 let scanProviderApiKeyMap = {};
 const scanRemoteModelsCache = new Map();
 let scanModelsRequestToken = 0;
+let scannerProviderSettingsUpdatedHandler = null;
 
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
@@ -201,6 +208,264 @@ function persistScannerFormDraft({ dirty = true } = {}) {
   writeScannerFormDraft(collectScannerForm(), { dirty });
 }
 
+function hasLoadedHistoryTask() {
+  return !!loadedHistoryTaskId && !activeTaskId;
+}
+
+function syncPrimaryActionButton() {
+  const startBtn = document.getElementById('start-btn');
+  if (!startBtn) return;
+  startBtn.textContent = hasLoadedHistoryTask()
+    ? t('scanner.view_results')
+    : t('scanner.start');
+}
+
+function clearLoadedHistoryState() {
+  if (!loadedHistoryTaskId) return;
+  loadedHistoryTaskId = null;
+  syncPrimaryActionButton();
+}
+
+function markHistoryTaskLoaded(taskId) {
+  loadedHistoryTaskId = String(taskId || '').trim() || null;
+  syncPrimaryActionButton();
+}
+
+function isScanLogCollapsed() {
+  return !!storage.get(SCAN_LOG_COLLAPSED_KEY, true);
+}
+
+function setScanLogCollapsed(collapsed) {
+  storage.set(SCAN_LOG_COLLAPSED_KEY, !!collapsed);
+}
+
+function refreshScanLogPanel() {
+  const collapsed = isScanLogCollapsed();
+  const panel = document.getElementById('scan-log-panel');
+  const toggleBtn = document.getElementById('toggle-log-btn');
+  if (panel) {
+    panel.classList.toggle('is-collapsed', collapsed);
+  }
+  if (toggleBtn) {
+    toggleBtn.textContent = collapsed ? t('scanner.log_expand') : t('scanner.log_collapse');
+    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+}
+
+function isScanRecordGroupCollapsed() {
+  return !!storage.get(SCAN_RECORD_GROUP_COLLAPSED_KEY, true);
+}
+
+function setScanRecordGroupCollapsed(collapsed) {
+  storage.set(SCAN_RECORD_GROUP_COLLAPSED_KEY, !!collapsed);
+}
+
+function setDetailLogExpanded(entryId, expanded) {
+  if (entryId == null) return;
+  if (expanded) {
+    expandedDetailLogIds.add(entryId);
+  } else {
+    expandedDetailLogIds.delete(entryId);
+  }
+}
+
+function isLogPinnedToBottom(log) {
+  if (!log) return true;
+  return (log.scrollHeight - log.scrollTop - log.clientHeight) <= 24;
+}
+
+function isGroupedScanLogType(type) {
+  return ['scanning', 'analyzing', 'found'].includes(type);
+}
+
+function getLogIcon(type) {
+  if (type === 'found') return '+';
+  if (type === 'analyzing') return '*';
+  if (type === 'agent_call') return '>';
+  if (type === 'agent_response') return '<';
+  return '-';
+}
+
+function createSimpleLogEntryElement(entry) {
+  const el = document.createElement('div');
+  el.className = `scan-log-entry ${entry.type}`;
+  el.innerHTML = `
+    <span class="log-icon">${getLogIcon(entry.type)}</span>
+    <span style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
+    <span>${entry.text}</span>
+  `;
+  return el;
+}
+
+function createDetailLogEntryElement(entry) {
+  const expanded = expandedDetailLogIds.has(entry.id);
+  const wrapper = document.createElement('div');
+  wrapper.className = `scan-log-entry ${entry.type}`;
+  wrapper.innerHTML = `
+    <span class="log-icon">${getLogIcon(entry.type)}</span>
+    <div style="flex: 1; min-width: 0;">
+      <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
+        <span style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
+        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">></span>
+        <span>${entry.summary}</span>
+      </div>
+      <div class="log-detail-body" style="display: ${expanded ? 'block' : 'none'}; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
+        ${entry.detailHtml}
+      </div>
+    </div>
+  `;
+
+  const header = wrapper.querySelector('.log-detail-header');
+  const body = wrapper.querySelector('.log-detail-body');
+  const arrow = wrapper.querySelector('.log-detail-arrow');
+  header?.addEventListener('click', () => {
+    if (!body || !arrow) return;
+    const nextOpen = body.style.display === 'none';
+    setDetailLogExpanded(entry.id, nextOpen);
+    body.style.display = nextOpen ? 'block' : 'none';
+    arrow.style.transform = nextOpen ? 'rotate(90deg)' : 'rotate(0deg)';
+  });
+
+  return wrapper;
+}
+
+function createScanRecordGroupElement(entries) {
+  const wrapper = document.createElement('div');
+  wrapper.className = `scan-log-group${isScanRecordGroupCollapsed() ? ' is-collapsed' : ''}`;
+
+  const header = document.createElement('div');
+  header.className = 'scan-log-group-header';
+  header.innerHTML = `
+    <div class="scan-log-group-title">
+      <span class="scan-log-group-arrow">></span>
+      <span>${t('scanner.scan_records')} (${entries.length})</span>
+    </div>
+    <span>${isScanRecordGroupCollapsed() ? t('scanner.log_expand') : t('scanner.log_collapse')}</span>
+  `;
+
+  const body = document.createElement('div');
+  body.className = 'scan-log-group-body';
+  for (const entry of entries) {
+    body.appendChild(createSimpleLogEntryElement(entry));
+  }
+
+  header.addEventListener('click', () => {
+    const nextCollapsed = !wrapper.classList.contains('is-collapsed');
+    setScanRecordGroupCollapsed(nextCollapsed);
+    wrapper.classList.toggle('is-collapsed', nextCollapsed);
+    const label = header.lastElementChild;
+    if (label) {
+      label.textContent = nextCollapsed ? t('scanner.log_expand') : t('scanner.log_collapse');
+    }
+  });
+
+  wrapper.appendChild(header);
+  wrapper.appendChild(body);
+  return wrapper;
+}
+
+function trimLogEntries() {
+  let trimmed = false;
+  while (logEntries.length > 200) {
+    trimmed = true;
+    const removed = logEntries.shift();
+    if (removed?.kind === 'detail') {
+      expandedDetailLogIds.delete(removed.id);
+    }
+  }
+  return trimmed;
+}
+
+function applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight }) {
+  if (shouldStickToBottom) {
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+
+  if (insertMode === 'top') {
+    const heightDelta = Math.max(0, log.scrollHeight - previousScrollHeight);
+    log.scrollTop = previousScrollTop + heightDelta;
+    return;
+  }
+
+  const maxScrollTop = Math.max(0, log.scrollHeight - log.clientHeight);
+  log.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+}
+
+function updateScanRecordGroupHeader(wrapper, count) {
+  if (!wrapper) return;
+  const titleText = wrapper.querySelector('.scan-log-group-title span:last-child');
+  if (titleText) {
+    titleText.textContent = `${t('scanner.scan_records')} (${count})`;
+  }
+  const label = wrapper.querySelector('.scan-log-group-header > span:last-child');
+  if (label) {
+    label.textContent = wrapper.classList.contains('is-collapsed')
+      ? t('scanner.log_expand')
+      : t('scanner.log_collapse');
+  }
+}
+
+function ensureScanRecordGroup(log) {
+  if (!log) return null;
+  let group = log.querySelector('.scan-log-group');
+  if (group) return group;
+
+  group = createScanRecordGroupElement([]);
+  log.prepend(group);
+  return group;
+}
+
+function appendLogEntry(entry) {
+  const log = document.getElementById('scan-log');
+  if (!log) return;
+  const shouldStickToBottom = isLogPinnedToBottom(log);
+  const previousScrollTop = log.scrollTop;
+  const previousScrollHeight = log.scrollHeight;
+  const insertMode = isGroupedScanLogType(entry.type) ? 'top' : 'bottom';
+
+  if (isGroupedScanLogType(entry.type)) {
+    const group = ensureScanRecordGroup(log);
+    const body = group?.querySelector('.scan-log-group-body');
+    if (body) {
+      body.appendChild(createSimpleLogEntryElement(entry));
+    }
+    updateScanRecordGroupHeader(group, logEntries.filter((item) => isGroupedScanLogType(item.type)).length);
+  } else if (entry.kind === 'detail') {
+    log.appendChild(createDetailLogEntryElement(entry));
+  } else {
+    log.appendChild(createSimpleLogEntryElement(entry));
+  }
+
+  applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight });
+}
+
+function renderLogEntries(insertMode = 'reset') {
+  const log = document.getElementById('scan-log');
+  if (!log) return;
+  const shouldStickToBottom = isLogPinnedToBottom(log);
+  const previousScrollTop = log.scrollTop;
+  const previousScrollHeight = log.scrollHeight;
+
+  log.innerHTML = '';
+  const groupedEntries = logEntries.filter((entry) => isGroupedScanLogType(entry.type));
+  const detailEntries = logEntries.filter((entry) => !isGroupedScanLogType(entry.type));
+
+  if (groupedEntries.length > 0) {
+    log.appendChild(createScanRecordGroupElement(groupedEntries));
+  }
+
+  for (const entry of detailEntries) {
+    if (entry.kind === 'detail') {
+      log.appendChild(createDetailLogEntryElement(entry));
+    } else {
+      log.appendChild(createSimpleLogEntryElement(entry));
+    }
+  }
+
+  applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight });
+}
+
 function normalizeRemoteModels(models) {
   const seen = new Set();
   const normalized = [];
@@ -228,6 +493,26 @@ function getProviderLabel(endpoint) {
 
 function getApiKeyForScanEndpoint(endpoint) {
   return String(scanProviderApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+}
+
+function syncScanProviderApiKeyMap(settings = {}) {
+  scanProviderApiKeyMap = {};
+  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+      scanProviderApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    }
+  }
+  if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
+    scanProviderApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+  }
+}
+
+function refreshScanApiConfigHint(endpoint = document.getElementById('scan-provider')?.value) {
+  const hintEl = document.getElementById('scan-api-config-hint');
+  if (!hintEl) return;
+  const isHidden = !!getApiKeyForScanEndpoint(endpoint);
+  hintEl.hidden = isHidden;
+  hintEl.style.display = isHidden ? 'none' : 'flex';
 }
 
 function renderScanModelOptions(select, models, selectedValue) {
@@ -295,15 +580,7 @@ async function initScanProviderFields(settings = {}) {
   const modelSelect = document.getElementById('scan-model');
   if (!providerSelect || !modelSelect) return;
 
-  scanProviderApiKeyMap = {};
-  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-      scanProviderApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
-    }
-  }
-  if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
-    scanProviderApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
-  }
+  syncScanProviderApiKeyMap(settings);
 
   providerSelect.innerHTML = '';
   for (const item of PROVIDER_OPTIONS) {
@@ -316,6 +593,7 @@ async function initScanProviderFields(settings = {}) {
   ensureSelectOptionExists(providerSelect, endpoint, getProviderLabel(endpoint));
   providerSelect.value = endpoint;
   await initScanModelSelectors({ endpoint, model });
+  refreshScanApiConfigHint(endpoint);
 }
 
 function mergeSettingsWithDraft(settings = {}, draftState = { dirty: false, data: null }) {
@@ -382,6 +660,7 @@ function applySettingsToForm(settings = {}) {
   }
 
   updatePathDisplay(form.scanPath);
+  refreshScanApiConfigHint(form.scanProviderEndpoint);
 }
 
 function updatePathDisplay(pathValue) {
@@ -500,18 +779,22 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
 }
 
 function setScanStatus(status) {
+  const statusLabel = getScanStatusLabel(status);
   const statusEl = document.getElementById('stat-status');
   if (!statusEl) return;
+  statusEl.textContent = statusLabel;
+}
 
+function getScanStatusLabel(status) {
   const statusMap = {
     scanning: t('scanner.scanning'),
     analyzing: t('scanner.analyzing'),
     idle: t('scanner.not_set'),
-    done: t('scanner.completed').split('!')[0],
+    done: t('scanner.done'),
     stopped: t('scanner.stopped'),
     error: t('toast.error'),
   };
-  statusEl.textContent = statusMap[status] || status || t('scanner.not_set');
+  return statusMap[status] || status || t('scanner.not_set');
 }
 
 async function refreshPrivilegeStatus() {
@@ -555,53 +838,59 @@ function bindSettingsEvents() {
   const sizeInput = document.getElementById('target-size-input');
   const depthSlider = document.getElementById('max-depth');
   const depthInput = document.getElementById('max-depth-input');
+  const handleFormMutation = () => {
+    clearLoadedHistoryState();
+    persistScannerFormDraft();
+  };
 
   sizeSlider?.addEventListener('input', () => {
     if (sizeInput) sizeInput.value = clampNumber(sizeSlider.value, 0.1, 100, 1).toFixed(1);
-    persistScannerFormDraft();
+    handleFormMutation();
   });
   sizeInput?.addEventListener('input', () => {
     const val = clampNumber(sizeInput.value, 0.1, 100, 1);
     if (sizeSlider) sizeSlider.value = String(val);
-    persistScannerFormDraft();
+    handleFormMutation();
   });
   sizeInput?.addEventListener('blur', () => {
     const val = clampNumber(sizeInput.value, 0.1, 100, 1);
     sizeInput.value = val.toFixed(1);
     if (sizeSlider) sizeSlider.value = String(val);
-    persistScannerFormDraft();
+    handleFormMutation();
   });
 
   depthSlider?.addEventListener('input', () => {
     if (depthInput) depthInput.value = String(Math.floor(clampNumber(depthSlider.value, 1, 10, 5)));
-    persistScannerFormDraft();
+    handleFormMutation();
   });
   depthInput?.addEventListener('input', () => {
     const val = Math.floor(clampNumber(depthInput.value, 1, 10, 5));
     if (depthSlider) depthSlider.value = String(val);
-    persistScannerFormDraft();
+    handleFormMutation();
   });
   depthInput?.addEventListener('blur', () => {
     const val = Math.floor(clampNumber(depthInput.value, 1, 10, 5));
     depthInput.value = String(val);
     if (depthSlider) depthSlider.value = String(val);
-    persistScannerFormDraft();
+    handleFormMutation();
   });
 
   document.getElementById('scan-path')?.addEventListener('input', (event) => {
     updatePathDisplay(event.target?.value || '');
-    persistScannerFormDraft();
+    handleFormMutation();
   });
 
   document.getElementById('scan-enable-web-search')?.addEventListener('change', () => {
-    persistScannerFormDraft();
+    handleFormMutation();
   });
   document.getElementById('scan-provider')?.addEventListener('change', async () => {
+    clearLoadedHistoryState();
     await initScanModelSelectors();
+    refreshScanApiConfigHint();
     persistScannerFormDraft();
   });
   document.getElementById('scan-model')?.addEventListener('change', () => {
-    persistScannerFormDraft();
+    handleFormMutation();
   });
 
   document.getElementById('browse-folder-btn')?.addEventListener('click', async () => {
@@ -616,7 +905,7 @@ function bindSettingsEvents() {
         const input = document.getElementById('scan-path');
         if (input) input.value = result.path;
         updatePathDisplay(result.path);
-        persistScannerFormDraft();
+        handleFormMutation();
         showToast(t('settings.toast_path_selected') + result.path, 'success');
       }
     } catch (err) {
@@ -661,149 +950,166 @@ function bindSettingsEvents() {
   });
 }
 
-function showManualAnalyzePanel(show) {
-  const panel = document.getElementById('manual-analyze-card');
-  if (panel) panel.style.display = show ? '' : 'none';
-}
-
-function isManualAnalyzeMode(scan) {
-  if (!scan) return false;
-  if (typeof scan.autoAnalyze === 'boolean') {
-    return scan.autoAnalyze === false;
-  }
-  return true;
-}
-
-function shouldShowManualAnalyzePanel(scan) {
-  return isManualAnalyzeMode(scan) && ['done', 'analyzing'].includes(scan?.status);
-}
-
-function setManualAnalyzeBusy(busy) {
-  const analyzeBtn = document.getElementById('manual-analyze-btn');
-  const refreshBtn = document.getElementById('manual-refresh-btn');
-  const startBtn = document.getElementById('start-btn');
-  const stopBtn = document.getElementById('stop-btn');
-
-  if (analyzeBtn) {
-    analyzeBtn.disabled = !!busy;
-    analyzeBtn.innerHTML = busy
-      ? `<span class="spinner"></span> ${t('scanner.manual_analyzing')}`
-      : t('scanner.manual_analyze_btn');
-  }
-  if (refreshBtn) {
-    refreshBtn.disabled = !!busy;
-  }
-  if (startBtn) {
-    startBtn.disabled = !!busy;
-  }
-  if (stopBtn && busy) {
-    stopBtn.disabled = true;
-  } else if (stopBtn) {
-    stopBtn.disabled = false;
+function formatHistoryTime(value) {
+  if (!value) return '-';
+  try {
+    return new Date(value).toLocaleString('zh-CN');
+  } catch {
+    return String(value);
   }
 }
 
-function renderFolderCandidates() {
-  const listEl = document.getElementById('manual-candidate-list');
+function renderHistoryList() {
+  const listEl = document.getElementById('scan-history-list');
   if (!listEl) return;
 
-  if (!candidateFolders.length) {
-    listEl.innerHTML = `<div class="form-hint">${t('scanner.manual_candidates_empty')}</div>`;
+  if (!historyTasks.length) {
+    listEl.innerHTML = `<div class="form-hint">${t('scanner.history_empty')}</div>`;
     return;
   }
 
-  listEl.innerHTML = candidateFolders
-    .map((item) => `
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
-        <div style="min-width:0;">
-          <div style="font-weight:600; font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escHtml(item.name)}</div>
-          <div class="form-hint mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escHtml(item.path)}</div>
-        </div>
-        <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
-          <span class="badge badge-info">${formatSize(item.size || 0)}</span>
-          <button class="btn btn-secondary manual-candidate-analyze-btn" data-path="${escHtml(item.path)}">${t('scanner.manual_analyze_btn')}</button>
+  listEl.innerHTML = historyTasks.map((task) => {
+    const selected = latestTaskId === task.taskId;
+    const running = ['idle', 'scanning', 'analyzing'].includes(task.status);
+    const disabled = !!activeTaskId;
+    return `
+      <div style="padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.06); ${selected ? 'background: rgba(255,255,255,0.03); border-radius: 8px; padding-left: 10px; padding-right: 10px;' : ''}">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+          <div style="min-width:0; flex:1;">
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <div style="font-weight:600; font-size:0.9rem;">${escHtml(task.rootPath)}</div>
+              <span class="badge badge-info">${escHtml(getScanStatusLabel(task.status))}</span>
+            </div>
+            <div class="form-hint" style="margin-top:4px;">
+              ${t('scanner.history_updated')}: ${escHtml(formatHistoryTime(task.updatedAt))}
+            </div>
+            <div class="form-hint" style="margin-top:2px;">
+              ${task.scannedCount || 0} items · ${formatSize(task.totalCleanable || 0)} · Token ${(task.tokenUsage?.total || 0).toLocaleString()}
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; flex-shrink:0;">
+            <button class="btn btn-secondary history-load-btn" data-task-id="${escHtml(task.taskId)}" ${disabled ? 'disabled' : ''}>${t('scanner.history_load')}</button>
+            <button class="btn btn-ghost history-delete-btn" data-task-id="${escHtml(task.taskId)}" ${disabled || running ? 'disabled' : ''}>${t('scanner.history_delete')}</button>
+          </div>
         </div>
       </div>
-    `)
-    .join('');
+    `;
+  }).join('');
 
-  document.querySelectorAll('.manual-candidate-analyze-btn').forEach((btn) => {
+  document.querySelectorAll('.history-load-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      const folderPath = String(btn.dataset.path || '').trim();
-      if (!folderPath) return;
-      const input = document.getElementById('manual-folder-path');
-      if (input) input.value = folderPath;
-      await handleManualAnalyze(folderPath);
+      const taskId = String(btn.dataset.taskId || '').trim();
+      if (!taskId) return;
+      await loadHistoryTask(taskId);
+    });
+  });
+
+  document.querySelectorAll('.history-delete-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const taskId = String(btn.dataset.taskId || '').trim();
+      if (!taskId) return;
+      await deleteHistoryTask(taskId);
     });
   });
 }
 
-async function refreshFolderCandidates(pathOverride = '') {
-  if (!latestTaskId) return;
-
-  const hintEl = document.getElementById('manual-candidate-hint');
-  if (hintEl) hintEl.textContent = t('scanner.manual_candidates_loading');
+async function refreshHistoryList(selectedTaskId = '') {
+  const refreshBtn = document.getElementById('history-refresh-btn');
+  if (refreshBtn) refreshBtn.disabled = true;
 
   try {
-    const lastScan = storage.get('lastScan', null);
-    const rootPath = String(pathOverride || lastScan?.targetPath || lastScan?.currentPath || '').trim();
-    if (!rootPath) {
-      candidateFolders = [];
-      renderFolderCandidates();
-      if (hintEl) hintEl.textContent = t('scanner.manual_candidates_empty');
-      return;
+    historyTasks = await listScanHistory(20);
+    if (selectedTaskId) {
+      latestTaskId = selectedTaskId;
     }
-
-    const tree = await getScanTree(latestTaskId, {
-      path: rootPath,
-      dirsOnly: true,
-      limit: 50,
-    });
-    candidateFolders = Array.isArray(tree?.children) ? tree.children : [];
-    renderFolderCandidates();
-    if (hintEl) hintEl.textContent = t('scanner.manual_candidates_hint');
   } catch (err) {
-    candidateFolders = [];
-    renderFolderCandidates();
-    if (hintEl) hintEl.textContent = t('scanner.manual_candidates_failed') + err.message;
+    console.warn('Failed to refresh scan history:', err);
+  } finally {
+    renderHistoryList();
+    if (refreshBtn) refreshBtn.disabled = false;
   }
 }
 
-async function handleManualAnalyze(folderPathArg = '') {
-  if (!latestTaskId) {
-    showToast(t('scanner.manual_no_task'), 'error');
-    return;
-  }
+function applySnapshotToUI(data) {
+  if (!data) return;
 
-  const input = document.getElementById('manual-folder-path');
-  const folderPath = String(folderPathArg || input?.value || '').trim();
-  if (!folderPath) {
-    showToast(t('scanner.manual_path_required'), 'error');
-    return;
-  }
+  updateStats(data);
+  setScanStatus(data.status);
+  storage.set('lastScan', data);
+  storage.set('scanResults', data.deletable || []);
 
-  setManualAnalyzeBusy(true);
-  addLog('analyzing', `${t('scanner.manual_start')} ${folderPath}`);
+  const pathEl = document.getElementById('breadcrumb-path');
+  const depthEl = document.getElementById('breadcrumb-depth');
+  const fill = document.getElementById('progress-fill');
+  const label = document.getElementById('progress-pct');
+  const activityEl = document.getElementById('scan-activity-hidden');
+  const emptyEl = document.getElementById('scan-empty');
+  const breadcrumb = document.getElementById('scan-breadcrumb');
+
+  if (activityEl) activityEl.style.display = '';
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (breadcrumb) breadcrumb.style.display = '';
+  if (pathEl && data.currentPath) pathEl.textContent = data.currentPath;
+  if (depthEl) depthEl.textContent = `Depth ${data.currentDepth || 0}`;
+
+  const scanPct = data.totalEntries > 0
+    ? Math.min(100, (data.processedEntries || 0) / data.totalEntries * 100)
+    : (data.status === 'done' ? 100 : 0);
+  if (fill) fill.style.width = `${scanPct}%`;
+  if (label) label.textContent = `${scanPct.toFixed(1)}%`;
+}
+
+async function loadHistoryTask(taskId) {
+  if (activeTaskId) return;
 
   try {
-    const response = await analyzeScanFolder(latestTaskId, folderPath);
-    const snap = response?.snapshot || null;
-    if (!snap) {
-      throw new Error('Empty snapshot');
-    }
-
-    updateStats(snap);
-    setScanStatus(snap.status);
-    storage.set('lastScan', snap);
-    storage.set('scanResults', snap.deletable || []);
-    addLog('found', t('scanner.manual_done').replace('{count}', snap.deletableCount || 0));
-    showToast(t('scanner.manual_done').replace('{count}', snap.deletableCount || 0), 'success');
-    await refreshFolderCandidates();
+    showToast(t('scanner.history_loading'), 'info');
+    const snap = await getScanResult(taskId);
+    latestTaskId = taskId;
+    storage.set('lastScanTaskId', latestTaskId);
+    resetButtons();
+    markHistoryTaskLoaded(taskId);
+    applySnapshotToUI(snap);
+    await refreshHistoryList(taskId);
+    showToast(t('scanner.history_loaded'), 'success');
   } catch (err) {
-    addLog('analyzing', `${t('toast.error')}: ${err.message}`);
-    showToast(t('scanner.manual_failed') + err.message, 'error');
-  } finally {
-    setManualAnalyzeBusy(false);
+    showToast(t('scanner.history_load_failed') + err.message, 'error');
+  }
+}
+
+async function deleteHistoryTask(taskId) {
+  if (activeTaskId) return;
+  if (!confirm(t('scanner.history_delete_confirm'))) return;
+
+  try {
+    await deleteScanHistory(taskId);
+    if (loadedHistoryTaskId === taskId) {
+      clearLoadedHistoryState();
+    }
+    if (latestTaskId === taskId) {
+      latestTaskId = null;
+      storage.remove('lastScanTaskId');
+      storage.remove('lastScan');
+      storage.remove('scanResults');
+      setScanStatus('idle');
+      updateStats({ scannedCount: 0, totalCleanable: 0, tokenUsage: { total: 0 } });
+      const fill = document.getElementById('progress-fill');
+      const label = document.getElementById('progress-pct');
+      const pathEl = document.getElementById('breadcrumb-path');
+      const depthEl = document.getElementById('breadcrumb-depth');
+      if (fill) fill.style.width = '0%';
+      if (label) label.textContent = '0.0%';
+      if (pathEl) pathEl.textContent = '...';
+      if (depthEl) depthEl.textContent = t('scanner.not_set');
+    }
+    await refreshHistoryList();
+    showToast(t('scanner.history_deleted'), 'success');
+  } catch (err) {
+    if (/still running/i.test(err.message)) {
+      showToast(t('scanner.history_running'), 'error');
+      return;
+    }
+    showToast(t('scanner.history_delete_failed') + err.message, 'error');
   }
 }
 
@@ -811,7 +1117,6 @@ export async function renderScanner(container) {
   const lastScan = storage.get('lastScan', null);
   const draftState = readScannerFormDraft();
   latestTaskId = storage.get('lastScanTaskId', null) || lastScan?.id || null;
-  candidateFolders = [];
 
   container.innerHTML = `
     <style>
@@ -884,7 +1189,7 @@ export async function renderScanner(container) {
           <select id="scan-model" class="form-input"></select>
         </div>
         <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
-        <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
+        <div id="scan-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
       </div>
 
       <div class="form-group" style="margin-bottom: 0;">
@@ -953,32 +1258,29 @@ export async function renderScanner(container) {
     <div class="card animate-in mb-24" style="animation-delay: 0.2s">
       <div class="card-header">
         <h2 class="card-title">${t('scanner.activity_log')}</h2>
-        <button id="clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="toggle-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.log_expand')}</button>
+          <button id="clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
+        </div>
       </div>
-      <div class="scan-activity" id="scan-activity-hidden" style="display:none;">
-        <div class="scan-log" id="scan-log"></div>
-      </div>
-      <div id="scan-empty" class="empty-state" style="padding:30px;">
-        <div class="empty-state-icon">...</div>
-        <div class="empty-state-text">${t('scanner.prepare')}</div>
-        <div class="empty-state-hint">${t('scanner.not_set')}</div>
+      <div id="scan-log-panel" class="scan-log-panel">
+        <div class="scan-activity" id="scan-activity-hidden" style="display:none;">
+          <div class="scan-log" id="scan-log"></div>
+        </div>
+        <div id="scan-empty" class="empty-state" style="padding:30px;">
+          <div class="empty-state-icon">...</div>
+          <div class="empty-state-text">${t('scanner.prepare')}</div>
+          <div class="empty-state-hint">${t('scanner.not_set')}</div>
+        </div>
       </div>
     </div>
 
-    <div id="manual-analyze-card" class="card animate-in mb-24" style="animation-delay: 0.23s; display:none;">
+    <div class="card animate-in mb-24" style="animation-delay: 0.22s">
       <div class="card-header">
-        <h2 class="card-title">${t('scanner.manual_title')}</h2>
-        <button id="manual-refresh-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.manual_refresh')}</button>
+        <h2 class="card-title">${t('scanner.history_title')}</h2>
+        <button id="history-refresh-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.history_refresh')}</button>
       </div>
-      <div class="form-group">
-        <label class="form-label">${t('scanner.manual_path_label')}</label>
-        <div style="display:flex; gap:8px;">
-          <input id="manual-folder-path" class="form-input mono" placeholder="C:\\path\\to\\folder" />
-          <button id="manual-analyze-btn" class="btn btn-primary">${t('scanner.manual_analyze_btn')}</button>
-        </div>
-        <div id="manual-candidate-hint" class="form-hint">${t('scanner.manual_candidates_hint')}</div>
-      </div>
-      <div id="manual-candidate-list"></div>
+      <div id="scan-history-list"></div>
     </div>
 
     <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
@@ -1013,26 +1315,47 @@ export async function renderScanner(container) {
     }
   }
 
+  if (scannerProviderSettingsUpdatedHandler) {
+    window.removeEventListener('provider-settings-updated', scannerProviderSettingsUpdatedHandler);
+  }
+  scannerProviderSettingsUpdatedHandler = async (event) => {
+    try {
+      currentSettings = event?.detail && typeof event.detail === 'object'
+        ? event.detail
+        : await getSettings();
+      syncScanProviderApiKeyMap(currentSettings);
+      const selectedEndpoint = String(document.getElementById('scan-provider')?.value || '').trim();
+      const selectedModel = String(document.getElementById('scan-model')?.value || '').trim();
+      await initScanModelSelectors({ endpoint: selectedEndpoint, model: selectedModel });
+      refreshScanApiConfigHint(selectedEndpoint);
+    } catch (err) {
+      console.warn('Failed to refresh scanner provider settings:', err);
+    }
+  };
+  window.addEventListener('provider-settings-updated', scannerProviderSettingsUpdatedHandler);
+
   if (lastScan) {
     updateStats(lastScan);
     setScanStatus(lastScan.status);
-    if (shouldShowManualAnalyzePanel(lastScan)) {
-      showManualAnalyzePanel(true);
-      refreshFolderCandidates();
-    } else {
-      showManualAnalyzePanel(false);
-    }
   }
 
   document.getElementById('start-btn')?.addEventListener('click', handleStart);
   document.getElementById('stop-btn')?.addEventListener('click', handleStop);
+  document.getElementById('toggle-log-btn')?.addEventListener('click', () => {
+    setScanLogCollapsed(!isScanLogCollapsed());
+    refreshScanLogPanel();
+  });
   document.getElementById('clear-log-btn')?.addEventListener('click', () => {
     logEntries = [];
+    nextLogEntryId = 0;
+    expandedDetailLogIds.clear();
     const logEl = document.getElementById('scan-log');
     if (logEl) logEl.innerHTML = '';
   });
-  document.getElementById('manual-refresh-btn')?.addEventListener('click', () => refreshFolderCandidates());
-  document.getElementById('manual-analyze-btn')?.addEventListener('click', () => handleManualAnalyze());
+  refreshScanLogPanel();
+  document.getElementById('history-refresh-btn')?.addEventListener('click', () => refreshHistoryList());
+  syncPrimaryActionButton();
+  await refreshHistoryList(latestTaskId || '');
 
   if (activeTaskId) {
     restoreActiveState();
@@ -1049,12 +1372,7 @@ export async function renderScanner(container) {
       updateStats(task);
       setScanStatus(task.status);
       storage.set('lastScan', task);
-      if (shouldShowManualAnalyzePanel(task)) {
-        showManualAnalyzePanel(true);
-        refreshFolderCandidates();
-      } else {
-        showManualAnalyzePanel(false);
-      }
+      await refreshHistoryList(latestTaskId);
       restoreActiveState();
     }
   } catch {
@@ -1063,6 +1381,7 @@ export async function renderScanner(container) {
 }
 
 function restoreActiveState() {
+  clearLoadedHistoryState();
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
   const activityEl = document.getElementById('scan-activity-hidden');
@@ -1077,18 +1396,7 @@ function restoreActiveState() {
 
   const log = document.getElementById('scan-log');
   if (log && logEntries.length > 0) {
-    log.innerHTML = '';
-    for (const entry of logEntries) {
-      const el = document.createElement('div');
-      el.className = `scan-log-entry ${entry.type}`;
-      el.innerHTML = `
-        <span class="log-icon">${entry.type === 'found' ? '+' : entry.type === 'analyzing' ? '*' : '-'}</span>
-        <span style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
-        <span>${entry.text}</span>
-      `;
-      log.appendChild(el);
-    }
-    log.scrollTop = log.scrollHeight;
+    renderLogEntries();
   }
 
   const lastScan = storage.get('lastScan', null);
@@ -1110,12 +1418,6 @@ function restoreActiveState() {
     if (label) label.textContent = `${scanPct.toFixed(1)}%`;
   }
 
-  const showManual = shouldShowManualAnalyzePanel(lastScan);
-  showManualAnalyzePanel(showManual);
-  if (showManual) {
-    refreshFolderCandidates();
-  }
-
   if (activeEventSource) {
     activeEventSource.close();
     activeEventSource = null;
@@ -1125,6 +1427,7 @@ function restoreActiveState() {
     onFound: handleFound,
     onAgentCall: handleAgentCall,
     onAgentResponse: handleAgentResponse,
+    onWarning: handleWarning,
     onDone: handleDone,
     onError: handleError,
     onStopped: handleStopped,
@@ -1136,6 +1439,12 @@ async function handleStart() {
   const stopBtn = document.getElementById('stop-btn');
 
   try {
+    if (hasLoadedHistoryTask()) {
+      window.location.hash = '#/results';
+      return;
+    }
+
+    clearLoadedHistoryState();
     await persistScannerSettings({ showSuccessToast: false });
     const form = collectScannerForm();
 
@@ -1159,9 +1468,7 @@ async function handleStart() {
     activeTaskId = result.taskId;
     latestTaskId = result.taskId;
     storage.set('lastScanTaskId', latestTaskId);
-    showManualAnalyzePanel(false);
-    candidateFolders = [];
-    renderFolderCandidates();
+    refreshHistoryList(latestTaskId);
 
     const activityEl = document.getElementById('scan-activity-hidden');
     const emptyEl = document.getElementById('scan-empty');
@@ -1180,6 +1487,7 @@ async function handleStart() {
       onFound: handleFound,
       onAgentCall: handleAgentCall,
       onAgentResponse: handleAgentResponse,
+      onWarning: handleWarning,
       onDone: handleDone,
       onError: handleError,
       onStopped: handleStopped,
@@ -1227,18 +1535,20 @@ function handleProgress(data) {
   if (label) label.textContent = `${scanPct.toFixed(1)}%`;
 
   if (data.status === 'analyzing') {
-    showManualAnalyzePanel(false);
     addLog('analyzing', `${t('scanner.analyzing')}: ${data.currentPath}`);
   } else if (data.status === 'scanning') {
-    showManualAnalyzePanel(false);
     addLog('scanning', `${t('scanner.scanning')}: ${data.currentPath}`);
-  } else if (data.status === 'done') {
-    showManualAnalyzePanel(shouldShowManualAnalyzePanel(data));
   }
 }
 
 function handleFound(item) {
   addLog('found', `${t('results.safe_to_clean')}: ${item.name} (${formatSize(item.size)}) - ${item.reason}`);
+}
+
+function handleWarning(info) {
+  if (info?.type !== 'permission_denied') return;
+  const path = String(info.path || '').trim();
+  addLog('analyzing', `${t('scanner.permission_denied_skip')}${path || info.message || ''}`);
 }
 
 function handleDone(data) {
@@ -1252,28 +1562,30 @@ function handleDone(data) {
   storage.set('lastScan', data);
   storage.set('scanResults', data.deletable);
   resetButtons();
-  const showManual = shouldShowManualAnalyzePanel(data);
-  showManualAnalyzePanel(showManual);
-  if (showManual) {
-    refreshFolderCandidates();
-  }
+  refreshHistoryList(latestTaskId);
 
   const fill = document.getElementById('progress-fill');
   const label = document.getElementById('progress-pct');
   if (fill) fill.style.width = '100%';
   if (label) label.textContent = '100.0%';
 
-  const doneText = t('scanner.completed').replace('{count}', data.deletableCount);
+  const doneText = t('scanner.completed', { count: data.deletableCount ?? 0 });
   addLog('found', doneText);
-  showToast(showManual ? `${doneText} ${t('scanner.manual_ready_hint')}` : doneText, 'success');
+  if (data.permissionDeniedCount > 0) {
+    const permissionText = t('scanner.permission_denied_summary', { count: data.permissionDeniedCount ?? 0 });
+    addLog('analyzing', permissionText);
+    showToast(`${doneText} ${permissionText}`, 'info');
+    return;
+  }
+  showToast(doneText, 'success');
 }
 
 function handleError(err) {
   resetButtons();
   setScanStatus('error');
-  showManualAnalyzePanel(false);
-  addLog('analyzing', `${t('toast.error')}: ${err.message || t('toast.error')}`);
-  showToast(t('toast.error'), 'error');
+  const message = err?.message || t('toast.error');
+  addLog('analyzing', `${t('scanner.toast_failed_detail')}${message}`);
+  showToast(`${t('scanner.toast_failed_detail')}${message}`, 'error');
 }
 
 function handleStopped(data) {
@@ -1286,7 +1598,7 @@ function handleStopped(data) {
   storage.set('lastScan', data);
   storage.set('scanResults', data.deletable);
   resetButtons();
-  showManualAnalyzePanel(false);
+  refreshHistoryList(latestTaskId);
   addLog('scanning', t('scanner.stopped'));
 }
 
@@ -1305,6 +1617,8 @@ function resetButtons() {
     activeEventSource.close();
     activeEventSource = null;
   }
+  syncPrimaryActionButton();
+  renderHistoryList();
 }
 
 function updateStats(data) {
@@ -1315,100 +1629,66 @@ function updateStats(data) {
 }
 
 function addLog(type, text) {
-  const log = document.getElementById('scan-log');
-  if (!log) return;
-
-  const entry = document.createElement('div');
-  entry.className = `scan-log-entry ${type}`;
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const iconMap = { found: '+', analyzing: '*', agent_call: '>', agent_response: '<' };
-
-  entry.innerHTML = `
-    <span class="log-icon">${iconMap[type] || '-'}</span>
-    <span style="color: var(--text-muted); margin-right: 6px;">[${time}]</span>
-    <span>${text}</span>
-  `;
-  log.appendChild(entry);
-  log.scrollTop = log.scrollHeight;
-
-  logEntries.push({ type, text, time });
-  while (log.children.length > 200) {
-    log.removeChild(log.firstChild);
+  const entry = { kind: 'simple', type, text, time };
+  logEntries.push(entry);
+  const trimmed = trimLogEntries();
+  if (trimmed) {
+    renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
+    return;
   }
+  appendLogEntry(entry);
 }
 
 function addDetailLog(type, summary, detailHtml) {
-  const log = document.getElementById('scan-log');
-  if (!log) return;
-
-  const wrapper = document.createElement('div');
-  wrapper.className = `scan-log-entry ${type}`;
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const iconMap = { agent_call: '>', agent_response: '<' };
-
-  wrapper.innerHTML = `
-    <span class="log-icon">${iconMap[type] || '*'}</span>
-    <div style="flex: 1; min-width: 0;">
-      <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
-        <span style="color: var(--text-muted); margin-right: 4px;">[${time}]</span>
-        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem;">></span>
-        <span>${summary}</span>
-      </div>
-      <div class="log-detail-body" style="display: none; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
-        ${detailHtml}
-      </div>
-    </div>
-  `;
-
-  const header = wrapper.querySelector('.log-detail-header');
-  const body = wrapper.querySelector('.log-detail-body');
-  const arrow = wrapper.querySelector('.log-detail-arrow');
-  header?.addEventListener('click', () => {
-    if (!body || !arrow) return;
-    const open = body.style.display !== 'none';
-    body.style.display = open ? 'none' : 'block';
-    arrow.style.transform = open ? 'rotate(0deg)' : 'rotate(90deg)';
-  });
-
-  log.appendChild(wrapper);
-  log.scrollTop = log.scrollHeight;
-
-  logEntries.push({ type, text: summary, time });
-  while (log.children.length > 200) {
-    log.removeChild(log.firstChild);
+  const entry = { id: nextLogEntryId++, kind: 'detail', type, summary, detailHtml, time };
+  logEntries.push(entry);
+  const trimmed = trimLogEntries();
+  if (trimmed) {
+    renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
+    return;
   }
+  appendLogEntry(entry);
 }
 
 function handleAgentCall(data) {
-  const entryList = (data.entries || [])
-    .map((e) => `- [${e.type}] ${e.name} (${formatSize(e.size)})`)
+  const childDirList = (data.childDirectories || [])
+    .map((entry) => `- ${entry.name} (${formatSize(entry.size)})`)
     .join('\n');
 
-  const detailHtml = `
-    <div style="margin-bottom: 8px;"><strong>Path:</strong> ${escHtml(data.dirPath)}</div>
-    <div style="margin-bottom: 8px;"><strong>Batch #${data.batchIndex}</strong> (${data.batchSize} items)</div>
-    <div style="margin-bottom: 4px;"><strong>Entries</strong></div>
-    <div style="padding-left: 8px; border-left: 2px solid rgba(6, 182, 212, 0.3);">${escHtml(entryList)}</div>
+  let detailHtml = `
+    <div style="margin-bottom: 8px;"><strong>Type:</strong> ${escHtml(data.nodeType)}</div>
+    <div style="margin-bottom: 8px;"><strong>Path:</strong> ${escHtml(data.nodePath)}</div>
+    <div style="margin-bottom: 8px;"><strong>Name:</strong> ${escHtml(data.nodeName)}</div>
+    <div style="margin-bottom: 8px;"><strong>Size:</strong> ${escHtml(formatSize(data.nodeSize || 0))}</div>
   `;
 
-  addDetailLog('agent_call', `LLM call - batch #${data.batchIndex}, ${data.batchSize} items`, detailHtml);
+  if (data.nodeType === 'directory') {
+    detailHtml += `
+      <div style="margin-bottom: 4px;"><strong>Direct Child Directories</strong></div>
+      <div style="padding-left: 8px; border-left: 2px solid rgba(6, 182, 212, 0.3);">${escHtml(childDirList || '(none)')}</div>
+    `;
+  }
+
+  addDetailLog('agent_call', `LLM call - ${data.nodeType}: ${data.nodeName}`, detailHtml);
 }
 
 function handleAgentResponse(data) {
   const elapsed = Number(data.elapsed || 0) / 1000;
-  const classLabels = { safe_to_delete: 'safe_to_delete', suspicious: 'suspicious', keep: 'keep' };
-  const classStr = Object.entries(data.classifications || {})
-    .map(([k, v]) => `${classLabels[k] || k}: ${v}`)
-    .join(', ');
+  const classStr = String(data.classification || 'suspicious');
+  const riskStr = String(data.risk || 'medium');
+  const hasSubfolders = data.nodeType === 'directory'
+    ? (data.hasPotentialDeletableSubfolders ? 'true' : 'false')
+    : 'n/a';
 
   let detailSections = '';
   detailSections += `<div style="margin-bottom: 10px;">
-    <strong>Model:</strong> ${escHtml(data.model)} | <strong>Elapsed:</strong> ${elapsed.toFixed(1)}s | <strong>Token:</strong> ${(data.tokenUsage?.total || 0).toLocaleString()}
+    <strong>Type:</strong> ${escHtml(data.nodeType)} | <strong>Model:</strong> ${escHtml(data.model)} | <strong>Elapsed:</strong> ${elapsed.toFixed(1)}s | <strong>Token:</strong> ${(data.tokenUsage?.total || 0).toLocaleString()}
   </div>`;
 
-  if (classStr) {
-    detailSections += `<div style="margin-bottom: 10px;"><strong>Classification:</strong> ${classStr}</div>`;
-  }
+  detailSections += `<div style="margin-bottom: 10px;"><strong>Path:</strong> ${escHtml(data.nodePath)}</div>`;
+  detailSections += `<div style="margin-bottom: 10px;"><strong>Classification:</strong> ${escHtml(classStr)} | <strong>Risk:</strong> ${escHtml(riskStr)} | <strong>HasPotentialDeletableSubfolders:</strong> ${escHtml(hasSubfolders)}</div>`;
 
   if (data.error) {
     detailSections += `<div style="margin-bottom: 10px; color: var(--accent-danger);"><strong>Error:</strong> ${escHtml(data.error)}</div>`;
@@ -1440,7 +1720,7 @@ function handleAgentResponse(data) {
   const statusIcon = data.error ? 'X' : 'OK';
   addDetailLog(
     'agent_response',
-    `${statusIcon} LLM response - ${elapsed.toFixed(1)}s, ${data.resultsCount} items (${classStr || 'none'})`,
+    `${statusIcon} LLM response - ${data.nodeType}: ${data.nodeName} (${classStr})`,
     detailSections
   );
 }

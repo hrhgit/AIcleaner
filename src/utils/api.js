@@ -5,17 +5,39 @@
 
 const BASE = '/api';
 
+function previewBody(text) {
+    return String(text || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 200);
+}
+
 export async function fetchJSON(path, options = {}) {
     const res = await fetch(`${BASE}${path}`, {
         headers: { 'Content-Type': 'application/json' },
         ...options,
         body: options.body ? JSON.stringify(options.body) : undefined,
     });
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.error || `HTTP ${res.status}`);
+
+    const raw = await res.text();
+    let data = null;
+
+    if (raw) {
+        try {
+            data = JSON.parse(raw);
+        } catch (err) {
+            const preview = previewBody(raw);
+            throw new Error(
+                `Invalid JSON response from ${path}: ${err.message}${preview ? ` | ${preview}` : ''}`
+            );
+        }
     }
-    return res.json();
+
+    if (!res.ok) {
+        throw new Error(data?.error || data?.message || res.statusText || `HTTP ${res.status}`);
+    }
+
+    return data ?? {};
 }
 
 export function getSettings() {
@@ -49,6 +71,14 @@ export function getActiveScan() {
     return fetchJSON('/scan/active');
 }
 
+export function listScanHistory(limit = 20) {
+    return fetchJSON(`/scan/history?limit=${encodeURIComponent(limit)}`);
+}
+
+export function deleteScanHistory(taskId) {
+    return fetchJSON(`/scan/history/${taskId}`, { method: 'DELETE' });
+}
+
 export function startScan(params) {
     return fetchJSON('/scan/start', { method: 'POST', body: params });
 }
@@ -59,22 +89,6 @@ export function stopScan(taskId) {
 
 export function getScanResult(taskId) {
     return fetchJSON(`/scan/result/${taskId}`);
-}
-
-export function getScanTree(taskId, params = {}) {
-    const query = new URLSearchParams();
-    if (params.path) query.set('path', params.path);
-    if (typeof params.dirsOnly === 'boolean') query.set('dirsOnly', String(params.dirsOnly));
-    if (params.limit != null) query.set('limit', String(params.limit));
-    const qs = query.toString();
-    return fetchJSON(`/scan/tree/${taskId}${qs ? `?${qs}` : ''}`);
-}
-
-export function analyzeScanFolder(taskId, folderPath) {
-    return fetchJSON(`/scan/analyze-folder/${taskId}`, {
-        method: 'POST',
-        body: { folderPath },
-    });
 }
 
 /**
@@ -111,6 +125,13 @@ export function connectScanStream(taskId, handlers) {
         try {
             const data = JSON.parse(e.data);
             handlers.onAgentResponse?.(data);
+        } catch { /* ignore */ }
+    });
+
+    es.addEventListener('warning', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handlers.onWarning?.(data);
         } catch { /* ignore */ }
     });
 

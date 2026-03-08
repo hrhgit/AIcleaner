@@ -1,16 +1,16 @@
 {
     "name": "aicleaner",
     "version": "1.0.0",
-    "description": "AI-driven space cleaning agent using dust CLI",
+    "description": "AI-driven space cleaning agent with Rust scanner sidecar",
     "type": "module",
     "scripts": {
         "dev": "vite",
         "server": "node server/index.js",
         "start": "concurrently \"npm run server\" \"npm run dev\"",
-        "build": "vite build",
-        "postinstall": "node scripts/download-dust.js"
+        "build": "vite build"
     },
     "dependencies": {
+        "better-sqlite3": "^12.6.2",
         "concurrently": "^9.1.0",
         "cors": "^2.8.5",
         "dotenv": "^17.3.1",

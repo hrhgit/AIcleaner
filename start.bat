@@ -1,10 +1,10 @@
 @echo off
-title Dust Space Cleaner
+title AIcleaner
 cd /d "%~dp0"
 set FRONTEND_PORT=4173
 set VITE_PORT=%FRONTEND_PORT%
 echo ===================================================
-echo        Starting Dust Space Cleaner Agent...
+echo        Starting AIcleaner...
 echo ===================================================
 echo.
 
