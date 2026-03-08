@@ -17,6 +17,7 @@ import {
   startScan,
   stopScan,
 } from '../utils/api.js';
+import { handleElevationTransition } from '../utils/elevation.js';
 import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
@@ -937,11 +938,14 @@ function bindSettingsEvents() {
     }
 
     try {
-      await requestElevation();
+      const result = await requestElevation();
       showToast(t('settings.elevation_uac_prompt'), 'info');
       if (adminStatusEl) {
         adminStatusEl.textContent = t('settings.elevation_restarting');
         adminStatusEl.style.color = 'var(--accent-info)';
+      }
+      if (result?.restarting) {
+        handleElevationTransition({ showToast, t });
       }
     } catch (err) {
       showToast(t('settings.elevation_failed') + err.message, 'error');
@@ -1450,6 +1454,11 @@ async function handleStart() {
 
     if (!form.scanPath) {
       showToast(t('scanner.path_not_configured'), 'error');
+      return;
+    }
+    const selectedEndpoint = String(form.scanProviderEndpoint || currentSettings?.apiEndpoint || '').trim();
+    if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
+      showToast(t('scanner.api_key_required'), 'error');
       return;
     }
 

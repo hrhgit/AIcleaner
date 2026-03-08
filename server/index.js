@@ -45,13 +45,9 @@ const server = app.listen(PORT, () => {
 
 server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-        console.warn(`[AIcleaner Server] Port ${PORT} is in use, retrying in 1s...`);
-        setTimeout(() => {
-            server.close();
-            server.listen(PORT);
-        }, 1000);
+        console.error(`[AIcleaner Server] Port ${PORT} is already in use. Exiting.`);
     } else {
         console.error('[AIcleaner Server] Fatal error:', err);
-        process.exit(1);
     }
+    process.exit(1);
 });

@@ -43,7 +43,9 @@ if exist bin xcopy bin release\bin\ /E /I /Q
 copy package.json release\ >nul
 copy package-lock.json release\ >nul
 
-if exist release\server\data\settings.json del release\server\data\settings.json
+if exist release\server\data rmdir /s /q release\server\data
+mkdir release\server\data
+mkdir release\server\data\organize-jobs
 
 echo [6/7] 安装生产依赖...
 cd release

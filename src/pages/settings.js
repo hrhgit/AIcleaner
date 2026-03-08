@@ -10,6 +10,7 @@ import {
   requestElevation,
   saveSettings,
 } from '../utils/api.js';
+import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -336,10 +337,13 @@ export async function renderSettings(container) {
     elevationBtn.innerHTML = `<span class="spinner"></span> ${t('settings.requesting_elevation')}`;
 
     try {
-      await requestElevation();
+      const result = await requestElevation();
       showToast(t('settings.elevation_uac_prompt'), 'info');
       adminStatusEl.textContent = t('settings.elevation_restarting');
       adminStatusEl.style.color = 'var(--accent-info)';
+      if (result?.restarting) {
+        handleElevationTransition({ showToast, t });
+      }
     } catch (err) {
       showToast(t('settings.elevation_failed') + err.message, 'error');
       elevationBtn.disabled = false;

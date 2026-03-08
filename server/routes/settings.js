@@ -181,6 +181,23 @@ const DEFAULT_SETTINGS = {
     },
 };
 
+export function getActiveProviderConfig(input = loadSettings()) {
+    const settings = input?.providerConfigs
+        ? input
+        : {
+            ...input,
+            ...resolveProviderSettings(input || {}),
+        };
+    const endpoint = normalizeEndpointValue(settings?.apiEndpoint || settings?.defaultProviderEndpoint);
+    const providerConfig = settings?.providerConfigs?.[endpoint] || {};
+
+    return {
+        endpoint,
+        apiKey: String(providerConfig.apiKey || settings?.apiKey || '').trim(),
+        model: String(providerConfig.model || settings?.model || defaultModelByEndpoint(endpoint)).trim(),
+    };
+}
+
 export function loadSettings() {
     try {
         if (existsSync(SETTINGS_FILE) || existsSync(`${SETTINGS_FILE}.bak`)) {

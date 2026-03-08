@@ -8,15 +8,6 @@ echo        Starting AIcleaner...
 echo ===================================================
 echo.
 
-REM Kill existing processes on port 3001 and frontend port
-echo [0/2] Freeing ports...
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":3001 " ^| findstr "LISTENING"') do (
-    taskkill /PID %%a /F >nul 2>&1
-)
-for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":%FRONTEND_PORT% " ^| findstr "LISTENING"') do (
-    taskkill /PID %%a /F >nul 2>&1
-)
-
 echo [1/2] Starting Express Backend (Port 3001)
 echo [2/2] Starting Vite Frontend  (Port %FRONTEND_PORT%)
 echo.

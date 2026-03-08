@@ -87,6 +87,7 @@ const translations = {
     'settings.elevation_confirm': '将触发 UAC 并重启，是否继续？',
     'settings.elevation_uac_prompt': '已发起提权请求，请在系统弹窗中确认',
     'settings.elevation_restarting': '正在以管理员模式重启...',
+    'settings.elevation_reload_hint': '管理员实例启动中，页面将在数秒后自动刷新。',
     'settings.elevation_failed': '请求管理员权限失败: ',
 
     'scanner.title': '全局扫描',
@@ -110,6 +111,7 @@ const translations = {
     'scanner.log_start': '---------- 扫描开始 ----------',
     'scanner.toast_start_failed': '启动扫描失败: ',
     'scanner.toast_stop_failed': '停止扫描失败: ',
+    'scanner.api_key_required': '当前扫描服务商未配置 API Key，请先在右上角“服务商 API”中完成配置。',
     'scanner.permission_denied_skip': '权限不足，已跳过: ',
     'scanner.permission_denied_summary': '扫描过程中跳过了 {count} 个无权限路径，建议使用管理员权限后重试以获得更完整结果。',
     'scanner.toast_failed_detail': '操作失败: ',
@@ -320,6 +322,7 @@ const translations = {
     'settings.elevation_confirm': 'Trigger UAC and restart, continue?',
     'settings.elevation_uac_prompt': 'UAC request sent',
     'settings.elevation_restarting': 'Restarting in administrator mode...',
+    'settings.elevation_reload_hint': 'The elevated instance is starting. This page will refresh automatically in a few seconds.',
     'settings.elevation_failed': 'Request admin failed: ',
 
     'scanner.title': 'Global Scan',
@@ -343,6 +346,7 @@ const translations = {
     'scanner.log_start': '---------- Scan Started ----------',
     'scanner.toast_start_failed': 'Failed to start scan: ',
     'scanner.toast_stop_failed': 'Failed to stop scan: ',
+    'scanner.api_key_required': 'The selected scan provider has no API key configured. Configure it in "Provider API" before starting a scan.',
     'scanner.permission_denied_skip': 'Skipped due to insufficient privilege: ',
     'scanner.permission_denied_summary': 'The scan skipped {count} paths due to insufficient privilege. Run as administrator for more complete results.',
     'scanner.toast_failed_detail': 'Operation failed: ',

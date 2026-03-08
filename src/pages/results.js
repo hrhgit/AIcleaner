@@ -5,6 +5,7 @@
 import * as storage from '../utils/storage.js';
 import { formatSize } from '../utils/storage.js';
 import { openFileLocation, cleanFiles, requestElevation } from '../utils/api.js';
+import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -174,8 +175,11 @@ export function renderResults(container) {
 
             if (elevationRequiredItems.length > 0 && confirm(t('results.elevation_needed_confirm', { count: elevationRequiredItems.length }))) {
               try {
-                await requestElevation();
+                const result = await requestElevation();
                 showToast(t('settings.elevation_uac_prompt'), 'info');
+                if (result?.restarting) {
+                  handleElevationTransition({ showToast, t });
+                }
               } catch (elevationErr) {
                 showToast(t('settings.elevation_failed') + elevationErr.message, 'error');
               }

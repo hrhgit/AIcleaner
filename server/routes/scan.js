@@ -4,6 +4,7 @@
  */
 import { Router } from 'express';
 import { ScanTask } from '../scanner.js';
+import { getActiveProviderConfig, loadSettings } from './settings.js';
 import {
     deleteScanTask,
     getTaskSnapshot,
@@ -163,16 +164,26 @@ scanRouter.delete('/history/:taskId', async (req, res) => {
 
 scanRouter.post('/start', (req, res) => {
     const { targetPath, targetSizeGB, maxDepth, autoAnalyze } = req.body;
+    const shouldAutoAnalyze = autoAnalyze !== false;
 
     if (!targetPath) {
         return res.status(400).json({ error: 'targetPath is required' });
+    }
+
+    if (shouldAutoAnalyze) {
+        const activeProvider = getActiveProviderConfig(loadSettings());
+        if (!activeProvider.apiKey) {
+            return res.status(400).json({
+                error: `API key is required for scan analysis. Configure the selected provider (${activeProvider.endpoint || 'current provider'}) before starting a scan.`,
+            });
+        }
     }
 
     const task = new ScanTask({
         targetPath,
         targetSize: (targetSizeGB || 1) * 1024 * 1024 * 1024,
         maxDepth: maxDepth || 5,
-        autoAnalyze: autoAnalyze !== false,
+        autoAnalyze: shouldAutoAnalyze,
     });
 
     activeTasks.set(task.id, task);
