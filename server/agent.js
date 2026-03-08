@@ -53,6 +53,57 @@ function normalizeResultArray(parsed) {
     return [];
 }
 
+function normalizeClassification(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'safe_to_delete') return 'safe_to_delete';
+    if (raw === 'keep') return 'keep';
+    if (raw === 'suspicious') return 'suspicious';
+    if (raw === 'needs_search') return 'suspicious';
+    return 'suspicious';
+}
+
+function normalizeRisk(value, fallback = 'medium') {
+    const raw = String(value || '').trim().toLowerCase();
+    if (raw === 'low' || raw === 'medium' || raw === 'high') return raw;
+    return fallback;
+}
+
+function normalizeDirectoryReview(parsed, entries, dirName) {
+    const source = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+    const folderRaw = source.folder && typeof source.folder === 'object' ? source.folder : {};
+    const childRaw = Array.isArray(source.children)
+        ? source.children
+        : Array.isArray(source.entries)
+            ? source.entries
+            : Array.isArray(source.items)
+                ? source.items
+                : [];
+
+    const folder = {
+        name: String(folderRaw.name || dirName || ''),
+        classification: normalizeClassification(folderRaw.classification),
+        purpose: String(folderRaw.purpose || ''),
+        reason: String(folderRaw.reason || ''),
+        risk: normalizeRisk(folderRaw.risk, 'medium'),
+    };
+
+    const children = entries.map((entry, idx) => {
+        const byIndex = childRaw.find((item) => Number(item?.index || 0) === idx + 1);
+        const byName = childRaw.find((item) => String(item?.name || '') === entry.name);
+        const hit = byIndex || byName || {};
+        return {
+            index: idx + 1,
+            name: entry.name,
+            classification: normalizeClassification(hit.classification),
+            purpose: String(hit.purpose || ''),
+            reason: String(hit.reason || ''),
+            risk: normalizeRisk(hit.risk, 'medium'),
+        };
+    });
+
+    return { folder, children };
+}
+
 function buildSystemPrompt(isWebSearchEnabled) {
     if (isWebSearchEnabled) {
         return `你是一个资深的操作系统与磁盘空间清理专家。
@@ -227,6 +278,123 @@ export async function analyzeEntries(entries, parentPath) {
                 name: e.name,
                 classification: 'suspicious',
                 purpose: 'Analysis failed - manual review recommended',
+                reason: err.message,
+                risk: 'high',
+            })),
+            tokenUsage: { prompt: 0, completion: 0, total: 0 },
+            trace: {
+                model,
+                systemPrompt,
+                userPrompt,
+                reasoning: '',
+                rawContent: '',
+                elapsed,
+                error: err.message,
+            },
+        };
+    }
+}
+
+/**
+ * Analyze a single directory as a whole, and classify all direct children.
+ * Returns one decision for the directory itself and one decision per child entry.
+ */
+export async function analyzeDirectoryReview(dirName, dirPath, entries) {
+    const { client, model } = getClient();
+
+    const entrySummary = entries
+        .map((e, i) => `${i + 1}. [${e.type}] "${e.name}" - ${formatSize(e.size)}`)
+        .join('\n');
+
+    const systemPrompt = `你是资深的磁盘清理专家。你将评估一个目录是否可整体删除，并同时评估其直接子项。
+要求：
+1) 如果目录整体可删除，folder.classification 使用 safe_to_delete。
+2) 如果目录整体不可删除，folder.classification 使用 keep 或 suspicious。
+3) children 必须逐项给出结论，classification 只能是 safe_to_delete | keep | suspicious。
+4) 风险 risk 只能是 low | medium | high。
+5) 严格输出 JSON 对象，不要输出 Markdown。`;
+
+    const userPrompt = `请分析目录 "${dirPath}"（目录名: "${dirName}"）。
+直接子项如下：
+${entrySummary || '(空目录)'}
+
+请仅返回 JSON，格式如下：
+{
+  "folder": {
+    "name": "${dirName}",
+    "classification": "safe_to_delete|keep|suspicious",
+    "purpose": "中文说明",
+    "reason": "中文说明",
+    "risk": "low|medium|high"
+  },
+  "children": [
+    {
+      "index": 1,
+      "name": "子项名称",
+      "classification": "safe_to_delete|keep|suspicious",
+      "purpose": "中文说明",
+      "reason": "中文说明",
+      "risk": "low|medium|high"
+    }
+  ]
+}`;
+
+    const startTime = Date.now();
+
+    try {
+        const response = await withRemoteLimit(() =>
+            retryWithBackoff(() =>
+                client.chat.completions.create({
+                    model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt },
+                    ],
+                    temperature: 0.1,
+                })
+            )
+        );
+
+        const elapsed = Date.now() - startTime;
+        const content = response.choices?.[0]?.message?.content || '';
+        const reasoning = response.choices?.[0]?.message?.reasoning_content || '';
+        const parsed = JSON.parse(extractJsonText(content));
+        const review = normalizeDirectoryReview(parsed, entries, dirName);
+
+        return {
+            ...review,
+            tokenUsage: {
+                prompt: response.usage?.prompt_tokens || 0,
+                completion: response.usage?.completion_tokens || 0,
+                total: response.usage?.total_tokens || 0,
+            },
+            trace: {
+                model,
+                systemPrompt,
+                userPrompt,
+                reasoning,
+                rawContent: content,
+                elapsed,
+                error: null,
+            },
+        };
+    } catch (err) {
+        const elapsed = Date.now() - startTime;
+        console.error('[Agent] Directory review failed:', err.message);
+
+        return {
+            folder: {
+                name: dirName,
+                classification: 'suspicious',
+                purpose: '分析失败，建议人工确认',
+                reason: err.message,
+                risk: 'high',
+            },
+            children: entries.map((entry, index) => ({
+                index: index + 1,
+                name: entry.name,
+                classification: 'suspicious',
+                purpose: '分析失败，建议人工确认',
                 reason: err.message,
                 risk: 'high',
             })),

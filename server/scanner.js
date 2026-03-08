@@ -1,19 +1,17 @@
-/**
+﻿/**
  * server/scanner.js
- * Layered scanning engine backed by an on-disk tree cache.
+ * Layered scanning engine with manual folder-by-folder AI analysis.
  */
 import { execSync } from 'child_process';
 import { EventEmitter } from 'events';
 import { join, dirname, basename, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, statSync, readdirSync } from 'fs';
-import pLimit from 'p-limit';
-import { analyzeEntries, verifyDirectoryDelete } from './agent.js';
+import { analyzeDirectoryReview } from './agent.js';
 import {
     createDirNode,
     createNodeId,
     initScanTaskStore,
-    loadDirChildChunks,
     loadDirChildren,
     loadDirNode,
     saveDirNode,
@@ -23,14 +21,6 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DUST_BIN = join(__dirname, '..', 'bin', 'dust.exe');
 
-const BATCH_SIZE = 50;
-const LAYER_CONCURRENCY = 5;
-
-/**
- * Determine if a dust entry is a directory.
- * dust outputs "children": [] for both files and directories when using -j,
- * so we cannot rely solely on `children !== undefined`.
- */
 function dustEntryIsDir(entryPath, dustEntry) {
     if (dustEntry && Array.isArray(dustEntry.children) && dustEntry.children.length > 0) {
         return true;
@@ -42,10 +32,6 @@ function dustEntryIsDir(entryPath, dustEntry) {
     return false;
 }
 
-/**
- * Run dust CLI and parse JSON output.
- * Fallback to fs-based scanning if dust is unavailable.
- */
 function runDust(targetPath, depth = 1) {
     try {
         const dustPath = existsSync(DUST_BIN) ? DUST_BIN : 'dust';
@@ -68,9 +54,6 @@ function runDust(targetPath, depth = 1) {
     }
 }
 
-/**
- * Fallback: use Node.js fs to list directory contents with sizes.
- */
 function fsFallback(targetPath) {
     try {
         const items = readdirSync(targetPath, { withFileTypes: true });
@@ -110,9 +93,6 @@ function parseDustSize(str) {
     return val;
 }
 
-/**
- * Parse dust JSON entries into a normalized format.
- */
 function normalizeDustEntries(dustEntries, parentPath) {
     return dustEntries
         .filter((e) => {
@@ -127,19 +107,20 @@ function normalizeDustEntries(dustEntries, parentPath) {
         }));
 }
 
-function toBatchEntry(entry) {
+function toFolderEntry(node, children = []) {
+    const estimatedSize = Number.isFinite(node.size)
+        ? node.size
+        : children.reduce((sum, child) => sum + (child.size || 0), 0);
+
     return {
-        name: entry.name,
-        size: entry.size,
-        type: entry.type,
-        path: entry.path,
-        nodeId: entry.nodeId || null,
+        name: node.name,
+        path: node.path,
+        size: estimatedSize,
+        type: 'directory',
+        nodeId: node.id,
     };
 }
 
-/**
- * ScanTask manages a single hierarchical scan operation.
- */
 export class ScanTask extends EventEmitter {
     constructor(options) {
         super();
@@ -151,6 +132,7 @@ export class ScanTask extends EventEmitter {
         this.stopped = false;
 
         this.deletable = [];
+        this.deletablePathSet = new Set();
         this.totalCleanable = 0;
         this.scannedCount = 0;
         this.totalEntries = 0;
@@ -182,11 +164,7 @@ export class ScanTask extends EventEmitter {
         await this._emitProgress();
 
         try {
-            await this._buildTree(this.targetPath, 0);
-
-            if (!this.stopped && !this._hasReachedTarget()) {
-                await this._analyzeDirectory(this.targetPath, 0);
-            }
+            await this._buildTree(this.targetPath, 0, null);
 
             if (!this.stopped) {
                 this.status = 'done';
@@ -202,6 +180,39 @@ export class ScanTask extends EventEmitter {
         }
     }
 
+    async analyzeFolder(folderPath) {
+        if (this.stopped) {
+            throw new Error('Task is stopped');
+        }
+        if (this.status === 'analyzing') {
+            throw new Error('Directory analysis is already running');
+        }
+
+        const resolvedPath = resolve(String(folderPath || ''));
+        const rootNode = await loadDirNode(this.id, createNodeId(resolvedPath));
+        if (!rootNode) {
+            throw new Error(`Folder is not in cached scan tree: ${resolvedPath}`);
+        }
+
+        this.status = 'analyzing';
+        this.currentPath = rootNode.path;
+        this.currentDepth = rootNode.depth || 0;
+        await this._emitProgress();
+
+        const visited = new Set();
+        await this._analyzeFolderRecursive(rootNode, visited);
+
+        if (!this.stopped) {
+            this.status = 'done';
+            const snap = this._snapshot();
+            this.emit('done', snap);
+            await this._queueSnapshotPersist(snap);
+            return snap;
+        }
+
+        return this._snapshot();
+    }
+
     _hasReachedTarget() {
         return this.totalCleanable >= this.targetSize;
     }
@@ -210,13 +221,6 @@ export class ScanTask extends EventEmitter {
         this.tokenUsage.prompt += tokenUsage?.prompt || 0;
         this.tokenUsage.completion += tokenUsage?.completion || 0;
         this.tokenUsage.total += tokenUsage?.total || 0;
-    }
-
-    _appendSuspiciousDir(list, entry) {
-        if (!entry || entry.type !== 'directory') return;
-        if (!list.some((d) => d.path === entry.path)) {
-            list.push(entry);
-        }
     }
 
     _queueSnapshotPersist(snapshot = this._snapshot()) {
@@ -236,30 +240,33 @@ export class ScanTask extends EventEmitter {
         await this._queueSnapshotPersist(snap);
     }
 
-    _addDeletable(entry, result, verifiedDirectory = false) {
+    _addDeletable(entry, result) {
         if (this.stopped || this._hasReachedTarget()) {
             return false;
         }
 
-        const reasonPrefix = result?.reason || '';
-        const reasonSuffix = verifiedDirectory ? ' (并已通过内部文件核查)' : '';
+        if (!entry?.path || this.deletablePathSet.has(entry.path)) {
+            return false;
+        }
+
         const item = {
             name: entry.name,
             path: entry.path,
-            size: entry.size,
+            size: Number(entry.size || 0),
             type: entry.type,
-            purpose: result?.purpose,
-            reason: `${reasonPrefix}${reasonSuffix}`,
+            purpose: result?.purpose || '',
+            reason: result?.reason || '',
             risk: result?.risk || 'low',
         };
 
         this.deletable.push(item);
-        this.totalCleanable += entry.size || 0;
+        this.deletablePathSet.add(entry.path);
+        this.totalCleanable += item.size;
         this.emit('found', item);
         return true;
     }
 
-    async _buildTree(dirPath, depth) {
+    async _buildTree(dirPath, depth, size = null) {
         if (this.stopped || depth > this.maxDepth) {
             return;
         }
@@ -269,7 +276,6 @@ export class ScanTask extends EventEmitter {
         this.status = 'scanning';
         await this._emitProgress();
 
-        console.log(`[Scanner] cache build: ${dirPath} (depth=${depth})`);
         const rawEntries = runDust(dirPath, 1);
         const entries = normalizeDustEntries(rawEntries, dirPath);
 
@@ -279,6 +285,7 @@ export class ScanTask extends EventEmitter {
         const node = createDirNode({
             path: dirPath,
             depth,
+            size,
             children: entries.map((entry) => ({
                 name: entry.name,
                 size: entry.size,
@@ -300,201 +307,111 @@ export class ScanTask extends EventEmitter {
         for (const entry of entries) {
             if (this.stopped) return;
             if (entry.type !== 'directory') continue;
-            await this._buildTree(entry.path, depth + 1);
+            await this._buildTree(entry.path, depth + 1, entry.size);
         }
     }
 
-    async _verifyDirectoryAndMaybeAdd(entry, result, suspiciousDirs) {
+    async _analyzeFolderRecursive(node, visited) {
         if (this.stopped || this._hasReachedTarget()) {
             return;
         }
+        if (!node || visited.has(node.path)) {
+            return;
+        }
 
-        console.log(`[Scanner] Verifying directory delete for ${entry.name}`);
-        this.currentPath = entry.path;
+        visited.add(node.path);
+        this.currentPath = node.path;
+        this.currentDepth = node.depth || 0;
         this.status = 'analyzing';
         await this._emitProgress();
 
-        const node = await loadDirNode(this.id, entry.nodeId || createNodeId(entry.path));
-        if (!node) {
-            console.warn(`[Scanner] Missing cached node for verification: ${entry.path}`);
-            this._appendSuspiciousDir(suspiciousDirs, entry);
-            return;
-        }
-
-        const children = (await loadDirChildren(this.id, node)).map(toBatchEntry);
-
-        this.emit('agent_call', {
-            batchIndex: `二次确认 [${entry.name}]`,
-            batchSize: children.length,
-            dirPath: entry.path,
-            entries: children.map((e) => ({ name: e.name, type: e.type, size: e.size })),
-        });
-
-        const verifyResult = await verifyDirectoryDelete(entry.name, children, entry.path);
-        if (this.stopped) {
-            return;
-        }
-
-        this._trackTokenUsage(verifyResult.tokenUsage);
-
-        this.emit('agent_response', {
-            model: verifyResult.trace.model,
-            elapsed: verifyResult.trace.elapsed,
-            reasoning: verifyResult.trace.reasoning,
-            rawContent: verifyResult.trace.rawContent,
-            userPrompt: verifyResult.trace.userPrompt,
-            error: verifyResult.trace.error,
-            tokenUsage: verifyResult.tokenUsage,
-            resultsCount: 1,
-            classifications: { [verifyResult.safe ? 'secondary_safe' : 'secondary_failed']: 1 },
-        });
-
-        if (!verifyResult.safe) {
-            console.log(`[Scanner] Folder ${entry.name} failed verification: ${verifyResult.reason}`);
-            this._appendSuspiciousDir(suspiciousDirs, entry);
-            return;
-        }
-
-        this._addDeletable(entry, result, true);
-    }
-
-    async _processBatch(batch, batchIndex, dirPath, depth) {
-        if (this.stopped || this._hasReachedTarget()) {
-            return;
-        }
-
-        console.log(`[Scanner] Sending batch of ${batch.length} to LLM (${dirPath})...`);
+        const children = await loadDirChildren(this.id, node);
+        const entries = children.map((entry) => ({
+            name: entry.name,
+            size: entry.size,
+            type: entry.type,
+            path: entry.path,
+            nodeId: entry.nodeId || null,
+        }));
 
         this.emit('agent_call', {
-            batchIndex,
-            batchSize: batch.length,
-            dirPath,
-            entries: batch.map((e) => ({ name: e.name, type: e.type, size: e.size })),
+            batchIndex: `folder:${node.name}`,
+            batchSize: entries.length,
+            dirPath: node.path,
+            entries: entries.map((e) => ({ name: e.name, type: e.type, size: e.size })),
         });
 
-        const { results, tokenUsage, trace } = await analyzeEntries(batch, dirPath);
-        if (this.stopped) {
-            return;
-        }
+        const review = await analyzeDirectoryReview(node.name, node.path, entries);
+        if (this.stopped) return;
 
-        console.log(`[Scanner] LLM returned ${results.length} results, tokens: ${tokenUsage.total}`);
+        this._trackTokenUsage(review.tokenUsage);
+        this.processedEntries += entries.length;
+
+        const childClassifications = review.children.reduce((acc, item) => {
+            acc[item.classification] = (acc[item.classification] || 0) + 1;
+            return acc;
+        }, {});
 
         this.emit('agent_response', {
-            model: trace.model,
-            elapsed: trace.elapsed,
-            reasoning: trace.reasoning,
-            rawContent: trace.rawContent,
-            userPrompt: trace.userPrompt,
-            error: trace.error,
-            tokenUsage,
-            resultsCount: results.length,
-            classifications: results.reduce((acc, r) => {
-                acc[r.classification] = (acc[r.classification] || 0) + 1;
-                return acc;
-            }, {}),
+            model: review.trace.model,
+            elapsed: review.trace.elapsed,
+            reasoning: review.trace.reasoning,
+            rawContent: review.trace.rawContent,
+            userPrompt: review.trace.userPrompt,
+            error: review.trace.error,
+            tokenUsage: review.tokenUsage,
+            resultsCount: review.children.length + 1,
+            classifications: {
+                [`folder_${review.folder.classification}`]: 1,
+                ...childClassifications,
+            },
         });
 
-        this.processedEntries += batch.length;
-        this._trackTokenUsage(tokenUsage);
-
-        if (this._hasReachedTarget()) {
+        if (review.folder.classification === 'safe_to_delete') {
+            const folderEntry = toFolderEntry(node, entries);
+            this._addDeletable(folderEntry, review.folder);
             await this._emitProgress();
             return;
         }
 
-        const suspiciousDirs = [];
-        const verifyTargets = [];
-
-        for (const result of results) {
+        for (let idx = 0; idx < review.children.length; idx += 1) {
             if (this.stopped || this._hasReachedTarget()) {
                 return;
             }
 
-            const idx = (result.index || 1) - 1;
-            const entry = batch[idx] || batch[0];
+            const result = review.children[idx];
+            const entry = entries[idx];
             if (!entry) continue;
 
             if (result.classification === 'safe_to_delete') {
-                if (entry.type === 'directory') {
-                    verifyTargets.push({ entry, result });
-                } else {
-                    this._addDeletable(entry, result, false);
-                }
-            } else if (result.classification === 'suspicious' && entry.type === 'directory') {
-                this._appendSuspiciousDir(suspiciousDirs, entry);
+                this._addDeletable(entry, result);
             }
         }
 
-        if (verifyTargets.length > 0 && !this.stopped && !this._hasReachedTarget()) {
-            const verifyLimiter = pLimit(LAYER_CONCURRENCY);
-            await Promise.all(
-                verifyTargets.map((target) =>
-                    verifyLimiter(() => this._verifyDirectoryAndMaybeAdd(target.entry, target.result, suspiciousDirs))
-                )
-            );
-        }
-
         await this._emitProgress();
 
-        if (suspiciousDirs.length > 0 && !this.stopped && !this._hasReachedTarget()) {
-            const recurseLimiter = pLimit(LAYER_CONCURRENCY);
-            await Promise.all(
-                suspiciousDirs.map((dir) => recurseLimiter(() => this._analyzeDirectory(dir.path, depth + 1)))
-            );
-        }
-    }
-
-    async _analyzeDirectory(dirPath, depth) {
-        if (this.stopped || depth >= this.maxDepth || this._hasReachedTarget()) {
-            return;
-        }
-
-        const node = await loadDirNode(this.id, createNodeId(dirPath));
-        if (!node) {
-            console.warn(`[Scanner] Missing cached node for analysis: ${dirPath}`);
-            return;
-        }
-
-        if ((node.childCount || 0) === 0) {
-            return;
-        }
-
-        this.currentPath = node.path;
-        this.currentDepth = depth;
-        this.status = 'analyzing';
-        await this._emitProgress();
-
-        let batchIndex = 1;
-        for await (const chunk of loadDirChildChunks(this.id, node)) {
+        for (let idx = 0; idx < review.children.length; idx += 1) {
             if (this.stopped || this._hasReachedTarget()) {
                 return;
             }
 
-            const batches = [];
-            const entries = chunk.map(toBatchEntry);
-            for (let i = 0; i < entries.length; i += BATCH_SIZE) {
-                batches.push({
-                    batchIndex,
-                    items: entries.slice(i, i + BATCH_SIZE),
-                });
-                batchIndex += 1;
-            }
+            const result = review.children[idx];
+            const entry = entries[idx];
+            if (!entry || entry.type !== 'directory') continue;
+            if (result.classification === 'safe_to_delete') continue;
 
-            const batchLimiter = pLimit(LAYER_CONCURRENCY);
-            await Promise.all(
-                batches.map(({ batchIndex: currentBatchIndex, items }) =>
-                    batchLimiter(() => this._processBatch(items, currentBatchIndex, node.path, depth))
-                )
-            );
+            const childNode = await loadDirNode(this.id, entry.nodeId || createNodeId(entry.path));
+            if (!childNode) continue;
+            await this._analyzeFolderRecursive(childNode, visited);
         }
-
-        await this._emitProgress();
     }
 
     _snapshot() {
         return {
             id: this.id,
             status: this.status,
+            targetPath: this.targetPath,
+            rootNodeId: this.rootNodeId,
             currentPath: this.currentPath,
             currentDepth: this.currentDepth,
             scannedCount: this.scannedCount,

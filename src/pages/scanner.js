@@ -3,10 +3,12 @@
  * Scanner page with merged settings + scan controls.
  */
 import {
+  analyzeScanFolder,
   browseFolder,
   connectScanStream,
   getActiveScan,
   getPrivilegeStatus,
+  getScanTree,
   getSettings,
   requestElevation,
   saveSettings,
@@ -19,9 +21,11 @@ import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
 let activeTaskId = null;
+let latestTaskId = null;
 let activeEventSource = null;
 let logEntries = [];
 let currentSettings = null;
+let candidateFolders = [];
 
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
@@ -340,8 +344,144 @@ function bindSettingsEvents() {
   });
 }
 
+function showManualAnalyzePanel(show) {
+  const panel = document.getElementById('manual-analyze-card');
+  if (panel) panel.style.display = show ? '' : 'none';
+}
+
+function setManualAnalyzeBusy(busy) {
+  const analyzeBtn = document.getElementById('manual-analyze-btn');
+  const refreshBtn = document.getElementById('manual-refresh-btn');
+  const startBtn = document.getElementById('start-btn');
+  const stopBtn = document.getElementById('stop-btn');
+
+  if (analyzeBtn) {
+    analyzeBtn.disabled = !!busy;
+    analyzeBtn.innerHTML = busy
+      ? `<span class="spinner"></span> ${t('scanner.manual_analyzing')}`
+      : t('scanner.manual_analyze_btn');
+  }
+  if (refreshBtn) {
+    refreshBtn.disabled = !!busy;
+  }
+  if (startBtn) {
+    startBtn.disabled = !!busy;
+  }
+  if (stopBtn && busy) {
+    stopBtn.disabled = true;
+  } else if (stopBtn) {
+    stopBtn.disabled = false;
+  }
+}
+
+function renderFolderCandidates() {
+  const listEl = document.getElementById('manual-candidate-list');
+  if (!listEl) return;
+
+  if (!candidateFolders.length) {
+    listEl.innerHTML = `<div class="form-hint">${t('scanner.manual_candidates_empty')}</div>`;
+    return;
+  }
+
+  listEl.innerHTML = candidateFolders
+    .map((item) => `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <div style="min-width:0;">
+          <div style="font-weight:600; font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escHtml(item.name)}</div>
+          <div class="form-hint mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${escHtml(item.path)}</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+          <span class="badge badge-info">${formatSize(item.size || 0)}</span>
+          <button class="btn btn-secondary manual-candidate-analyze-btn" data-path="${escHtml(item.path)}">${t('scanner.manual_analyze_btn')}</button>
+        </div>
+      </div>
+    `)
+    .join('');
+
+  document.querySelectorAll('.manual-candidate-analyze-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const folderPath = String(btn.dataset.path || '').trim();
+      if (!folderPath) return;
+      const input = document.getElementById('manual-folder-path');
+      if (input) input.value = folderPath;
+      await handleManualAnalyze(folderPath);
+    });
+  });
+}
+
+async function refreshFolderCandidates(pathOverride = '') {
+  if (!latestTaskId) return;
+
+  const hintEl = document.getElementById('manual-candidate-hint');
+  if (hintEl) hintEl.textContent = t('scanner.manual_candidates_loading');
+
+  try {
+    const lastScan = storage.get('lastScan', null);
+    const rootPath = String(pathOverride || lastScan?.targetPath || lastScan?.currentPath || '').trim();
+    if (!rootPath) {
+      candidateFolders = [];
+      renderFolderCandidates();
+      if (hintEl) hintEl.textContent = t('scanner.manual_candidates_empty');
+      return;
+    }
+
+    const tree = await getScanTree(latestTaskId, {
+      path: rootPath,
+      dirsOnly: true,
+      limit: 50,
+    });
+    candidateFolders = Array.isArray(tree?.children) ? tree.children : [];
+    renderFolderCandidates();
+    if (hintEl) hintEl.textContent = t('scanner.manual_candidates_hint');
+  } catch (err) {
+    candidateFolders = [];
+    renderFolderCandidates();
+    if (hintEl) hintEl.textContent = t('scanner.manual_candidates_failed') + err.message;
+  }
+}
+
+async function handleManualAnalyze(folderPathArg = '') {
+  if (!latestTaskId) {
+    showToast(t('scanner.manual_no_task'), 'error');
+    return;
+  }
+
+  const input = document.getElementById('manual-folder-path');
+  const folderPath = String(folderPathArg || input?.value || '').trim();
+  if (!folderPath) {
+    showToast(t('scanner.manual_path_required'), 'error');
+    return;
+  }
+
+  setManualAnalyzeBusy(true);
+  addLog('analyzing', `${t('scanner.manual_start')} ${folderPath}`);
+
+  try {
+    const response = await analyzeScanFolder(latestTaskId, folderPath);
+    const snap = response?.snapshot || null;
+    if (!snap) {
+      throw new Error('Empty snapshot');
+    }
+
+    updateStats(snap);
+    setScanStatus(snap.status);
+    storage.set('lastScan', snap);
+    storage.set('scanResults', snap.deletable || []);
+    addLog('found', t('scanner.manual_done').replace('{count}', snap.deletableCount || 0));
+    showToast(t('scanner.manual_done').replace('{count}', snap.deletableCount || 0), 'success');
+    await refreshFolderCandidates();
+  } catch (err) {
+    addLog('analyzing', `${t('toast.error')}: ${err.message}`);
+    showToast(t('scanner.manual_failed') + err.message, 'error');
+  } finally {
+    setManualAnalyzeBusy(false);
+  }
+}
+
 export async function renderScanner(container) {
   const lastScan = storage.get('lastScan', null);
+  latestTaskId = storage.get('lastScanTaskId', null) || lastScan?.id || null;
+  candidateFolders = [];
 
   container.innerHTML = `
     <style>
@@ -485,6 +625,22 @@ export async function renderScanner(container) {
       </div>
     </div>
 
+    <div id="manual-analyze-card" class="card animate-in mb-24" style="animation-delay: 0.23s; display:none;">
+      <div class="card-header">
+        <h2 class="card-title">${t('scanner.manual_title')}</h2>
+        <button id="manual-refresh-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.manual_refresh')}</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">${t('scanner.manual_path_label')}</label>
+        <div style="display:flex; gap:8px;">
+          <input id="manual-folder-path" class="form-input mono" placeholder="C:\\path\\to\\folder" />
+          <button id="manual-analyze-btn" class="btn btn-primary">${t('scanner.manual_analyze_btn')}</button>
+        </div>
+        <div id="manual-candidate-hint" class="form-hint">${t('scanner.manual_candidates_hint')}</div>
+      </div>
+      <div id="manual-candidate-list"></div>
+    </div>
+
     <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
       <div><span id="scan-path-display" class="form-hint mono"></span></div>
       <div class="flex gap-16">
@@ -509,6 +665,10 @@ export async function renderScanner(container) {
   if (lastScan) {
     updateStats(lastScan);
     setScanStatus(lastScan.status);
+    if (['done', 'analyzing'].includes(lastScan.status)) {
+      showManualAnalyzePanel(true);
+      refreshFolderCandidates();
+    }
   }
 
   document.getElementById('start-btn')?.addEventListener('click', handleStart);
@@ -518,6 +678,8 @@ export async function renderScanner(container) {
     const logEl = document.getElementById('scan-log');
     if (logEl) logEl.innerHTML = '';
   });
+  document.getElementById('manual-refresh-btn')?.addEventListener('click', () => refreshFolderCandidates());
+  document.getElementById('manual-analyze-btn')?.addEventListener('click', () => handleManualAnalyze());
 
   if (activeTaskId) {
     restoreActiveState();
@@ -529,9 +691,15 @@ export async function renderScanner(container) {
     if (activeTasks.length > 0) {
       const task = activeTasks[0];
       activeTaskId = task.taskId;
+      latestTaskId = task.taskId;
+      storage.set('lastScanTaskId', latestTaskId);
       updateStats(task);
       setScanStatus(task.status);
       storage.set('lastScan', task);
+      if (task.status === 'done') {
+        showManualAnalyzePanel(true);
+        refreshFolderCandidates();
+      }
       restoreActiveState();
     }
   } catch {
@@ -587,6 +755,11 @@ function restoreActiveState() {
     if (label) label.textContent = `${scanPct.toFixed(1)}%`;
   }
 
+  showManualAnalyzePanel(lastScan?.status === 'done');
+  if (lastScan?.status === 'done') {
+    refreshFolderCandidates();
+  }
+
   if (activeEventSource) {
     activeEventSource.close();
     activeEventSource = null;
@@ -609,14 +782,9 @@ async function handleStart() {
   try {
     await persistScannerSettings({ showSuccessToast: false });
     const form = collectScannerForm();
-    const settings = currentSettings || await getSettings();
 
     if (!form.scanPath) {
       showToast(t('scanner.path_not_configured'), 'error');
-      return;
-    }
-    if (!settings?.apiKey) {
-      showToast(t('settings.api_key_placeholder'), 'error');
       return;
     }
 
@@ -632,6 +800,11 @@ async function handleStart() {
     });
 
     activeTaskId = result.taskId;
+    latestTaskId = result.taskId;
+    storage.set('lastScanTaskId', latestTaskId);
+    showManualAnalyzePanel(false);
+    candidateFolders = [];
+    renderFolderCandidates();
 
     const activityEl = document.getElementById('scan-activity-hidden');
     const emptyEl = document.getElementById('scan-empty');
@@ -674,6 +847,11 @@ async function handleStop() {
 }
 
 function handleProgress(data) {
+  if (data?.id) {
+    latestTaskId = data.id;
+    storage.set('lastScanTaskId', latestTaskId);
+  }
+
   updateStats(data);
   setScanStatus(data.status);
   storage.set('lastScan', data);
@@ -692,9 +870,13 @@ function handleProgress(data) {
   if (label) label.textContent = `${scanPct.toFixed(1)}%`;
 
   if (data.status === 'analyzing') {
+    showManualAnalyzePanel(false);
     addLog('analyzing', `${t('scanner.analyzing')}: ${data.currentPath}`);
   } else if (data.status === 'scanning') {
+    showManualAnalyzePanel(false);
     addLog('scanning', `${t('scanner.scanning')}: ${data.currentPath}`);
+  } else if (data.status === 'done') {
+    showManualAnalyzePanel(true);
   }
 }
 
@@ -703,11 +885,18 @@ function handleFound(item) {
 }
 
 function handleDone(data) {
+  if (data?.id) {
+    latestTaskId = data.id;
+    storage.set('lastScanTaskId', latestTaskId);
+  }
+
   updateStats(data);
   setScanStatus('done');
   storage.set('lastScan', data);
   storage.set('scanResults', data.deletable);
   resetButtons();
+  showManualAnalyzePanel(true);
+  refreshFolderCandidates();
 
   const fill = document.getElementById('progress-fill');
   const label = document.getElementById('progress-pct');
@@ -715,22 +904,28 @@ function handleDone(data) {
   if (label) label.textContent = '100.0%';
 
   addLog('found', t('scanner.completed').replace('{count}', data.deletableCount));
-  showToast(t('scanner.completed').replace('{count}', data.deletableCount), 'success');
+  showToast(`${t('scanner.completed').replace('{count}', data.deletableCount)} ${t('scanner.manual_ready_hint')}`, 'success');
 }
 
 function handleError(err) {
   resetButtons();
   setScanStatus('error');
+  showManualAnalyzePanel(false);
   addLog('analyzing', `${t('toast.error')}: ${err.message || t('toast.error')}`);
   showToast(t('toast.error'), 'error');
 }
 
 function handleStopped(data) {
+  if (data?.id) {
+    latestTaskId = data.id;
+    storage.set('lastScanTaskId', latestTaskId);
+  }
   updateStats(data);
   setScanStatus('stopped');
   storage.set('lastScan', data);
   storage.set('scanResults', data.deletable);
   resetButtons();
+  showManualAnalyzePanel(false);
   addLog('scanning', t('scanner.stopped'));
 }
 

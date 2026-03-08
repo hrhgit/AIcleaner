@@ -61,6 +61,22 @@ export function getScanResult(taskId) {
     return fetchJSON(`/scan/result/${taskId}`);
 }
 
+export function getScanTree(taskId, params = {}) {
+    const query = new URLSearchParams();
+    if (params.path) query.set('path', params.path);
+    if (typeof params.dirsOnly === 'boolean') query.set('dirsOnly', String(params.dirsOnly));
+    if (params.limit != null) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return fetchJSON(`/scan/tree/${taskId}${qs ? `?${qs}` : ''}`);
+}
+
+export function analyzeScanFolder(taskId, folderPath) {
+    return fetchJSON(`/scan/analyze-folder/${taskId}`, {
+        method: 'POST',
+        body: { folderPath },
+    });
+}
+
 /**
  * Connect to SSE stream for scan progress.
  * @param {string} taskId

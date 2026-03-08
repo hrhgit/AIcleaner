@@ -4,7 +4,7 @@
  */
 import { Router } from 'express';
 import { ScanTask } from '../scanner.js';
-import { loadScanTask } from '../scan-store.js';
+import { createNodeId, loadDirChildren, loadDirNode, loadScanTask } from '../scan-store.js';
 
 export const scanRouter = Router();
 
@@ -12,7 +12,7 @@ export const scanRouter = Router();
 const activeTasks = new Map();
 
 function scheduleCleanup(task) {
-    setTimeout(() => activeTasks.delete(task.id), 5 * 60 * 1000);
+    setTimeout(() => activeTasks.delete(task.id), 24 * 60 * 60 * 1000);
 }
 
 async function loadStoredSnapshot(taskId) {
@@ -53,10 +53,7 @@ scanRouter.post('/start', (req, res) => {
 
     activeTasks.set(task.id, task);
 
-    // Auto-cleanup when done
-    task.on('done', () => {
-        scheduleCleanup(task);
-    });
+    // Keep completed tasks for manual folder-by-folder analysis.
     task.on('error', () => {
         scheduleCleanup(task);
     });
@@ -101,6 +98,24 @@ scanRouter.get('/status/:taskId', async (req, res) => {
             res.write(`event: stopped\ndata: ${JSON.stringify(terminalSnapshot)}\n\n`);
         }
 
+        return res.end();
+    }
+
+    if (['done', 'stopped', 'error'].includes(task.status)) {
+        const snap = task._snapshot();
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.write(`data: ${JSON.stringify(snap)}\n\n`);
+
+        if (snap.status === 'done') {
+            res.write(`event: done\ndata: ${JSON.stringify(snap)}\n\n`);
+        } else if (snap.status === 'error') {
+            res.write(`event: error\ndata: ${JSON.stringify({ message: 'Task failed', snapshot: snap })}\n\n`);
+        } else {
+            res.write(`event: stopped\ndata: ${JSON.stringify(snap)}\n\n`);
+        }
         return res.end();
     }
 
@@ -188,4 +203,80 @@ scanRouter.get('/result/:taskId', async (req, res) => {
         return res.status(404).json({ error: 'Task not found' });
     }
     res.json(stored);
+});
+
+/**
+ * GET /api/scan/tree/:taskId
+ * Query: path?, dirsOnly?, limit?
+ */
+scanRouter.get('/tree/:taskId', async (req, res) => {
+    const task = activeTasks.get(req.params.taskId);
+    if (!task) {
+        return res.status(404).json({ error: 'Task not found or expired in memory' });
+    }
+
+    const targetPath = String(req.query.path || task.targetPath || '').trim();
+    if (!targetPath) {
+        return res.status(400).json({ error: 'path is required' });
+    }
+
+    const node = await loadDirNode(task.id, createNodeId(targetPath));
+    if (!node) {
+        return res.status(404).json({ error: 'Directory not found in scan cache' });
+    }
+
+    const dirsOnly = String(req.query.dirsOnly || '').toLowerCase() === 'true';
+    const rawLimit = Number(req.query.limit || 200);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, rawLimit)) : 200;
+    const children = await loadDirChildren(task.id, node);
+
+    const normalized = children
+        .filter((entry) => (dirsOnly ? entry.type === 'directory' : true))
+        .sort((a, b) => (b.size || 0) - (a.size || 0))
+        .slice(0, limit)
+        .map((entry) => ({
+            name: entry.name,
+            path: entry.path,
+            size: entry.size,
+            type: entry.type,
+            nodeId: entry.nodeId || null,
+        }));
+
+    res.json({
+        taskId: task.id,
+        path: node.path,
+        depth: node.depth || 0,
+        childCount: node.childCount || 0,
+        children: normalized,
+    });
+});
+
+/**
+ * POST /api/scan/analyze-folder/:taskId
+ * Body: { folderPath }
+ */
+scanRouter.post('/analyze-folder/:taskId', async (req, res) => {
+    const task = activeTasks.get(req.params.taskId);
+    if (!task) {
+        return res.status(404).json({ error: 'Task not found or expired in memory' });
+    }
+
+    const folderPath = String(req.body?.folderPath || '').trim();
+    if (!folderPath) {
+        return res.status(400).json({ error: 'folderPath is required' });
+    }
+
+    if (task.status === 'scanning') {
+        return res.status(409).json({ error: 'Initial scan is still running' });
+    }
+    if (task.status === 'analyzing') {
+        return res.status(409).json({ error: 'Directory analysis is already running' });
+    }
+
+    try {
+        const snapshot = await task.analyzeFolder(folderPath);
+        res.json({ success: true, snapshot });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });

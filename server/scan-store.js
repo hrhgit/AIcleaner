@@ -63,7 +63,7 @@ export function createNodeId(pathValue) {
     return createHash('sha1').update(normalized).digest('hex');
 }
 
-export function createDirNode({ path, depth, children = [] }) {
+export function createDirNode({ path, depth, size = null, children = [] }) {
     const normalizedPath = normalizePathValue(path);
     return {
         id: createNodeId(normalizedPath),
@@ -71,6 +71,7 @@ export function createDirNode({ path, depth, children = [] }) {
         name: basename(normalizedPath) || normalizedPath,
         type: 'directory',
         depth,
+        size: Number.isFinite(size) ? size : null,
         childCount: children.length,
         children,
         cachedAt: new Date().toISOString(),
