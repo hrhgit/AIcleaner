@@ -2,12 +2,12 @@
 
 [English Version Below](#english-version)
 
-**AIcleaner** 是一款由人工智能驱动的智能磁盘空间清理工具。它将基于 Rust 的高性能扫描 sidecar 与大语言模型 (LLM) 的分析能力相结合，帮助您深入了解文件系统，精准定位占用空间庞大的文件，并在删除前提供详尽的风险评估，让您彻底告别误删系统文件的担忧。
+**AIcleaner** 是一款由人工智能驱动的智能磁盘空间清理工具。它将基于 Rust 的高性能扫描 sidecar 与大语言模型 (LLM) 的分析能力相结合，帮助您深入了解文件系统，精准定位占用空间庞大的文件，并在清理前提供详尽的风险评估，让您彻底告别误删系统文件的担忧。
 
 ## 🚀 核心功能
 
 - **极速扫描引擎**：底层使用 Rust 扫描 sidecar 直接索引文件与目录并写入 SQLite，适合深层目录树、历史任务查询和后续 AI 分析。
-- **AI 安全护航**：在执行删除操作前，AI 将对文件及其所在目录进行智能分类和功能解析，直观展示删除风险，让清理决定有据可依。
+- **AI 安全护航**：在执行清理操作前，AI 将对文件及其所在目录进行智能分类和功能解析，直观展示清理风险，让清理决定有据可依。
 - **现代化 UI 设计**：采用 HTML/CSS/JS 与 Vite 打造响应式玻璃拟态界面（Glassmorphism），提供丝滑的交互体验。
 - **一键打包部署**：内置完善的构建脚本，支持生成绿色免安装版以及专业的 Windows 安装向导 (`.exe`)。
 
@@ -85,7 +85,7 @@ build.bat
 ### 3. 查看分析结果与执行清理
 扫描完成后，点击进入 **📄 结果** 界面。顶部的统计面板会总结安全可清理的空间大小。
 * **风险过滤**：利用分类按钮（全部、推荐清理 Safe、谨慎清理 Warning、不建议清理 Danger）快速筛选文件。
-* **双重确认**：详细列表中展示了每个文件的大小和详细的 AI 判定理由。在勾选复选框决定是否批量删除前，您还可以点击右侧的 📁 图标直接**打开文件所在文件夹**进行最终的人工确认。确认无误后，点击“清理中...”按钮即可释放空间。
+* **双重确认**：详细列表中展示了每个项目的大小和详细的 AI 判定理由。在勾选复选框决定是否批量清理前，您还可以点击右侧的 📁 图标直接**打开文件所在文件夹**进行最终的人工确认。确认无误后，点击“清理中...”按钮即可释放空间。对于目录类候选项，应用会清空其内容以释放空间，并保留目录本身。
 <div align="center">
   <img src="./assets/clean.png" alt="结果界面" width="80%">
 </div>
@@ -104,12 +104,12 @@ build.bat
 
 <a id="english-version"></a>
 
-**AIcleaner** is an intelligent, AI-driven disk space cleaning tool. It combines a high-performance Rust scanner sidecar with the analytical power of Large Language Models (LLMs) to help you understand your file system, identify space hogs, and safely delete unnecessary files without the fear of breaking your system.
+**AIcleaner** is an intelligent, AI-driven disk space cleaning tool. It combines a high-performance Rust scanner sidecar with the analytical power of Large Language Models (LLMs) to help you understand your file system, identify space hogs, and safely clean unnecessary files without the fear of breaking your system.
 
 ## 🚀 Features
 
 - **Blazing Fast Scanning**: Uses a Rust scanner sidecar that indexes files and directories directly into SQLite for fast history queries and AI follow-up analysis.
-- **AI-Powered Safety Analysis**: Before you delete anything, AI analyzes the directories and files, categorizing them and explaining their purpose, minimizing the risk of accidentally deleting critical system or application files.
+- **AI-Powered Safety Analysis**: Before you clean anything, AI analyzes the directories and files, categorizing them and explaining their purpose, minimizing the risk of accidentally removing critical system or application files.
 - **Modern Glassmorphism UI**: A beautiful, responsive, and dynamic user interface built with HTML/CSS/JS and Vite.
 - **Standalone Windows Installer**: Effortlessly package the application into a standalone Windows installer (`.exe`) or a portable version using the provided build scripts.
 
@@ -187,7 +187,7 @@ After configuration, switch to the **📈 Scan** interface. You will see a dashb
 ### 3. Review Analysis Results and Clean Up
 Once the scan concludes, navigate to the **📄 Results** interface. The top statistics panel summarizes the total space that is safe to clean.
 - **Risk Filtering**: Use the category buttons (All, Safe, Warning, Danger) to quickly filter the identified files.
-- **Double Verification**: The detailed list shows the size and the complete AI justification for each item. Before checking the boxes for bulk deletion, click the 📁 icon on the right to directly **open the containing folder** for a final manual check. Once confirmed, click the clean button to free up space.
+- **Double Verification**: The detailed list shows the size and the complete AI justification for each item. Before checking the boxes for bulk cleanup, click the 📁 icon on the right to directly **open the containing folder** for a final manual check. Once confirmed, click the clean button to free up space. For directory candidates, the app clears the directory contents to reclaim space while preserving the directory itself.
 <div align="center">
   <img src="./assets/clean.png" alt="Results Interface" width="80%">
 </div>

@@ -4,7 +4,7 @@
  */
 import * as storage from '../utils/storage.js';
 import { formatSize } from '../utils/storage.js';
-import { openFileLocation, deleteFiles, requestElevation } from '../utils/api.js';
+import { openFileLocation, cleanFiles, requestElevation } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 
@@ -131,7 +131,7 @@ export function renderResults(container) {
     });
   }
 
-  // Batch delete event
+  // Batch clean event
   const batchDeleteBtn = document.getElementById('batch-delete-btn');
   if (batchDeleteBtn) {
     batchDeleteBtn.addEventListener('click', async () => {
@@ -143,24 +143,24 @@ export function renderResults(container) {
           batchDeleteBtn.disabled = true;
           batchDeleteBtn.innerHTML = `<span class="spinner"></span> ${t('results.cleaning')}`;
 
-          const res = await deleteFiles(selectedPaths);
+          const res = await cleanFiles(selectedPaths);
           if (res.success) {
-            const handledPaths = Array.isArray(res.results?.handled) ? res.results.handled : res.results?.deleted || [];
-            const handledCount = handledPaths.length;
+            const cleanedPaths = Array.isArray(res.results?.cleaned) ? res.results.cleaned : [];
+            const cleanedCount = cleanedPaths.length;
             const failedItems = Array.isArray(res.results?.failed) ? res.results.failed : [];
             const failedCount = failedItems.length;
             const elevationRequiredItems = failedItems.filter(item => item?.requiresElevation);
 
-            if (handledCount > 0 && failedCount > 0) {
-              showToast(t('results.cleaned_partial', { handled: handledCount, failed: failedCount }), 'warning');
-            } else if (handledCount > 0) {
-              showToast(t('results.cleaned_success', { count: handledCount }), 'success');
+            if (cleanedCount > 0 && failedCount > 0) {
+              showToast(t('results.cleaned_partial', { cleaned: cleanedCount, failed: failedCount }), 'warning');
+            } else if (cleanedCount > 0) {
+              showToast(t('results.cleaned_success', { count: cleanedCount }), 'success');
             } else {
               showToast(t('results.cleaned_none', { count: failedCount || selectedPaths.length }), 'error');
             }
 
             // Update UI data state
-            currentData = currentData.filter(item => !handledPaths.includes(item.path));
+            currentData = currentData.filter(item => !cleanedPaths.includes(item.path));
             storage.set('scanResults', currentData);
 
             // Refresh display

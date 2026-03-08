@@ -168,8 +168,8 @@ export function openFileLocation(path) {
     return fetchJSON('/files/open-location', { method: 'POST', body: { path } });
 }
 
-export function deleteFiles(paths) {
-    return fetchJSON('/files/delete', { method: 'POST', body: { paths } });
+export function cleanFiles(paths) {
+    return fetchJSON('/files/clean', { method: 'POST', body: { paths } });
 }
 
 export function suggestOrganizeCategories(params) {

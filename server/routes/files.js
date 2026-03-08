@@ -50,16 +50,16 @@ function createFailureRecord(targetPath, err, overrides = {}) {
     return record;
 }
 
-async function deleteEntryRecursive(targetPath) {
+async function cleanEntryRecursive(targetPath) {
     let stat;
     try {
         stat = await lstat(targetPath);
     } catch (err) {
         if (err?.code === 'ENOENT') {
-            return { handled: true, failure: null };
+            return { cleaned: true, failure: null };
         }
         return {
-            handled: false,
+            cleaned: false,
             failure: createFailureRecord(targetPath, err),
         };
     }
@@ -67,10 +67,10 @@ async function deleteEntryRecursive(targetPath) {
     if (!isDirectoryEntry(stat)) {
         try {
             await rm(targetPath, { force: false });
-            return { handled: true, failure: null };
+            return { cleaned: true, failure: null };
         } catch (err) {
             return {
-                handled: false,
+                cleaned: false,
                 failure: createFailureRecord(targetPath, err),
             };
         }
@@ -80,45 +80,54 @@ async function deleteEntryRecursive(targetPath) {
     const childNames = await readdir(targetPath);
     for (const childName of childNames) {
         const childPath = path.join(targetPath, childName);
-        const childResult = await deleteEntryRecursive(childPath);
-        if (!childResult.handled && !firstFailure) {
+        const childResult = await cleanEntryRecursive(childPath);
+        if (!childResult.cleaned && !firstFailure) {
             firstFailure = childResult.failure;
         }
     }
 
     if (firstFailure) {
-        return { handled: false, failure: firstFailure };
+        return { cleaned: false, failure: firstFailure };
     }
 
     try {
         await rmdir(targetPath);
-        return { handled: true, failure: null };
+        return { cleaned: true, failure: null };
     } catch (err) {
         return {
-            handled: false,
+            cleaned: false,
             failure: createFailureRecord(targetPath, err),
         };
     }
 }
 
-async function clearDirectoryContents(targetPath) {
+async function cleanDirectoryContents(targetPath) {
     let firstFailure = null;
-    const childNames = await readdir(targetPath);
+    let childNames;
+    try {
+        childNames = await readdir(targetPath);
+    } catch (err) {
+        return {
+            cleaned: false,
+            removedSelf: false,
+            failure: createFailureRecord(targetPath, err),
+        };
+    }
 
     for (const childName of childNames) {
         const childPath = path.join(targetPath, childName);
-        const childResult = await deleteEntryRecursive(childPath);
-        if (!childResult.handled && !firstFailure) {
+        const childResult = await cleanEntryRecursive(childPath);
+        if (!childResult.cleaned && !firstFailure) {
             firstFailure = childResult.failure;
         }
     }
 
     if (firstFailure) {
         return {
-            handled: false,
+            cleaned: false,
             removedSelf: false,
             failure: createFailureRecord(targetPath, null, {
-                error: `Skipped because a child item could not be deleted: ${firstFailure.error}`,
+                error: `Skipped because a child item could not be cleaned: ${firstFailure.error}`,
                 code: firstFailure.code || 'PARTIAL_DELETE',
                 skipped: true,
                 causePath: firstFailure.path,
@@ -128,18 +137,18 @@ async function clearDirectoryContents(targetPath) {
         };
     }
 
-    return { handled: true, removedSelf: false, failure: null };
+    return { cleaned: true, removedSelf: false, failure: null };
 }
 
-export async function deleteTargetPath(targetPath) {
+export async function cleanTargetPath(targetPath) {
     const stat = await lstat(targetPath);
 
     if (isDirectoryEntry(stat)) {
-        return clearDirectoryContents(targetPath);
+        return cleanDirectoryContents(targetPath);
     }
 
     await rm(targetPath, { force: false });
-    return { handled: true, removedSelf: true, failure: null };
+    return { cleaned: true, removedSelf: true, failure: null };
 }
 
 /**
@@ -172,18 +181,18 @@ filesRouter.post('/open-location', (req, res) => {
 });
 
 /**
- * POST /api/files/delete
+ * POST /api/files/clean
  * Body: { paths: string[] }
  */
-filesRouter.post('/delete', async (req, res) => {
+filesRouter.post('/clean', async (req, res) => {
     const { paths } = req.body;
     if (!paths || !Array.isArray(paths)) {
         return res.status(400).json({ success: false, error: 'Paths array is required' });
     }
 
     const results = {
-        deleted: [],
-        handled: [],
+        cleaned: [],
+        removed: [],
         failed: []
     };
 
@@ -194,12 +203,12 @@ filesRouter.post('/delete', async (req, res) => {
         }
 
         try {
-            const outcome = await deleteTargetPath(targetPath);
-            if (outcome.handled) {
-                results.handled.push(targetPath);
+            const outcome = await cleanTargetPath(targetPath);
+            if (outcome.cleaned) {
+                results.cleaned.push(targetPath);
             }
             if (outcome.removedSelf) {
-                results.deleted.push(targetPath);
+                results.removed.push(targetPath);
             }
             if (outcome.failure) {
                 results.failed.push(outcome.failure);
