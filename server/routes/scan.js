@@ -36,10 +36,10 @@ scanRouter.get('/active', (req, res) => {
 
 /**
  * POST /api/scan/start
- * Body: { targetPath, targetSizeGB, maxDepth }
+ * Body: { targetPath, targetSizeGB, maxDepth, autoAnalyze? }
  */
 scanRouter.post('/start', (req, res) => {
-    const { targetPath, targetSizeGB, maxDepth } = req.body;
+    const { targetPath, targetSizeGB, maxDepth, autoAnalyze } = req.body;
 
     if (!targetPath) {
         return res.status(400).json({ error: 'targetPath is required' });
@@ -49,11 +49,12 @@ scanRouter.post('/start', (req, res) => {
         targetPath,
         targetSize: (targetSizeGB || 1) * 1024 * 1024 * 1024,
         maxDepth: maxDepth || 5,
+        autoAnalyze: autoAnalyze !== false,
     });
 
     activeTasks.set(task.id, task);
 
-    // Keep completed tasks for manual folder-by-folder analysis.
+    // Keep completed tasks available for follow-up analysis/review.
     task.on('error', () => {
         scheduleCleanup(task);
     });

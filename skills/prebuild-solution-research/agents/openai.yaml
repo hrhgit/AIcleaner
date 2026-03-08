@@ -1,4 +1,0 @@
-interface:
-  display_name: "Prebuild Solution Research"
-  short_description: "Research mature reusable options before new features"
-  default_prompt: "Use $prebuild-solution-research to evaluate mature reusable options before implementing this new feature."

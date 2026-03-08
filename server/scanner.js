@@ -1,6 +1,6 @@
 ﻿/**
  * server/scanner.js
- * Layered scanning engine with manual folder-by-folder AI analysis.
+ * Layered scanning engine with optional auto AI analysis after scan.
  */
 import { execSync } from 'child_process';
 import { EventEmitter } from 'events';
@@ -128,6 +128,7 @@ export class ScanTask extends EventEmitter {
         this.targetPath = resolve(String(options.targetPath || ''));
         this.targetSize = options.targetSize || Infinity;
         this.maxDepth = options.maxDepth || 5;
+        this.autoAnalyze = options.autoAnalyze !== false;
         this.rootNodeId = createNodeId(this.targetPath);
         this.stopped = false;
 
@@ -167,6 +168,10 @@ export class ScanTask extends EventEmitter {
             await this._buildTree(this.targetPath, 0, null);
 
             if (!this.stopped) {
+                if (this.autoAnalyze) {
+                    await this.analyzeFolder(this.targetPath);
+                    return;
+                }
                 this.status = 'done';
                 const snap = this._snapshot();
                 this.emit('done', snap);
@@ -411,6 +416,7 @@ export class ScanTask extends EventEmitter {
             id: this.id,
             status: this.status,
             targetPath: this.targetPath,
+            autoAnalyze: this.autoAnalyze,
             rootNodeId: this.rootNodeId,
             currentPath: this.currentPath,
             currentDepth: this.currentDepth,
