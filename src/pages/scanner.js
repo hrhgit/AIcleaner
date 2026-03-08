@@ -7,6 +7,7 @@ import {
   browseFolder,
   connectScanStream,
   getActiveScan,
+  getProviderModels,
   getPrivilegeStatus,
   getScanTree,
   getSettings,
@@ -26,6 +27,49 @@ let activeEventSource = null;
 let logEntries = [];
 let currentSettings = null;
 let candidateFolders = [];
+const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v1';
+const SCANNER_FORM_DRAFT_VERSION = 1;
+const PROVIDER_OPTIONS = [
+  { value: 'https://api.deepseek.com', label: 'DeepSeek' },
+  { value: 'https://api.openai.com/v1', label: 'OpenAI' },
+  { value: 'https://generativelanguage.googleapis.com/v1beta/openai/', label: 'Google Gemini' },
+  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: 'Qwen (DashScope)' },
+  { value: 'https://open.bigmodel.cn/api/paas/v4', label: 'GLM (BigModel)' },
+  { value: 'https://api.moonshot.cn/v1', label: 'Kimi (Moonshot)' },
+];
+const PROVIDER_MODELS = {
+  'https://api.openai.com/v1': [
+    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
+    { value: 'gpt-4o', label: 'gpt-4o' },
+    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
+  ],
+  'https://api.deepseek.com': [
+    { value: 'deepseek-chat', label: 'deepseek-chat' },
+    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
+  ],
+  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
+    { value: 'qwen-plus', label: 'qwen-plus' },
+    { value: 'qwen-turbo', label: 'qwen-turbo' },
+    { value: 'qwen-max', label: 'qwen-max' },
+  ],
+  'https://open.bigmodel.cn/api/paas/v4': [
+    { value: 'glm-4-flash', label: 'glm-4-flash' },
+    { value: 'glm-4', label: 'glm-4' },
+  ],
+  'https://api.moonshot.cn/v1': [
+    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
+    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
+  ],
+  'https://generativelanguage.googleapis.com/v1beta/openai/': [
+    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
+  ],
+};
+let scanProviderApiKeyMap = {};
+const scanRemoteModelsCache = new Map();
+let scanModelsRequestToken = 0;
 
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
@@ -86,23 +130,232 @@ function collectScannerForm() {
     5
   ));
   const scanWebSearchEnabled = !!document.getElementById('scan-enable-web-search')?.checked;
+  const scanProviderEndpoint = String(document.getElementById('scan-provider')?.value || '').trim();
+  const scanModel = String(document.getElementById('scan-model')?.value || '').trim();
 
   return {
     scanPath,
     targetSizeGB: targetSize,
     maxDepth,
     scanWebSearchEnabled,
+    scanProviderEndpoint,
+    scanModel,
+  };
+}
+
+function normalizeScannerFormDraft(raw = {}) {
+  return {
+    scanPath: String(raw?.scanPath || '').trim(),
+    targetSizeGB: clampNumber(raw?.targetSizeGB, 0.1, 100, 1),
+    maxDepth: Math.floor(clampNumber(raw?.maxDepth, 1, 10, 5)),
+    scanWebSearchEnabled: !!raw?.scanWebSearchEnabled,
+    scanProviderEndpoint: String(raw?.scanProviderEndpoint || '').trim(),
+    scanModel: String(raw?.scanModel || '').trim(),
+  };
+}
+
+function extractScannerFormFromSettings(settings = {}) {
+  const searchApi = resolveSearchApi(settings);
+  const scanWebSearchEnabled = typeof settings?.scanWebSearchEnabled === 'boolean'
+    ? settings.scanWebSearchEnabled
+    : !!searchApi.scopes.scan;
+
+  return normalizeScannerFormDraft({
+    scanPath: settings?.scanPath,
+    targetSizeGB: settings?.targetSizeGB,
+    maxDepth: settings?.maxDepth,
+    scanWebSearchEnabled,
+    scanProviderEndpoint: settings?.apiEndpoint || settings?.defaultProviderEndpoint || '',
+    scanModel: settings?.model || '',
+  });
+}
+
+function readScannerFormDraft() {
+  const raw = storage.get(SCANNER_FORM_DRAFT_KEY, null);
+  if (!raw || typeof raw !== 'object') {
+    return { dirty: false, data: null };
+  }
+  if (Number(raw.version) !== SCANNER_FORM_DRAFT_VERSION) {
+    return { dirty: false, data: null };
+  }
+  if (!raw.data || typeof raw.data !== 'object') {
+    return { dirty: false, data: null };
+  }
+
+  return {
+    dirty: !!raw.dirty,
+    data: normalizeScannerFormDraft(raw.data),
+  };
+}
+
+function writeScannerFormDraft(form, { dirty = true } = {}) {
+  storage.set(SCANNER_FORM_DRAFT_KEY, {
+    version: SCANNER_FORM_DRAFT_VERSION,
+    dirty: !!dirty,
+    updatedAt: Date.now(),
+    data: normalizeScannerFormDraft(form),
+  });
+}
+
+function persistScannerFormDraft({ dirty = true } = {}) {
+  writeScannerFormDraft(collectScannerForm(), { dirty });
+}
+
+function normalizeRemoteModels(models) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of models || []) {
+    if (!item?.value) continue;
+    const value = String(item.value).trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push({ value, label: String(item.label || value) });
+  }
+  return normalized;
+}
+
+function ensureSelectOptionExists(select, value, label = null) {
+  if (!select || !value) return;
+  const exists = Array.from(select.options).some((opt) => opt.value === value);
+  if (!exists) {
+    select.add(new Option(String(label || value), String(value)));
+  }
+}
+
+function getProviderLabel(endpoint) {
+  return PROVIDER_OPTIONS.find((item) => item.value === endpoint)?.label || endpoint;
+}
+
+function getApiKeyForScanEndpoint(endpoint) {
+  return String(scanProviderApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+}
+
+function renderScanModelOptions(select, models, selectedValue) {
+  if (!select) return;
+  select.innerHTML = '';
+  for (const model of models) {
+    select.add(new Option(String(model.label || model.value), String(model.value)));
+  }
+  const selected = String(selectedValue || '').trim();
+  if (selected) {
+    ensureSelectOptionExists(select, selected, selected);
+    select.value = selected;
+  } else if (select.options.length > 0) {
+    select.value = select.options[0].value;
+  }
+}
+
+async function initScanModelSelectors(defaultSelection = {}) {
+  const providerSelect = document.getElementById('scan-provider');
+  const modelSelect = document.getElementById('scan-model');
+  if (!providerSelect || !modelSelect) return;
+
+  const endpoint = String(defaultSelection?.endpoint || providerSelect.value || '').trim();
+  if (endpoint) {
+    ensureSelectOptionExists(providerSelect, endpoint, getProviderLabel(endpoint));
+    providerSelect.value = endpoint;
+  }
+
+  const selectedModel = String(defaultSelection?.model || modelSelect.value || '').trim();
+  const requestToken = ++scanModelsRequestToken;
+  modelSelect.disabled = true;
+  modelSelect.innerHTML = `<option value="">${t('organizer.model_loading')}</option>`;
+
+  const apiKey = getApiKeyForScanEndpoint(endpoint);
+  const cacheKey = `${endpoint}|${apiKey}`;
+  let models = [];
+  try {
+    if (endpoint) {
+      if (scanRemoteModelsCache.has(cacheKey)) {
+        models = scanRemoteModelsCache.get(cacheKey);
+      } else {
+        const resp = await getProviderModels(endpoint, apiKey);
+        models = normalizeRemoteModels(resp?.models || []);
+        scanRemoteModelsCache.set(cacheKey, models);
+      }
+    }
+  } catch {
+    models = [];
+  }
+
+  if (!models.length) {
+    models = normalizeRemoteModels(PROVIDER_MODELS[endpoint] || PROVIDER_MODELS['https://api.deepseek.com']);
+  }
+  if (!models.length) {
+    models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
+  }
+
+  if (requestToken !== scanModelsRequestToken) return;
+  renderScanModelOptions(modelSelect, models, selectedModel || models[0]?.value);
+  modelSelect.disabled = false;
+}
+
+async function initScanProviderFields(settings = {}) {
+  const providerSelect = document.getElementById('scan-provider');
+  const modelSelect = document.getElementById('scan-model');
+  if (!providerSelect || !modelSelect) return;
+
+  scanProviderApiKeyMap = {};
+  if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
+    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
+      scanProviderApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    }
+  }
+  if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
+    scanProviderApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+  }
+
+  providerSelect.innerHTML = '';
+  for (const item of PROVIDER_OPTIONS) {
+    providerSelect.add(new Option(item.label, item.value));
+  }
+
+  const form = extractScannerFormFromSettings(settings);
+  const endpoint = String(form.scanProviderEndpoint || settings?.apiEndpoint || 'https://api.deepseek.com').trim();
+  const model = String(form.scanModel || settings?.model || 'deepseek-chat').trim();
+  ensureSelectOptionExists(providerSelect, endpoint, getProviderLabel(endpoint));
+  providerSelect.value = endpoint;
+  await initScanModelSelectors({ endpoint, model });
+}
+
+function mergeSettingsWithDraft(settings = {}, draftState = { dirty: false, data: null }) {
+  if (!draftState?.dirty || !draftState?.data) {
+    return settings;
+  }
+
+  const remoteSearch = resolveSearchApi(settings);
+  const draft = normalizeScannerFormDraft(draftState.data);
+  const classifyEnabled = !!remoteSearch.scopes.classify;
+  const mergedSearchApi = {
+    provider: 'tavily',
+    enabled: !!(draft.scanWebSearchEnabled || classifyEnabled),
+    scopes: {
+      scan: !!draft.scanWebSearchEnabled,
+      classify: classifyEnabled,
+      organizer: classifyEnabled,
+    },
+  };
+  if (remoteSearch.apiKey) {
+    mergedSearchApi.apiKey = remoteSearch.apiKey;
+  }
+
+  return {
+    ...settings,
+    scanPath: draft.scanPath,
+    targetSizeGB: draft.targetSizeGB,
+    maxDepth: draft.maxDepth,
+    apiEndpoint: draft.scanProviderEndpoint || settings?.apiEndpoint,
+    defaultProviderEndpoint: draft.scanProviderEndpoint || settings?.defaultProviderEndpoint,
+    model: draft.scanModel || settings?.model,
+    enableWebSearch: !!draft.scanWebSearchEnabled,
+    enableWebSearchClassify: classifyEnabled,
+    enableWebSearchOrganizer: classifyEnabled,
+    searchApi: mergedSearchApi,
   };
 }
 
 function applySettingsToForm(settings = {}) {
-  const form = {
-    scanPath: String(settings?.scanPath || ''),
-    targetSizeGB: clampNumber(settings?.targetSizeGB, 0.1, 100, 1),
-    maxDepth: Math.floor(clampNumber(settings?.maxDepth, 1, 10, 5)),
-  };
-
-  const searchApi = resolveSearchApi(settings);
+  const form = extractScannerFormFromSettings(settings);
 
   const scanPathInput = document.getElementById('scan-path');
   const targetSizeSlider = document.getElementById('target-size');
@@ -110,13 +363,23 @@ function applySettingsToForm(settings = {}) {
   const maxDepthSlider = document.getElementById('max-depth');
   const maxDepthInput = document.getElementById('max-depth-input');
   const scanToggle = document.getElementById('scan-enable-web-search');
+  const providerSelect = document.getElementById('scan-provider');
+  const modelSelect = document.getElementById('scan-model');
 
   if (scanPathInput) scanPathInput.value = form.scanPath;
   if (targetSizeSlider) targetSizeSlider.value = String(form.targetSizeGB);
   if (targetSizeInput) targetSizeInput.value = form.targetSizeGB.toFixed(1);
   if (maxDepthSlider) maxDepthSlider.value = String(form.maxDepth);
   if (maxDepthInput) maxDepthInput.value = String(form.maxDepth);
-  if (scanToggle) scanToggle.checked = !!searchApi.scopes.scan;
+  if (scanToggle) scanToggle.checked = !!form.scanWebSearchEnabled;
+  if (providerSelect) {
+    ensureSelectOptionExists(providerSelect, form.scanProviderEndpoint, getProviderLabel(form.scanProviderEndpoint));
+    if (form.scanProviderEndpoint) providerSelect.value = form.scanProviderEndpoint;
+  }
+  if (modelSelect) {
+    ensureSelectOptionExists(modelSelect, form.scanModel, form.scanModel);
+    if (form.scanModel) modelSelect.value = form.scanModel;
+  }
 
   updatePathDisplay(form.scanPath);
 }
@@ -155,8 +418,36 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
     }
 
     const form = collectScannerForm();
+    writeScannerFormDraft(form, { dirty: true });
     const existingSearchApi = resolveSearchApi(currentSettings);
     const classifyEnabled = !!existingSearchApi.scopes.classify;
+    const selectedEndpoint = String(
+      form.scanProviderEndpoint
+      || currentSettings?.defaultProviderEndpoint
+      || currentSettings?.apiEndpoint
+      || 'https://api.deepseek.com'
+    ).trim();
+    const selectedModel = String(form.scanModel || currentSettings?.model || 'deepseek-chat').trim();
+    const providerConfigs = currentSettings?.providerConfigs && typeof currentSettings.providerConfigs === 'object'
+      ? { ...currentSettings.providerConfigs }
+      : {};
+    const selectedConfig = providerConfigs[selectedEndpoint] && typeof providerConfigs[selectedEndpoint] === 'object'
+      ? { ...providerConfigs[selectedEndpoint] }
+      : {};
+    const selectedApiKey = String(
+      selectedConfig.apiKey
+      || scanProviderApiKeyMap[selectedEndpoint]
+      || (selectedEndpoint === currentSettings?.apiEndpoint ? currentSettings?.apiKey : '')
+      || ''
+    ).trim();
+    providerConfigs[selectedEndpoint] = {
+      ...selectedConfig,
+      endpoint: selectedEndpoint,
+      name: String(selectedConfig.name || getProviderLabel(selectedEndpoint)),
+      apiKey: selectedApiKey,
+      model: selectedModel,
+    };
+
     const searchApi = {
       provider: 'tavily',
       enabled: !!(form.scanWebSearchEnabled || classifyEnabled),
@@ -177,12 +468,19 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
       enableWebSearch: !!form.scanWebSearchEnabled,
       enableWebSearchClassify: classifyEnabled,
       enableWebSearchOrganizer: classifyEnabled,
+      providerConfigs,
+      defaultProviderEndpoint: selectedEndpoint,
+      apiEndpoint: selectedEndpoint,
+      apiKey: selectedApiKey,
+      model: selectedModel,
       searchApi,
     };
 
     const result = await saveSettings(payload);
     currentSettings = result?.settings || await getSettings();
     applySettingsToForm(currentSettings);
+    await initScanProviderFields(currentSettings);
+    writeScannerFormDraft(extractScannerFormFromSettings(currentSettings), { dirty: false });
 
     setSaveStatus(t('settings.saved'), '--accent-success');
     if (showSuccessToast) {
@@ -260,32 +558,50 @@ function bindSettingsEvents() {
 
   sizeSlider?.addEventListener('input', () => {
     if (sizeInput) sizeInput.value = clampNumber(sizeSlider.value, 0.1, 100, 1).toFixed(1);
+    persistScannerFormDraft();
   });
   sizeInput?.addEventListener('input', () => {
     const val = clampNumber(sizeInput.value, 0.1, 100, 1);
     if (sizeSlider) sizeSlider.value = String(val);
+    persistScannerFormDraft();
   });
   sizeInput?.addEventListener('blur', () => {
     const val = clampNumber(sizeInput.value, 0.1, 100, 1);
     sizeInput.value = val.toFixed(1);
     if (sizeSlider) sizeSlider.value = String(val);
+    persistScannerFormDraft();
   });
 
   depthSlider?.addEventListener('input', () => {
     if (depthInput) depthInput.value = String(Math.floor(clampNumber(depthSlider.value, 1, 10, 5)));
+    persistScannerFormDraft();
   });
   depthInput?.addEventListener('input', () => {
     const val = Math.floor(clampNumber(depthInput.value, 1, 10, 5));
     if (depthSlider) depthSlider.value = String(val);
+    persistScannerFormDraft();
   });
   depthInput?.addEventListener('blur', () => {
     const val = Math.floor(clampNumber(depthInput.value, 1, 10, 5));
     depthInput.value = String(val);
     if (depthSlider) depthSlider.value = String(val);
+    persistScannerFormDraft();
   });
 
   document.getElementById('scan-path')?.addEventListener('input', (event) => {
     updatePathDisplay(event.target?.value || '');
+    persistScannerFormDraft();
+  });
+
+  document.getElementById('scan-enable-web-search')?.addEventListener('change', () => {
+    persistScannerFormDraft();
+  });
+  document.getElementById('scan-provider')?.addEventListener('change', async () => {
+    await initScanModelSelectors();
+    persistScannerFormDraft();
+  });
+  document.getElementById('scan-model')?.addEventListener('change', () => {
+    persistScannerFormDraft();
   });
 
   document.getElementById('browse-folder-btn')?.addEventListener('click', async () => {
@@ -300,6 +616,7 @@ function bindSettingsEvents() {
         const input = document.getElementById('scan-path');
         if (input) input.value = result.path;
         updatePathDisplay(result.path);
+        persistScannerFormDraft();
         showToast(t('settings.toast_path_selected') + result.path, 'success');
       }
     } catch (err) {
@@ -480,6 +797,7 @@ async function handleManualAnalyze(folderPathArg = '') {
 
 export async function renderScanner(container) {
   const lastScan = storage.get('lastScan', null);
+  const draftState = readScannerFormDraft();
   latestTaskId = storage.get('lastScanTaskId', null) || lastScan?.id || null;
   candidateFolders = [];
 
@@ -545,6 +863,16 @@ export async function renderScanner(container) {
           </div>
         </div>
         <div class="form-hint">${t('settings.max_depth_hint')}</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">${t('settings.model')}</label>
+        <div class="provider-model-inline">
+          <select id="scan-provider" class="form-input"></select>
+          <select id="scan-model" class="form-input"></select>
+        </div>
+        <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
+        <div class="form-hint">${t('settings.api_key_managed_hint')}</div>
       </div>
 
       <div class="form-group" style="margin-bottom: 0;">
@@ -651,15 +979,26 @@ export async function renderScanner(container) {
   `;
 
   bindSettingsEvents();
+  if (draftState.data) {
+    applySettingsToForm(draftState.data);
+    await initScanProviderFields(draftState.data);
+  }
   await refreshPrivilegeStatus();
 
   try {
-    currentSettings = await getSettings();
+    const remoteSettings = await getSettings();
+    currentSettings = mergeSettingsWithDraft(remoteSettings, draftState);
     applySettingsToForm(currentSettings);
+    await initScanProviderFields(currentSettings);
+    if (!draftState.dirty) {
+      writeScannerFormDraft(extractScannerFormFromSettings(currentSettings), { dirty: false });
+    }
   } catch (err) {
     currentSettings = null;
     console.warn('Failed to load scanner settings:', err);
-    updatePathDisplay('');
+    if (!draftState.data) {
+      updatePathDisplay('');
+    }
   }
 
   if (lastScan) {
