@@ -9,3 +9,4 @@ release/
 .encoding-policy.json
 server/data/settings.json
 server/data/organize-jobs/
+server/data/scan-cache/

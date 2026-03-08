@@ -4,11 +4,21 @@
  */
 import { Router } from 'express';
 import { ScanTask } from '../scanner.js';
+import { loadScanTask } from '../scan-store.js';
 
 export const scanRouter = Router();
 
 // Active tasks registry
 const activeTasks = new Map();
+
+function scheduleCleanup(task) {
+    setTimeout(() => activeTasks.delete(task.id), 5 * 60 * 1000);
+}
+
+async function loadStoredSnapshot(taskId) {
+    const manifest = await loadScanTask(taskId);
+    return manifest?.snapshot || null;
+}
 
 /**
  * GET /api/scan/active
@@ -45,10 +55,13 @@ scanRouter.post('/start', (req, res) => {
 
     // Auto-cleanup when done
     task.on('done', () => {
-        setTimeout(() => activeTasks.delete(task.id), 5 * 60 * 1000);
+        scheduleCleanup(task);
     });
     task.on('error', () => {
-        setTimeout(() => activeTasks.delete(task.id), 5 * 60 * 1000);
+        scheduleCleanup(task);
+    });
+    task.on('stopped', () => {
+        scheduleCleanup(task);
     });
 
     // Start scanning (async)
@@ -61,11 +74,34 @@ scanRouter.post('/start', (req, res) => {
  * GET /api/scan/status/:taskId
  * SSE stream for real-time progress updates
  */
-scanRouter.get('/status/:taskId', (req, res) => {
+scanRouter.get('/status/:taskId', async (req, res) => {
     const task = activeTasks.get(req.params.taskId);
 
     if (!task) {
-        return res.status(404).json({ error: 'Task not found' });
+        const stored = await loadStoredSnapshot(req.params.taskId);
+        if (!stored) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+
+        const terminalSnapshot = ['done', 'stopped', 'error'].includes(stored.status)
+            ? stored
+            : { ...stored, status: 'stopped' };
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.write(`data: ${JSON.stringify(terminalSnapshot)}\n\n`);
+
+        if (terminalSnapshot.status === 'done') {
+            res.write(`event: done\ndata: ${JSON.stringify(terminalSnapshot)}\n\n`);
+        } else if (terminalSnapshot.status === 'error') {
+            res.write(`event: error\ndata: ${JSON.stringify({ message: 'Task failed', snapshot: terminalSnapshot })}\n\n`);
+        } else {
+            res.write(`event: stopped\ndata: ${JSON.stringify(terminalSnapshot)}\n\n`);
+        }
+
+        return res.end();
     }
 
     // SSE headers
@@ -141,10 +177,15 @@ scanRouter.post('/stop/:taskId', (req, res) => {
  * GET /api/scan/result/:taskId
  * Get final results of a completed scan
  */
-scanRouter.get('/result/:taskId', (req, res) => {
+scanRouter.get('/result/:taskId', async (req, res) => {
     const task = activeTasks.get(req.params.taskId);
-    if (!task) {
+    if (task) {
+        return res.json(task._snapshot());
+    }
+
+    const stored = await loadStoredSnapshot(req.params.taskId);
+    if (!stored) {
         return res.status(404).json({ error: 'Task not found' });
     }
-    res.json(task._snapshot());
+    res.json(stored);
 });
