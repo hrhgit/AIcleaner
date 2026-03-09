@@ -13,6 +13,7 @@ import {
 import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
+import { getProviderSecretPresence } from '../utils/secret-ui.js';
 
 const PROVIDER_MODELS = {
   'https://api.openai.com/v1': [
@@ -77,17 +78,17 @@ function renderModelOptions(models, selectedValue) {
 function syncProviderApiKeyMap(targetMap, settings = {}) {
   Object.keys(targetMap).forEach((key) => delete targetMap[key]);
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-      targetMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    for (const [endpoint] of Object.entries(settings.providerConfigs)) {
+      targetMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !targetMap[settings.apiEndpoint]) {
-    targetMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+    targetMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
   }
 }
 
 function hasConfiguredApiKey(targetMap, endpoint) {
-  return !!String(targetMap?.[String(endpoint || '').trim()] || '').trim();
+  return !!targetMap?.[String(endpoint || '').trim()];
 }
 
 export async function renderSettings(container) {
@@ -247,7 +248,6 @@ export async function renderSettings(container) {
 
   async function updateModelsDropdown(selectedValue) {
     const endpoint = String(endpointSelect?.value || '').trim();
-    const apiKey = String(providerApiKeyMap[endpoint] || '').trim();
     const modelSelect = document.getElementById('api-model');
     const requestToken = ++modelsRequestToken;
 
@@ -255,13 +255,13 @@ export async function renderSettings(container) {
     modelSelect.innerHTML = `<option value="">Loading models...</option>`;
 
     let models = [];
-    const cacheKey = `${endpoint}|${apiKey}`;
+    const cacheKey = endpoint;
     try {
       if (endpoint) {
         if (remoteModelsCache.has(cacheKey)) {
           models = remoteModelsCache.get(cacheKey);
         } else {
-          const resp = await getProviderModels(endpoint, apiKey);
+          const resp = await getProviderModels(endpoint);
           models = normalizeModels(resp?.models || []);
           remoteModelsCache.set(cacheKey, models);
         }
@@ -458,7 +458,7 @@ export async function renderSettings(container) {
     searchApiSettings = {
       provider: 'tavily',
       enabled: searchApiEnabled,
-      apiKey: String(s?.searchApi?.apiKey || s?.tavilyApiKey || '').trim(),
+      apiKey: '',
       scopes: {
         scan: !!scanWebSearchEnabled,
         organizer: !!organizerWebSearchEnabled,
@@ -495,7 +495,6 @@ function collectForm(providerApiKeyMap, searchApiSettings = {}) {
 
   const scanWebSearchEnabled = !!document.getElementById('enable-web-search').checked;
   const organizerWebSearchEnabled = !!document.getElementById('enable-organizer-web-search').checked;
-  const tavilyApiKey = String(searchApiSettings?.apiKey || '').trim();
   const searchApi = {
     provider: 'tavily',
     enabled: scanWebSearchEnabled || organizerWebSearchEnabled,
@@ -504,13 +503,9 @@ function collectForm(providerApiKeyMap, searchApiSettings = {}) {
       organizer: organizerWebSearchEnabled,
     },
   };
-  if (tavilyApiKey) {
-    searchApi.apiKey = tavilyApiKey;
-  }
 
   return {
     apiEndpoint: endpoint,
-    apiKey: String(providerApiKeyMap?.[endpoint] || '').trim(),
     model,
     scanPath: document.getElementById('scan-path').value.trim(),
     targetSizeGB: parseFloat(targetSizeVal),

@@ -1,5 +1,19 @@
-import { getProviderModels, getSettings, saveSettings } from '../utils/api.js';
+import {
+  getEditableSecrets,
+  getProviderModels,
+  getSettings,
+  saveSecrets,
+  saveSettings,
+} from '../utils/api.js';
 import { showToast } from '../main.js';
+import {
+  ensureSecretVaultReady,
+  getCachedSecretStatus,
+  lockSecretVaultInUi,
+  refreshSecretStatus,
+  registerSecretStatusChangeHandler,
+  resetSecretVaultInUi,
+} from '../utils/secret-ui.js';
 import { registerLangChangeHandler, t } from '../utils/i18n.js';
 
 const PROVIDER_PRESETS = [
@@ -47,6 +61,17 @@ const requestTokens = new Map();
 const state = {
   providers: [],
   defaultProviderEndpoint: '',
+  secretStatus: {
+    initialized: false,
+    unlocked: false,
+    needsMigration: false,
+    providerHasApiKey: {},
+    searchApiHasKey: false,
+  },
+  editableSecrets: {
+    providerSecrets: {},
+    searchApiKey: '',
+  },
   searchApi: {
     provider: 'tavily',
     enabled: false,
@@ -113,7 +138,7 @@ function normalizeProviders(settings) {
     merged.push({
       name: String(config?.name || preset.name),
       endpoint: preset.endpoint,
-      apiKey: String(config?.apiKey || (isActive ? settings?.apiKey || '' : '')),
+      apiKey: '',
       model: String(config?.model || (isActive ? settings?.model || '' : '') || defaultModelByEndpoint(preset.endpoint)),
     });
   }
@@ -124,7 +149,7 @@ function normalizeProviders(settings) {
     merged.push({
       name: String(rawConfig?.name || endpoint),
       endpoint,
-      apiKey: String(rawConfig?.apiKey || ''),
+      apiKey: '',
       model: String(rawConfig?.model || defaultModelByEndpoint(endpoint)),
     });
   }
@@ -133,7 +158,7 @@ function normalizeProviders(settings) {
     merged.push({
       name: 'OpenAI',
       endpoint: 'https://api.openai.com/v1',
-      apiKey: String(settings?.apiKey || ''),
+      apiKey: '',
       model: String(settings?.model || 'gpt-4o-mini'),
     });
   }
@@ -187,7 +212,7 @@ function normalizeSearchApi(settings) {
 
 function setSavingState(isSaving) {
   if (!saveBtn) return;
-  saveBtn.disabled = isSaving;
+  saveBtn.disabled = isSaving || !state.secretStatus?.unlocked;
   saveBtn.textContent = isSaving ? t('provider_modal.saving') : t('provider_modal.save');
 }
 
@@ -209,6 +234,51 @@ function renderModelOptions(selectEl, models, selected) {
 
 function renderProviderRows() {
   if (!listEl) return;
+  const secretStatus = state.secretStatus || {};
+  if (saveBtn) saveBtn.disabled = !secretStatus.unlocked;
+  if (!secretStatus.unlocked) {
+    const actionLabel = secretStatus.initialized
+      ? t('provider_modal.unlock')
+      : t('provider_modal.setup');
+    const migrationHint = secretStatus.needsMigration
+      ? `<div class="form-hint" style="color: var(--accent-warning); margin-top: 8px;">${escapeHtml(t('provider_modal.needs_migration'))}</div>`
+      : '';
+    listEl.innerHTML = `
+      <div class="provider-row provider-search-row">
+        <div class="provider-row-head">
+          <div>
+            <div class="provider-name">${escapeHtml(t('provider_modal.locked'))}</div>
+            <div class="provider-endpoint mono">Stronghold</div>
+          </div>
+        </div>
+        <div class="form-hint">${escapeHtml(t('provider_modal.locked_hint'))}</div>
+        ${migrationHint}
+        <div class="flex items-center gap-8" style="margin-top: 16px;">
+          <button id="provider-vault-open-btn" class="btn btn-primary" type="button">${escapeHtml(actionLabel)}</button>
+          <button id="provider-vault-reset-btn" class="btn btn-secondary" type="button">${escapeHtml(t('provider_modal.reset'))}</button>
+        </div>
+      </div>
+    `;
+    listEl.querySelector('#provider-vault-open-btn')?.addEventListener('click', async () => {
+      try {
+        await ensureSecretVaultReady();
+        await refreshModalData();
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
+      try {
+        await resetSecretVaultInUi();
+        await refreshModalData();
+        window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+    return;
+  }
+
   const providerRowsHtml = state.providers.map((provider) => {
     const endpointKey = encodeURIComponent(provider.endpoint);
     const models = fallbackModelsByEndpoint(provider.endpoint);
@@ -240,7 +310,7 @@ function renderProviderRows() {
               type="password"
               class="form-input provider-api-key"
               placeholder="${escapeHtml(t('provider_modal.api_key_placeholder'))}"
-              value="${escapeHtml(provider.apiKey)}"
+              value="${escapeHtml(state.editableSecrets?.providerSecrets?.[provider.endpoint] || '')}"
             />
           </div>
           <div class="form-group">
@@ -271,7 +341,7 @@ function renderProviderRows() {
             type="password"
             class="form-input"
             placeholder="tvly-xxxxxxxxxxxxxxx"
-            value="${escapeHtml(state.searchApi.apiKey || '')}"
+            value="${escapeHtml(state.editableSecrets?.searchApiKey || '')}"
           />
           <div class="form-hint">
             <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
@@ -283,7 +353,34 @@ function renderProviderRows() {
     </div>
   `;
 
-  listEl.innerHTML = `${providerRowsHtml}${searchApiRowHtml}`;
+  listEl.innerHTML = `
+    <div class="flex items-center justify-between" style="margin-bottom: 12px;">
+      <div class="form-hint">${escapeHtml(t('provider_modal.locked_hint'))}</div>
+      <div class="flex items-center gap-8">
+        <button id="provider-vault-lock-btn" class="btn btn-ghost" type="button">${escapeHtml(t('provider_modal.lock'))}</button>
+        <button id="provider-vault-reset-btn" class="btn btn-secondary" type="button">${escapeHtml(t('provider_modal.reset'))}</button>
+      </div>
+    </div>
+    ${providerRowsHtml}${searchApiRowHtml}
+  `;
+
+  listEl.querySelector('#provider-vault-lock-btn')?.addEventListener('click', async () => {
+    try {
+      await lockSecretVaultInUi();
+      await refreshModalData();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+  listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
+    try {
+      await resetSecretVaultInUi();
+      await refreshModalData();
+      window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
 
   for (const row of listEl.querySelectorAll('.provider-row')) {
     const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
@@ -294,7 +391,9 @@ function renderProviderRows() {
 
     apiKeyInput?.addEventListener('input', () => {
       const target = state.providers.find((p) => p.endpoint === endpoint);
-      if (target) target.apiKey = String(apiKeyInput.value || '').trim();
+      const nextValue = String(apiKeyInput.value || '').trim();
+      if (target) target.apiKey = nextValue;
+      state.editableSecrets.providerSecrets[endpoint] = nextValue;
     });
 
     apiKeyInput?.addEventListener('blur', () => {
@@ -317,7 +416,9 @@ function renderProviderRows() {
 
   const tavilyApiKeyInput = listEl.querySelector('#provider-tavily-api-key');
   tavilyApiKeyInput?.addEventListener('input', () => {
-    state.searchApi.apiKey = String(tavilyApiKeyInput.value || '').trim();
+    const nextValue = String(tavilyApiKeyInput.value || '').trim();
+    state.searchApi.apiKey = nextValue;
+    state.editableSecrets.searchApiKey = nextValue;
   });
 
   // Auto-fetch available models for each provider row independently.
@@ -391,6 +492,19 @@ async function refreshModalData() {
   state.providers = normalized.providers;
   state.defaultProviderEndpoint = normalized.defaultProviderEndpoint;
   state.searchApi = normalizeSearchApi(settings);
+  state.secretStatus = settings?.secretStatus || getCachedSecretStatus() || state.secretStatus;
+  state.editableSecrets = { providerSecrets: {}, searchApiKey: '' };
+  if (state.secretStatus?.unlocked) {
+    try {
+      const editable = await getEditableSecrets();
+      state.editableSecrets = {
+        providerSecrets: { ...(editable?.providerSecrets || {}) },
+        searchApiKey: String(editable?.searchApiKey || ''),
+      };
+    } catch {
+      state.secretStatus = { ...state.secretStatus, unlocked: false };
+    }
+  }
   renderProviderRows();
 }
 
@@ -402,12 +516,10 @@ function collectPayloadFromDOM() {
     const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
     if (!endpoint) continue;
     const fromState = state.providers.find((item) => item.endpoint === endpoint);
-    const apiKey = String(row.querySelector('.provider-api-key')?.value || '').trim();
     const model = String(row.querySelector('.provider-model')?.value || '').trim() || defaultModelByEndpoint(endpoint);
     providerConfigs[endpoint] = {
       name: String(fromState?.name || endpoint),
       endpoint,
-      apiKey,
       model,
     };
   }
@@ -418,11 +530,9 @@ function collectPayloadFromDOM() {
     || PROVIDER_PRESETS[0].endpoint;
   const activeConfig = providerConfigs[defaultProviderEndpoint] || {
     endpoint: defaultProviderEndpoint,
-    apiKey: '',
     model: defaultModelByEndpoint(defaultProviderEndpoint),
   };
 
-  const tavilyApiKey = String(listEl?.querySelector('#provider-tavily-api-key')?.value || state.searchApi.apiKey || '').trim();
   const searchApi = {
     provider: 'tavily',
     enabled: !!(
@@ -431,7 +541,6 @@ function collectPayloadFromDOM() {
       || state.searchApi?.scopes?.classify
       || state.searchApi?.scopes?.organizer
     ),
-    apiKey: tavilyApiKey,
     scopes: {
       scan: !!state.searchApi?.scopes?.scan,
       classify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
@@ -443,18 +552,38 @@ function collectPayloadFromDOM() {
     providerConfigs,
     defaultProviderEndpoint,
     apiEndpoint: defaultProviderEndpoint,
-    apiKey: String(activeConfig.apiKey || ''),
     model: String(activeConfig.model || defaultModelByEndpoint(defaultProviderEndpoint)),
     searchApi,
-    tavilyApiKey,
     enableWebSearch: searchApi.enabled && searchApi.scopes.scan,
     enableWebSearchClassify: searchApi.enabled && searchApi.scopes.classify,
     enableWebSearchOrganizer: searchApi.enabled && searchApi.scopes.organizer,
   };
 }
 
+function collectSecretsFromDOM() {
+  const providerSecrets = {};
+  const rows = listEl?.querySelectorAll('.provider-row') || [];
+  for (const row of rows) {
+    const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
+    if (!endpoint) continue;
+    providerSecrets[endpoint] = String(row.querySelector('.provider-api-key')?.value || '').trim();
+  }
+  return {
+    providerSecrets,
+    searchApiKey: String(listEl?.querySelector('#provider-tavily-api-key')?.value || state.editableSecrets.searchApiKey || '').trim(),
+  };
+}
+
 async function handleOpenModal() {
   try {
+    const settings = await getSettings();
+    if (!settings?.secretStatus?.unlocked) {
+      try {
+        await ensureSecretVaultReady();
+      } catch {
+        // Fall back to locked view so user can choose to unlock later.
+      }
+    }
     await refreshModalData();
     openModal();
   } catch (err) {
@@ -466,10 +595,15 @@ async function handleSave() {
   try {
     setSavingState(true);
     const payload = collectPayloadFromDOM();
-    const saved = await saveSettings(payload);
+    await saveSettings(payload);
+    if (state.secretStatus?.unlocked) {
+      const secretResult = await saveSecrets(collectSecretsFromDOM());
+      state.secretStatus = secretResult?.secretStatus || state.secretStatus;
+    }
     state.defaultProviderEndpoint = payload.defaultProviderEndpoint;
+    const latestSettings = await getSettings();
     showToast(t('provider_modal.saved'), 'success');
-    window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: saved?.settings || payload }));
+    window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: latestSettings }));
     closeModal();
   } catch (err) {
     showToast(`${t('provider_modal.failed')}${err.message}`, 'error');
@@ -514,4 +648,14 @@ export function initProviderManager() {
   saveBtn = document.getElementById('provider-modal-save');
 
   bindStaticEvents();
+  registerSecretStatusChangeHandler(async (event) => {
+    state.secretStatus = event?.detail || state.secretStatus;
+    if (modalEl?.classList.contains('open')) {
+      try {
+        await refreshModalData();
+      } catch (err) {
+        console.warn('Failed to refresh provider modal after secret status change:', err);
+      }
+    }
+  });
 }

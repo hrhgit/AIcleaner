@@ -1,27 +1,23 @@
 {
     "name": "aicleaner",
     "version": "1.0.0",
-    "description": "AI-driven space cleaning agent with Rust scanner sidecar",
+    "description": "AI-driven space cleaning desktop app powered by Tauri v2 and Rust",
     "type": "module",
     "scripts": {
         "dev": "vite",
-        "server": "node server/index.js",
-        "start": "concurrently \"npm run server\" \"npm run dev\"",
-        "build": "vite build"
+        "build": "vite build",
+        "tauri": "tauri",
+        "tauri:dev": "tauri dev",
+        "tauri:build": "tauri build",
+        "start": "npm run tauri:dev"
     },
     "dependencies": {
-        "better-sqlite3": "^12.6.2",
-        "concurrently": "^9.1.0",
-        "cors": "^2.8.5",
-        "dotenv": "^17.3.1",
-        "express": "^4.21.0",
-        "fs-extra": "^11.3.3",
-        "node-fetch": "^3.3.2",
-        "officeparser": "^6.0.4",
-        "openai": "^4.77.0",
-        "p-limit": "^7.3.0"
+        "@tauri-apps/api": "^2.8.0",
+        "@tauri-apps/plugin-dialog": "^2.6.0",
+        "@tauri-apps/plugin-stronghold": "^2.3.1"
     },
     "devDependencies": {
+        "@tauri-apps/cli": "^2.10.1",
         "vite": "^6.0.0"
     }
 }

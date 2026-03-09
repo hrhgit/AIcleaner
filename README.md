@@ -1,102 +1,118 @@
-﻿# AIcleaner ✨
+# AIcleaner ✨
 
 [English Version Below](#english-version)
 
-**AIcleaner** 是一款由人工智能驱动的智能磁盘空间清理工具。它将基于 Rust 的高性能扫描 sidecar 与大语言模型 (LLM) 的分析能力相结合，帮助您深入了解文件系统，精准定位占用空间庞大的文件，并在清理前提供详尽的风险评估，让您彻底告别误删系统文件的担忧。
+**AIcleaner** 是一个 Tauri 桌面应用，结合 Rust 扫描 sidecar 与大模型分析能力，帮助用户定位可清理文件、评估清理风险，并执行更安全的磁盘整理。
 
-## 🚀 核心功能
+## 核心特性
 
-- **极速扫描引擎**：底层使用 Rust 扫描 sidecar 直接索引文件与目录并写入 SQLite，适合深层目录树、历史任务查询和后续 AI 分析。
-- **AI 安全护航**：在执行清理操作前，AI 将对文件及其所在目录进行智能分类和功能解析，直观展示清理风险，让清理决定有据可依。
-- **现代化 UI 设计**：采用 HTML/CSS/JS 与 Vite 打造响应式玻璃拟态界面（Glassmorphism），提供丝滑的交互体验。
-- **一键打包部署**：内置完善的构建脚本，支持生成绿色免安装版以及专业的 Windows 安装向导 (`.exe`)。
+- Rust 扫描 sidecar 负责高速索引文件与目录，适合大目录树和历史结果查询。
+- Tauri v2 后端通过 commands 和事件流驱动扫描、整理、清理等桌面能力。
+- 前端使用 Vite + 原生 HTML/CSS/JS，运行于 Tauri WebView。
+- 支持 OpenAI、Gemini、GLM 等模型提供商配置与 AI 辅助分析。
 
-## 🛠️ 技术栈
+## 技术栈
 
-- **前端**：全原生 HTML/CSS/JS 结合 Vite 构建工具
-- **服务端**：Node.js, Express
-- **AI 赋能**：支持 OpenAI / Gemini 等平台 API 接入
-- **打包工具**：Inno Setup（制作 `.iss` 安装包），Windows 批处理脚本
+- 前端：Vite + Vanilla JS
+- 桌面端：Tauri v2 + Rust
+- 本地扫描：Rust sidecar (`native/scanner` -> `bin/scanner.exe`)
+- 打包：Tauri Bundle（Windows NSIS）
 
-## 📦 快速开始
+## 快速开始
 
-### 环境依赖
+### 环境要求
 
-- [Node.js](https://nodejs.org/) (推荐 v16 及以上版本)
-- AI 提供商的 API Key (如 OpenAI, Gemini 等)
+- [Node.js](https://nodejs.org/) 16+
+- Rust / Cargo 工具链
+- Windows 开发环境
 
-### 安装步骤
-
-1. 克隆代码库：
-
-   ```bash
-   git clone https://github.com/hrhgit/AIcleaner.git
-   cd AIcleaner
-   ```
-
-2. 安装依赖并自动下载底层清理组件：
-
-   ```bash
-   npm install
-   ```
-
-   *（注：Windows 发布产物需包含预编译的 `bin/scanner.exe`，开发环境不再依赖额外的扫描器下载步骤。）*
-
-3. 环境变量配置：
-   您可以在根目录下创建 `.env` 文件存放环境变量，或者直接通过 UI 界面的“设置”选项填入您的 API Key。
-
-### 启动开发环境
-
-通过以下命令同时启动前端 Vite 服务和后端 Node.js 服务：
+### 安装依赖
 
 ```bash
-npm start
+npm install
 ```
 
-- 前端访问地址: `http://localhost:5173` (或 Vite 提示的其它端口)
-- 服务端地址: `http://localhost:3001`
+如果仓库中不存在 `bin/scanner.exe`，可运行启动脚本自动构建，或手动执行：
 
-### 🏗️ 构建生产环境 (Windows)
-
-如果您需要生成绿色发布文件以及 Windows 安装包 (`AIcleaner_Setup.exe`)，只需双击或在终端执行：
-
-```cmd
-build.bat
+```bash
+cd native/scanner
+cargo build --release
 ```
 
-*提示：生成安装向导需确保系统中已安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。如果只需要绿色版文件，直接拷贝脚本生成的 `release` 目录即可。*
+然后将生成的 `scanner.exe` 复制到 `bin/`。
 
-## 📖 使用指南
+### 开发启动
 
-### 1. 配置基础参数与 AI 辅助
-首先打开左侧导航栏的 **⚙️ 设置** 界面。在这里，您需要配置扫描的基础参数和 AI 选项：
-- **扫描配置**：设定要扫描的目标文件夹路径，并可通过滑块或输入框精确设定“期望清理空间”和“最大扫描深度”。
-- **AI 联网搜索**：建议填入 Tavily API Key 并启用自动联网搜索。这能大幅提升 AI 对罕见或未知文件的判定准确率。
+推荐直接使用：
+
+```bash
+./start-tauri.ps1
+```
+
+或：
+
+```bash
+npm run tauri:dev
+```
+
+说明：
+
+- 当前仓库已收敛为 **Tauri-only**，不再提供 Node/Express 本地 HTTP 服务。
+- 前端仅支持在 Tauri 容器内运行，直接用浏览器打开 Vite 页面不属于受支持模式。
+
+### 生产构建
+
+```bash
+npm run tauri:build
+```
+
+Windows 安装包输出目录：
+
+`src-tauri/target/release/bundle/nsis/`
+
+## 使用说明
+
+### 1. 设置
+
+在 **设置** 页面配置：
+
+- 扫描目录
+- 目标清理空间
+- 最大扫描深度
+- AI 提供商与模型
+- 联网搜索相关配置
+
+应用数据会保存在 Tauri 的应用数据目录中，不再使用仓库内的 `server/data/`。
+
 <div align="center">
   <img src="./assets/setting.png" alt="设置界面" width="80%">
 </div>
 
-### 2. 执行全局扫描
-配置完毕后，切换到 **📈 扫描** 界面，系统将显示包含“分析中”状态的仪表盘。实时滚动的 **活动日志** 会展示当前由 Rust 扫描器索引和 AI 处理的具体文件路径与耗时。在这个过程中，您可以直观地看到每个被扫描项的 AI 判定理由。
+### 2. 扫描
+
+在 **扫描** 页面启动任务后，界面会通过 Tauri 事件流展示扫描进度、发现项和 AI 分析状态。
+
 <div align="center">
   <img src="./assets/scan.png" alt="扫描界面" width="80%">
 </div>
 
-### 3. 查看分析结果与执行清理
-扫描完成后，点击进入 **📄 结果** 界面。顶部的统计面板会总结安全可清理的空间大小。
-* **风险过滤**：利用分类按钮（全部、推荐清理 Safe、谨慎清理 Warning、不建议清理 Danger）快速筛选文件。
-* **双重确认**：详细列表中展示了每个项目的大小和详细的 AI 判定理由。在勾选复选框决定是否批量清理前，您还可以点击右侧的 📁 图标直接**打开文件所在文件夹**进行最终的人工确认。确认无误后，点击“清理中...”按钮即可释放空间。对于目录类候选项，应用会清空其内容以释放空间，并保留目录本身。
+### 3. 结果与清理
+
+在 **结果** 页面查看候选项、风险等级和 AI 解释，确认后执行批量清理；对于目录类候选项，应用会清空其内容并保留目录本身。
+
 <div align="center">
   <img src="./assets/clean.png" alt="结果界面" width="80%">
 </div>
 
-## 🤝 参与贡献
+## 开发说明
 
-欢迎提交 Issue 或 Pull Request，任何有助于项目完善的建议都会被认真采纳。详情请查看 [Issues 页面](https://github.com/yourusername/aicleaner/issues)。
+- 前端与桌面后端接口统一通过 Tauri `invoke` / event stream 通信。
+- 仓库不再保留 `/api/*` HTTP 回退接口。
+- 旧 Node 服务器、旧便携版启动脚本和旧 Inno Setup 打包链路已移除。
 
-## 📝 开源协议
+## License
 
-本项目基于 MIT 协议开源。
+MIT
 
 ---
 
@@ -104,99 +120,114 @@ build.bat
 
 <a id="english-version"></a>
 
-**AIcleaner** is an intelligent, AI-driven disk space cleaning tool. It combines a high-performance Rust scanner sidecar with the analytical power of Large Language Models (LLMs) to help you understand your file system, identify space hogs, and safely clean unnecessary files without the fear of breaking your system.
+**AIcleaner** is a Tauri desktop application that combines a Rust scanner sidecar with LLM-based analysis to identify cleanup candidates, explain risk, and help users clean disk space more safely.
 
-## 🚀 Features
+## Highlights
 
-- **Blazing Fast Scanning**: Uses a Rust scanner sidecar that indexes files and directories directly into SQLite for fast history queries and AI follow-up analysis.
-- **AI-Powered Safety Analysis**: Before you clean anything, AI analyzes the directories and files, categorizing them and explaining their purpose, minimizing the risk of accidentally removing critical system or application files.
-- **Modern Glassmorphism UI**: A beautiful, responsive, and dynamic user interface built with HTML/CSS/JS and Vite.
-- **Standalone Windows Installer**: Effortlessly package the application into a standalone Windows installer (`.exe`) or a portable version using the provided build scripts.
+- A Rust scanner sidecar indexes files and directories efficiently for large trees and history queries.
+- Tauri v2 handles desktop capabilities through Rust commands and event streams.
+- The frontend is built with Vite and vanilla HTML/CSS/JS and runs inside Tauri WebView.
+- AI-assisted analysis supports providers such as OpenAI, Gemini, and GLM.
 
-## 🛠️ Technology Stack
+## Stack
 
-- **Frontend**: Vanilla JS, HTML, CSS (Vite)
-- **Backend**: Node.js, Express
-- **AI Integration**: OpenAI / Gemini APIs
-- **Packaging**: Inno Setup (`.iss`), Windows Batch Scripts
+- Frontend: Vite + Vanilla JS
+- Desktop runtime: Tauri v2 + Rust
+- Native scanner: Rust sidecar (`native/scanner` -> `bin/scanner.exe`)
+- Packaging: Tauri Bundle (Windows NSIS)
 
-## 📦 Getting Started
+## Getting Started
 
-### Prerequisites
+### Requirements
 
-- [Node.js](https://nodejs.org/) (v16 or higher recommended)
-- API Key (OpenAI, Gemini, or other supported AI providers)
+- [Node.js](https://nodejs.org/) 16+
+- Rust / Cargo toolchain
+- Windows development environment
 
-### Installation
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/yourusername/aicleaner.git
-   cd aicleaner
-   ```
-
-2. Install dependencies:
-
-   ```bash
-   npm install
-   ```
-
-   *(Note: Windows release artifacts should include the prebuilt `bin/scanner.exe`; the app no longer relies on any scanner download step.)*
-
-3. Set up your environment variables:
-   Create a `.env` file in the root directory (or use the built-in UI settings) to configure your AI API keys.
-
-### Running in Development
-
-Start both the Vite frontend and the Node.js backend concurrently:
+### Install Dependencies
 
 ```bash
-npm start
+npm install
 ```
 
-- Frontend: `http://localhost:5173` (or depending on your Vite config)
-- Backend Server: `http://localhost:3001`
+If `bin/scanner.exe` is missing, build it automatically through the launcher script or manually:
 
-### 🏗️ Building for Production (Windows)
-
-To create a portable release and a standalone Windows setup executable (`AIcleaner_Setup.exe`), simply run the build script:
-
-```cmd
-build.bat
+```bash
+cd native/scanner
+cargo build --release
 ```
 
-*Note: Building the installer requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed on your system. If you just want the portable version, you can grab the `release` folder generated by the script.*
+Then copy the produced `scanner.exe` into `bin/`.
 
-## 📖 Usage Guide
+### Run in Development
 
-### 1. Configure Parameters and AI Assistance
-First, open the **⚙️ Settings** interface from the left sidebar. Here, configure your scanning parameters and AI options:
-- **Scan Configuration**: Set the target folder path to scan. You can also precisely adjust the "Target Clean Size" and "Max Scan Depth" using the sliders or input fields.
-- **AI Web Search**: We recommend entering a Tavily API Key and enabling automatic web search. This significantly improves the AI's accuracy when evaluating rare or unknown files.
+Recommended:
+
+```bash
+./start-tauri.ps1
+```
+
+Or:
+
+```bash
+npm run tauri:dev
+```
+
+Notes:
+
+- The repository is now **Tauri-only** and no longer ships a Node/Express local HTTP backend.
+- The frontend is only supported inside the Tauri runtime; opening the Vite page directly in a browser is not a supported mode.
+
+### Production Build
+
+```bash
+npm run tauri:build
+```
+
+Windows installer output:
+
+`src-tauri/target/release/bundle/nsis/`
+
+## Usage
+
+### 1. Settings
+
+Configure the following in the **Settings** page:
+
+- scan target folder
+- desired cleanup size
+- max scan depth
+- AI provider and model
+- optional web search settings
+
+Application data is stored in the Tauri app data directory rather than `server/data/` inside the repository.
+
 <div align="center">
   <img src="./assets/setting.png" alt="Settings Interface" width="80%">
 </div>
 
-### 2. Execute Global Scan
-After configuration, switch to the **📈 Scan** interface. You will see a dashboard displaying the "Analyzing" status. The real-time **Activity Log** shows the specific file paths and processing times as the Rust scanner indexes them and the AI evaluates them. You can monitor the AI's reasoning for each item in real-time.
+### 2. Scan
+
+Start a task from the **Scan** page. Progress, discoveries, and AI analysis updates are delivered through Tauri event streams.
+
 <div align="center">
   <img src="./assets/scan.png" alt="Scanning Interface" width="80%">
 </div>
 
-### 3. Review Analysis Results and Clean Up
-Once the scan concludes, navigate to the **📄 Results** interface. The top statistics panel summarizes the total space that is safe to clean.
-- **Risk Filtering**: Use the category buttons (All, Safe, Warning, Danger) to quickly filter the identified files.
-- **Double Verification**: The detailed list shows the size and the complete AI justification for each item. Before checking the boxes for bulk cleanup, click the 📁 icon on the right to directly **open the containing folder** for a final manual check. Once confirmed, click the clean button to free up space. For directory candidates, the app clears the directory contents to reclaim space while preserving the directory itself.
+### 3. Results and Cleanup
+
+Review candidates, risk levels, and AI explanations on the **Results** page, then run cleanup after confirmation. For directory candidates, the app clears contents while preserving the directory itself.
+
 <div align="center">
   <img src="./assets/clean.png" alt="Results Interface" width="80%">
 </div>
 
-## 🤝 Contributing
+## Development Notes
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/yourusername/aicleaner/issues).
+- Frontend-to-backend communication is unified on Tauri `invoke` and event streams.
+- `/api/*` HTTP fallback endpoints are no longer part of the project.
+- The legacy Node server, portable launcher flow, and old Inno Setup packaging path have been removed.
 
-## 📝 License
+## License
 
-This project is licensed under the MIT License.
-
+MIT

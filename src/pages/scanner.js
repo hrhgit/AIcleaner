@@ -22,6 +22,7 @@ import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
+import { ensureSecretVaultReady, getProviderSecretPresence } from '../utils/secret-ui.js';
 
 let activeTaskId = null;
 let latestTaskId = null;
@@ -493,18 +494,18 @@ function getProviderLabel(endpoint) {
 }
 
 function getApiKeyForScanEndpoint(endpoint) {
-  return String(scanProviderApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+  return !!scanProviderApiKeyMap?.[String(endpoint || '').trim()];
 }
 
 function syncScanProviderApiKeyMap(settings = {}) {
   scanProviderApiKeyMap = {};
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-      scanProviderApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    for (const [endpoint] of Object.entries(settings.providerConfigs)) {
+      scanProviderApiKeyMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
-    scanProviderApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+    scanProviderApiKeyMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -547,15 +548,14 @@ async function initScanModelSelectors(defaultSelection = {}) {
   modelSelect.disabled = true;
   modelSelect.innerHTML = `<option value="">${t('organizer.model_loading')}</option>`;
 
-  const apiKey = getApiKeyForScanEndpoint(endpoint);
-  const cacheKey = `${endpoint}|${apiKey}`;
+  const cacheKey = endpoint;
   let models = [];
   try {
     if (endpoint) {
       if (scanRemoteModelsCache.has(cacheKey)) {
         models = scanRemoteModelsCache.get(cacheKey);
       } else {
-        const resp = await getProviderModels(endpoint, apiKey);
+        const resp = await getProviderModels(endpoint);
         models = normalizeRemoteModels(resp?.models || []);
         scanRemoteModelsCache.set(cacheKey, models);
       }
@@ -614,9 +614,6 @@ function mergeSettingsWithDraft(settings = {}, draftState = { dirty: false, data
       organizer: classifyEnabled,
     },
   };
-  if (remoteSearch.apiKey) {
-    mergedSearchApi.apiKey = remoteSearch.apiKey;
-  }
 
   return {
     ...settings,
@@ -714,17 +711,10 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
     const selectedConfig = providerConfigs[selectedEndpoint] && typeof providerConfigs[selectedEndpoint] === 'object'
       ? { ...providerConfigs[selectedEndpoint] }
       : {};
-    const selectedApiKey = String(
-      selectedConfig.apiKey
-      || scanProviderApiKeyMap[selectedEndpoint]
-      || (selectedEndpoint === currentSettings?.apiEndpoint ? currentSettings?.apiKey : '')
-      || ''
-    ).trim();
     providerConfigs[selectedEndpoint] = {
       ...selectedConfig,
       endpoint: selectedEndpoint,
       name: String(selectedConfig.name || getProviderLabel(selectedEndpoint)),
-      apiKey: selectedApiKey,
       model: selectedModel,
     };
 
@@ -737,9 +727,6 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
         organizer: classifyEnabled,
       },
     };
-    if (existingSearchApi.apiKey) {
-      searchApi.apiKey = existingSearchApi.apiKey;
-    }
 
     const payload = {
       scanPath: form.scanPath,
@@ -751,7 +738,6 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
       providerConfigs,
       defaultProviderEndpoint: selectedEndpoint,
       apiEndpoint: selectedEndpoint,
-      apiKey: selectedApiKey,
       model: selectedModel,
       searchApi,
     };
@@ -1040,7 +1026,6 @@ function applySnapshotToUI(data) {
   updateStats(data);
   setScanStatus(data.status);
   storage.set('lastScan', data);
-  storage.set('scanResults', data.deletable || []);
 
   const pathEl = document.getElementById('breadcrumb-path');
   const depthEl = document.getElementById('breadcrumb-depth');
@@ -1094,7 +1079,6 @@ async function deleteHistoryTask(taskId) {
       latestTaskId = null;
       storage.remove('lastScanTaskId');
       storage.remove('lastScan');
-      storage.remove('scanResults');
       setScanStatus('idle');
       updateStats({ scannedCount: 0, totalCleanable: 0, tokenUsage: { total: 0 } });
       const fill = document.getElementById('progress-fill');
@@ -1118,9 +1102,9 @@ async function deleteHistoryTask(taskId) {
 }
 
 export async function renderScanner(container) {
-  const lastScan = storage.get('lastScan', null);
+  const cachedLastScan = storage.get('lastScan', null);
   const draftState = readScannerFormDraft();
-  latestTaskId = storage.get('lastScanTaskId', null) || lastScan?.id || null;
+  latestTaskId = storage.get('lastScanTaskId', null) || cachedLastScan?.id || null;
 
   container.innerHTML = `
     <style>
@@ -1338,11 +1322,6 @@ export async function renderScanner(container) {
   };
   window.addEventListener('provider-settings-updated', scannerProviderSettingsUpdatedHandler);
 
-  if (lastScan) {
-    updateStats(lastScan);
-    setScanStatus(lastScan.status);
-  }
-
   document.getElementById('start-btn')?.addEventListener('click', handleStart);
   document.getElementById('stop-btn')?.addEventListener('click', handleStop);
   document.getElementById('toggle-log-btn')?.addEventListener('click', () => {
@@ -1373,14 +1352,33 @@ export async function renderScanner(container) {
       activeTaskId = task.taskId;
       latestTaskId = task.taskId;
       storage.set('lastScanTaskId', latestTaskId);
-      updateStats(task);
-      setScanStatus(task.status);
-      storage.set('lastScan', task);
+      applySnapshotToUI(task);
       await refreshHistoryList(latestTaskId);
       restoreActiveState();
+      return;
     }
   } catch {
     // ignore
+  }
+
+  if (!latestTaskId) return;
+
+  try {
+    const snapshot = await getScanResult(latestTaskId);
+    storage.set('lastScanTaskId', snapshot.id);
+    applySnapshotToUI(snapshot);
+    await refreshHistoryList(snapshot.id);
+    if (['idle', 'scanning', 'analyzing'].includes(snapshot.status)) {
+      activeTaskId = snapshot.id;
+      restoreActiveState();
+      return;
+    }
+    resetButtons();
+    markHistoryTaskLoaded(snapshot.id);
+  } catch (err) {
+    console.warn('Failed to restore latest scan snapshot:', err);
+    storage.remove('lastScanTaskId');
+    storage.remove('lastScan');
   }
 }
 
@@ -1458,8 +1456,18 @@ async function handleStart() {
     }
     const selectedEndpoint = String(form.scanProviderEndpoint || currentSettings?.apiEndpoint || '').trim();
     if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
-      showToast(t('scanner.api_key_required'), 'error');
-      return;
+      try {
+        await ensureSecretVaultReady(t('scanner.api_key_required'));
+        currentSettings = await getSettings();
+        syncScanProviderApiKeyMap(currentSettings);
+      } catch (err) {
+        showToast(err.message, 'error');
+        return;
+      }
+      if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
+        showToast(t('scanner.api_key_required'), 'error');
+        return;
+      }
     }
 
     if (startBtn) {
@@ -1569,7 +1577,6 @@ function handleDone(data) {
   updateStats(data);
   setScanStatus('done');
   storage.set('lastScan', data);
-  storage.set('scanResults', data.deletable);
   resetButtons();
   refreshHistoryList(latestTaskId);
 
@@ -1605,7 +1612,6 @@ function handleStopped(data) {
   updateStats(data);
   setScanStatus('stopped');
   storage.set('lastScan', data);
-  storage.set('scanResults', data.deletable);
   resetButtons();
   refreshHistoryList(latestTaskId);
   addLog('scanning', t('scanner.stopped'));

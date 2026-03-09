@@ -14,6 +14,11 @@
 } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
+import {
+  ensureSecretVaultReady,
+  getProviderSecretPresence,
+  getSearchSecretPresence,
+} from '../utils/secret-ui.js';
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.organizer.global.root_path.v1',
@@ -27,6 +32,7 @@ const PERSIST_KEYS = {
   modelRouting: 'wipeout.organizer.global.model_routing.v1',
   modelSelection: 'wipeout.organizer.global.model_selection.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
+  lastTaskId: 'wipeout.organizer.global.last_task_id.v1',
 };
 
 const DEFAULT_CATEGORIES = [
@@ -163,18 +169,18 @@ function ensureProviderOptionExists(select, endpoint) {
 }
 
 function getApiKeyForEndpoint(endpoint) {
-  return String(providerApiKeyMap?.[String(endpoint || '').trim()] || '').trim();
+  return !!providerApiKeyMap?.[String(endpoint || '').trim()];
 }
 
 function syncProviderApiKeys(settings = {}) {
   providerApiKeyMap = {};
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
-    for (const [endpoint, config] of Object.entries(settings.providerConfigs)) {
-      providerApiKeyMap[String(endpoint).trim()] = String(config?.apiKey || '').trim();
+    for (const [endpoint] of Object.entries(settings.providerConfigs)) {
+      providerApiKeyMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
-    providerApiKeyMap[settings.apiEndpoint] = String(settings?.apiKey || '').trim();
+    providerApiKeyMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -199,22 +205,18 @@ function readModelRoutingFromDOM() {
   return {
     text: {
       endpoint: textEndpoint,
-      apiKey: getApiKeyForEndpoint(textEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.text)?.value?.trim() || '',
     },
     image: {
       endpoint: imageEndpoint,
-      apiKey: getApiKeyForEndpoint(imageEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.image)?.value?.trim() || '',
     },
     video: {
       endpoint: videoEndpoint,
-      apiKey: getApiKeyForEndpoint(videoEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.video)?.value?.trim() || '',
     },
     audio: {
       endpoint: audioEndpoint,
-      apiKey: getApiKeyForEndpoint(audioEndpoint),
       model: document.getElementById(MODEL_SELECT_IDS.audio)?.value?.trim() || '',
     },
   };
@@ -261,10 +263,10 @@ function restoreDefaults() {
   const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
 
   const fallbackRouting = {
-    text: { endpoint: '', apiKey: '', model: legacyModelSelection?.text || '' },
-    image: { endpoint: '', apiKey: '', model: legacyModelSelection?.image || '' },
-    video: { endpoint: '', apiKey: '', model: legacyModelSelection?.video || '' },
-    audio: { endpoint: '', apiKey: '', model: legacyModelSelection?.audio || '' },
+    text: { endpoint: '', model: legacyModelSelection?.text || '' },
+    image: { endpoint: '', model: legacyModelSelection?.image || '' },
+    video: { endpoint: '', model: legacyModelSelection?.video || '' },
+    audio: { endpoint: '', model: legacyModelSelection?.audio || '' },
   };
 
   return {
@@ -326,7 +328,6 @@ async function syncClassifyWebSearchToSettings(isEnabled) {
   const nextSearchApi = {
     provider: 'tavily',
     enabled: !!(currentSearchApi.scopes.scan || isEnabled),
-    apiKey: currentSearchApi.apiKey,
     scopes: {
       scan: !!currentSearchApi.scopes.scan,
       classify: !!isEnabled,
@@ -339,7 +340,6 @@ async function syncClassifyWebSearchToSettings(isEnabled) {
     enableWebSearch: nextSearchApi.enabled && nextSearchApi.scopes.scan,
     enableWebSearchClassify: nextSearchApi.enabled && nextSearchApi.scopes.classify,
     enableWebSearchOrganizer: nextSearchApi.enabled && nextSearchApi.scopes.organizer,
-    tavilyApiKey: nextSearchApi.apiKey,
   });
 }
 
@@ -471,21 +471,20 @@ async function initModelSelectors(defaultSelection = {}) {
   if (!providerSelect || !modelSelect) return;
 
   const endpoint = String(providerSelect.value || '').trim();
-  const apiKey = getApiKeyForEndpoint(endpoint);
   const selectedModel = String(defaultSelection?.model || modelSelect.value || '').trim();
   const requestToken = ++modelsRequestToken[modality];
 
   modelSelect.disabled = true;
   modelSelect.innerHTML = `<option value="">${t('organizer.model_loading')}</option>`;
 
-  const cacheKey = `${endpoint}|${apiKey}`;
+  const cacheKey = endpoint;
   let models = [];
   try {
     if (endpoint) {
       if (remoteModelsCache.has(cacheKey)) {
         models = remoteModelsCache.get(cacheKey);
       } else {
-        const resp = await getProviderModels(endpoint, apiKey);
+        const resp = await getProviderModels(endpoint);
         models = normalizeRemoteModels(resp?.models || []);
         remoteModelsCache.set(cacheKey, models);
       }
@@ -745,6 +744,13 @@ function syncAllowNewCategoriesInput(snapshot) {
 
 function refreshView(snapshot) {
   latestSnapshot = snapshot || null;
+  if (snapshot?.id) {
+    activeTaskId = snapshot.id;
+    setPersisted(PERSIST_KEYS.lastTaskId, snapshot.id);
+  }
+  if (snapshot?.jobId) {
+    setPersisted(PERSIST_KEYS.lastJobId, snapshot.jobId);
+  }
   syncAllowNewCategoriesInput(snapshot);
   syncCategoryInput(snapshot);
   setStatusText(snapshot);
@@ -860,6 +866,30 @@ async function handleStart() {
 
   persistForm(form);
 
+  const selectedEndpoints = Object.values(form.modelRouting || {})
+    .map((item) => String(item?.endpoint || '').trim())
+    .filter(Boolean);
+  const missingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
+  let settingsSnapshot = await getSettings().catch(() => null);
+  const needsSearchSecret = !!form.useWebSearch && !getSearchSecretPresence(settingsSnapshot || {});
+  if (missingProviderSecret || needsSearchSecret) {
+    try {
+      await ensureSecretVaultReady(t('settings.api_key_managed_hint'));
+      settingsSnapshot = await getSettings();
+      syncProviderApiKeys(settingsSnapshot);
+      refreshOrganizerApiConfigHint();
+    } catch (err) {
+      showToast(err.message, 'error');
+      return;
+    }
+    const stillMissingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
+    const stillMissingSearchSecret = !!form.useWebSearch && !getSearchSecretPresence(settingsSnapshot || {});
+    if (stillMissingProviderSecret || stillMissingSearchSecret) {
+      showToast(t('settings.api_key_managed_hint'), 'error');
+      return;
+    }
+  }
+
   const btn = document.getElementById('org-start-btn');
   if (btn) {
     btn.disabled = true;
@@ -876,7 +906,7 @@ async function handleStart() {
       supportsMultimodal: result.supportsMultimodal,
     };
     renderCapability();
-    setPersisted('wipeout.organizer.global.last_task_id.v1', activeTaskId);
+    setPersisted(PERSIST_KEYS.lastTaskId, activeTaskId);
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
   } catch (err) {
@@ -980,6 +1010,15 @@ async function handleRollback() {
   try {
     const result = await rollbackOrganize(jobId);
     const summary = result?.rollback?.summary;
+    const persistedTaskId = activeTaskId || getPersisted(PERSIST_KEYS.lastTaskId, null);
+    if (persistedTaskId) {
+      try {
+        const snapshot = await getOrganizeResult(persistedTaskId);
+        refreshView(snapshot);
+      } catch (refreshErr) {
+        console.warn('[Organizer] Failed to refresh snapshot after rollback:', refreshErr);
+      }
+    }
     if (summary) {
       showToast(
         `${t('organizer.toast_rollback_done')} (${summary.rolledBack}/${summary.total})`,
@@ -1342,7 +1381,7 @@ export async function renderOrganizer(container) {
   renderCapability();
 
   // Try to reconnect to a running task.
-  const lastTaskId = getPersisted('wipeout.organizer.global.last_task_id.v1', null);
+  const lastTaskId = getPersisted(PERSIST_KEYS.lastTaskId, null);
   if (lastTaskId) {
     try {
       const snapshot = await getOrganizeResult(lastTaskId);

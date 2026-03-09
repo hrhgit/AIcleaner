@@ -13,12 +13,6 @@ export default defineConfig({
             clientPort: devPort,
         },
         open: `http://127.0.0.1:${devPort}/`,
-        proxy: {
-            '/api': {
-                target: 'http://localhost:3001',
-                changeOrigin: true,
-            },
-        },
     },
     build: {
         outDir: 'dist',

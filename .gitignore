@@ -2,7 +2,6 @@ node_modules/
 dist/
 bin/*
 !bin/
-release/
 *.exe
 !bin/scanner.exe
 .env
@@ -13,7 +12,5 @@ release/
 AGENTS.md
 .encoding-policy.json
 
-# Local personal config and persisted runtime data
-server/data/
-
 native/scanner/target/
+src-tauri/target/
