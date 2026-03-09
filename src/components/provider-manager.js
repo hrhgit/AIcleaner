@@ -1,20 +1,14 @@
 import {
-  getEditableSecrets,
+  getCredentials,
   getProviderModels,
-  getSecretStatus,
   getSettings,
-  saveSecrets,
+  saveCredentials,
   saveSettings,
-  setupSecretVault,
-  unlockSecretVault,
 } from '../utils/api.js';
 import { showToast } from '../main.js';
 import {
-  getCachedSecretStatus,
-  lockSecretVaultInUi,
-  refreshSecretStatus,
-  registerSecretStatusChangeHandler,
-  resetSecretVaultInUi,
+  refreshCredentialsStatus,
+  registerCredentialsStatusChangeHandler,
 } from '../utils/secret-ui.js';
 import { registerLangChangeHandler, t } from '../utils/i18n.js';
 
@@ -63,17 +57,19 @@ const requestTokens = new Map();
 const state = {
   providers: [],
   defaultProviderEndpoint: '',
-  secretStatus: {
-    initialized: false,
-    unlocked: false,
-    needsMigration: false,
+  credentialsStatus: {
     providerHasApiKey: {},
     searchApiHasKey: false,
   },
-  editableSecrets: {
+  editableCredentials: {
     providerSecrets: {},
     searchApiKey: '',
   },
+  dirtyCredentials: {
+    providerSecrets: {},
+    searchApiKey: false,
+  },
+  initialModalSnapshot: null,
   searchApi: {
     provider: 'tavily',
     enabled: false,
@@ -92,9 +88,10 @@ let openBtn;
 let closeBtn;
 let cancelBtn;
 let saveBtn;
+let closeConfirmEl;
+let closeConfirmCancelBtn;
+let closeConfirmSaveBtn;
 let initialized = false;
-let vaultActionPending = false;
-const VAULT_SLOW_HINT_DELAY_MS = 1800;
 
 function escapeHtml(value) {
   return String(value || '')
@@ -215,7 +212,7 @@ function normalizeSearchApi(settings) {
   return {
     provider: 'tavily',
     enabled,
-    apiKey: String(source?.apiKey || settings?.tavilyApiKey || '').trim(),
+    apiKey: '',
     scopes: {
       scan: !!scanEnabled,
       classify: !!classifyEnabled,
@@ -226,8 +223,16 @@ function normalizeSearchApi(settings) {
 
 function setSavingState(isSaving) {
   if (!saveBtn) return;
-  saveBtn.disabled = isSaving || !state.secretStatus?.unlocked;
+  saveBtn.disabled = isSaving;
   saveBtn.textContent = isSaving ? t('provider_modal.saving') : t('provider_modal.save');
+}
+
+function hasStoredProviderSecret(endpoint) {
+  return !!state.credentialsStatus?.providerHasApiKey?.[String(endpoint || '').trim()];
+}
+
+function hasStoredSearchApiSecret() {
+  return !!state.credentialsStatus?.searchApiHasKey;
 }
 
 function renderModelOptions(selectEl, models, selected) {
@@ -248,143 +253,6 @@ function renderModelOptions(selectEl, models, selected) {
 
 function renderProviderRows() {
   if (!listEl) return;
-  const secretStatus = state.secretStatus || {};
-  if (saveBtn) saveBtn.disabled = !secretStatus.unlocked;
-  if (!secretStatus.unlocked) {
-    const actionLabel = secretStatus.initialized
-      ? t('provider_modal.unlock')
-      : t('provider_modal.setup');
-    const pendingLabel = secretStatus.initialized
-      ? t('provider_modal.unlocking')
-      : t('provider_modal.setting_up');
-    const passwordLabel = t('secret.password_label');
-    const confirmLabel = t('secret.password_confirm_label');
-    const migrationHint = secretStatus.needsMigration
-      ? `<div class="form-hint" style="color: var(--accent-warning); margin-top: 8px;">${escapeHtml(t('provider_modal.needs_migration'))}</div>`
-      : '';
-    const missingVaultHint = !secretStatus.initialized
-      ? `<div class="form-hint" style="color: var(--accent-warning); margin-top: 8px;">${escapeHtml(t('provider_modal.setup_missing_vault'))}</div>`
-      : '';
-    listEl.innerHTML = `
-      <div class="provider-row provider-search-row">
-        <div class="provider-row-head">
-          <div>
-            <div class="provider-name">${escapeHtml(t('provider_modal.locked'))}</div>
-            <div class="provider-endpoint mono">Stronghold</div>
-          </div>
-        </div>
-        <div class="form-hint">${escapeHtml(t('provider_modal.locked_hint'))}</div>
-        ${migrationHint}
-        ${missingVaultHint}
-        <div class="provider-grid" style="margin-top: 16px;">
-          <div class="form-group">
-            <label class="form-label">${escapeHtml(passwordLabel)}</label>
-            <input id="provider-vault-password" class="form-input" type="password" autocomplete="${secretStatus.initialized ? 'current-password' : 'new-password'}" />
-          </div>
-          ${secretStatus.initialized ? '' : `
-          <div class="form-group">
-            <label class="form-label">${escapeHtml(confirmLabel)}</label>
-            <input id="provider-vault-password-confirm" class="form-input" type="password" autocomplete="new-password" />
-          </div>
-          `}
-        </div>
-        <div id="provider-vault-status" class="form-hint" style="color: var(--accent-info); margin-top: 10px;" hidden></div>
-        <div id="provider-vault-error" class="form-hint" style="color: #fca5a5; margin-top: -4px; margin-bottom: 8px;" hidden></div>
-        <div class="flex items-center gap-8" style="margin-top: 12px;">
-          <button id="provider-vault-open-btn" class="btn btn-primary" type="button" data-label-id="${secretStatus.initialized ? 'unlock' : 'setup'}" data-pending-label="${escapeHtml(pendingLabel)}">${escapeHtml(actionLabel)}</button>
-          <button id="provider-vault-reset-btn" class="btn btn-secondary" type="button">${escapeHtml(t('provider_modal.reset'))}</button>
-        </div>
-      </div>
-    `;
-    listEl.querySelector('#provider-vault-open-btn')?.addEventListener('click', async () => {
-      if (vaultActionPending) return;
-      const passwordInput = listEl.querySelector('#provider-vault-password');
-      const confirmInput = listEl.querySelector('#provider-vault-password-confirm');
-      const statusEl = listEl.querySelector('#provider-vault-status');
-      const errorEl = listEl.querySelector('#provider-vault-error');
-      const actionBtn = listEl.querySelector('#provider-vault-open-btn');
-      const resetBtn = listEl.querySelector('#provider-vault-reset-btn');
-      const password = String(passwordInput?.value || '').trim();
-      const confirmPassword = String(confirmInput?.value || '').trim();
-      let slowHintTimer = null;
-      const setError = (message) => {
-        if (!errorEl) return;
-        errorEl.textContent = message;
-        errorEl.hidden = !message;
-      };
-      const setStatus = (message) => {
-        if (!statusEl) return;
-        statusEl.textContent = message;
-        statusEl.hidden = !message;
-      };
-      try {
-        if (!password) {
-          setError(t('secret.password_required'));
-          passwordInput?.focus();
-          return;
-        }
-        if (!secretStatus.initialized && password !== confirmPassword) {
-          setError(t('secret.password_mismatch'));
-          confirmInput?.focus();
-          return;
-        }
-        setError('');
-        setStatus('');
-        vaultActionPending = true;
-        if (actionBtn) {
-          actionBtn.disabled = true;
-          actionBtn.textContent = actionBtn.getAttribute('data-pending-label') || pendingLabel;
-        }
-        if (resetBtn) resetBtn.disabled = true;
-        if (passwordInput) passwordInput.disabled = true;
-        if (confirmInput) confirmInput.disabled = true;
-        slowHintTimer = window.setTimeout(() => {
-          setStatus(t('provider_modal.slow_hint'));
-        }, VAULT_SLOW_HINT_DELAY_MS);
-        if (secretStatus.initialized) {
-          const result = await unlockSecretVault(password);
-          state.secretStatus = result?.secretStatus || await getSecretStatus();
-          showToast(result?.migrated ? t('secret.migrated') : t('secret.unlock_done'), 'success');
-        } else {
-          const result = await setupSecretVault(password);
-          state.secretStatus = result?.secretStatus || await getSecretStatus();
-          showToast(result?.migrated ? t('secret.migrated') : t('secret.setup_done'), 'success');
-        }
-        await refreshSecretStatus();
-        await refreshModalData();
-        focusFirstProviderApiInput();
-      } catch (err) {
-        const message = getErrorMessage(err);
-        console.error('Provider vault open/setup failed:', err);
-        setError(message);
-        setStatus('');
-        showToast(message, 'error');
-      } finally {
-        vaultActionPending = false;
-        if (slowHintTimer != null) window.clearTimeout(slowHintTimer);
-        const resetLabel = secretStatus.initialized
-          ? t('provider_modal.unlock')
-          : t('provider_modal.setup');
-        if (actionBtn) {
-          actionBtn.disabled = false;
-          actionBtn.textContent = resetLabel;
-        }
-        if (resetBtn) resetBtn.disabled = false;
-        if (passwordInput) passwordInput.disabled = false;
-        if (confirmInput) confirmInput.disabled = false;
-      }
-    });
-    listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
-      try {
-        await resetSecretVaultInUi();
-        await refreshModalData();
-        window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
-      } catch (err) {
-        showToast(getErrorMessage(err), 'error');
-      }
-    });
-    return;
-  }
 
   const providerRowsHtml = state.providers.map((provider) => {
     const endpointKey = encodeURIComponent(provider.endpoint);
@@ -393,6 +261,9 @@ function renderProviderRows() {
     const mergedModels = hasSelected || !provider.model
       ? models
       : [...models, { value: provider.model, label: provider.model }];
+    const secretLoaded = !!state.editableCredentials?.providerSecrets?.[provider.endpoint];
+    const secretStored = hasStoredProviderSecret(provider.endpoint);
+    const secretUnavailable = secretStored && !secretLoaded;
     const modelOptions = mergedModels.map((item) => {
       const selected = item.value === provider.model ? 'selected' : '';
       return `<option value="${escapeHtml(item.value)}" ${selected}>${escapeHtml(item.label)}</option>`;
@@ -416,9 +287,10 @@ function renderProviderRows() {
             <input
               type="password"
               class="form-input provider-api-key"
-              placeholder="${escapeHtml(t('provider_modal.api_key_placeholder'))}"
-              value="${escapeHtml(state.editableSecrets?.providerSecrets?.[provider.endpoint] || '')}"
+              placeholder="${escapeHtml(secretUnavailable ? t('provider_modal.api_key_saved_placeholder') : t('provider_modal.api_key_placeholder'))}"
+              value="${escapeHtml(state.editableCredentials?.providerSecrets?.[provider.endpoint] || '')}"
             />
+            ${secretUnavailable ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
           </div>
           <div class="form-group">
             <label class="form-label">${t('provider_modal.model')}</label>
@@ -447,9 +319,10 @@ function renderProviderRows() {
             id="provider-tavily-api-key"
             type="password"
             class="form-input"
-            placeholder="tvly-xxxxxxxxxxxxxxx"
-            value="${escapeHtml(state.editableSecrets?.searchApiKey || '')}"
+            placeholder="${escapeHtml(hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? t('provider_modal.api_key_saved_placeholder') : 'tvly-xxxxxxxxxxxxxxx')}"
+            value="${escapeHtml(state.editableCredentials?.searchApiKey || '')}"
           />
+          ${hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
           <div class="form-hint">
             <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
               ${escapeHtml(t('provider_modal.search_api_hint'))}
@@ -461,33 +334,9 @@ function renderProviderRows() {
   `;
 
   listEl.innerHTML = `
-    <div class="flex items-center justify-between" style="margin-bottom: 12px;">
-      <div class="form-hint">${escapeHtml(t('provider_modal.locked_hint'))}</div>
-      <div class="flex items-center gap-8">
-        <button id="provider-vault-lock-btn" class="btn btn-ghost" type="button">${escapeHtml(t('provider_modal.lock'))}</button>
-        <button id="provider-vault-reset-btn" class="btn btn-secondary" type="button">${escapeHtml(t('provider_modal.reset'))}</button>
-      </div>
-    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">${escapeHtml(t('provider_modal.credentials_hint'))}</div>
     ${providerRowsHtml}${searchApiRowHtml}
   `;
-
-  listEl.querySelector('#provider-vault-lock-btn')?.addEventListener('click', async () => {
-    try {
-      await lockSecretVaultInUi();
-      await refreshModalData();
-      } catch (err) {
-        showToast(getErrorMessage(err), 'error');
-      }
-    });
-    listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
-    try {
-      await resetSecretVaultInUi();
-      await refreshModalData();
-      window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
-      } catch (err) {
-        showToast(getErrorMessage(err), 'error');
-      }
-    });
 
   for (const row of listEl.querySelectorAll('.provider-row')) {
     const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
@@ -500,7 +349,8 @@ function renderProviderRows() {
       const target = state.providers.find((p) => p.endpoint === endpoint);
       const nextValue = String(apiKeyInput.value || '').trim();
       if (target) target.apiKey = nextValue;
-      state.editableSecrets.providerSecrets[endpoint] = nextValue;
+      state.editableCredentials.providerSecrets[endpoint] = nextValue;
+      state.dirtyCredentials.providerSecrets[endpoint] = true;
     });
 
     apiKeyInput?.addEventListener('blur', () => {
@@ -525,10 +375,10 @@ function renderProviderRows() {
   tavilyApiKeyInput?.addEventListener('input', () => {
     const nextValue = String(tavilyApiKeyInput.value || '').trim();
     state.searchApi.apiKey = nextValue;
-    state.editableSecrets.searchApiKey = nextValue;
+    state.editableCredentials.searchApiKey = nextValue;
+    state.dirtyCredentials.searchApiKey = true;
   });
 
-  // Auto-fetch available models for each provider row independently.
   for (const provider of state.providers) {
     loadModelsForProvider(provider.endpoint, false);
   }
@@ -545,8 +395,8 @@ async function loadModelsForProvider(endpoint, forceRefresh = false) {
 
   providerState.apiKey = String(apiKeyInput?.value || '').trim();
   const selectedModel = String(modelSelect.value || providerState.model || '').trim();
-  const cacheKey = `${endpoint}|${providerState.apiKey}`;
-
+  const storedCredential = hasStoredProviderSecret(endpoint);
+  const cacheKey = `${endpoint}|${providerState.apiKey || (storedCredential ? '__stored__' : '')}`;
   const token = (requestTokens.get(endpoint) || 0) + 1;
   requestTokens.set(endpoint, token);
 
@@ -555,11 +405,13 @@ async function loadModelsForProvider(endpoint, forceRefresh = false) {
 
   let models = [];
   try {
-    if (providerState.apiKey) {
+    if (providerState.apiKey || storedCredential) {
       if (!forceRefresh && remoteModelsCache.has(cacheKey)) {
         models = remoteModelsCache.get(cacheKey);
       } else {
-        const resp = await getProviderModels(endpoint, providerState.apiKey);
+        const resp = providerState.apiKey
+          ? await getProviderModels(endpoint, providerState.apiKey)
+          : await getProviderModels(endpoint);
         models = normalizeModels(resp?.models || []);
         remoteModelsCache.set(cacheKey, models);
       }
@@ -595,9 +447,79 @@ function focusFirstProviderApiInput() {
 
 function closeModal() {
   if (!modalEl) return;
+  closeCloseConfirm();
   modalEl.classList.remove('open');
   modalEl.setAttribute('aria-hidden', 'true');
   document.body.style.overflow = '';
+}
+
+function openCloseConfirm() {
+  if (!closeConfirmEl) return;
+  closeConfirmEl.hidden = false;
+  closeConfirmSaveBtn?.focus();
+}
+
+function closeCloseConfirm() {
+  if (!closeConfirmEl) return;
+  closeConfirmEl.hidden = true;
+}
+
+function collectEditableCredentialsFromDOM() {
+  const providerSecrets = {};
+  const rows = listEl?.querySelectorAll('.provider-row') || [];
+  for (const row of rows) {
+    const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
+    if (!endpoint) continue;
+    providerSecrets[endpoint] = String(row.querySelector('.provider-api-key')?.value || '').trim();
+  }
+  return {
+    providerSecrets,
+    searchApiKey: String(listEl?.querySelector('#provider-tavily-api-key')?.value || state.editableCredentials.searchApiKey || '').trim(),
+  };
+}
+
+function buildModalSnapshot() {
+  const settings = listEl ? collectPayloadFromDOM() : {
+    providerConfigs: Object.fromEntries(
+      state.providers.map((provider) => [provider.endpoint, {
+        name: String(provider.name || provider.endpoint),
+        endpoint: provider.endpoint,
+        model: String(provider.model || defaultModelByEndpoint(provider.endpoint)),
+      }]),
+    ),
+    defaultProviderEndpoint: state.defaultProviderEndpoint,
+    apiEndpoint: state.defaultProviderEndpoint,
+    model: String(
+      state.providers.find((provider) => provider.endpoint === state.defaultProviderEndpoint)?.model
+      || defaultModelByEndpoint(state.defaultProviderEndpoint),
+    ),
+    searchApi: {
+      provider: 'tavily',
+      enabled: !!(
+        state.searchApi?.enabled
+        || state.searchApi?.scopes?.scan
+        || state.searchApi?.scopes?.classify
+        || state.searchApi?.scopes?.organizer
+      ),
+      scopes: {
+        scan: !!state.searchApi?.scopes?.scan,
+        classify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
+        organizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
+      },
+    },
+    enableWebSearch: !!state.searchApi?.scopes?.scan,
+    enableWebSearchClassify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
+    enableWebSearchOrganizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
+  };
+  const credentials = listEl ? collectEditableCredentialsFromDOM() : {
+    providerSecrets: { ...(state.editableCredentials?.providerSecrets || {}) },
+    searchApiKey: String(state.editableCredentials?.searchApiKey || ''),
+  };
+  return JSON.stringify({ settings, credentials });
+}
+
+function hasUnsavedChanges() {
+  return buildModalSnapshot() !== state.initialModalSnapshot;
 }
 
 async function refreshModalData() {
@@ -608,20 +530,18 @@ async function refreshModalData() {
   state.providers = normalized.providers;
   state.defaultProviderEndpoint = normalized.defaultProviderEndpoint;
   state.searchApi = normalizeSearchApi(settings);
-  state.secretStatus = settings?.secretStatus || getCachedSecretStatus() || state.secretStatus;
-  state.editableSecrets = { providerSecrets: {}, searchApiKey: '' };
-  if (state.secretStatus?.unlocked) {
-    try {
-      const editable = await getEditableSecrets();
-      state.editableSecrets = {
-        providerSecrets: { ...(editable?.providerSecrets || {}) },
-        searchApiKey: String(editable?.searchApiKey || ''),
-      };
-    } catch {
-      state.secretStatus = { ...state.secretStatus, unlocked: false };
-    }
-  }
+  state.credentialsStatus = settings?.credentialsStatus || state.credentialsStatus;
+  const editable = await getCredentials();
+  state.editableCredentials = {
+    providerSecrets: { ...(editable?.providerSecrets || {}) },
+    searchApiKey: String(editable?.searchApiKey || ''),
+  };
+  state.dirtyCredentials = {
+    providerSecrets: {},
+    searchApiKey: false,
+  };
   renderProviderRows();
+  state.initialModalSnapshot = buildModalSnapshot();
 }
 
 function collectPayloadFromDOM() {
@@ -676,30 +596,30 @@ function collectPayloadFromDOM() {
   };
 }
 
-function collectSecretsFromDOM() {
+function collectCredentialsFromDOM() {
   const providerSecrets = {};
-  const rows = listEl?.querySelectorAll('.provider-row') || [];
-  for (const row of rows) {
-    const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
-    if (!endpoint) continue;
-    providerSecrets[endpoint] = String(row.querySelector('.provider-api-key')?.value || '').trim();
+  const fullCredentials = collectEditableCredentialsFromDOM();
+  for (const [endpoint, value] of Object.entries(fullCredentials.providerSecrets || {})) {
+    if (state.dirtyCredentials?.providerSecrets?.[endpoint]) {
+      providerSecrets[endpoint] = value;
+    }
   }
-  return {
-    providerSecrets,
-    searchApiKey: String(listEl?.querySelector('#provider-tavily-api-key')?.value || state.editableSecrets.searchApiKey || '').trim(),
-  };
+  const payload = {};
+  if (Object.keys(providerSecrets).length > 0) {
+    payload.providerSecrets = providerSecrets;
+  }
+  if (state.dirtyCredentials?.searchApiKey) {
+    payload.searchApiKey = fullCredentials.searchApiKey;
+  }
+  return payload;
 }
 
 async function handleOpenModal() {
   try {
     await refreshModalData();
+    closeCloseConfirm();
     openModal();
-    if (state.secretStatus?.unlocked) {
-      focusFirstProviderApiInput();
-    } else {
-      const passwordInput = listEl?.querySelector('#provider-vault-password');
-      setTimeout(() => passwordInput?.focus(), 0);
-    }
+    focusFirstProviderApiInput();
   } catch (err) {
     showToast(`${t('provider_modal.failed')}${getErrorMessage(err)}`, 'error');
   }
@@ -708,14 +628,14 @@ async function handleOpenModal() {
 async function handleSave() {
   try {
     setSavingState(true);
+    closeCloseConfirm();
     const payload = collectPayloadFromDOM();
     await saveSettings(payload);
-    if (state.secretStatus?.unlocked) {
-      const secretResult = await saveSecrets(collectSecretsFromDOM());
-      state.secretStatus = secretResult?.secretStatus || state.secretStatus;
-    }
-    state.defaultProviderEndpoint = payload.defaultProviderEndpoint;
+    const credentialResult = await saveCredentials(collectCredentialsFromDOM());
+    state.credentialsStatus = credentialResult?.credentialsStatus || state.credentialsStatus;
     const latestSettings = await getSettings();
+    await refreshCredentialsStatus();
+    state.initialModalSnapshot = buildModalSnapshot();
     showToast(t('provider_modal.saved'), 'success');
     window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: latestSettings }));
     closeModal();
@@ -726,20 +646,36 @@ async function handleSave() {
   }
 }
 
+async function requestCloseModal() {
+  if (saveBtn?.disabled) return;
+  if (!modalEl?.classList.contains('open')) {
+    closeModal();
+    return;
+  }
+  if (!hasUnsavedChanges()) {
+    closeModal();
+    return;
+  }
+  openCloseConfirm();
+}
+
 function bindStaticEvents() {
   openBtn?.addEventListener('click', handleOpenModal);
-  closeBtn?.addEventListener('click', closeModal);
-  cancelBtn?.addEventListener('click', closeModal);
+  closeBtn?.addEventListener('click', requestCloseModal);
+  cancelBtn?.addEventListener('click', requestCloseModal);
   saveBtn?.addEventListener('click', handleSave);
+  closeConfirmCancelBtn?.addEventListener('click', closeCloseConfirm);
+  closeConfirmSaveBtn?.addEventListener('click', handleSave);
 
   modalEl?.addEventListener('click', (event) => {
+    if (!closeConfirmEl?.hidden && closeConfirmEl?.contains(event.target)) return;
     const closeTarget = event.target?.getAttribute('data-modal-close');
-    if (closeTarget === 'true') closeModal();
+    if (closeTarget === 'true') requestCloseModal();
   });
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && modalEl?.classList.contains('open')) {
-      closeModal();
+      requestCloseModal();
     }
   });
 
@@ -747,6 +683,10 @@ function bindStaticEvents() {
     if (modalEl?.classList.contains('open')) {
       renderProviderRows();
     }
+  });
+
+  window.addEventListener('open-provider-manager-requested', () => {
+    handleOpenModal();
   });
 }
 
@@ -760,15 +700,18 @@ export function initProviderManager() {
   closeBtn = document.getElementById('provider-modal-close');
   cancelBtn = document.getElementById('provider-modal-cancel');
   saveBtn = document.getElementById('provider-modal-save');
+  closeConfirmEl = document.getElementById('provider-close-confirm');
+  closeConfirmCancelBtn = document.getElementById('provider-close-confirm-cancel');
+  closeConfirmSaveBtn = document.getElementById('provider-close-confirm-save');
 
   bindStaticEvents();
-  registerSecretStatusChangeHandler(async (event) => {
-    state.secretStatus = event?.detail || state.secretStatus;
+  registerCredentialsStatusChangeHandler(async (event) => {
+    state.credentialsStatus = event?.detail || state.credentialsStatus;
     if (modalEl?.classList.contains('open')) {
       try {
         await refreshModalData();
       } catch (err) {
-        console.warn('Failed to refresh provider modal after secret status change:', err);
+        console.warn('Failed to refresh provider modal after credentials change:', err);
       }
     }
   });

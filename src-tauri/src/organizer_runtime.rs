@@ -57,11 +57,25 @@ pub struct OrganizeTaskRuntime {
     pub snapshot: Mutex<OrganizeSnapshot>,
     routes: HashMap<String, RouteConfig>,
     search_api_key: Option<String>,
+    response_language: String,
     pub job: Mutex<Option<JoinHandle<()>>>,
 }
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn is_zh_language(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized == "zh" || normalized.starts_with("zh-") || normalized.starts_with("zh_")
+}
+
+fn prompt_language_name(value: &str) -> &'static str {
+    if is_zh_language(value) {
+        "Simplified Chinese"
+    } else {
+        "English"
+    }
 }
 
 fn normalize_categories(categories: Option<Vec<String>>) -> Vec<String> {
@@ -368,6 +382,7 @@ async fn classify_file(
     allow_new_categories: bool,
     use_web_search: bool,
     search_api_key: Option<&str>,
+    response_language: &str,
 ) -> (String, bool, bool, Vec<String>, TokenUsage) {
     if route.api_key.trim().is_empty() {
         return (
@@ -379,9 +394,10 @@ async fn classify_file(
         );
     }
     let system_prompt = format!(
-        "You classify one file into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} If unsure choose 其他待定.",
+        "You classify one file into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} If unsure choose 其他待定. If you create a new category, its name must be in {}.",
         categories.join(" | "),
-        if allow_new_categories { "You may create one short new Chinese category if none fits." } else { "You must choose from the preferred categories." }
+        if allow_new_categories { "You may create one short new category if none fits." } else { "You must choose from the preferred categories." },
+        prompt_language_name(response_language),
     );
     let mut user_prompt = format!(
         "name={}\nrelativePath={}\nsize={}\nmodality={}\nChoose the best category.",
@@ -576,6 +592,7 @@ async fn run_organize_task<R: Runtime>(
             allow_new_categories,
             use_web_search,
             task.search_api_key.as_deref(),
+            &task.response_language,
         )
         .await;
         let row = json!({
@@ -740,6 +757,7 @@ pub async fn organize_start<R: Runtime>(
         snapshot: Mutex::new(snapshot.clone()),
         routes,
         search_api_key: input.search_api_key.clone(),
+        response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
         job: Mutex::new(None),
     });
     state

@@ -1,6 +1,13 @@
 import * as storage from '../utils/storage.js';
 import { formatSize } from '../utils/storage.js';
-import { cleanFiles, getScanResult, openFileLocation, requestElevation } from '../utils/api.js';
+import {
+  cleanFiles,
+  deleteScanHistory,
+  getScanResult,
+  listScanHistory,
+  openFileLocation,
+  requestElevation,
+} from '../utils/api.js';
 import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
@@ -10,6 +17,16 @@ let sortDir = 'desc';
 let currentTaskId = null;
 let currentSnapshot = null;
 let currentData = [];
+let historyTasks = [];
+let renderVersion = 0;
+
+function getCachedLastSnapshot() {
+  return storage.get('lastScan', null);
+}
+
+function getPreferredTaskId() {
+  return storage.get('lastScanTaskId', null) || getCachedLastSnapshot()?.id || currentTaskId || null;
+}
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -23,6 +40,27 @@ function riskBadge(risk) {
 
 function riskLabel(risk) {
   return risk === 'low' ? t('results.risk_safe') : risk === 'high' ? t('results.risk_danger') : t('results.risk_warning');
+}
+
+function getScanStatusLabel(status) {
+  const statusMap = {
+    scanning: t('scanner.scanning'),
+    analyzing: t('scanner.analyzing'),
+    idle: t('scanner.not_set'),
+    done: t('scanner.done'),
+    stopped: t('scanner.stopped'),
+    error: t('toast.error'),
+  };
+  return statusMap[status] || status || t('scanner.not_set');
+}
+
+function formatHistoryTime(value) {
+  if (!value) return '-';
+  try {
+    return new Date(value).toLocaleString('zh-CN');
+  } catch {
+    return String(value);
+  }
 }
 
 function getFilteredData() {
@@ -66,6 +104,73 @@ function updateBatchDeleteBtn() {
   if (selectAllCb) {
     selectAllCb.checked = selectedCount > 0 && selectedCount === totalVisible;
     selectAllCb.indeterminate = selectedCount > 0 && selectedCount < totalVisible;
+  }
+}
+
+function renderHistoryList() {
+  const listEl = document.getElementById('results-history-list');
+  if (!listEl) return;
+
+  if (!historyTasks.length) {
+    listEl.innerHTML = `<div class="form-hint">${t('scanner.history_empty')}</div>`;
+    return;
+  }
+
+  listEl.innerHTML = historyTasks.map((task) => {
+    const selected = currentTaskId === task.taskId;
+    const running = ['idle', 'scanning', 'analyzing'].includes(task.status);
+    return `
+      <div style="padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.06); ${selected ? 'background: rgba(255,255,255,0.03); border-radius: 8px; padding-left: 10px; padding-right: 10px;' : ''}">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+          <div style="min-width:0; flex:1;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <div style="font-weight:600; font-size:0.9rem;">${escapeHtml(task.rootPath)}</div>
+              <span class="badge badge-info">${escapeHtml(getScanStatusLabel(task.status))}</span>
+            </div>
+            <div class="form-hint" style="margin-top:4px;">
+              ${t('scanner.history_updated')}: ${escapeHtml(formatHistoryTime(task.updatedAt))}
+            </div>
+            <div class="form-hint" style="margin-top:2px;">
+              ${task.scannedCount || 0} items · ${formatSize(task.totalCleanable || 0)} · Token ${(task.tokenUsage?.total || 0).toLocaleString()}
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; flex-shrink:0;">
+            <button class="btn btn-secondary results-history-load-btn" data-task-id="${escapeHtml(task.taskId)}">${t('scanner.history_load')}</button>
+            <button class="btn btn-ghost results-history-delete-btn" data-task-id="${escapeHtml(task.taskId)}" ${running ? 'disabled' : ''}>${t('scanner.history_delete')}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  document.querySelectorAll('.results-history-load-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const taskId = String(btn.dataset.taskId || '').trim();
+      if (!taskId) return;
+      await loadHistoryTask(taskId);
+    });
+  });
+
+  document.querySelectorAll('.results-history-delete-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const taskId = String(btn.dataset.taskId || '').trim();
+      if (!taskId) return;
+      await deleteHistoryTask(taskId);
+    });
+  });
+}
+
+async function refreshHistoryList() {
+  const refreshBtn = document.getElementById('results-history-refresh-btn');
+  if (refreshBtn) refreshBtn.disabled = true;
+
+  try {
+    historyTasks = await listScanHistory(20);
+  } catch (err) {
+    console.warn('Failed to refresh scan history:', err);
+  } finally {
+    renderHistoryList();
+    if (refreshBtn) refreshBtn.disabled = false;
   }
 }
 
@@ -159,7 +264,7 @@ function renderTable(data) {
 
 function applySnapshot(snapshot) {
   currentSnapshot = snapshot || null;
-  currentTaskId = snapshot?.id || currentTaskId || null;
+  currentTaskId = snapshot?.id || null;
   currentData = Array.isArray(snapshot?.deletable) ? snapshot.deletable : [];
 
   if (snapshot?.id) {
@@ -169,33 +274,83 @@ function applySnapshot(snapshot) {
 
   updateSummary(snapshot);
   renderTable(getFilteredData());
+  renderHistoryList();
 }
 
-async function refreshSnapshot({ silent = false } = {}) {
+function clearCurrentSnapshot() {
+  currentTaskId = null;
+  currentSnapshot = null;
+  currentData = [];
+  storage.remove('lastScanTaskId');
+  storage.remove('lastScan');
+  updateSummary(null);
+  renderTable([]);
+  renderHistoryList();
+}
+
+async function loadHistoryTask(taskId) {
+  try {
+    showToast(t('scanner.history_loading'), 'info');
+    const snapshot = await getScanResult(taskId);
+    applySnapshot(snapshot);
+    await refreshHistoryList();
+    showToast(t('scanner.history_loaded'), 'success');
+  } catch (err) {
+    showToast(t('scanner.history_load_failed') + err.message, 'error');
+  }
+}
+
+async function deleteHistoryTask(taskId) {
+  if (!confirm(t('scanner.history_delete_confirm'))) return;
+
+  try {
+    await deleteScanHistory(taskId);
+    if (currentTaskId === taskId) {
+      clearCurrentSnapshot();
+    }
+    await refreshHistoryList();
+    showToast(t('scanner.history_deleted'), 'success');
+  } catch (err) {
+    if (/still running/i.test(err.message)) {
+      showToast(t('scanner.history_running'), 'error');
+      return;
+    }
+    showToast(t('scanner.history_delete_failed') + err.message, 'error');
+  }
+}
+
+async function refreshSnapshot({ silent = false, expectedRenderVersion = null } = {}) {
   const refreshBtn = document.getElementById('results-refresh-btn');
-  const taskId = storage.get('lastScanTaskId', null) || currentTaskId;
+  const taskId = getPreferredTaskId();
+  const isStale = () => expectedRenderVersion != null && expectedRenderVersion !== renderVersion;
 
   if (refreshBtn) refreshBtn.disabled = true;
 
   try {
     if (!taskId) {
-      currentTaskId = null;
-      applySnapshot(null);
+      const cachedSnapshot = getCachedLastSnapshot();
+      if (cachedSnapshot) {
+        applySnapshot(cachedSnapshot);
+      } else {
+        clearCurrentSnapshot();
+      }
       return;
     }
+
     const snapshot = await getScanResult(taskId);
+    if (isStale()) return;
     applySnapshot(snapshot);
     if (!silent) {
       showToast(t('scanner.history_loaded'), 'success');
     }
   } catch (err) {
-    currentTaskId = null;
-    currentSnapshot = null;
-    currentData = [];
-    storage.remove('lastScanTaskId');
-    storage.remove('lastScan');
-    updateSummary(null);
-    renderTable([]);
+    if (isStale()) return;
+    const cachedSnapshot = currentSnapshot || getCachedLastSnapshot();
+    if (cachedSnapshot) {
+      applySnapshot(cachedSnapshot);
+    } else {
+      clearCurrentSnapshot();
+    }
     if (!silent) {
       showToast(t('scanner.history_load_failed') + err.message, 'error');
     }
@@ -228,6 +383,7 @@ async function handleBatchClean() {
 
     if (res.scanSnapshot && typeof res.scanSnapshot === 'object') {
       applySnapshot(res.scanSnapshot);
+      await refreshHistoryList();
     } else {
       currentData = currentData.filter((item) => !cleanedPaths.includes(item.path));
       updateSummary(currentSnapshot);
@@ -265,9 +421,12 @@ async function handleBatchClean() {
 }
 
 export async function renderResults(container) {
-  currentTaskId = storage.get('lastScanTaskId', null);
+  const expectedRenderVersion = ++renderVersion;
+  const cachedSnapshot = getCachedLastSnapshot();
+  currentTaskId = storage.get('lastScanTaskId', null) || cachedSnapshot?.id || null;
   currentSnapshot = null;
   currentData = [];
+  historyTasks = [];
 
   container.innerHTML = `
     <div class="page-header animate-in">
@@ -294,6 +453,14 @@ export async function renderResults(container) {
       </div>
     </div>
 
+    <div class="card animate-in mb-24" style="animation-delay: 0.08s">
+      <div class="card-header">
+        <h2 class="card-title">${t('scanner.history_title')}</h2>
+        <button id="results-history-refresh-btn" class="btn btn-ghost" type="button" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.history_refresh')}</button>
+      </div>
+      <div id="results-history-list"></div>
+    </div>
+
     <div class="card animate-in mb-24" style="animation-delay: 0.1s; padding: 14px 20px;">
       <div class="flex items-center justify-between" style="gap: 16px; flex-wrap: wrap;">
         <div class="flex items-center gap-16" style="flex-wrap: wrap;">
@@ -308,7 +475,7 @@ export async function renderResults(container) {
         </div>
         <div class="flex items-center gap-8" style="font-size: 0.8rem; color: var(--text-muted);">
           <span id="results-task-meta"></span>
-          <button id="results-refresh-btn" class="btn btn-ghost" type="button" style="padding: 6px 12px; font-size: 0.75rem;">刷新</button>
+          <button id="results-refresh-btn" class="btn btn-ghost" type="button" style="padding: 6px 12px; font-size: 0.75rem;">${t('results.refresh')}</button>
         </div>
       </div>
     </div>
@@ -373,8 +540,14 @@ export async function renderResults(container) {
 
   document.getElementById('batch-delete-btn')?.addEventListener('click', handleBatchClean);
   document.getElementById('results-refresh-btn')?.addEventListener('click', () => refreshSnapshot());
+  document.getElementById('results-history-refresh-btn')?.addEventListener('click', () => refreshHistoryList());
 
   updateSummary(null);
   renderTable([]);
-  await refreshSnapshot({ silent: true });
+  renderHistoryList();
+  if (cachedSnapshot) {
+    applySnapshot(cachedSnapshot);
+  }
+  await refreshHistoryList();
+  await refreshSnapshot({ silent: true, expectedRenderVersion });
 }

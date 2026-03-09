@@ -5,13 +5,11 @@
 import {
   browseFolder,
   connectScanStream,
-  deleteScanHistory,
   getActiveScan,
   getProviderModels,
   getScanResult,
   getPrivilegeStatus,
   getSettings,
-  listScanHistory,
   requestElevation,
   saveSettings,
   startScan,
@@ -21,22 +19,22 @@ import { handleElevationTransition } from '../utils/elevation.js';
 import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
-import { t } from '../utils/i18n.js';
-import { ensureSecretVaultReady, getProviderSecretPresence } from '../utils/secret-ui.js';
+import { getLang, t } from '../utils/i18n.js';
+import { ensureRequiredCredentialsConfigured, getProviderCredentialPresence } from '../utils/secret-ui.js';
 
 let activeTaskId = null;
 let latestTaskId = null;
-let loadedHistoryTaskId = null;
 let activeEventSource = null;
 let logEntries = [];
 let nextLogEntryId = 0;
 let currentSettings = null;
-let historyTasks = [];
+let renderVersion = 0;
 const expandedDetailLogIds = new Set();
 const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v1';
 const SCANNER_FORM_DRAFT_VERSION = 1;
 const SCAN_LOG_COLLAPSED_KEY = 'wipeout.scanner.log.collapsed.v1';
 const SCAN_RECORD_GROUP_COLLAPSED_KEY = 'wipeout.scanner.record-group.collapsed.v1';
+const SCAN_LOG_CACHE_KEY = 'wipeout.scanner.global.log.v1';
 const PROVIDER_OPTIONS = [
   { value: 'https://api.deepseek.com', label: 'DeepSeek' },
   { value: 'https://api.openai.com/v1', label: 'OpenAI' },
@@ -210,27 +208,39 @@ function persistScannerFormDraft({ dirty = true } = {}) {
   writeScannerFormDraft(collectScannerForm(), { dirty });
 }
 
-function hasLoadedHistoryTask() {
-  return !!loadedHistoryTaskId && !activeTaskId;
+function normalizePersistedLogEntries(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((entry) => entry && typeof entry === 'object')
+    .map((entry) => ({
+      id: Number.isFinite(Number(entry.id)) ? Number(entry.id) : undefined,
+      kind: entry.kind === 'detail' ? 'detail' : 'simple',
+      type: String(entry.type || 'scanning'),
+      text: String(entry.text || ''),
+      summary: String(entry.summary || ''),
+      detailHtml: String(entry.detailHtml || ''),
+      time: String(entry.time || ''),
+    }))
+    .slice(-200);
 }
 
-function syncPrimaryActionButton() {
-  const startBtn = document.getElementById('start-btn');
-  if (!startBtn) return;
-  startBtn.textContent = hasLoadedHistoryTask()
-    ? t('scanner.view_results')
-    : t('scanner.start');
+function readPersistedScanLog() {
+  const raw = storage.get(SCAN_LOG_CACHE_KEY, null);
+  if (!raw || typeof raw !== 'object') return { entries: [], nextId: 0 };
+  const entries = normalizePersistedLogEntries(raw.entries);
+  const maxId = entries.reduce((acc, entry) => Math.max(acc, Number.isFinite(entry.id) ? entry.id : -1), -1);
+  return {
+    entries,
+    nextId: Math.max(Number(raw.nextId) || 0, maxId + 1),
+  };
 }
 
-function clearLoadedHistoryState() {
-  if (!loadedHistoryTaskId) return;
-  loadedHistoryTaskId = null;
-  syncPrimaryActionButton();
-}
-
-function markHistoryTaskLoaded(taskId) {
-  loadedHistoryTaskId = String(taskId || '').trim() || null;
-  syncPrimaryActionButton();
+function persistScanLog() {
+  storage.set(SCAN_LOG_CACHE_KEY, {
+    entries: logEntries,
+    nextId: nextLogEntryId,
+    updatedAt: Date.now(),
+  });
 }
 
 function isScanLogCollapsed() {
@@ -375,6 +385,9 @@ function trimLogEntries() {
       expandedDetailLogIds.delete(removed.id);
     }
   }
+  if (trimmed) {
+    persistScanLog();
+  }
   return trimmed;
 }
 
@@ -501,11 +514,11 @@ function syncScanProviderApiKeyMap(settings = {}) {
   scanProviderApiKeyMap = {};
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
     for (const [endpoint] of Object.entries(settings.providerConfigs)) {
-      scanProviderApiKeyMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
+      scanProviderApiKeyMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
-    scanProviderApiKeyMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
+    scanProviderApiKeyMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -551,7 +564,7 @@ async function initScanModelSelectors(defaultSelection = {}) {
   const cacheKey = endpoint;
   let models = [];
   try {
-    if (endpoint) {
+    if (endpoint && getApiKeyForScanEndpoint(endpoint)) {
       if (scanRemoteModelsCache.has(cacheKey)) {
         models = scanRemoteModelsCache.get(cacheKey);
       } else {
@@ -826,7 +839,6 @@ function bindSettingsEvents() {
   const depthSlider = document.getElementById('max-depth');
   const depthInput = document.getElementById('max-depth-input');
   const handleFormMutation = () => {
-    clearLoadedHistoryState();
     persistScannerFormDraft();
   };
 
@@ -871,7 +883,6 @@ function bindSettingsEvents() {
     handleFormMutation();
   });
   document.getElementById('scan-provider')?.addEventListener('change', async () => {
-    clearLoadedHistoryState();
     await initScanModelSelectors();
     refreshScanApiConfigHint();
     persistScannerFormDraft();
@@ -940,86 +951,6 @@ function bindSettingsEvents() {
   });
 }
 
-function formatHistoryTime(value) {
-  if (!value) return '-';
-  try {
-    return new Date(value).toLocaleString('zh-CN');
-  } catch {
-    return String(value);
-  }
-}
-
-function renderHistoryList() {
-  const listEl = document.getElementById('scan-history-list');
-  if (!listEl) return;
-
-  if (!historyTasks.length) {
-    listEl.innerHTML = `<div class="form-hint">${t('scanner.history_empty')}</div>`;
-    return;
-  }
-
-  listEl.innerHTML = historyTasks.map((task) => {
-    const selected = latestTaskId === task.taskId;
-    const running = ['idle', 'scanning', 'analyzing'].includes(task.status);
-    const disabled = !!activeTaskId;
-    return `
-      <div style="padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.06); ${selected ? 'background: rgba(255,255,255,0.03); border-radius: 8px; padding-left: 10px; padding-right: 10px;' : ''}">
-        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
-          <div style="min-width:0; flex:1;">
-              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-              <div style="font-weight:600; font-size:0.9rem;">${escHtml(task.rootPath)}</div>
-              <span class="badge badge-info">${escHtml(getScanStatusLabel(task.status))}</span>
-            </div>
-            <div class="form-hint" style="margin-top:4px;">
-              ${t('scanner.history_updated')}: ${escHtml(formatHistoryTime(task.updatedAt))}
-            </div>
-            <div class="form-hint" style="margin-top:2px;">
-              ${task.scannedCount || 0} items · ${formatSize(task.totalCleanable || 0)} · Token ${(task.tokenUsage?.total || 0).toLocaleString()}
-            </div>
-          </div>
-          <div style="display:flex; gap:8px; flex-shrink:0;">
-            <button class="btn btn-secondary history-load-btn" data-task-id="${escHtml(task.taskId)}" ${disabled ? 'disabled' : ''}>${t('scanner.history_load')}</button>
-            <button class="btn btn-ghost history-delete-btn" data-task-id="${escHtml(task.taskId)}" ${disabled || running ? 'disabled' : ''}>${t('scanner.history_delete')}</button>
-          </div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  document.querySelectorAll('.history-load-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const taskId = String(btn.dataset.taskId || '').trim();
-      if (!taskId) return;
-      await loadHistoryTask(taskId);
-    });
-  });
-
-  document.querySelectorAll('.history-delete-btn').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const taskId = String(btn.dataset.taskId || '').trim();
-      if (!taskId) return;
-      await deleteHistoryTask(taskId);
-    });
-  });
-}
-
-async function refreshHistoryList(selectedTaskId = '') {
-  const refreshBtn = document.getElementById('history-refresh-btn');
-  if (refreshBtn) refreshBtn.disabled = true;
-
-  try {
-    historyTasks = await listScanHistory(20);
-    if (selectedTaskId) {
-      latestTaskId = selectedTaskId;
-    }
-  } catch (err) {
-    console.warn('Failed to refresh scan history:', err);
-  } finally {
-    renderHistoryList();
-    if (refreshBtn) refreshBtn.disabled = false;
-  }
-}
-
 function applySnapshotToUI(data) {
   if (!data) return;
 
@@ -1048,62 +979,16 @@ function applySnapshotToUI(data) {
   if (label) label.textContent = `${scanPct.toFixed(1)}%`;
 }
 
-async function loadHistoryTask(taskId) {
-  if (activeTaskId) return;
-
-  try {
-    showToast(t('scanner.history_loading'), 'info');
-    const snap = await getScanResult(taskId);
-    latestTaskId = taskId;
-    storage.set('lastScanTaskId', latestTaskId);
-    resetButtons();
-    markHistoryTaskLoaded(taskId);
-    applySnapshotToUI(snap);
-    await refreshHistoryList(taskId);
-    showToast(t('scanner.history_loaded'), 'success');
-  } catch (err) {
-    showToast(t('scanner.history_load_failed') + err.message, 'error');
-  }
-}
-
-async function deleteHistoryTask(taskId) {
-  if (activeTaskId) return;
-  if (!confirm(t('scanner.history_delete_confirm'))) return;
-
-  try {
-    await deleteScanHistory(taskId);
-    if (loadedHistoryTaskId === taskId) {
-      clearLoadedHistoryState();
-    }
-    if (latestTaskId === taskId) {
-      latestTaskId = null;
-      storage.remove('lastScanTaskId');
-      storage.remove('lastScan');
-      setScanStatus('idle');
-      updateStats({ scannedCount: 0, totalCleanable: 0, tokenUsage: { total: 0 } });
-      const fill = document.getElementById('progress-fill');
-      const label = document.getElementById('progress-pct');
-      const pathEl = document.getElementById('breadcrumb-path');
-      const depthEl = document.getElementById('breadcrumb-depth');
-      if (fill) fill.style.width = '0%';
-      if (label) label.textContent = '0.0%';
-      if (pathEl) pathEl.textContent = '...';
-      if (depthEl) depthEl.textContent = t('scanner.not_set');
-    }
-    await refreshHistoryList();
-    showToast(t('scanner.history_deleted'), 'success');
-  } catch (err) {
-    if (/still running/i.test(err.message)) {
-      showToast(t('scanner.history_running'), 'error');
-      return;
-    }
-    showToast(t('scanner.history_delete_failed') + err.message, 'error');
-  }
-}
-
 export async function renderScanner(container) {
+  const expectedRenderVersion = ++renderVersion;
+  const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
   const cachedLastScan = storage.get('lastScan', null);
   const draftState = readScannerFormDraft();
+  const persistedLog = readPersistedScanLog();
+  if (!logEntries.length && persistedLog.entries.length) {
+    logEntries = persistedLog.entries;
+    nextLogEntryId = persistedLog.nextId;
+  }
   latestTaskId = storage.get('lastScanTaskId', null) || cachedLastScan?.id || null;
 
   container.innerHTML = `
@@ -1263,14 +1148,6 @@ export async function renderScanner(container) {
       </div>
     </div>
 
-    <div class="card animate-in mb-24" style="animation-delay: 0.22s">
-      <div class="card-header">
-        <h2 class="card-title">${t('scanner.history_title')}</h2>
-        <button id="history-refresh-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.history_refresh')}</button>
-      </div>
-      <div id="scan-history-list"></div>
-    </div>
-
     <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
       <div><span id="scan-path-display" class="form-hint mono"></span></div>
       <div class="flex gap-16">
@@ -1284,14 +1161,18 @@ export async function renderScanner(container) {
   if (draftState.data) {
     applySettingsToForm(draftState.data);
     await initScanProviderFields(draftState.data);
+    if (isStale()) return;
   }
   await refreshPrivilegeStatus();
+  if (isStale()) return;
 
   try {
     const remoteSettings = await getSettings();
+    if (isStale()) return;
     currentSettings = mergeSettingsWithDraft(remoteSettings, draftState);
     applySettingsToForm(currentSettings);
     await initScanProviderFields(currentSettings);
+    if (isStale()) return;
     if (!draftState.dirty) {
       writeScannerFormDraft(extractScannerFormFromSettings(currentSettings), { dirty: false });
     }
@@ -1332,13 +1213,14 @@ export async function renderScanner(container) {
     logEntries = [];
     nextLogEntryId = 0;
     expandedDetailLogIds.clear();
+    persistScanLog();
     const logEl = document.getElementById('scan-log');
     if (logEl) logEl.innerHTML = '';
   });
   refreshScanLogPanel();
-  document.getElementById('history-refresh-btn')?.addEventListener('click', () => refreshHistoryList());
-  syncPrimaryActionButton();
-  await refreshHistoryList(latestTaskId || '');
+  if (logEntries.length > 0) {
+    renderLogEntries();
+  }
 
   if (activeTaskId) {
     restoreActiveState();
@@ -1347,13 +1229,13 @@ export async function renderScanner(container) {
 
   try {
     const activeTasks = await getActiveScan();
+    if (isStale()) return;
     if (activeTasks.length > 0) {
       const task = activeTasks[0];
       activeTaskId = task.taskId;
       latestTaskId = task.taskId;
       storage.set('lastScanTaskId', latestTaskId);
       applySnapshotToUI(task);
-      await refreshHistoryList(latestTaskId);
       restoreActiveState();
       return;
     }
@@ -1365,25 +1247,30 @@ export async function renderScanner(container) {
 
   try {
     const snapshot = await getScanResult(latestTaskId);
+    if (isStale()) return;
     storage.set('lastScanTaskId', snapshot.id);
     applySnapshotToUI(snapshot);
-    await refreshHistoryList(snapshot.id);
     if (['idle', 'scanning', 'analyzing'].includes(snapshot.status)) {
       activeTaskId = snapshot.id;
       restoreActiveState();
       return;
     }
     resetButtons();
-    markHistoryTaskLoaded(snapshot.id);
   } catch (err) {
     console.warn('Failed to restore latest scan snapshot:', err);
+    if (isStale()) return;
+    if (cachedLastScan?.id) {
+      latestTaskId = cachedLastScan.id;
+      applySnapshotToUI(cachedLastScan);
+      resetButtons();
+      return;
+    }
     storage.remove('lastScanTaskId');
     storage.remove('lastScan');
   }
 }
 
 function restoreActiveState() {
-  clearLoadedHistoryState();
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
   const activityEl = document.getElementById('scan-activity-hidden');
@@ -1441,12 +1328,6 @@ async function handleStart() {
   const stopBtn = document.getElementById('stop-btn');
 
   try {
-    if (hasLoadedHistoryTask()) {
-      window.location.hash = '#/results';
-      return;
-    }
-
-    clearLoadedHistoryState();
     await persistScannerSettings({ showSuccessToast: false });
     const form = collectScannerForm();
 
@@ -1457,15 +1338,12 @@ async function handleStart() {
     const selectedEndpoint = String(form.scanProviderEndpoint || currentSettings?.apiEndpoint || '').trim();
     if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
       try {
-        await ensureSecretVaultReady(t('scanner.api_key_required'));
-        currentSettings = await getSettings();
-        syncScanProviderApiKeyMap(currentSettings);
+        await ensureRequiredCredentialsConfigured({
+          providerEndpoints: [selectedEndpoint],
+          reasonText: t('scanner.api_key_required'),
+        });
       } catch (err) {
         showToast(err.message, 'error');
-        return;
-      }
-      if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
-        showToast(t('scanner.api_key_required'), 'error');
         return;
       }
     }
@@ -1480,12 +1358,12 @@ async function handleStart() {
       targetSizeGB: form.targetSizeGB,
       maxDepth: form.maxDepth,
       autoAnalyze: true,
+      responseLanguage: getLang(),
     });
 
     activeTaskId = result.taskId;
     latestTaskId = result.taskId;
     storage.set('lastScanTaskId', latestTaskId);
-    refreshHistoryList(latestTaskId);
 
     const activityEl = document.getElementById('scan-activity-hidden');
     const emptyEl = document.getElementById('scan-empty');
@@ -1578,7 +1456,6 @@ function handleDone(data) {
   setScanStatus('done');
   storage.set('lastScan', data);
   resetButtons();
-  refreshHistoryList(latestTaskId);
 
   const fill = document.getElementById('progress-fill');
   const label = document.getElementById('progress-pct');
@@ -1591,9 +1468,10 @@ function handleDone(data) {
     const permissionText = t('scanner.permission_denied_summary', { count: data.permissionDeniedCount ?? 0 });
     addLog('analyzing', permissionText);
     showToast(`${doneText} ${permissionText}`, 'info');
-    return;
+  } else {
+    showToast(doneText, 'success');
   }
-  showToast(doneText, 'success');
+  window.location.hash = '#/results';
 }
 
 function handleError(err) {
@@ -1613,7 +1491,6 @@ function handleStopped(data) {
   setScanStatus('stopped');
   storage.set('lastScan', data);
   resetButtons();
-  refreshHistoryList(latestTaskId);
   addLog('scanning', t('scanner.stopped'));
 }
 
@@ -1632,8 +1509,6 @@ function resetButtons() {
     activeEventSource.close();
     activeEventSource = null;
   }
-  syncPrimaryActionButton();
-  renderHistoryList();
 }
 
 function updateStats(data) {
@@ -1647,6 +1522,7 @@ function addLog(type, text) {
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const entry = { kind: 'simple', type, text, time };
   logEntries.push(entry);
+  persistScanLog();
   const trimmed = trimLogEntries();
   if (trimmed) {
     renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
@@ -1659,6 +1535,7 @@ function addDetailLog(type, summary, detailHtml) {
   const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const entry = { id: nextLogEntryId++, kind: 'detail', type, summary, detailHtml, time };
   logEntries.push(entry);
+  persistScanLog();
   const trimmed = trimLogEntries();
   if (trimmed) {
     renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');

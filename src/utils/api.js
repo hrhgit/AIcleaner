@@ -54,32 +54,12 @@ export async function saveSettings(data) {
   return call('settings_save', { data });
 }
 
-export async function getSecretStatus() {
-  return call('secret_status');
+export async function getCredentials() {
+  return call('credentials_get');
 }
 
-export async function setupSecretVault(password) {
-  return call('secret_setup', { data: { password } });
-}
-
-export async function unlockSecretVault(password) {
-  return call('secret_unlock', { data: { password } });
-}
-
-export async function lockSecretVault() {
-  return call('secret_lock');
-}
-
-export async function resetSecretVault() {
-  return call('secret_reset', { data: { confirmed: true } });
-}
-
-export async function getEditableSecrets() {
-  return call('secret_get_editable');
-}
-
-export async function saveSecrets(payload) {
-  return call('secret_save', { data: payload });
+export async function saveCredentials(payload) {
+  return call('credentials_save', { data: payload });
 }
 
 export async function browseFolder() {

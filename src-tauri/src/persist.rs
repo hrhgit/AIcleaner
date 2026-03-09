@@ -13,7 +13,6 @@ pub struct ScanNode {
     pub node_type: String,
     pub depth: u32,
     pub size: u64,
-    pub child_count: u64,
 }
 
 fn open_db(db_path: &Path) -> Result<Connection, String> {
@@ -536,33 +535,6 @@ pub fn delete_scan_task(db_path: &Path, task_id: &str) -> Result<bool, String> {
     Ok(changed > 0)
 }
 
-pub fn load_scan_node_by_path(
-    db_path: &Path,
-    task_id: &str,
-    path: &str,
-) -> Result<Option<ScanNode>, String> {
-    let conn = open_db(db_path)?;
-    conn.query_row(
-        "SELECT node_id, path, name, type, depth, total_size, child_count
-         FROM scan_nodes
-         WHERE task_id = ?1 AND path = ?2",
-        params![task_id, path],
-        |row| {
-            Ok(ScanNode {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                name: row.get(2)?,
-                node_type: row.get(3)?,
-                depth: row.get::<_, i64>(4)? as u32,
-                size: row.get::<_, i64>(5)? as u64,
-                child_count: row.get::<_, i64>(6)? as u64,
-            })
-        },
-    )
-    .optional()
-    .map_err(|e| e.to_string())
-}
-
 pub fn load_scan_children(
     db_path: &Path,
     task_id: &str,
@@ -571,12 +543,12 @@ pub fn load_scan_children(
 ) -> Result<Vec<ScanNode>, String> {
     let conn = open_db(db_path)?;
     let sql = if dirs_only {
-        "SELECT node_id, path, name, type, depth, total_size, child_count
+        "SELECT node_id, path, name, type, depth, total_size
          FROM scan_nodes
          WHERE task_id = ?1 AND parent_id = ?2 AND type = 'directory'
          ORDER BY total_size DESC, path COLLATE NOCASE ASC"
     } else {
-        "SELECT node_id, path, name, type, depth, total_size, child_count
+        "SELECT node_id, path, name, type, depth, total_size
          FROM scan_nodes
          WHERE task_id = ?1 AND parent_id = ?2
          ORDER BY total_size DESC, path COLLATE NOCASE ASC"
@@ -591,7 +563,6 @@ pub fn load_scan_children(
                 node_type: row.get(3)?,
                 depth: row.get::<_, i64>(4)? as u32,
                 size: row.get::<_, i64>(5)? as u64,
-                child_count: row.get::<_, i64>(6)? as u64,
             })
         })
         .map_err(|e| e.to_string())?;

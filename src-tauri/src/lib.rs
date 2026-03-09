@@ -4,7 +4,6 @@ mod persist;
 mod scan_runtime;
 
 use backend::AppState;
-use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -12,14 +11,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_stronghold::Builder::new(|password| {
-                let mut hasher = Sha256::new();
-                hasher.update(password.as_bytes());
-                hasher.finalize().to_vec()
-            })
-            .build(),
-        )
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let state = AppState::bootstrap(data_dir)?;
@@ -29,13 +20,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backend::settings_get,
             backend::settings_save,
-            backend::secret_status,
-            backend::secret_setup,
-            backend::secret_unlock,
-            backend::secret_lock,
-            backend::secret_reset,
-            backend::secret_get_editable,
-            backend::secret_save,
+            backend::credentials_get,
+            backend::credentials_save,
             backend::settings_get_provider_models,
             backend::settings_browse_folder,
             backend::system_get_privilege,

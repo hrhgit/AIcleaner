@@ -13,7 +13,7 @@ import {
 import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
-import { getProviderSecretPresence } from '../utils/secret-ui.js';
+import { getProviderCredentialPresence } from '../utils/secret-ui.js';
 
 const PROVIDER_MODELS = {
   'https://api.openai.com/v1': [
@@ -79,11 +79,11 @@ function syncProviderApiKeyMap(targetMap, settings = {}) {
   Object.keys(targetMap).forEach((key) => delete targetMap[key]);
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
     for (const [endpoint] of Object.entries(settings.providerConfigs)) {
-      targetMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
+      targetMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !targetMap[settings.apiEndpoint]) {
-    targetMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
+    targetMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -258,7 +258,7 @@ export async function renderSettings(container) {
     let models = [];
     const cacheKey = endpoint;
     try {
-      if (endpoint) {
+      if (endpoint && hasConfiguredApiKey(providerApiKeyMap, endpoint)) {
         if (remoteModelsCache.has(cacheKey)) {
           models = remoteModelsCache.get(cacheKey);
         } else {

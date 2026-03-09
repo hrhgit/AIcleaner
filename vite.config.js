@@ -12,7 +12,7 @@ export default defineConfig({
             port: devPort,
             clientPort: devPort,
         },
-        open: `http://127.0.0.1:${devPort}/`,
+        open: false,
     },
     build: {
         outDir: 'dist',

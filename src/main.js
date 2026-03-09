@@ -16,6 +16,13 @@ const pages = {
 
 let currentPage = null;
 
+function hideBootSplash() {
+    const splash = document.getElementById('boot-splash');
+    if (!splash) return;
+    splash.classList.add('hidden');
+    window.setTimeout(() => splash.remove(), 220);
+}
+
 function navigate(pageName) {
     const container = document.getElementById('page-container');
     if (!container) return;
@@ -93,6 +100,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initial page
     navigate(getPageFromHash());
+    hideBootSplash();
 });
 
 // Toast utility

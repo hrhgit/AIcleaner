@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,10 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 use tauri::{Runtime, State};
-use tauri_plugin_stronghold::stronghold::Stronghold as SecureStronghold;
 
-const STRONGHOLD_FILE: &str = "secrets.hold";
-const STRONGHOLD_CLIENT: &[u8] = b"aicleaner";
+const CREDENTIAL_SERVICE: &str = "aicleaner";
 const SEARCH_SECRET_KEY: &str = "search:tavily:apiKey";
 
 #[derive(Clone)]
@@ -22,119 +19,99 @@ pub struct AppState {
     pub(crate) scan_tasks: Arc<Mutex<HashMap<String, Arc<crate::scan_runtime::ScanTaskRuntime>>>>,
     pub(crate) organize_tasks:
         Arc<Mutex<HashMap<String, Arc<crate::organizer_runtime::OrganizeTaskRuntime>>>>,
-    secret_vault: Arc<Mutex<SecretVaultState>>,
+    credential_store: Arc<dyn CredentialStore>,
 }
 
-struct SecretVaultState {
-    snapshot_path: PathBuf,
-    session: Option<SecureStronghold>,
+trait CredentialStore: Send + Sync {
+    fn get(&self, account: &str) -> Result<Option<String>, String>;
+    fn set(&self, account: &str, value: &str) -> Result<(), String>;
+    fn delete(&self, account: &str) -> Result<(), String>;
+
+    fn get_many(&self, accounts: &[String]) -> Result<HashMap<String, String>, String> {
+        let mut values = HashMap::with_capacity(accounts.len());
+        for account in accounts {
+            if let Some(value) = self.get(account)? {
+                values.insert(account.clone(), value);
+            }
+        }
+        Ok(values)
+    }
+
+    fn set_many(&self, entries: &[(String, String)]) -> Result<(), String> {
+        for (account, value) in entries {
+            if value.trim().is_empty() {
+                self.delete(account)?;
+            } else {
+                self.set(account, value)?;
+            }
+        }
+        Ok(())
+    }
 }
 
-impl SecretVaultState {
-    fn new(snapshot_path: PathBuf) -> Self {
+struct WindowsCredentialStore {
+    service: String,
+}
+
+impl WindowsCredentialStore {
+    fn new(service: &str) -> Self {
         Self {
-            snapshot_path,
-            session: None,
+            service: service.to_string(),
         }
     }
 
-    fn is_initialized(&self) -> bool {
-        self.snapshot_path.exists()
-    }
-
-    fn is_unlocked(&self) -> bool {
-        self.session.is_some()
-    }
-
-    fn setup(&mut self, password: &str) -> Result<(), String> {
-        if self.is_initialized() {
-            return Err("Secret vault is already initialized.".to_string());
-        }
-        let stronghold = open_stronghold(&self.snapshot_path, password)?;
-        let _ = ensure_client(&stronghold)?;
-        stronghold.save().map_err(|e| e.to_string())?;
-        self.session = Some(stronghold);
-        Ok(())
-    }
-
-    fn unlock(&mut self, password: &str) -> Result<(), String> {
-        if !self.is_initialized() {
-            return Err("Secret vault is not initialized.".to_string());
-        }
-        let stronghold = open_stronghold(&self.snapshot_path, password)?;
-        let _ = ensure_client(&stronghold)?;
-        self.session = Some(stronghold);
-        Ok(())
-    }
-
-    fn lock(&mut self) {
-        self.session = None;
-    }
-
-    fn reset(&mut self) -> Result<(), String> {
-        self.session = None;
-        if self.snapshot_path.exists() {
-            fs::remove_file(&self.snapshot_path).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-
-    fn read(&self, key: &str) -> Result<String, String> {
-        let stronghold = self
-            .session
-            .as_ref()
-            .ok_or_else(|| "Secret vault is locked.".to_string())?;
-        let client = ensure_client(stronghold)?;
-        let raw = client
-            .store()
-            .get(key.as_bytes())
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        String::from_utf8(raw).map_err(|e| e.to_string())
-    }
-
-    fn write(&self, key: &str, value: &str) -> Result<(), String> {
-        let stronghold = self
-            .session
-            .as_ref()
-            .ok_or_else(|| "Secret vault is locked.".to_string())?;
-        let client = ensure_client(stronghold)?;
-        if value.trim().is_empty() {
-            let _ = client
-                .store()
-                .delete(key.as_bytes())
-                .map_err(|e| e.to_string())?;
-        } else {
-            let _ = client
-                .store()
-                .insert(key.as_bytes().to_vec(), value.as_bytes().to_vec(), None)
-                .map_err(|e| e.to_string())?;
-        }
-        stronghold.save().map_err(|e| e.to_string())?;
-        Ok(())
+    fn entry(&self, account: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(&self.service, account).map_err(|e| e.to_string())
     }
 }
 
-fn hash_password(password: &str) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hasher.finalize().to_vec()
+impl CredentialStore for WindowsCredentialStore {
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
+        match self.entry(account)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        self.entry(account)?
+            .set_password(value)
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        match self.entry(account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
 }
 
-fn open_stronghold(path: &Path, password: &str) -> Result<SecureStronghold, String> {
-    SecureStronghold::new(path, hash_password(password)).map_err(|e| e.to_string())
+#[cfg(test)]
+#[derive(Default)]
+struct InMemoryCredentialStore {
+    values: Mutex<HashMap<String, String>>,
 }
 
-fn ensure_client(stronghold: &SecureStronghold) -> Result<iota_stronghold::Client, String> {
-    if let Ok(client) = stronghold.get_client(STRONGHOLD_CLIENT) {
-        return Ok(client);
+#[cfg(test)]
+impl CredentialStore for InMemoryCredentialStore {
+    fn get(&self, account: &str) -> Result<Option<String>, String> {
+        Ok(self.values.lock().unwrap().get(account).cloned())
     }
-    if let Ok(client) = stronghold.load_client(STRONGHOLD_CLIENT) {
-        return Ok(client);
+
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        self.values
+            .lock()
+            .unwrap()
+            .insert(account.to_string(), value.to_string());
+        Ok(())
     }
-    stronghold
-        .create_client(STRONGHOLD_CLIENT)
-        .map_err(|e| e.to_string())
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        self.values.lock().unwrap().remove(account);
+        Ok(())
+    }
 }
 
 fn provider_secret_key(endpoint: &str) -> String {
@@ -156,14 +133,23 @@ impl AppState {
         crate::persist::init_db(&db_path)?;
         crate::persist::mark_stale_tasks(&db_path)?;
         Ok(Self {
-            secret_vault: Arc::new(Mutex::new(SecretVaultState::new(
-                data_dir.join(STRONGHOLD_FILE),
-            ))),
+            credential_store: Arc::new(WindowsCredentialStore::new(CREDENTIAL_SERVICE)),
             settings_path,
             db_path,
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
             organize_tasks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    #[cfg(test)]
+    fn with_store(settings_path: PathBuf, credential_store: Arc<dyn CredentialStore>) -> Self {
+        Self {
+            settings_path,
+            db_path: std::env::temp_dir().join("aicleaner-test.sqlite"),
+            scan_tasks: Arc::new(Mutex::new(HashMap::new())),
+            organize_tasks: Arc::new(Mutex::new(HashMap::new())),
+            credential_store,
+        }
     }
 }
 
@@ -244,19 +230,7 @@ pub struct OrganizeSnapshot {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SecretPasswordInput {
-    password: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretResetInput {
-    confirmed: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretSaveInput {
+pub struct CredentialsSaveInput {
     provider_secrets: Option<HashMap<String, String>>,
     search_api_key: Option<String>,
 }
@@ -289,7 +263,7 @@ fn default_settings() -> Value {
             "apiKey": "",
             "scopes": { "scan": false, "classify": false, "organizer": false }
         },
-        "secretMeta": {
+        "credentialsMeta": {
             "providers": {},
             "searchApi": false
         }
@@ -326,6 +300,7 @@ pub(crate) fn read_settings(path: &Path) -> Value {
 fn strip_secret_fields(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("secretStatus");
+        obj.remove("credentialsStatus");
         obj.insert("apiKey".to_string(), Value::String(String::new()));
         obj.insert("tavilyApiKey".to_string(), Value::String(String::new()));
         if let Some(search) = obj.get_mut("searchApi").and_then(Value::as_object_mut) {
@@ -359,33 +334,15 @@ fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn read_secret_meta(settings: &Value) -> (HashMap<String, bool>, bool) {
-    let provider_meta = settings
-        .get("secretMeta")
-        .and_then(|v| v.get("providers"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut providers = HashMap::new();
-    for (endpoint, raw) in provider_meta {
-        providers.insert(endpoint, raw.as_bool().unwrap_or(false));
-    }
-    let search = settings
-        .get("secretMeta")
-        .and_then(|v| v.get("searchApi"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    (providers, search)
-}
-
-fn apply_secret_meta(
+fn apply_credentials_meta(
     settings: &mut Value,
     provider_meta: &HashMap<String, bool>,
     search_has_api_key: bool,
 ) {
     if let Some(obj) = settings.as_object_mut() {
+        obj.remove("secretMeta");
         obj.insert(
-            "secretMeta".to_string(),
+            "credentialsMeta".to_string(),
             json!({
                 "providers": provider_meta,
                 "searchApi": search_has_api_key
@@ -394,50 +351,8 @@ fn apply_secret_meta(
     }
 }
 
-fn has_plaintext_secrets(settings: &Value) -> bool {
-    let top_level_api_key = settings
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if !top_level_api_key.is_empty() {
-        return true;
-    }
-    let tavily_api_key = settings
-        .get("tavilyApiKey")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if !tavily_api_key.is_empty() {
-        return true;
-    }
-    let search_api_key = settings
-        .get("searchApi")
-        .and_then(|v| v.get("apiKey"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if !search_api_key.is_empty() {
-        return true;
-    }
-    settings
-        .get("providerConfigs")
-        .and_then(Value::as_object)
-        .map(|configs| {
-            configs.values().any(|config| {
-                !config
-                    .get("apiKey")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .is_empty()
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn extract_plaintext_provider_secrets(settings: &Value) -> HashMap<String, String> {
-    let mut providers = HashMap::new();
+fn collect_provider_endpoints(settings: &Value) -> Vec<String> {
+    let mut endpoints = Vec::new();
     if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
         for (key, config) in configs {
             let endpoint = config
@@ -446,62 +361,53 @@ fn extract_plaintext_provider_secrets(settings: &Value) -> HashMap<String, Strin
                 .unwrap_or(key)
                 .trim()
                 .to_string();
-            let api_key = config
-                .get("apiKey")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !endpoint.is_empty() && !api_key.is_empty() {
-                providers.insert(endpoint, api_key);
+            if !endpoint.is_empty() && !endpoints.contains(&endpoint) {
+                endpoints.push(endpoint);
             }
         }
     }
-    let endpoint = settings
-        .get("apiEndpoint")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let api_key = settings
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if !endpoint.is_empty() && !api_key.is_empty() {
-        providers.insert(endpoint, api_key);
+    for field in ["defaultProviderEndpoint", "apiEndpoint"] {
+        let endpoint = settings
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !endpoint.is_empty() && !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
     }
-    providers
+    endpoints
 }
 
-fn extract_plaintext_search_secret(settings: &Value) -> String {
-    let search_api_key = settings
-        .get("searchApi")
-        .and_then(|v| v.get("apiKey"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if !search_api_key.is_empty() {
-        return search_api_key.to_string();
+fn build_credentials_status_value(state: &AppState, settings: &Value) -> Value {
+    let endpoints = collect_provider_endpoints(settings);
+    let mut accounts = endpoints
+        .iter()
+        .map(|endpoint| provider_secret_key(endpoint))
+        .collect::<Vec<_>>();
+    accounts.push(SEARCH_SECRET_KEY.to_string());
+    let values = state
+        .credential_store
+        .get_many(&accounts)
+        .unwrap_or_default();
+    let mut provider_meta = HashMap::new();
+    for endpoint in endpoints {
+        let account = provider_secret_key(&endpoint);
+        provider_meta.insert(
+            endpoint,
+            values
+                .get(&account)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        );
     }
-    settings
-        .get("tavilyApiKey")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
-fn build_secret_status_value(state: &AppState, settings: &Value) -> Value {
-    let (provider_meta, search_has_api_key) = read_secret_meta(settings);
-    let vault = state.secret_vault.lock().unwrap();
     json!({
-        "initialized": vault.is_initialized(),
-        "unlocked": vault.is_unlocked(),
-        "needsMigration": has_plaintext_secrets(settings),
         "providerHasApiKey": provider_meta,
-        "searchApiHasKey": search_has_api_key
+        "searchApiHasKey": values
+            .get(SEARCH_SECRET_KEY)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
     })
 }
 
@@ -510,60 +416,39 @@ fn redact_settings_for_client(state: &AppState, raw_settings: &Value) -> Value {
     strip_secret_fields(&mut sanitized);
     if let Some(obj) = sanitized.as_object_mut() {
         obj.insert(
-            "secretStatus".to_string(),
-            build_secret_status_value(state, raw_settings),
+            "credentialsStatus".to_string(),
+            build_credentials_status_value(state, raw_settings),
         );
     }
     sanitized
 }
 
-fn update_secret_meta_in_settings(
+fn update_credentials_meta_in_settings(
     state: &AppState,
     provider_meta: &HashMap<String, bool>,
     search_has_api_key: bool,
 ) -> Result<Value, String> {
     let mut settings = read_settings(&state.settings_path);
-    apply_secret_meta(&mut settings, provider_meta, search_has_api_key);
+    apply_credentials_meta(&mut settings, provider_meta, search_has_api_key);
     write_settings(&state.settings_path, &settings)?;
     Ok(settings)
 }
 
-fn migrate_plaintext_secrets_if_needed(state: &AppState) -> Result<bool, String> {
-    let settings = read_settings(&state.settings_path);
-    if !has_plaintext_secrets(&settings) {
-        return Ok(false);
-    }
-    let provider_secrets = extract_plaintext_provider_secrets(&settings);
-    let search_api_key = extract_plaintext_search_secret(&settings);
-    {
-        let vault = state.secret_vault.lock().unwrap();
-        for (endpoint, api_key) in &provider_secrets {
-            vault.write(&provider_secret_key(endpoint), api_key)?;
-        }
-        vault.write(SEARCH_SECRET_KEY, &search_api_key)?;
-    }
-    let mut provider_meta = HashMap::new();
-    if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
-        for (key, config) in configs {
-            let endpoint = config
-                .get("endpoint")
-                .and_then(Value::as_str)
-                .unwrap_or(key)
-                .trim()
-                .to_string();
-            provider_meta.insert(
-                endpoint.clone(),
-                provider_secrets
-                    .get(&endpoint)
-                    .map(|value| !value.trim().is_empty())
-                    .unwrap_or(false),
-            );
-        }
-    }
-    let mut next_settings = settings.clone();
-    apply_secret_meta(&mut next_settings, &provider_meta, !search_api_key.trim().is_empty());
-    write_settings(&state.settings_path, &next_settings)?;
-    Ok(true)
+fn extract_credentials_meta(status: &Value) -> (HashMap<String, bool>, bool) {
+    let provider_meta = status
+        .get("providerHasApiKey")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(endpoint, value)| (endpoint.clone(), value.as_bool().unwrap_or(false)))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let search_has_api_key = status
+        .get("searchApiHasKey")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    (provider_meta, search_has_api_key)
 }
 
 trait StringExt {
@@ -635,14 +520,16 @@ pub(crate) fn resolve_provider_endpoint_and_model(
 
 pub(crate) fn resolve_provider_api_key(state: &AppState, endpoint: &str) -> Result<String, String> {
     state
-        .secret_vault
-        .lock()
-        .unwrap()
-        .read(&provider_secret_key(endpoint))
+        .credential_store
+        .get(&provider_secret_key(endpoint))?
+        .ok_or_else(|| "Credential not found.".to_string())
 }
 
 pub(crate) fn resolve_search_api_key(state: &AppState) -> Result<String, String> {
-    state.secret_vault.lock().unwrap().read(SEARCH_SECRET_KEY)
+    state
+        .credential_store
+        .get(SEARCH_SECRET_KEY)?
+        .ok_or_else(|| "Credential not found.".to_string())
 }
 
 #[tauri::command]
@@ -662,95 +549,10 @@ pub async fn settings_save(state: State<'_, AppState>, data: Value) -> Result<Va
 }
 
 #[tauri::command]
-pub async fn secret_status(state: State<'_, AppState>) -> Result<Value, String> {
-    let raw = read_settings(&state.settings_path);
-    Ok(build_secret_status_value(state.inner(), &raw))
-}
-
-#[tauri::command]
-pub async fn secret_setup(
-    state: State<'_, AppState>,
-    data: SecretPasswordInput,
-) -> Result<Value, String> {
-    if data.password.trim().is_empty() {
-        return Err("Password is required.".to_string());
-    }
-    let started_at = Instant::now();
-    {
-        let mut vault = state.secret_vault.lock().unwrap();
-        vault.setup(&data.password)?;
-    }
-    let migrated = migrate_plaintext_secrets_if_needed(state.inner())?;
-    let raw = read_settings(&state.settings_path);
-    log::info!(
-        "secret_setup completed in {} ms (migrated={})",
-        started_at.elapsed().as_millis(),
-        migrated
-    );
-    Ok(json!({
-        "success": true,
-        "migrated": migrated,
-        "secretStatus": build_secret_status_value(state.inner(), &raw)
-    }))
-}
-
-#[tauri::command]
-pub async fn secret_unlock(
-    state: State<'_, AppState>,
-    data: SecretPasswordInput,
-) -> Result<Value, String> {
-    if data.password.trim().is_empty() {
-        return Err("Password is required.".to_string());
-    }
-    let started_at = Instant::now();
-    {
-        let mut vault = state.secret_vault.lock().unwrap();
-        vault.unlock(&data.password)?;
-    }
-    let migrated = migrate_plaintext_secrets_if_needed(state.inner())?;
-    let raw = read_settings(&state.settings_path);
-    log::info!(
-        "secret_unlock completed in {} ms (migrated={})",
-        started_at.elapsed().as_millis(),
-        migrated
-    );
-    Ok(json!({
-        "success": true,
-        "migrated": migrated,
-        "secretStatus": build_secret_status_value(state.inner(), &raw)
-    }))
-}
-
-#[tauri::command]
-pub async fn secret_lock(state: State<'_, AppState>) -> Result<Value, String> {
-    state.secret_vault.lock().unwrap().lock();
-    let raw = read_settings(&state.settings_path);
-    Ok(json!({
-        "success": true,
-        "secretStatus": build_secret_status_value(state.inner(), &raw)
-    }))
-}
-
-#[tauri::command]
-pub async fn secret_reset(
-    state: State<'_, AppState>,
-    data: SecretResetInput,
-) -> Result<Value, String> {
-    if !data.confirmed {
-        return Err("Reset confirmation is required.".to_string());
-    }
-    state.secret_vault.lock().unwrap().reset()?;
-    let settings = update_secret_meta_in_settings(state.inner(), &HashMap::new(), false)?;
-    Ok(json!({
-        "success": true,
-        "secretStatus": build_secret_status_value(state.inner(), &settings)
-    }))
-}
-
-#[tauri::command]
-pub async fn secret_get_editable(state: State<'_, AppState>) -> Result<Value, String> {
+pub async fn credentials_get(state: State<'_, AppState>) -> Result<Value, String> {
     let settings = read_settings(&state.settings_path);
-    let mut providers = HashMap::new();
+    let mut provider_key_map = HashMap::new();
+    let mut secret_keys = Vec::new();
     if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
         for (key, config) in configs {
             let endpoint = config
@@ -762,11 +564,24 @@ pub async fn secret_get_editable(state: State<'_, AppState>) -> Result<Value, St
             if endpoint.is_empty() {
                 continue;
             }
-            let value = resolve_provider_api_key(state.inner(), &endpoint)?;
-            providers.insert(endpoint, value);
+            let secret_key = provider_secret_key(&endpoint);
+            provider_key_map.insert(endpoint, secret_key.clone());
+            secret_keys.push(secret_key);
         }
     }
-    let search_api_key = resolve_search_api_key(state.inner()).unwrap_or_default();
+    secret_keys.push(SEARCH_SECRET_KEY.to_string());
+    let secret_values = state.credential_store.get_many(&secret_keys)?;
+    let mut providers = HashMap::new();
+    for (endpoint, secret_key) in provider_key_map {
+        providers.insert(
+            endpoint,
+            secret_values.get(&secret_key).cloned().unwrap_or_default(),
+        );
+    }
+    let search_api_key = secret_values
+        .get(SEARCH_SECRET_KEY)
+        .cloned()
+        .unwrap_or_default();
     Ok(json!({
         "providerSecrets": providers,
         "searchApiKey": search_api_key
@@ -774,13 +589,21 @@ pub async fn secret_get_editable(state: State<'_, AppState>) -> Result<Value, St
 }
 
 #[tauri::command]
-pub async fn secret_save(
+pub async fn credentials_save(
     state: State<'_, AppState>,
-    data: SecretSaveInput,
+    data: CredentialsSaveInput,
 ) -> Result<Value, String> {
+    save_credentials_internal(state.inner(), data)
+}
+
+fn save_credentials_internal(
+    state: &AppState,
+    data: CredentialsSaveInput,
+) -> Result<Value, String> {
+    let started_at = Instant::now();
     let settings = read_settings(&state.settings_path);
-    let mut provider_meta = HashMap::new();
     let provider_secrets = data.provider_secrets.unwrap_or_default();
+    let mut entries = Vec::new();
     if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
         for (key, config) in configs {
             let endpoint = config
@@ -789,29 +612,32 @@ pub async fn secret_save(
                 .unwrap_or(key)
                 .trim()
                 .to_string();
-            let value = provider_secrets
-                .get(&endpoint)
-                .map(|raw| raw.trim().to_string())
-                .unwrap_or_default();
-            state
-                .secret_vault
-                .lock()
-                .unwrap()
-                .write(&provider_secret_key(&endpoint), &value)?;
-            provider_meta.insert(endpoint, !value.is_empty());
+            if let Some(raw) = provider_secrets.get(&endpoint) {
+                entries.push((provider_secret_key(&endpoint), raw.trim().to_string()));
+            }
         }
     }
-    let search_api_key = data.search_api_key.unwrap_or_default().trim().to_string();
-    state
-        .secret_vault
-        .lock()
-        .unwrap()
-        .write(SEARCH_SECRET_KEY, &search_api_key)?;
+    if let Some(search_api_key) = data.search_api_key {
+        entries.push((
+            SEARCH_SECRET_KEY.to_string(),
+            search_api_key.trim().to_string(),
+        ));
+    }
+    if !entries.is_empty() {
+        state.credential_store.set_many(&entries)?;
+    }
+    let latest_status = build_credentials_status_value(state, &settings);
+    let (provider_meta, search_has_api_key) = extract_credentials_meta(&latest_status);
     let next_settings =
-        update_secret_meta_in_settings(state.inner(), &provider_meta, !search_api_key.is_empty())?;
+        update_credentials_meta_in_settings(state, &provider_meta, search_has_api_key)?;
+    log::info!(
+        "credentials_save completed in {} ms (entries={})",
+        started_at.elapsed().as_millis(),
+        entries.len()
+    );
     Ok(json!({
         "success": true,
-        "secretStatus": build_secret_status_value(state.inner(), &next_settings)
+        "credentialsStatus": build_credentials_status_value(state, &next_settings)
     }))
 }
 
@@ -1041,6 +867,7 @@ pub struct ScanStartInput {
     pub api_endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub response_language: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1056,6 +883,7 @@ pub struct OrganizeStartInput {
     pub use_web_search: Option<bool>,
     pub model_routing: Option<Value>,
     pub search_api_key: Option<String>,
+    pub response_language: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1221,10 +1049,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_save_preserves_secret_meta() {
+    fn partial_save_preserves_credentials_meta() {
         let path = temp_settings_path();
         let seeded = json!({
-            "secretMeta": {
+            "credentialsMeta": {
                 "providers": {
                     "https://api.deepseek.com": true
                 },
@@ -1241,10 +1069,10 @@ mod tests {
 
         let saved = read_settings(&path);
         assert_eq!(
-            saved["secretMeta"]["providers"]["https://api.deepseek.com"],
+            saved["credentialsMeta"]["providers"]["https://api.deepseek.com"],
             Value::Bool(true)
         );
-        assert_eq!(saved["secretMeta"]["searchApi"], Value::Bool(true));
+        assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(true));
 
         let _ = fs::remove_file(path);
     }
@@ -1280,6 +1108,215 @@ mod tests {
             saved["providerConfigs"][custom_endpoint]["model"],
             Value::String("custom-model".to_string())
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_app_state() -> (AppState, PathBuf) {
+        let path = temp_settings_path();
+        write_settings(&path, &default_settings()).expect("seed default settings");
+        let state =
+            AppState::with_store(path.clone(), Arc::new(InMemoryCredentialStore::default()));
+        (state, path)
+    }
+
+    #[test]
+    fn credentials_meta_reflects_saved_values() {
+        let (state, path) = temp_app_state();
+        let payload = CredentialsSaveInput {
+            provider_secrets: Some(HashMap::from([(
+                "https://api.openai.com/v1".to_string(),
+                "sk-test".to_string(),
+            )])),
+            search_api_key: Some("tvly-test".to_string()),
+        };
+
+        let settings = read_settings(&state.settings_path);
+        let mut provider_meta = HashMap::new();
+        provider_meta.insert("https://api.openai.com/v1".to_string(), true);
+        state
+            .credential_store
+            .set_many(&[
+                (
+                    provider_secret_key("https://api.openai.com/v1"),
+                    "sk-test".to_string(),
+                ),
+                (SEARCH_SECRET_KEY.to_string(), "tvly-test".to_string()),
+            ])
+            .expect("save credentials");
+        let saved = update_credentials_meta_in_settings(&state, &provider_meta, true)
+            .expect("update credentials meta");
+        let status = build_credentials_status_value(&state, &settings);
+
+        assert_eq!(
+            saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
+            Value::Bool(true)
+        );
+        assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(true));
+        assert_eq!(
+            status["providerHasApiKey"]["https://api.openai.com/v1"],
+            Value::Bool(true)
+        );
+        assert_eq!(status["searchApiHasKey"], Value::Bool(true));
+        assert_eq!(payload.search_api_key, Some("tvly-test".to_string()));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn credentials_meta_clears_when_empty_values_saved() {
+        let (state, path) = temp_app_state();
+        state
+            .credential_store
+            .set_many(&[
+                (
+                    provider_secret_key("https://api.openai.com/v1"),
+                    "sk-test".to_string(),
+                ),
+                (SEARCH_SECRET_KEY.to_string(), "tvly-test".to_string()),
+            ])
+            .expect("seed credentials");
+
+        let provider_meta = HashMap::from([("https://api.openai.com/v1".to_string(), false)]);
+        let saved = update_credentials_meta_in_settings(&state, &provider_meta, false)
+            .expect("update credentials meta");
+        state
+            .credential_store
+            .set_many(&[
+                (
+                    provider_secret_key("https://api.openai.com/v1"),
+                    String::new(),
+                ),
+                (SEARCH_SECRET_KEY.to_string(), String::new()),
+            ])
+            .expect("clear credentials");
+
+        let status = build_credentials_status_value(&state, &read_settings(&state.settings_path));
+
+        assert_eq!(
+            saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
+            Value::Bool(false)
+        );
+        assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(false));
+        assert_eq!(
+            status["providerHasApiKey"]["https://api.openai.com/v1"],
+            Value::Bool(false)
+        );
+        assert_eq!(status["searchApiHasKey"], Value::Bool(false));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn credentials_save_preserves_existing_values_for_omitted_fields() {
+        let (state, path) = temp_app_state();
+        state
+            .credential_store
+            .set_many(&[
+                (
+                    provider_secret_key("https://api.openai.com/v1"),
+                    "sk-existing".to_string(),
+                ),
+                (SEARCH_SECRET_KEY.to_string(), "tvly-existing".to_string()),
+            ])
+            .expect("seed credentials");
+
+        save_credentials_internal(
+            &state,
+            CredentialsSaveInput {
+                provider_secrets: Some(HashMap::new()),
+                search_api_key: None,
+            },
+        )
+        .expect("save without touching secrets");
+
+        assert_eq!(
+            state
+                .credential_store
+                .get(&provider_secret_key("https://api.openai.com/v1"))
+                .expect("read provider credential"),
+            Some("sk-existing".to_string())
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .get(SEARCH_SECRET_KEY)
+                .expect("read search credential"),
+            Some("tvly-existing".to_string())
+        );
+
+        let saved = read_settings(&state.settings_path);
+        assert_eq!(
+            saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
+            Value::Bool(true)
+        );
+        assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(true));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn credentials_save_updates_only_explicitly_touched_fields() {
+        let (state, path) = temp_app_state();
+        state
+            .credential_store
+            .set_many(&[
+                (
+                    provider_secret_key("https://api.openai.com/v1"),
+                    "sk-openai".to_string(),
+                ),
+                (
+                    provider_secret_key("https://api.deepseek.com"),
+                    "sk-deepseek".to_string(),
+                ),
+                (SEARCH_SECRET_KEY.to_string(), "tvly-existing".to_string()),
+            ])
+            .expect("seed credentials");
+
+        save_credentials_internal(
+            &state,
+            CredentialsSaveInput {
+                provider_secrets: Some(HashMap::from([(
+                    "https://api.openai.com/v1".to_string(),
+                    String::new(),
+                )])),
+                search_api_key: Some(String::new()),
+            },
+        )
+        .expect("save touched secrets");
+
+        assert_eq!(
+            state
+                .credential_store
+                .get(&provider_secret_key("https://api.openai.com/v1"))
+                .expect("read cleared provider credential"),
+            None
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .get(&provider_secret_key("https://api.deepseek.com"))
+                .expect("read untouched provider credential"),
+            Some("sk-deepseek".to_string())
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .get(SEARCH_SECRET_KEY)
+                .expect("read cleared search credential"),
+            None
+        );
+
+        let saved = read_settings(&state.settings_path);
+        assert_eq!(
+            saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            saved["credentialsMeta"]["providers"]["https://api.deepseek.com"],
+            Value::Bool(true)
+        );
+        assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(false));
 
         let _ = fs::remove_file(path);
     }

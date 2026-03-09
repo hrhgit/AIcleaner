@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection, Transaction};
 use serde_json::json;

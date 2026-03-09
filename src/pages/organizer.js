@@ -13,11 +13,11 @@
   suggestOrganizeCategories,
 } from '../utils/api.js';
 import { showToast } from '../main.js';
-import { t } from '../utils/i18n.js';
+import { getLang, t } from '../utils/i18n.js';
 import {
-  ensureSecretVaultReady,
-  getProviderSecretPresence,
-  getSearchSecretPresence,
+  ensureRequiredCredentialsConfigured,
+  getProviderCredentialPresence,
+  getSearchCredentialPresence,
 } from '../utils/secret-ui.js';
 
 const PERSIST_KEYS = {
@@ -33,6 +33,7 @@ const PERSIST_KEYS = {
   modelSelection: 'wipeout.organizer.global.model_selection.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
   lastTaskId: 'wipeout.organizer.global.last_task_id.v1',
+  lastSnapshot: 'wipeout.organizer.global.last_snapshot.v1',
 };
 
 const DEFAULT_CATEGORIES = [
@@ -120,6 +121,7 @@ let providerApiKeyMap = {};
 const remoteModelsCache = new Map();
 const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
 let organizerProviderSettingsUpdatedHandler = null;
+let renderVersion = 0;
 
 function getPersisted(key, fallback) {
   try {
@@ -176,11 +178,11 @@ function syncProviderApiKeys(settings = {}) {
   providerApiKeyMap = {};
   if (settings?.providerConfigs && typeof settings.providerConfigs === 'object') {
     for (const [endpoint] of Object.entries(settings.providerConfigs)) {
-      providerApiKeyMap[String(endpoint).trim()] = getProviderSecretPresence(settings, endpoint);
+      providerApiKeyMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
   }
   if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
-    providerApiKeyMap[settings.apiEndpoint] = getProviderSecretPresence(settings, settings.apiEndpoint);
+    providerApiKeyMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -243,6 +245,7 @@ function collectForm() {
     parallelism: Number.isFinite(parallelism) ? Math.max(1, Math.min(20, Math.floor(parallelism))) : 5,
     useWebSearch,
     modelRouting,
+    responseLanguage: getLang(),
   };
 }
 
@@ -480,7 +483,7 @@ async function initModelSelectors(defaultSelection = {}) {
   const cacheKey = endpoint;
   let models = [];
   try {
-    if (endpoint) {
+    if (endpoint && getApiKeyForEndpoint(endpoint)) {
       if (remoteModelsCache.has(cacheKey)) {
         models = remoteModelsCache.get(cacheKey);
       } else {
@@ -747,6 +750,9 @@ function refreshView(snapshot) {
   if (snapshot?.id) {
     activeTaskId = snapshot.id;
     setPersisted(PERSIST_KEYS.lastTaskId, snapshot.id);
+    setPersisted(PERSIST_KEYS.lastSnapshot, snapshot);
+  } else {
+    activeTaskId = null;
   }
   if (snapshot?.jobId) {
     setPersisted(PERSIST_KEYS.lastJobId, snapshot.jobId);
@@ -871,10 +877,14 @@ async function handleStart() {
     .filter(Boolean);
   const missingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
   let settingsSnapshot = await getSettings().catch(() => null);
-  const needsSearchSecret = !!form.useWebSearch && !getSearchSecretPresence(settingsSnapshot || {});
+  const needsSearchSecret = !!form.useWebSearch && !getSearchCredentialPresence(settingsSnapshot || {});
   if (missingProviderSecret || needsSearchSecret) {
     try {
-      await ensureSecretVaultReady(t('settings.api_key_managed_hint'));
+      await ensureRequiredCredentialsConfigured({
+        providerEndpoints: Array.from(new Set(selectedEndpoints)),
+        requireSearchApi: !!form.useWebSearch,
+        reasonText: t('settings.api_key_managed_hint'),
+      });
       settingsSnapshot = await getSettings();
       syncProviderApiKeys(settingsSnapshot);
       refreshOrganizerApiConfigHint();
@@ -883,7 +893,7 @@ async function handleStart() {
       return;
     }
     const stillMissingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
-    const stillMissingSearchSecret = !!form.useWebSearch && !getSearchSecretPresence(settingsSnapshot || {});
+    const stillMissingSearchSecret = !!form.useWebSearch && !getSearchCredentialPresence(settingsSnapshot || {});
     if (stillMissingProviderSecret || stillMissingSearchSecret) {
       showToast(t('settings.api_key_managed_hint'), 'error');
       return;
@@ -1123,7 +1133,10 @@ function bindModelRoutingListeners() {
 }
 
 export async function renderOrganizer(container) {
+  const expectedRenderVersion = ++renderVersion;
+  const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
   const defaults = restoreDefaults();
+  const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
 
   container.innerHTML = `
     <div class="page-header animate-in">
@@ -1335,6 +1348,7 @@ export async function renderOrganizer(container) {
   document.getElementById(COPY_TEXT_ROUTE_BTN_ID)?.addEventListener('click', handleCopyTextRoute);
 
   const runtimeSettings = await initModelRoutingFields(defaults.modelRouting);
+  if (isStale()) return;
   if (defaults.useWebSearch == null) {
     const searchApi = resolveSearchApi(runtimeSettings);
     const organizerDefault = searchApi.enabled && (searchApi.scopes.classify || searchApi.scopes.organizer);
@@ -1348,6 +1362,9 @@ export async function renderOrganizer(container) {
   bindPersistenceListeners();
   refreshOrganizerApiConfigHint();
   renderCapability();
+  if (cachedSnapshot?.id) {
+    refreshView(cachedSnapshot);
+  }
 
   if (organizerProviderSettingsUpdatedHandler) {
     window.removeEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
@@ -1378,13 +1395,15 @@ export async function renderOrganizer(container) {
   } catch {
     latestCapability = null;
   }
+  if (isStale()) return;
   renderCapability();
 
   // Try to reconnect to a running task.
-  const lastTaskId = getPersisted(PERSIST_KEYS.lastTaskId, null);
+  const lastTaskId = getPersisted(PERSIST_KEYS.lastTaskId, null) || cachedSnapshot?.id || null;
   if (lastTaskId) {
     try {
       const snapshot = await getOrganizeResult(lastTaskId);
+      if (isStale()) return;
       activeTaskId = lastTaskId;
       refreshView(snapshot);
 
@@ -1392,9 +1411,13 @@ export async function renderOrganizer(container) {
         connectTaskStream(lastTaskId);
       }
     } catch {
-      refreshView(null);
+      if (cachedSnapshot?.id === lastTaskId) {
+        refreshView(cachedSnapshot);
+      } else {
+        refreshView(null);
+      }
     }
-  } else {
+  } else if (!cachedSnapshot?.id) {
     refreshView(null);
   }
 }

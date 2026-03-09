@@ -1030,6 +1030,39 @@ input[type="number"].no-spin {
     border-top: 1px solid var(--bg-glass-border);
 }
 
+.provider-close-confirm {
+    position: absolute;
+    inset: 0;
+    z-index: 12;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+
+.provider-close-confirm[hidden] {
+    display: none !important;
+}
+
+.provider-close-confirm-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 6, 23, 0.78);
+    -webkit-backdrop-filter: blur(3px);
+    backdrop-filter: blur(3px);
+}
+
+.provider-close-confirm-card {
+    position: relative;
+    z-index: 1;
+    width: min(460px, calc(100% - 8px));
+}
+
+.provider-close-confirm-actions {
+    margin-top: 18px;
+    padding-top: 16px;
+}
+
 @media (max-width: 920px) {
     .provider-model-inline {
         grid-template-columns: 1fr;

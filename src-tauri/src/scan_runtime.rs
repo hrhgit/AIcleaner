@@ -16,6 +16,7 @@ struct ScanAiConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    response_language: String,
 }
 
 pub struct ScanTaskRuntime {
@@ -66,6 +67,35 @@ fn extract_json_text(content: &str) -> String {
         clean.truncate(clean.len().saturating_sub(3));
     }
     clean.trim().to_string()
+}
+
+fn is_zh_language(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized == "zh" || normalized.starts_with("zh-") || normalized.starts_with("zh_")
+}
+
+fn prompt_language_name(value: &str) -> &'static str {
+    if is_zh_language(value) {
+        "Simplified Chinese"
+    } else {
+        "English"
+    }
+}
+
+fn default_unclear_reason(value: &str) -> &'static str {
+    if is_zh_language(value) {
+        "用途不明确，建议保留并人工复核。"
+    } else {
+        "Unclear purpose, keep for manual review."
+    }
+}
+
+fn default_analysis_failed_reason(value: &str, err: &str) -> String {
+    if is_zh_language(value) {
+        format!("分析失败，建议人工复核：{err}")
+    } else {
+        format!("Analysis failed, manual review recommended: {err}")
+    }
 }
 
 fn scanner_binary_candidates<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
@@ -200,12 +230,17 @@ async fn analyze_scan_node(
     node: &persist::ScanNode,
     child_dirs: &[persist::ScanNode],
 ) -> ScanReview {
+    let response_language = prompt_language_name(&ai.response_language);
     let system_prompt = if node.node_type == "directory" {
         [
             "You are a disk cleanup safety assistant.",
             "Return JSON only.",
             "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
             "Be conservative. If unsure, use suspicious.",
+            &format!(
+                "The \"reason\" field must be written in {} only.",
+                response_language
+            ),
         ]
         .join("\n")
     } else {
@@ -214,6 +249,10 @@ async fn analyze_scan_node(
             "Return JSON only.",
             "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
             "Be conservative. If unsure, use suspicious.",
+            &format!(
+                "The \"reason\" field must be written in {} only.",
+                response_language
+            ),
         ]
         .join("\n")
     };
@@ -256,7 +295,7 @@ async fn analyze_scan_node(
                 reason: parsed
                     .get("reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("Unclear purpose, keep for manual review.")
+                    .unwrap_or(default_unclear_reason(&ai.response_language))
                     .to_string(),
                 risk: parsed
                     .get("risk")
@@ -270,6 +309,7 @@ async fn analyze_scan_node(
                 token_usage: resp.token_usage,
                 trace: json!({
                     "model": ai.model,
+                    "responseLanguage": ai.response_language,
                     "systemPrompt": system_prompt,
                     "userPrompt": user_prompt,
                     "rawContent": resp.content,
@@ -278,12 +318,13 @@ async fn analyze_scan_node(
         }
         Err(err) => ScanReview {
             classification: "suspicious".to_string(),
-            reason: format!("Analysis failed, manual review recommended: {err}"),
+            reason: default_analysis_failed_reason(&ai.response_language, &err),
             risk: "high".to_string(),
             has_potential_deletable_subfolders: node.node_type == "directory",
             token_usage: TokenUsage::default(),
             trace: json!({
                 "model": ai.model,
+                "responseLanguage": ai.response_language,
                 "systemPrompt": system_prompt,
                 "userPrompt": user_prompt,
                 "error": err,
@@ -692,6 +733,7 @@ pub async fn scan_start<R: Runtime>(
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             api_key: input.api_key.unwrap_or_default(),
             model: input.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
         },
         job: Mutex::new(None),
     });
