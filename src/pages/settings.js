@@ -228,11 +228,12 @@ export async function renderSettings(container) {
 
   const remoteModelsCache = new Map();
   const providerApiKeyMap = {};
+  let currentSettings = null;
   let searchApiSettings = {
     provider: 'tavily',
     enabled: false,
     apiKey: '',
-    scopes: { scan: false, organizer: false },
+    scopes: { scan: false, classify: false, organizer: false },
   };
   let modelsRequestToken = 0;
 
@@ -289,6 +290,7 @@ export async function renderSettings(container) {
 
   try {
     const settings = await getSettings();
+    currentSettings = settings;
     syncProviderApiKeyMap(providerApiKeyMap, settings);
     await fillForm(settings);
   } catch (err) {
@@ -413,7 +415,10 @@ export async function renderSettings(container) {
     btn.innerHTML = `<span class="spinner"></span> ${t('settings.saving')}`;
 
     try {
-      await saveSettings(collectForm(providerApiKeyMap, searchApiSettings));
+      const result = await saveSettings(collectForm(currentSettings));
+      currentSettings = result?.settings || await getSettings();
+      syncProviderApiKeyMap(providerApiKeyMap, currentSettings);
+      await fillForm(currentSettings);
       showToast(t('settings.toast_saved'), 'success');
       status.textContent = t('settings.saved');
       status.style.color = 'var(--accent-success)';
@@ -461,6 +466,7 @@ export async function renderSettings(container) {
       apiKey: '',
       scopes: {
         scan: !!scanWebSearchEnabled,
+        classify: !!organizerWebSearchEnabled,
         organizer: !!organizerWebSearchEnabled,
       },
     };
@@ -475,6 +481,7 @@ export async function renderSettings(container) {
       const latestSettings = event?.detail && typeof event.detail === 'object'
         ? event.detail
         : await getSettings();
+      currentSettings = latestSettings;
       syncProviderApiKeyMap(providerApiKeyMap, latestSettings);
       refreshApiConfigHint();
       await updateModelsDropdown(String(document.getElementById('api-model')?.value || '').trim());
@@ -485,13 +492,16 @@ export async function renderSettings(container) {
   window.addEventListener('provider-settings-updated', providerSettingsUpdatedHandler);
 }
 
-function collectForm(providerApiKeyMap, searchApiSettings = {}) {
+function collectForm(currentSettings) {
   const endpoint = document.getElementById('api-endpoint').value.trim();
   const model = document.getElementById('api-model').value.trim() || 'deepseek-chat';
   const targetSizeInputVal = document.getElementById('target-size-input')?.value;
   const targetSizeVal = targetSizeInputVal || document.getElementById('target-size').value;
   const maxDepthInputVal = document.getElementById('max-depth-input')?.value;
   const maxDepthVal = maxDepthInputVal || document.getElementById('max-depth').value;
+  const providerConfigs = currentSettings?.providerConfigs && typeof currentSettings.providerConfigs === 'object'
+    ? { ...currentSettings.providerConfigs }
+    : {};
 
   const scanWebSearchEnabled = !!document.getElementById('enable-web-search').checked;
   const organizerWebSearchEnabled = !!document.getElementById('enable-organizer-web-search').checked;
@@ -500,17 +510,33 @@ function collectForm(providerApiKeyMap, searchApiSettings = {}) {
     enabled: scanWebSearchEnabled || organizerWebSearchEnabled,
     scopes: {
       scan: scanWebSearchEnabled,
+      classify: organizerWebSearchEnabled,
       organizer: organizerWebSearchEnabled,
     },
   };
 
+  if (endpoint) {
+    const existingConfig = providerConfigs[endpoint] && typeof providerConfigs[endpoint] === 'object'
+      ? { ...providerConfigs[endpoint] }
+      : {};
+    providerConfigs[endpoint] = {
+      ...existingConfig,
+      name: String(existingConfig.name || endpoint),
+      endpoint,
+      model,
+    };
+  }
+
   return {
+    providerConfigs,
+    defaultProviderEndpoint: endpoint || currentSettings?.defaultProviderEndpoint || currentSettings?.apiEndpoint || '',
     apiEndpoint: endpoint,
     model,
     scanPath: document.getElementById('scan-path').value.trim(),
     targetSizeGB: parseFloat(targetSizeVal),
     maxDepth: parseInt(maxDepthVal, 10),
     enableWebSearch: scanWebSearchEnabled,
+    enableWebSearchClassify: organizerWebSearchEnabled,
     enableWebSearchOrganizer: organizerWebSearchEnabled,
     searchApi,
   };

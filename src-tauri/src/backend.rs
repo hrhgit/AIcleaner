@@ -346,7 +346,11 @@ fn strip_secret_fields(v: &mut Value) {
 }
 
 fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
-    let mut merged = default_settings();
+    let mut merged = if path.exists() {
+        read_settings(path)
+    } else {
+        default_settings()
+    };
     merge_json(&mut merged, value);
     strip_secret_fields(&mut merged);
     fs::write(
@@ -1194,4 +1198,78 @@ pub async fn organize_rollback(
     job_id: String,
 ) -> Result<Value, String> {
     crate::organizer_runtime::organize_rollback(state, job_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_settings_path() -> PathBuf {
+        std::env::temp_dir().join(format!("aicleaner-settings-{}.json", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn partial_save_preserves_secret_meta() {
+        let path = temp_settings_path();
+        let seeded = json!({
+            "secretMeta": {
+                "providers": {
+                    "https://api.deepseek.com": true
+                },
+                "searchApi": true
+            }
+        });
+        write_settings(&path, &seeded).expect("seed settings");
+
+        let patch = json!({
+            "scanPath": "C:\\Users\\tester\\Downloads",
+            "targetSizeGB": 2
+        });
+        write_settings(&path, &patch).expect("partial save");
+
+        let saved = read_settings(&path);
+        assert_eq!(
+            saved["secretMeta"]["providers"]["https://api.deepseek.com"],
+            Value::Bool(true)
+        );
+        assert_eq!(saved["secretMeta"]["searchApi"], Value::Bool(true));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_save_preserves_custom_provider_configs() {
+        let path = temp_settings_path();
+        let custom_endpoint = "https://example.com/openai";
+        let seeded = json!({
+            "defaultProviderEndpoint": custom_endpoint,
+            "providerConfigs": {
+                custom_endpoint: {
+                    "name": "Custom",
+                    "endpoint": custom_endpoint,
+                    "model": "custom-model"
+                }
+            }
+        });
+        write_settings(&path, &seeded).expect("seed provider config");
+
+        let patch = json!({
+            "scanPath": "C:\\temp",
+            "maxDepth": 4
+        });
+        write_settings(&path, &patch).expect("partial save");
+
+        let saved = read_settings(&path);
+        assert_eq!(
+            saved["defaultProviderEndpoint"],
+            Value::String(custom_endpoint.to_string())
+        );
+        assert_eq!(
+            saved["providerConfigs"][custom_endpoint]["model"],
+            Value::String("custom-model".to_string())
+        );
+
+        let _ = fs::remove_file(path);
+    }
 }
