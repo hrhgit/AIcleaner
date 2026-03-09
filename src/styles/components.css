@@ -1057,3 +1057,23 @@ input[type="number"].no-spin {
     }
 }
 
+.secret-dialog-panel {
+    max-width: 460px;
+}
+
+.secret-dialog-message {
+    margin-top: 10px;
+    white-space: pre-wrap;
+    line-height: 1.6;
+}
+
+.secret-dialog-form {
+    margin-top: 20px;
+}
+
+.secret-dialog-error {
+    margin-top: -6px;
+    margin-bottom: 12px;
+    color: #fca5a5;
+}
+

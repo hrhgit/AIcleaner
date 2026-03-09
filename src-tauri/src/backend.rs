@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha1::Digest;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 use tauri::{Runtime, State};
 use tauri_plugin_stronghold::stronghold::Stronghold as SecureStronghold;
 
@@ -16,7 +17,6 @@ const SEARCH_SECRET_KEY: &str = "search:tavily:apiKey";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub data_dir: PathBuf,
     pub settings_path: PathBuf,
     pub db_path: PathBuf,
     pub(crate) scan_tasks: Arc<Mutex<HashMap<String, Arc<crate::scan_runtime::ScanTaskRuntime>>>>,
@@ -116,7 +116,7 @@ impl SecretVaultState {
 }
 
 fn hash_password(password: &str) -> Vec<u8> {
-    let mut hasher = sha1::Sha1::new();
+    let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     hasher.finalize().to_vec()
 }
@@ -159,7 +159,6 @@ impl AppState {
             secret_vault: Arc::new(Mutex::new(SecretVaultState::new(
                 data_dir.join(STRONGHOLD_FILE),
             ))),
-            data_dir,
             settings_path,
             db_path,
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -676,12 +675,18 @@ pub async fn secret_setup(
     if data.password.trim().is_empty() {
         return Err("Password is required.".to_string());
     }
+    let started_at = Instant::now();
     {
         let mut vault = state.secret_vault.lock().unwrap();
         vault.setup(&data.password)?;
     }
     let migrated = migrate_plaintext_secrets_if_needed(state.inner())?;
     let raw = read_settings(&state.settings_path);
+    log::info!(
+        "secret_setup completed in {} ms (migrated={})",
+        started_at.elapsed().as_millis(),
+        migrated
+    );
     Ok(json!({
         "success": true,
         "migrated": migrated,
@@ -697,12 +702,18 @@ pub async fn secret_unlock(
     if data.password.trim().is_empty() {
         return Err("Password is required.".to_string());
     }
+    let started_at = Instant::now();
     {
         let mut vault = state.secret_vault.lock().unwrap();
         vault.unlock(&data.password)?;
     }
     let migrated = migrate_plaintext_secrets_if_needed(state.inner())?;
     let raw = read_settings(&state.settings_path);
+    log::info!(
+        "secret_unlock completed in {} ms (migrated={})",
+        started_at.elapsed().as_millis(),
+        migrated
+    );
     Ok(json!({
         "success": true,
         "migrated": migrated,

@@ -1,13 +1,15 @@
 import {
   getEditableSecrets,
   getProviderModels,
+  getSecretStatus,
   getSettings,
   saveSecrets,
   saveSettings,
+  setupSecretVault,
+  unlockSecretVault,
 } from '../utils/api.js';
 import { showToast } from '../main.js';
 import {
-  ensureSecretVaultReady,
   getCachedSecretStatus,
   lockSecretVaultInUi,
   refreshSecretStatus,
@@ -91,6 +93,8 @@ let closeBtn;
 let cancelBtn;
 let saveBtn;
 let initialized = false;
+let vaultActionPending = false;
+const VAULT_SLOW_HINT_DELAY_MS = 1800;
 
 function escapeHtml(value) {
   return String(value || '')
@@ -99,6 +103,16 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function getErrorMessage(err) {
+  if (typeof err === 'string') return err;
+  if (err && typeof err.message === 'string' && err.message.trim()) return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err || 'Unknown error');
+  }
 }
 
 function normalizeModels(models) {
@@ -240,8 +254,16 @@ function renderProviderRows() {
     const actionLabel = secretStatus.initialized
       ? t('provider_modal.unlock')
       : t('provider_modal.setup');
+    const pendingLabel = secretStatus.initialized
+      ? t('provider_modal.unlocking')
+      : t('provider_modal.setting_up');
+    const passwordLabel = t('secret.password_label');
+    const confirmLabel = t('secret.password_confirm_label');
     const migrationHint = secretStatus.needsMigration
       ? `<div class="form-hint" style="color: var(--accent-warning); margin-top: 8px;">${escapeHtml(t('provider_modal.needs_migration'))}</div>`
+      : '';
+    const missingVaultHint = !secretStatus.initialized
+      ? `<div class="form-hint" style="color: var(--accent-warning); margin-top: 8px;">${escapeHtml(t('provider_modal.setup_missing_vault'))}</div>`
       : '';
     listEl.innerHTML = `
       <div class="provider-row provider-search-row">
@@ -253,18 +275,103 @@ function renderProviderRows() {
         </div>
         <div class="form-hint">${escapeHtml(t('provider_modal.locked_hint'))}</div>
         ${migrationHint}
-        <div class="flex items-center gap-8" style="margin-top: 16px;">
-          <button id="provider-vault-open-btn" class="btn btn-primary" type="button">${escapeHtml(actionLabel)}</button>
+        ${missingVaultHint}
+        <div class="provider-grid" style="margin-top: 16px;">
+          <div class="form-group">
+            <label class="form-label">${escapeHtml(passwordLabel)}</label>
+            <input id="provider-vault-password" class="form-input" type="password" autocomplete="${secretStatus.initialized ? 'current-password' : 'new-password'}" />
+          </div>
+          ${secretStatus.initialized ? '' : `
+          <div class="form-group">
+            <label class="form-label">${escapeHtml(confirmLabel)}</label>
+            <input id="provider-vault-password-confirm" class="form-input" type="password" autocomplete="new-password" />
+          </div>
+          `}
+        </div>
+        <div id="provider-vault-status" class="form-hint" style="color: var(--accent-info); margin-top: 10px;" hidden></div>
+        <div id="provider-vault-error" class="form-hint" style="color: #fca5a5; margin-top: -4px; margin-bottom: 8px;" hidden></div>
+        <div class="flex items-center gap-8" style="margin-top: 12px;">
+          <button id="provider-vault-open-btn" class="btn btn-primary" type="button" data-label-id="${secretStatus.initialized ? 'unlock' : 'setup'}" data-pending-label="${escapeHtml(pendingLabel)}">${escapeHtml(actionLabel)}</button>
           <button id="provider-vault-reset-btn" class="btn btn-secondary" type="button">${escapeHtml(t('provider_modal.reset'))}</button>
         </div>
       </div>
     `;
     listEl.querySelector('#provider-vault-open-btn')?.addEventListener('click', async () => {
+      if (vaultActionPending) return;
+      const passwordInput = listEl.querySelector('#provider-vault-password');
+      const confirmInput = listEl.querySelector('#provider-vault-password-confirm');
+      const statusEl = listEl.querySelector('#provider-vault-status');
+      const errorEl = listEl.querySelector('#provider-vault-error');
+      const actionBtn = listEl.querySelector('#provider-vault-open-btn');
+      const resetBtn = listEl.querySelector('#provider-vault-reset-btn');
+      const password = String(passwordInput?.value || '').trim();
+      const confirmPassword = String(confirmInput?.value || '').trim();
+      let slowHintTimer = null;
+      const setError = (message) => {
+        if (!errorEl) return;
+        errorEl.textContent = message;
+        errorEl.hidden = !message;
+      };
+      const setStatus = (message) => {
+        if (!statusEl) return;
+        statusEl.textContent = message;
+        statusEl.hidden = !message;
+      };
       try {
-        await ensureSecretVaultReady();
+        if (!password) {
+          setError(t('secret.password_required'));
+          passwordInput?.focus();
+          return;
+        }
+        if (!secretStatus.initialized && password !== confirmPassword) {
+          setError(t('secret.password_mismatch'));
+          confirmInput?.focus();
+          return;
+        }
+        setError('');
+        setStatus('');
+        vaultActionPending = true;
+        if (actionBtn) {
+          actionBtn.disabled = true;
+          actionBtn.textContent = actionBtn.getAttribute('data-pending-label') || pendingLabel;
+        }
+        if (resetBtn) resetBtn.disabled = true;
+        if (passwordInput) passwordInput.disabled = true;
+        if (confirmInput) confirmInput.disabled = true;
+        slowHintTimer = window.setTimeout(() => {
+          setStatus(t('provider_modal.slow_hint'));
+        }, VAULT_SLOW_HINT_DELAY_MS);
+        if (secretStatus.initialized) {
+          const result = await unlockSecretVault(password);
+          state.secretStatus = result?.secretStatus || await getSecretStatus();
+          showToast(result?.migrated ? t('secret.migrated') : t('secret.unlock_done'), 'success');
+        } else {
+          const result = await setupSecretVault(password);
+          state.secretStatus = result?.secretStatus || await getSecretStatus();
+          showToast(result?.migrated ? t('secret.migrated') : t('secret.setup_done'), 'success');
+        }
+        await refreshSecretStatus();
         await refreshModalData();
+        focusFirstProviderApiInput();
       } catch (err) {
-        showToast(err.message, 'error');
+        const message = getErrorMessage(err);
+        console.error('Provider vault open/setup failed:', err);
+        setError(message);
+        setStatus('');
+        showToast(message, 'error');
+      } finally {
+        vaultActionPending = false;
+        if (slowHintTimer != null) window.clearTimeout(slowHintTimer);
+        const resetLabel = secretStatus.initialized
+          ? t('provider_modal.unlock')
+          : t('provider_modal.setup');
+        if (actionBtn) {
+          actionBtn.disabled = false;
+          actionBtn.textContent = resetLabel;
+        }
+        if (resetBtn) resetBtn.disabled = false;
+        if (passwordInput) passwordInput.disabled = false;
+        if (confirmInput) confirmInput.disabled = false;
       }
     });
     listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
@@ -273,7 +380,7 @@ function renderProviderRows() {
         await refreshModalData();
         window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
       } catch (err) {
-        showToast(err.message, 'error');
+        showToast(getErrorMessage(err), 'error');
       }
     });
     return;
@@ -368,19 +475,19 @@ function renderProviderRows() {
     try {
       await lockSecretVaultInUi();
       await refreshModalData();
-    } catch (err) {
-      showToast(err.message, 'error');
-    }
-  });
-  listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
+      } catch (err) {
+        showToast(getErrorMessage(err), 'error');
+      }
+    });
+    listEl.querySelector('#provider-vault-reset-btn')?.addEventListener('click', async () => {
     try {
       await resetSecretVaultInUi();
       await refreshModalData();
       window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: await getSettings() }));
-    } catch (err) {
-      showToast(err.message, 'error');
-    }
-  });
+      } catch (err) {
+        showToast(getErrorMessage(err), 'error');
+      }
+    });
 
   for (const row of listEl.querySelectorAll('.provider-row')) {
     const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
@@ -475,6 +582,15 @@ function openModal() {
   modalEl.classList.add('open');
   modalEl.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
+}
+
+function focusFirstProviderApiInput() {
+  const firstInput = listEl?.querySelector('.provider-api-key');
+  if (!firstInput) return;
+  setTimeout(() => {
+    firstInput.focus();
+    firstInput.select?.();
+  }, 0);
 }
 
 function closeModal() {
@@ -576,18 +692,16 @@ function collectSecretsFromDOM() {
 
 async function handleOpenModal() {
   try {
-    const settings = await getSettings();
-    if (!settings?.secretStatus?.unlocked) {
-      try {
-        await ensureSecretVaultReady();
-      } catch {
-        // Fall back to locked view so user can choose to unlock later.
-      }
-    }
     await refreshModalData();
     openModal();
+    if (state.secretStatus?.unlocked) {
+      focusFirstProviderApiInput();
+    } else {
+      const passwordInput = listEl?.querySelector('#provider-vault-password');
+      setTimeout(() => passwordInput?.focus(), 0);
+    }
   } catch (err) {
-    showToast(`${t('provider_modal.failed')}${err.message}`, 'error');
+    showToast(`${t('provider_modal.failed')}${getErrorMessage(err)}`, 'error');
   }
 }
 
@@ -606,7 +720,7 @@ async function handleSave() {
     window.dispatchEvent(new CustomEvent('provider-settings-updated', { detail: latestSettings }));
     closeModal();
   } catch (err) {
-    showToast(`${t('provider_modal.failed')}${err.message}`, 'error');
+    showToast(`${t('provider_modal.failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     setSavingState(false);
   }

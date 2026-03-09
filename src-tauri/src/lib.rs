@@ -4,7 +4,7 @@ mod persist;
 mod scan_runtime;
 
 use backend::AppState;
-use sha1::Digest;
+use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -14,7 +14,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_stronghold::Builder::new(|password| {
-                let mut hasher = sha1::Sha1::new();
+                let mut hasher = Sha256::new();
                 hasher.update(password.as_bytes());
                 hasher.finalize().to_vec()
             })
