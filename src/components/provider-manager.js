@@ -57,6 +57,7 @@ const requestTokens = new Map();
 const state = {
   providers: [],
   defaultProviderEndpoint: '',
+  activeTab: null, // Track currently selected provider endpoint or 'tavily'
   credentialsStatus: {
     providerHasApiKey: {},
     searchApiHasKey: false,
@@ -90,7 +91,7 @@ let cancelBtn;
 let saveBtn;
 let closeConfirmEl;
 let closeConfirmCancelBtn;
-let closeConfirmSaveBtn;
+let closeConfirmDiscardBtn;
 let initialized = false;
 
 function escapeHtml(value) {
@@ -254,96 +255,157 @@ function renderModelOptions(selectEl, models, selected) {
 function renderProviderRows() {
   if (!listEl) return;
 
-  const providerRowsHtml = state.providers.map((provider) => {
-    const endpointKey = encodeURIComponent(provider.endpoint);
-    const models = fallbackModelsByEndpoint(provider.endpoint);
-    const hasSelected = models.some((item) => item.value === provider.model);
-    const mergedModels = hasSelected || !provider.model
-      ? models
-      : [...models, { value: provider.model, label: provider.model }];
-    const secretLoaded = !!state.editableCredentials?.providerSecrets?.[provider.endpoint];
-    const secretStored = hasStoredProviderSecret(provider.endpoint);
-    const secretUnavailable = secretStored && !secretLoaded;
-    const modelOptions = mergedModels.map((item) => {
-      const selected = item.value === provider.model ? 'selected' : '';
-      return `<option value="${escapeHtml(item.value)}" ${selected}>${escapeHtml(item.label)}</option>`;
-    }).join('');
+  if (!state.activeTab && state.providers.length > 0) {
+    state.activeTab = state.defaultProviderEndpoint || state.providers[0].endpoint;
+  }
 
-    return `
-      <div class="provider-row" data-endpoint="${endpointKey}">
+  // Generate sidebar tabs
+  const sidebarHtml = `
+    <div class="provider-sidebar">
+      <div class="provider-group-label">${t('provider_modal.llm_group') || '大模型 API'}</div>
+      ${state.providers.map((provider) => {
+        const hasKeyLocally = !!state.editableCredentials?.providerSecrets?.[provider.endpoint];
+        const hasKeyStored = hasStoredProviderSecret(provider.endpoint);
+        const isConfigured = hasKeyLocally || hasKeyStored;
+        const badgeHtml = isConfigured ? '<div class="provider-status-badge"></div>' : '';
+        return `
+        <div class="provider-tab ${state.activeTab === provider.endpoint ? 'active' : ''}" data-tab="${escapeHtml(provider.endpoint)}">
+          <div class="provider-tab-name">${escapeHtml(provider.name)}</div>
+          ${badgeHtml}
+        </div>
+        `;
+      }).join('')}
+      
+      <div class="provider-group-label">${t('provider_modal.search_group') || '聚合搜索引擎'}</div>
+      ${(() => {
+        const hasSearchLocally = !!state.editableCredentials?.searchApiKey;
+        const hasSearchStored = hasStoredSearchApiSecret();
+        const searchConfigured = hasSearchLocally || hasSearchStored;
+        const searchBadge = searchConfigured ? '<div class="provider-status-badge"></div>' : '';
+        return `
+        <div class="provider-tab ${state.activeTab === 'tavily' ? 'active' : ''}" data-tab="tavily">
+          <div class="provider-tab-name">${t('provider_modal.search_api_title')}</div>
+          ${searchBadge}
+        </div>
+        `;
+      })()}
+    </div>
+  `;
+
+  // Generate main content
+  let contentHtml = '';
+  
+  if (state.activeTab === 'tavily') {
+    contentHtml = `
+      <div class="provider-row provider-search-row">
         <div class="provider-row-head">
-          <label class="provider-default-toggle">
-            <input type="radio" name="provider-default" value="${escapeHtml(provider.endpoint)}" ${provider.endpoint === state.defaultProviderEndpoint ? 'checked' : ''} />
-            <span>${t('provider_modal.default')}</span>
-          </label>
           <div>
-            <div class="provider-name">${escapeHtml(provider.name)}</div>
-            <div class="provider-endpoint mono">${escapeHtml(provider.endpoint)}</div>
+            <div class="provider-name">${t('provider_modal.search_api_title')}</div>
+            <div class="provider-endpoint mono">Tavily</div>
           </div>
         </div>
         <div class="provider-grid">
           <div class="form-group">
-            <label class="form-label">${t('provider_modal.api_key')}</label>
+            <label class="form-label">${t('provider_modal.search_api_key')}</label>
             <input
+              id="provider-tavily-api-key"
               type="password"
-              class="form-input provider-api-key"
-              placeholder="${escapeHtml(secretUnavailable ? t('provider_modal.api_key_saved_placeholder') : t('provider_modal.api_key_placeholder'))}"
-              value="${escapeHtml(state.editableCredentials?.providerSecrets?.[provider.endpoint] || '')}"
+              class="form-input"
+              placeholder="${escapeHtml(hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? t('provider_modal.api_key_saved_placeholder') : 'tvly-xxxxxxxxxxxxxxx')}"
+              value="${escapeHtml(state.editableCredentials?.searchApiKey || '')}"
             />
-            ${secretUnavailable ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
-          </div>
-          <div class="form-group">
-            <label class="form-label">${t('provider_modal.model')}</label>
-            <div class="provider-model-line">
-              <select class="form-input provider-model">${modelOptions}</select>
-              <button type="button" class="btn btn-ghost provider-refresh-btn">${t('provider_modal.refresh')}</button>
+            ${hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
+            <div class="form-hint">
+              <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
+                ${escapeHtml(t('provider_modal.search_api_hint'))}
+              </a>
             </div>
           </div>
         </div>
       </div>
     `;
-  }).join('');
+  } else {
+    const provider = state.providers.find(p => p.endpoint === state.activeTab);
+    if (provider) {
+      const endpointKey = encodeURIComponent(provider.endpoint);
+      const models = fallbackModelsByEndpoint(provider.endpoint);
+      const hasSelected = models.some((item) => item.value === provider.model);
+      const mergedModels = hasSelected || !provider.model
+        ? models
+        : [...models, { value: provider.model, label: provider.model }];
+      const secretLoaded = !!state.editableCredentials?.providerSecrets?.[provider.endpoint];
+      const secretStored = hasStoredProviderSecret(provider.endpoint);
+      const secretUnavailable = secretStored && !secretLoaded;
+      const modelOptions = mergedModels.map((item) => {
+        const selected = item.value === provider.model ? 'selected' : '';
+        return `<option value="${escapeHtml(item.value)}" ${selected}>${escapeHtml(item.label)}</option>`;
+      }).join('');
 
-  const searchApiRowHtml = `
-    <div class="provider-row provider-search-row">
-      <div class="provider-row-head">
-        <div>
-          <div class="provider-name">${t('provider_modal.search_api_title')}</div>
-          <div class="provider-endpoint mono">Tavily</div>
-        </div>
-      </div>
-      <div class="provider-grid">
-        <div class="form-group">
-          <label class="form-label">${t('provider_modal.search_api_key')}</label>
-          <input
-            id="provider-tavily-api-key"
-            type="password"
-            class="form-input"
-            placeholder="${escapeHtml(hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? t('provider_modal.api_key_saved_placeholder') : 'tvly-xxxxxxxxxxxxxxx')}"
-            value="${escapeHtml(state.editableCredentials?.searchApiKey || '')}"
-          />
-          ${hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
-          <div class="form-hint">
-            <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
-              ${escapeHtml(t('provider_modal.search_api_hint'))}
-            </a>
+      contentHtml = `
+        <div class="provider-row" data-endpoint="${endpointKey}">
+          <div class="provider-row-head">
+            <label class="provider-default-toggle">
+              <input type="radio" name="provider-default" value="${escapeHtml(provider.endpoint)}" ${provider.endpoint === state.defaultProviderEndpoint ? 'checked' : ''} />
+              <span>${t('provider_modal.default')}</span>
+            </label>
+            <div>
+              <div class="provider-name">${escapeHtml(provider.name)}</div>
+              <div class="provider-endpoint mono">${escapeHtml(provider.endpoint)}</div>
+            </div>
+          </div>
+          <div class="provider-grid">
+            <div class="form-group">
+              <label class="form-label">${t('provider_modal.api_key')}</label>
+              <input
+                type="password"
+                class="form-input provider-api-key"
+                placeholder="${escapeHtml(secretUnavailable ? t('provider_modal.api_key_saved_placeholder') : t('provider_modal.api_key_placeholder'))}"
+                value="${escapeHtml(state.editableCredentials?.providerSecrets?.[provider.endpoint] || '')}"
+              />
+              ${secretUnavailable ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
+            </div>
+            <div class="form-group">
+              <label class="form-label">${t('provider_modal.model')}</label>
+              <div class="provider-model-line">
+                <select class="form-input provider-model">${modelOptions}</select>
+                <button type="button" class="btn btn-ghost provider-refresh-btn">${t('provider_modal.refresh')}</button>
+              </div>
+            </div>
           </div>
         </div>
+      `;
+    }
+  }
+
+  listEl.innerHTML = `
+    <div class="form-hint" style="margin-bottom: 12px; padding: 0 16px;">${escapeHtml(t('provider_modal.credentials_hint'))}</div>
+    <div class="provider-layout">
+      ${sidebarHtml}
+      <div class="provider-content">
+        ${contentHtml}
       </div>
     </div>
   `;
 
-  listEl.innerHTML = `
-    <div class="form-hint" style="margin-bottom: 12px;">${escapeHtml(t('provider_modal.credentials_hint'))}</div>
-    ${providerRowsHtml}${searchApiRowHtml}
-  `;
+  // Bind tab switching events
+  listEl.querySelectorAll('.provider-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      const targetTab = tab.getAttribute('data-tab');
+      if (state.activeTab !== targetTab) {
+        state.activeTab = targetTab;
+        renderProviderRows();
+      }
+    });
+  });
 
-  for (const row of listEl.querySelectorAll('.provider-row')) {
-    const endpoint = decodeURIComponent(String(row.getAttribute('data-endpoint') || ''));
-    const apiKeyInput = row.querySelector('.provider-api-key');
-    const modelSelect = row.querySelector('.provider-model');
-    const defaultRadio = row.querySelector('input[name="provider-default"]');
-    const refreshBtn = row.querySelector('.provider-refresh-btn');
+  // Bind input events for active tab content
+  const activeRow = listEl.querySelector('.provider-row');
+  if (activeRow && state.activeTab !== 'tavily') {
+    const endpoint = decodeURIComponent(String(activeRow.getAttribute('data-endpoint') || ''));
+    const apiKeyInput = activeRow.querySelector('.provider-api-key');
+    const modelSelect = activeRow.querySelector('.provider-model');
+    const defaultRadio = activeRow.querySelector('input[name="provider-default"]');
+    const refreshBtn = activeRow.querySelector('.provider-refresh-btn');
 
     apiKeyInput?.addEventListener('input', () => {
       const target = state.providers.find((p) => p.endpoint === endpoint);
@@ -364,6 +426,8 @@ function renderProviderRows() {
 
     defaultRadio?.addEventListener('change', () => {
       if (defaultRadio.checked) state.defaultProviderEndpoint = endpoint;
+      // Re-render to update the radio button state across tabs if needed, 
+      // though only one is visible at a time.
     });
 
     refreshBtn?.addEventListener('click', () => {
@@ -379,8 +443,13 @@ function renderProviderRows() {
     state.dirtyCredentials.searchApiKey = true;
   });
 
-  for (const provider of state.providers) {
-    loadModelsForProvider(provider.endpoint, false);
+  // Automatically load models for the currently active tab if it's a provider
+  if (state.activeTab && state.activeTab !== 'tavily') {
+    const activeProvider = state.providers.find(p => p.endpoint === state.activeTab);
+    if (activeProvider && !activeProvider.modelLoaded) {
+       loadModelsForProvider(activeProvider.endpoint, false);
+       activeProvider.modelLoaded = true; // prevent infinite loops
+    }
   }
 }
 
@@ -665,7 +734,10 @@ function bindStaticEvents() {
   cancelBtn?.addEventListener('click', requestCloseModal);
   saveBtn?.addEventListener('click', handleSave);
   closeConfirmCancelBtn?.addEventListener('click', closeCloseConfirm);
-  closeConfirmSaveBtn?.addEventListener('click', handleSave);
+  closeConfirmDiscardBtn?.addEventListener('click', () => {
+    closeCloseConfirm();
+    closeModal();
+  });
 
   modalEl?.addEventListener('click', (event) => {
     if (!closeConfirmEl?.hidden && closeConfirmEl?.contains(event.target)) return;
@@ -702,7 +774,7 @@ export function initProviderManager() {
   saveBtn = document.getElementById('provider-modal-save');
   closeConfirmEl = document.getElementById('provider-close-confirm');
   closeConfirmCancelBtn = document.getElementById('provider-close-confirm-cancel');
-  closeConfirmSaveBtn = document.getElementById('provider-close-confirm-save');
+  closeConfirmDiscardBtn = document.getElementById('provider-close-confirm-discard');
 
   bindStaticEvents();
   registerCredentialsStatusChangeHandler(async (event) => {
