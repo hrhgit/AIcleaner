@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use uuid::Uuid;
@@ -531,7 +532,7 @@ async fn emit_snapshot<R: Runtime>(
     state: &AppState,
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
-    let snap = task.snapshot.lock().unwrap().clone();
+    let snap = task.snapshot.lock().clone();
     persist::save_organize_snapshot(&state.db_path, &snap)?;
     app.emit(
         "organize_progress",
@@ -546,7 +547,7 @@ async fn run_organize_task<R: Runtime>(
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
     let (root_path, recursive, excluded, allow_new_categories, use_web_search) = {
-        let snap = task.snapshot.lock().unwrap();
+        let snap = task.snapshot.lock();
         (
             snap.root_path.clone(),
             snap.recursive,
@@ -556,14 +557,14 @@ async fn run_organize_task<R: Runtime>(
         )
     };
     {
-        let mut snap = task.snapshot.lock().unwrap();
+        let mut snap = task.snapshot.lock();
         snap.status = "scanning".to_string();
     }
     emit_snapshot(app, state, task).await?;
 
     let files = collect_files(Path::new(&root_path), recursive, &excluded, &task.stop);
     {
-        let mut snap = task.snapshot.lock().unwrap();
+        let mut snap = task.snapshot.lock();
         snap.status = "classifying".to_string();
         snap.total_files = files.len() as u64;
     }
@@ -584,7 +585,7 @@ async fn run_organize_task<R: Runtime>(
                 api_key: String::new(),
                 model: "gpt-4o-mini".to_string(),
             });
-        let categories = task.snapshot.lock().unwrap().categories.clone();
+        let categories = task.snapshot.lock().categories.clone();
         let (category, created_category, degraded, warnings, usage) = classify_file(
             &route,
             file,
@@ -596,7 +597,7 @@ async fn run_organize_task<R: Runtime>(
         )
         .await;
         let row = json!({
-            "taskId": task.snapshot.lock().unwrap().id,
+            "taskId": task.snapshot.lock().id,
             "index": idx + 1,
             "name": file.name,
             "path": file.path,
@@ -610,9 +611,9 @@ async fn run_organize_task<R: Runtime>(
             "provider": route.endpoint,
             "model": route.model,
         });
-        persist::upsert_organize_result(&state.db_path, &task.snapshot.lock().unwrap().id, &row)?;
+        persist::upsert_organize_result(&state.db_path, &task.snapshot.lock().id, &row)?;
         {
-            let mut snap = task.snapshot.lock().unwrap();
+            let mut snap = task.snapshot.lock();
             if created_category {
                 let new_category = row
                     .get("category")
@@ -636,7 +637,7 @@ async fn run_organize_task<R: Runtime>(
     }
 
     let final_snapshot = {
-        let mut snap = task.snapshot.lock().unwrap();
+        let mut snap = task.snapshot.lock();
         snap.results
             .sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
         snap.preview = build_preview(&snap.root_path, &snap.results);
@@ -763,7 +764,6 @@ pub async fn organize_start<R: Runtime>(
     state
         .organize_tasks
         .lock()
-        .unwrap()
         .insert(task_id.clone(), task.clone());
     let state_clone = state.inner().clone();
     let task_id_clone = task_id.clone();
@@ -772,7 +772,7 @@ pub async fn organize_start<R: Runtime>(
     let handle = tauri::async_runtime::spawn(async move {
         let result = run_organize_task(&app_clone, &state_clone, &runtime).await;
         if runtime.stop.load(Ordering::Relaxed) {
-            let mut snap = runtime.snapshot.lock().unwrap();
+            let mut snap = runtime.snapshot.lock();
             snap.status = "stopped".to_string();
             snap.completed_at = Some(now_iso());
             let _ = persist::save_organize_snapshot(&state_clone.db_path, &snap);
@@ -780,7 +780,7 @@ pub async fn organize_start<R: Runtime>(
             drop(snap);
             let _ = app_clone.emit("organize_stopped", payload);
         } else if let Err(err) = result {
-            let mut snap = runtime.snapshot.lock().unwrap();
+            let mut snap = runtime.snapshot.lock();
             snap.status = "error".to_string();
             snap.error = Some(err.clone());
             snap.completed_at = Some(now_iso());
@@ -792,10 +792,9 @@ pub async fn organize_start<R: Runtime>(
         state_clone
             .organize_tasks
             .lock()
-            .unwrap()
             .remove(&task_id_clone);
     });
-    *task.job.lock().unwrap() = Some(handle);
+    *task.job.lock() = Some(handle);
     Ok(json!({
         "taskId": task_id,
         "selectedModel": snapshot.selected_model,
@@ -809,7 +808,6 @@ pub async fn organize_stop(state: State<'_, AppState>, task_id: String) -> Resul
     let task = state
         .organize_tasks
         .lock()
-        .unwrap()
         .get(&task_id)
         .cloned()
         .ok_or_else(|| "Task not found".to_string())?;
@@ -821,8 +819,8 @@ pub async fn organize_get_result(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Value, String> {
-    if let Some(task) = state.organize_tasks.lock().unwrap().get(&task_id).cloned() {
-        let snap = task.snapshot.lock().unwrap().clone();
+    if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
+        let snap = task.snapshot.lock().clone();
         return serde_json::to_value(snap).map_err(|e| e.to_string());
     }
     let snapshot = persist::load_organize_snapshot(&state.db_path, &task_id)?
@@ -933,8 +931,8 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         .and_then(Value::as_str)
         .map(|x| x.to_string());
     persist::save_organize_snapshot(&state.db_path, &snapshot)?;
-    if let Some(task) = state.organize_tasks.lock().unwrap().get(&task_id).cloned() {
-        *task.snapshot.lock().unwrap() = snapshot;
+    if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
+        *task.snapshot.lock() = snapshot;
     }
     Ok(json!({ "success": true, "manifest": manifest }))
 }

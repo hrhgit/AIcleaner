@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tauri::{Runtime, State};
@@ -97,7 +98,7 @@ struct InMemoryCredentialStore {
 #[cfg(test)]
 impl CredentialStore for InMemoryCredentialStore {
     fn get(&self, account: &str) -> Result<Option<String>, String> {
-        Ok(self.values.lock().unwrap().get(account).cloned())
+        Ok(self.values.lock().get(account).cloned())
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
@@ -109,7 +110,7 @@ impl CredentialStore for InMemoryCredentialStore {
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {
-        self.values.lock().unwrap().remove(account);
+        self.values.lock().remove(account);
         Ok(())
     }
 }

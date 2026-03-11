@@ -6,7 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use uuid::Uuid;
@@ -346,7 +347,7 @@ async fn emit_progress<R: Runtime>(
     state: &AppState,
     task: &Arc<ScanTaskRuntime>,
 ) -> Result<(), String> {
-    let snap = task.snapshot.lock().unwrap().clone();
+    let snap = task.snapshot.lock().clone();
     persist::save_scan_snapshot(&state.db_path, &snap)?;
     app.emit(
         "scan_progress",
@@ -360,8 +361,8 @@ async fn run_auto_analyze<R: Runtime>(
     state: &AppState,
     task: &Arc<ScanTaskRuntime>,
 ) -> Result<(), String> {
-    let root = task.snapshot.lock().unwrap().root_node_id.clone();
-    let task_id = task.snapshot.lock().unwrap().id.clone();
+    let root = task.snapshot.lock().root_node_id.clone();
+    let task_id = task.snapshot.lock().id.clone();
     let mut queue = persist::load_scan_children(&state.db_path, &task_id, &root, false)?;
     let mut queued: HashSet<String> = queue.iter().map(|x| x.path.to_lowercase()).collect();
     let mut analyzed = HashSet::new();
@@ -377,7 +378,7 @@ async fn run_auto_analyze<R: Runtime>(
             continue;
         }
         {
-            let mut snap = task.snapshot.lock().unwrap();
+            let mut snap = task.snapshot.lock();
             snap.status = "analyzing".to_string();
             snap.current_path = node.path.clone();
             snap.current_depth = node.depth;
@@ -443,7 +444,7 @@ async fn run_auto_analyze<R: Runtime>(
         persist::upsert_scan_finding(&state.db_path, &task_id, &item)?;
 
         let (should_enqueue_children, reached_target) = {
-            let mut snap = task.snapshot.lock().unwrap();
+            let mut snap = task.snapshot.lock();
             snap.processed_entries = snap.processed_entries.saturating_add(1);
             snap.token_usage.prompt = snap
                 .token_usage
@@ -517,11 +518,11 @@ async fn handle_sidecar_line<R: Runtime>(
     task: &Arc<ScanTaskRuntime>,
     payload: &Value,
 ) -> Result<(), String> {
-    let task_id = task.snapshot.lock().unwrap().id.clone();
+    let task_id = task.snapshot.lock().id.clone();
     match payload.get("type").and_then(Value::as_str).unwrap_or("") {
         "task_started" | "scan_progress" | "scan_completed" => {
             {
-                let mut snap = task.snapshot.lock().unwrap();
+                let mut snap = task.snapshot.lock();
                 snap.status = "scanning".to_string();
                 if let Some(path) = payload.get("current_path").and_then(Value::as_str) {
                     snap.current_path = path.to_string();
@@ -543,7 +544,7 @@ async fn handle_sidecar_line<R: Runtime>(
         }
         "permission_denied" => {
             let warning = {
-                let mut snap = task.snapshot.lock().unwrap();
+                let mut snap = task.snapshot.lock();
                 snap.permission_denied_count = snap.permission_denied_count.saturating_add(1);
                 if let Some(path) = payload.get("path").and_then(Value::as_str) {
                     if !snap
@@ -581,7 +582,7 @@ async fn run_sidecar_scan<R: Runtime>(
     task: &Arc<ScanTaskRuntime>,
 ) -> Result<(), String> {
     let bin = scanner_binary_path(app)?;
-    let snap = task.snapshot.lock().unwrap().clone();
+    let snap = task.snapshot.lock().clone();
     let mut child = Command::new(bin)
         .arg("scan")
         .arg("--db")
@@ -597,7 +598,7 @@ async fn run_sidecar_scan<R: Runtime>(
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    *task.child_pid.lock().unwrap() = child.id().into();
+    *task.child_pid.lock() = child.id().into();
     let stdout = child
         .stdout
         .take()
@@ -612,7 +613,7 @@ async fn run_sidecar_scan<R: Runtime>(
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let trimmed = line.trim().to_string();
             if !trimmed.is_empty() {
-                *stderr_last_clone.lock().unwrap() = trimmed;
+                *stderr_last_clone.lock() = trimmed;
             }
         }
     });
@@ -631,12 +632,12 @@ async fn run_sidecar_scan<R: Runtime>(
 
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = stderr_handle.join();
-    *task.child_pid.lock().unwrap() = None;
+    *task.child_pid.lock() = None;
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
     if !status.success() {
-        let msg = stderr_last.lock().unwrap().clone();
+        let msg = stderr_last.lock().clone();
         return Err(if msg.is_empty() {
             format!("scanner.exe exited with {status}")
         } else {
@@ -652,7 +653,7 @@ async fn run_scan_task<R: Runtime>(
     task: &Arc<ScanTaskRuntime>,
 ) -> Result<(), String> {
     {
-        let mut snap = task.snapshot.lock().unwrap();
+        let mut snap = task.snapshot.lock();
         snap.status = "scanning".to_string();
     }
     emit_progress(app, state, task).await?;
@@ -660,11 +661,11 @@ async fn run_scan_task<R: Runtime>(
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    if task.snapshot.lock().unwrap().auto_analyze {
+    if task.snapshot.lock().auto_analyze {
         run_auto_analyze(app, state, task).await?;
     }
     if !task.stop.load(Ordering::Relaxed) {
-        let mut snap = task.snapshot.lock().unwrap();
+        let mut snap = task.snapshot.lock();
         snap.status = "done".to_string();
         persist::save_scan_snapshot(&state.db_path, &snap)?;
         let payload = serde_json::to_value(&*snap).map_err(|e| e.to_string())?;
@@ -740,7 +741,6 @@ pub async fn scan_start<R: Runtime>(
     state
         .scan_tasks
         .lock()
-        .unwrap()
         .insert(task_id.clone(), task.clone());
 
     let state_clone = state.inner().clone();
@@ -750,7 +750,7 @@ pub async fn scan_start<R: Runtime>(
     let handle = tauri::async_runtime::spawn(async move {
         let result = run_scan_task(&app_clone, &state_clone, &runtime).await;
         if let Err(err) = result {
-            let mut snap = runtime.snapshot.lock().unwrap();
+            let mut snap = runtime.snapshot.lock();
             snap.status = "error".to_string();
             snap.error_message = err.clone();
             let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
@@ -758,7 +758,7 @@ pub async fn scan_start<R: Runtime>(
             drop(snap);
             let _ = app_clone.emit("scan_error", payload);
         } else if runtime.stop.load(Ordering::Relaxed) {
-            let mut snap = runtime.snapshot.lock().unwrap();
+            let mut snap = runtime.snapshot.lock();
             snap.status = "stopped".to_string();
             let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
             let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
@@ -768,10 +768,9 @@ pub async fn scan_start<R: Runtime>(
         state_clone
             .scan_tasks
             .lock()
-            .unwrap()
             .remove(&task_id_clone);
     });
-    *task.job.lock().unwrap() = Some(handle);
+    *task.job.lock() = Some(handle);
     Ok(json!({ "taskId": task_id, "status": "started" }))
 }
 
@@ -779,22 +778,21 @@ pub async fn scan_stop(state: State<'_, AppState>, task_id: String) -> Result<Va
     let task = state
         .scan_tasks
         .lock()
-        .unwrap()
         .get(&task_id)
         .cloned()
         .ok_or_else(|| "Task not found".to_string())?;
     task.stop.store(true, Ordering::Relaxed);
-    if let Some(pid) = *task.child_pid.lock().unwrap() {
+    if let Some(pid) = *task.child_pid.lock() {
         let _ = kill_pid(pid);
     }
     Ok(json!({ "success": true }))
 }
 
 pub async fn scan_get_active(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
-    let map = state.scan_tasks.lock().unwrap();
+    let map = state.scan_tasks.lock();
     Ok(map
         .values()
-        .map(|task| task.snapshot.lock().unwrap().clone())
+        .map(|task| task.snapshot.lock().clone())
         .filter(|snap| matches!(snap.status.as_str(), "idle" | "scanning" | "analyzing"))
         .map(|snap| {
             json!({
@@ -833,8 +831,8 @@ pub async fn scan_delete_history(
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<Value, String> {
-    if let Some(task) = state.scan_tasks.lock().unwrap().get(&task_id).cloned() {
-        let status = task.snapshot.lock().unwrap().status.clone();
+    if let Some(task) = state.scan_tasks.lock().get(&task_id).cloned() {
+        let status = task.snapshot.lock().status.clone();
         if matches!(status.as_str(), "idle" | "scanning" | "analyzing") {
             return Err("Task is still running".to_string());
         }
@@ -846,8 +844,8 @@ pub async fn scan_delete_history(
 }
 
 pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    if let Some(task) = state.scan_tasks.lock().unwrap().get(&task_id).cloned() {
-        let snap = task.snapshot.lock().unwrap().clone();
+    if let Some(task) = state.scan_tasks.lock().get(&task_id).cloned() {
+        let snap = task.snapshot.lock().clone();
         return serde_json::to_value(snap).map_err(|e| e.to_string());
     }
     let snapshot = persist::load_scan_snapshot(&state.db_path, &task_id)?

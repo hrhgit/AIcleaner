@@ -1,4 +1,4 @@
-﻿/**
+/**
  * src/utils/i18n.js
  * Internationalization utilities
  */
@@ -48,7 +48,7 @@ const translations = {
     'settings.provider_hint': '选择模型服务提供商',
     'settings.api_key': 'API Key',
     'settings.api_key_placeholder': '请输入 API Key',
-    'settings.api_key_hint': '密钥仅存储在本地服务端',
+    'settings.api_key_hint': '密钥存储在 Windows 凭据管理器中',
     'settings.model': '模型',
     'settings.model_hint': '根据服务商选择合适模型',
     'settings.api_key_managed_hint': '请先在右上角“服务商 API”中配置 API Key。密钥会保存在 Windows 凭据管理器中，再返回此处选择服务商和模型。',
@@ -290,7 +290,7 @@ const translations = {
     'settings.provider_hint': 'Select model provider',
     'settings.api_key': 'API Key',
     'settings.api_key_placeholder': 'Enter API Key',
-    'settings.api_key_hint': 'Stored locally on server',
+    'settings.api_key_hint': 'Stored in Windows Credential Manager',
     'settings.model': 'Model',
     'settings.model_hint': 'Select a model for the selected provider',
     'settings.api_key_managed_hint': 'Configure API keys in the top-right "Provider API" first. Keys are stored in Windows Credential Manager, then return here to pick the provider and model.',
