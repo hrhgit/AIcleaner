@@ -44,6 +44,48 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function renderActionIcon(type) {
+  if (type === 'open') {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M3.75 7.5A2.25 2.25 0 0 1 6 5.25h3.19c.6 0 1.17.24 1.6.66l1.06 1.09c.14.14.34.22.53.22H18A2.25 2.25 0 0 1 20.25 9.5v.25" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4.73 18.75h11.74a2.25 2.25 0 0 0 2.15-1.59l1.3-4.25A1.5 1.5 0 0 0 18.48 11H6.63a2.25 2.25 0 0 0-2.15 1.59l-1.2 3.9a1.75 1.75 0 0 0 1.45 2.26Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    `;
+  }
+
+  return `
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.25" stroke="currentColor" stroke-width="1.7"/>
+      <path d="M8.5 12h7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+    </svg>
+  `;
+}
+
+function renderActionButton({ type, path, label }) {
+  return `
+    <button
+      class="btn btn-ghost results-action-icon ${type === 'open' ? 'open-loc-btn' : 'whitelist-btn'}"
+      data-path="${escapeHtml(path || '')}"
+      title="${escapeHtml(label)}"
+      aria-label="${escapeHtml(label)}"
+      type="button"
+    >
+      ${renderActionIcon(type)}
+    </button>
+  `;
+}
+
+function setActionButtonBusy(btn, busy) {
+  btn.disabled = busy;
+  btn.classList.toggle('is-busy', busy);
+  if (busy) {
+    btn.setAttribute('aria-busy', 'true');
+  } else {
+    btn.removeAttribute('aria-busy');
+  }
+}
+
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -491,12 +533,8 @@ function renderTable(data) {
       </td>
       <td style="text-align: center;">
         <div class="results-row-actions">
-          <button class="btn btn-ghost open-loc-btn" data-path="${escapeHtml(item.path || '')}" style="padding: 4px; font-size: 0.85rem;" title="${t('results.open_folder')}">
-            Open
-          </button>
-          <button class="btn btn-ghost whitelist-btn" data-path="${escapeHtml(item.path || '')}" style="padding: 4px; font-size: 0.85rem;" title="${t('results.add_to_whitelist')}">
-            ${t('results.add_to_whitelist')}
-          </button>
+          ${renderActionButton({ type: 'open', path: item.path, label: t('results.open_folder') })}
+          ${renderActionButton({ type: 'whitelist', path: item.path, label: t('results.add_to_whitelist') })}
         </div>
       </td>
     </tr>
@@ -509,10 +547,8 @@ function renderTable(data) {
   document.querySelectorAll('.open-loc-btn').forEach((btn) => {
     btn.addEventListener('click', async (event) => {
       event.preventDefault();
-      const originalHtml = btn.innerHTML;
       try {
-        btn.innerHTML = '...';
-        btn.disabled = true;
+        setActionButtonBusy(btn, true);
         const res = await openFileLocation(btn.dataset.path);
         if (!res.success) {
           showToast(t('results.toast_open_failed') + res.error, 'error');
@@ -520,8 +556,7 @@ function renderTable(data) {
       } catch (err) {
         showToast(t('results.toast_open_failed') + err.message, 'error');
       } finally {
-        btn.innerHTML = originalHtml;
-        btn.disabled = false;
+        setActionButtonBusy(btn, false);
       }
     });
   });
@@ -531,14 +566,11 @@ function renderTable(data) {
       event.preventDefault();
       const path = String(btn.dataset.path || '').trim();
       if (!path) return;
-      const originalHtml = btn.innerHTML;
       try {
-        btn.innerHTML = t('results.adding_to_whitelist');
-        btn.disabled = true;
+        setActionButtonBusy(btn, true);
         await addPathToWhitelist(path);
       } finally {
-        btn.innerHTML = originalHtml;
-        btn.disabled = false;
+        setActionButtonBusy(btn, false);
       }
     });
   });

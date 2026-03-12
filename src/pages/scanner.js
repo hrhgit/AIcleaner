@@ -381,7 +381,6 @@ function createScanRecordGroupElement(entries) {
       <span class="scan-log-group-arrow">></span>
       <span>${t('scanner.scan_records')} (${entries.length})</span>
     </div>
-    <span>${isScanRecordGroupCollapsed() ? t('scanner.log_expand') : t('scanner.log_collapse')}</span>
   `;
 
   const body = document.createElement('div');
@@ -394,10 +393,6 @@ function createScanRecordGroupElement(entries) {
     const nextCollapsed = !wrapper.classList.contains('is-collapsed');
     setScanRecordGroupCollapsed(nextCollapsed);
     wrapper.classList.toggle('is-collapsed', nextCollapsed);
-    const label = header.lastElementChild;
-    if (label) {
-      label.textContent = nextCollapsed ? t('scanner.log_expand') : t('scanner.log_collapse');
-    }
   });
 
   wrapper.appendChild(header);
@@ -441,12 +436,6 @@ function updateScanRecordGroupHeader(wrapper, count) {
   const titleText = wrapper.querySelector('.scan-log-group-title span:last-child');
   if (titleText) {
     titleText.textContent = `${t('scanner.scan_records')} (${count})`;
-  }
-  const label = wrapper.querySelector('.scan-log-group-header > span:last-child');
-  if (label) {
-    label.textContent = wrapper.classList.contains('is-collapsed')
-      ? t('scanner.log_expand')
-      : t('scanner.log_collapse');
   }
 }
 
