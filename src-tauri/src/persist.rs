@@ -8,11 +8,21 @@ use std::path::Path;
 #[derive(Clone, Debug)]
 pub struct ScanNode {
     pub id: String,
+    pub parent_id: Option<String>,
     pub path: String,
     pub name: String,
     pub node_type: String,
     pub depth: u32,
+    pub self_size: u64,
     pub size: u64,
+    pub child_count: u64,
+    pub mtime_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanFindingRecord {
+    pub item: ScanResultItem,
+    pub should_expand: bool,
 }
 
 fn open_db(db_path: &Path) -> Result<Connection, String> {
@@ -51,6 +61,10 @@ pub fn create_node_id(path_value: &str) -> String {
     format!("{:x}", sha.finalize())
 }
 
+pub fn create_root_path_key(path_value: &str) -> String {
+    path_value.trim().to_lowercase()
+}
+
 pub fn init_db(db_path: &Path) -> Result<(), String> {
     let conn = open_db(db_path)?;
     conn.execute_batch(
@@ -58,7 +72,11 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS scan_tasks (
             task_id TEXT PRIMARY KEY,
             root_path TEXT NOT NULL,
+            root_path_key TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
+            scan_mode TEXT NOT NULL DEFAULT 'full_rescan_incremental',
+            baseline_task_id TEXT,
+            visible_latest INTEGER NOT NULL DEFAULT 1,
             target_size INTEGER,
             max_depth INTEGER,
             auto_analyze INTEGER NOT NULL DEFAULT 1,
@@ -105,6 +123,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             type TEXT NOT NULL,
             size INTEGER NOT NULL DEFAULT 0,
             classification TEXT NOT NULL,
+            should_expand INTEGER NOT NULL DEFAULT 0,
             purpose TEXT,
             reason TEXT,
             risk TEXT,
@@ -119,6 +138,8 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         ON scan_nodes(task_id, path);
         CREATE INDEX IF NOT EXISTS idx_scan_findings_classification
         ON scan_findings(task_id, classification, size DESC);
+        CREATE INDEX IF NOT EXISTS idx_scan_tasks_root_visible
+        ON scan_tasks(root_path_key, visible_latest, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS organize_tasks (
             task_id TEXT PRIMARY KEY,
@@ -190,6 +211,65 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         "#,
     )
     .map_err(|e| e.to_string())?;
+    let scan_task_columns = conn
+        .prepare("PRAGMA table_info(scan_tasks)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !scan_task_columns.iter().any(|col| col == "root_path_key") {
+        conn.execute(
+            "ALTER TABLE scan_tasks ADD COLUMN root_path_key TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !scan_task_columns.iter().any(|col| col == "scan_mode") {
+        conn.execute(
+            "ALTER TABLE scan_tasks ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'full_rescan_incremental'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !scan_task_columns.iter().any(|col| col == "baseline_task_id") {
+        conn.execute(
+            "ALTER TABLE scan_tasks ADD COLUMN baseline_task_id TEXT",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !scan_task_columns.iter().any(|col| col == "visible_latest") {
+        conn.execute(
+            "ALTER TABLE scan_tasks ADD COLUMN visible_latest INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "UPDATE scan_tasks SET root_path_key = COALESCE(NULLIF(root_path_key, ''), lower(root_path)) WHERE root_path_key = '' OR root_path_key IS NULL",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    let scan_finding_columns = conn
+        .prepare("PRAGMA table_info(scan_findings)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !scan_finding_columns.iter().any(|col| col == "should_expand") {
+        conn.execute(
+            "ALTER TABLE scan_findings ADD COLUMN should_expand INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scan_tasks_root_visible ON scan_tasks(root_path_key, visible_latest, updated_at DESC)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     let organize_results_columns = conn
         .prepare("PRAGMA table_info(organize_results)")
         .and_then(|mut stmt| {
@@ -250,12 +330,20 @@ pub fn init_scan_task(
     task_id: &str,
     root_path: &str,
     target_size: u64,
-    max_depth: u32,
+    max_depth: Option<u32>,
     auto_analyze: bool,
+    baseline_task_id: Option<&str>,
+    scan_mode: &str,
 ) -> Result<(), String> {
     let mut conn = open_db(db_path)?;
     let now = now_iso();
+    let root_path_key = create_root_path_key(root_path);
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE scan_tasks SET visible_latest = 0 WHERE root_path_key = ?1",
+        params![root_path_key],
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM scan_nodes WHERE task_id = ?1",
         params![task_id],
@@ -268,12 +356,22 @@ pub fn init_scan_task(
     .map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT OR REPLACE INTO scan_tasks (
-            task_id, root_path, status, target_size, max_depth, auto_analyze,
+            task_id, root_path, root_path_key, status, scan_mode, baseline_task_id, visible_latest, target_size, max_depth, auto_analyze,
             current_path, current_depth, scanned_count, total_entries, processed_entries,
             deletable_count, total_cleanable, token_prompt, token_completion, token_total,
             permission_denied_count, permission_denied_paths, error_message, created_at, updated_at, finished_at
-        ) VALUES (?1, ?2, 'idle', ?3, ?4, ?5, ?2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '[]', NULL, ?6, ?6, NULL)",
-        params![task_id, root_path, target_size as i64, max_depth as i64, bool_to_i64(auto_analyze), now],
+        ) VALUES (?1, ?2, ?3, 'idle', ?4, ?5, 1, ?6, ?7, ?8, ?2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '[]', NULL, ?9, ?9, NULL)",
+        params![
+            task_id,
+            root_path,
+            root_path_key,
+            scan_mode,
+            baseline_task_id,
+            target_size as i64,
+            max_depth.map(|value| value as i64),
+            bool_to_i64(auto_analyze),
+            now
+        ],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
@@ -337,17 +435,19 @@ pub fn upsert_scan_finding(
     db_path: &Path,
     task_id: &str,
     item: &ScanResultItem,
+    should_expand: bool,
 ) -> Result<(), String> {
     let conn = open_db(db_path)?;
     conn.execute(
         "INSERT INTO scan_findings (
-            task_id, path, name, type, size, classification, purpose, reason, risk, source, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            task_id, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(task_id, path) DO UPDATE SET
             name = excluded.name,
             type = excluded.type,
             size = excluded.size,
             classification = excluded.classification,
+            should_expand = excluded.should_expand,
             purpose = excluded.purpose,
             reason = excluded.reason,
             risk = excluded.risk,
@@ -360,6 +460,7 @@ pub fn upsert_scan_finding(
             item.item_type,
             item.size as i64,
             item.classification,
+            bool_to_i64(should_expand),
             item.purpose,
             item.reason,
             item.risk,
@@ -388,24 +489,6 @@ pub fn refresh_scan_stats(db_path: &Path, task_id: &str) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-pub fn delete_scan_findings_by_paths(
-    db_path: &Path,
-    task_id: &str,
-    paths: &[String],
-) -> Result<(), String> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    for path in paths {
-        tx.execute(
-            "DELETE FROM scan_findings WHERE task_id = ?1 AND path = ?2",
-            params![task_id, path],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    refresh_scan_stats(db_path, task_id)
 }
 
 fn load_scan_findings(conn: &Connection, task_id: &str) -> Result<Vec<ScanResultItem>, String> {
@@ -437,11 +520,50 @@ fn load_scan_findings(conn: &Connection, task_id: &str) -> Result<Vec<ScanResult
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+pub fn load_scan_findings_map(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<std::collections::HashMap<String, ScanFindingRecord>, String> {
+    let conn = open_db(db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, path, size, type, purpose, reason, risk, classification, source, should_expand
+             FROM scan_findings
+             WHERE task_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id], |row| {
+            Ok(ScanFindingRecord {
+                item: ScanResultItem {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    size: row.get::<_, i64>(2)? as u64,
+                    item_type: row.get(3)?,
+                    purpose: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    reason: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    risk: row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "medium".to_string()),
+                    classification: row.get(7)?,
+                    source: row.get(8)?,
+                },
+                should_expand: row.get::<_, i64>(9)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .map(|record| (record.item.path.to_lowercase(), record))
+        .collect())
+}
+
 pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSnapshot>, String> {
     let conn = open_db(db_path)?;
     let row = conn
         .query_row(
-            "SELECT root_path, status, auto_analyze, current_path, current_depth, scanned_count,
+            "SELECT root_path, root_path_key, status, scan_mode, baseline_task_id, visible_latest,
+                    auto_analyze, max_depth, current_path, current_depth, scanned_count,
                     total_entries, processed_entries, deletable_count, total_cleanable, target_size,
                     token_prompt, token_completion, token_total, permission_denied_count,
                     permission_denied_paths, error_message
@@ -451,21 +573,26 @@ pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSn
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, i64>(12)?,
                     row.get::<_, i64>(13)?,
                     row.get::<_, i64>(14)?,
-                    row.get::<_, String>(15)?,
-                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, i64>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, String>(20)?,
+                    row.get::<_, Option<String>>(21)?,
                 ))
             },
         )
@@ -476,29 +603,42 @@ pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSn
     };
     let findings = load_scan_findings(&conn, task_id)?;
     let root_path = row.0.clone();
+    let max_scanned_depth = conn
+        .query_row(
+            "SELECT COALESCE(MAX(depth), 0) FROM scan_nodes WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())? as u32;
     Ok(Some(ScanSnapshot {
         id: task_id.to_string(),
-        status: row.1,
+        status: row.2,
+        scan_mode: row.3,
+        baseline_task_id: row.4,
+        visible_latest: row.5 != 0,
+        root_path_key: row.1,
         target_path: root_path.clone(),
-        auto_analyze: row.2 != 0,
+        auto_analyze: row.6 != 0,
         root_node_id: create_node_id(&root_path),
-        current_path: row.3.unwrap_or_else(|| root_path.clone()),
-        current_depth: row.4 as u32,
-        scanned_count: row.5 as u64,
-        total_entries: row.6 as u64,
-        processed_entries: row.7 as u64,
-        deletable_count: row.8 as u64,
-        total_cleanable: row.9 as u64,
-        target_size: row.10 as u64,
+        configured_max_depth: row.7.map(|value| value as u32),
+        max_scanned_depth,
+        current_path: row.8.unwrap_or_else(|| root_path.clone()),
+        current_depth: row.9 as u32,
+        scanned_count: row.10 as u64,
+        total_entries: row.11 as u64,
+        processed_entries: row.12 as u64,
+        deletable_count: row.13 as u64,
+        total_cleanable: row.14 as u64,
+        target_size: row.15 as u64,
         token_usage: TokenUsage {
-            prompt: row.11 as u64,
-            completion: row.12 as u64,
-            total: row.13 as u64,
+            prompt: row.16 as u64,
+            completion: row.17 as u64,
+            total: row.18 as u64,
         },
         deletable: findings,
-        permission_denied_count: row.14 as u64,
-        permission_denied_paths: parse_json_or_default(Some(row.15)),
-        error_message: row.16.unwrap_or_default(),
+        permission_denied_count: row.19 as u64,
+        permission_denied_paths: parse_json_or_default(Some(row.20)),
+        error_message: row.21.unwrap_or_default(),
     }))
 }
 
@@ -506,11 +646,12 @@ pub fn list_scan_history(db_path: &Path, limit: u32) -> Result<Vec<Value>, Strin
     let conn = open_db(db_path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT task_id, root_path, status, target_size, max_depth, auto_analyze, current_path,
+            "SELECT task_id, root_path, root_path_key, status, scan_mode, baseline_task_id, target_size, max_depth, auto_analyze, current_path,
                     current_depth, scanned_count, total_entries, processed_entries, deletable_count,
                     total_cleanable, token_prompt, token_completion, token_total, created_at,
                     updated_at, finished_at, error_message
              FROM scan_tasks
+             WHERE visible_latest = 1
              ORDER BY datetime(updated_at) DESC, task_id DESC
              LIMIT ?1",
         )
@@ -520,26 +661,29 @@ pub fn list_scan_history(db_path: &Path, limit: u32) -> Result<Vec<Value>, Strin
             Ok(json!({
                 "taskId": row.get::<_, String>(0)?,
                 "rootPath": row.get::<_, String>(1)?,
-                "status": row.get::<_, String>(2)?,
-                "targetSize": row.get::<_, i64>(3)? as u64,
-                "maxDepth": row.get::<_, i64>(4)? as u64,
-                "autoAnalyze": row.get::<_, i64>(5)? != 0,
-                "currentPath": row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                "currentDepth": row.get::<_, i64>(7)? as u64,
-                "scannedCount": row.get::<_, i64>(8)? as u64,
-                "totalEntries": row.get::<_, i64>(9)? as u64,
-                "processedEntries": row.get::<_, i64>(10)? as u64,
-                "deletableCount": row.get::<_, i64>(11)? as u64,
-                "totalCleanable": row.get::<_, i64>(12)? as u64,
+                "rootPathKey": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "scanMode": row.get::<_, String>(4)?,
+                "baselineTaskId": row.get::<_, Option<String>>(5)?,
+                "targetSize": row.get::<_, i64>(6)? as u64,
+                "maxDepth": row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                "autoAnalyze": row.get::<_, i64>(8)? != 0,
+                "currentPath": row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                "currentDepth": row.get::<_, i64>(10)? as u64,
+                "scannedCount": row.get::<_, i64>(11)? as u64,
+                "totalEntries": row.get::<_, i64>(12)? as u64,
+                "processedEntries": row.get::<_, i64>(13)? as u64,
+                "deletableCount": row.get::<_, i64>(14)? as u64,
+                "totalCleanable": row.get::<_, i64>(15)? as u64,
                 "tokenUsage": {
-                    "prompt": row.get::<_, i64>(13)? as u64,
-                    "completion": row.get::<_, i64>(14)? as u64,
-                    "total": row.get::<_, i64>(15)? as u64,
+                    "prompt": row.get::<_, i64>(16)? as u64,
+                    "completion": row.get::<_, i64>(17)? as u64,
+                    "total": row.get::<_, i64>(18)? as u64,
                 },
-                "createdAt": row.get::<_, String>(16)?,
-                "updatedAt": row.get::<_, String>(17)?,
-                "finishedAt": row.get::<_, Option<String>>(18)?,
-                "errorMessage": row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                "createdAt": row.get::<_, String>(19)?,
+                "updatedAt": row.get::<_, String>(20)?,
+                "finishedAt": row.get::<_, Option<String>>(21)?,
+                "errorMessage": row.get::<_, Option<String>>(22)?.unwrap_or_default(),
             }))
         })
         .map_err(|e| e.to_string())?;
@@ -549,6 +693,17 @@ pub fn list_scan_history(db_path: &Path, limit: u32) -> Result<Vec<Value>, Strin
 pub fn delete_scan_task(db_path: &Path, task_id: &str) -> Result<bool, String> {
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let meta = tx
+        .query_row(
+            "SELECT root_path_key, visible_latest FROM scan_tasks WHERE task_id = ?1",
+            params![task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((root_path_key, was_visible_latest)) = meta else {
+        return Ok(false);
+    };
     tx.execute(
         "DELETE FROM scan_findings WHERE task_id = ?1",
         params![task_id],
@@ -565,6 +720,21 @@ pub fn delete_scan_task(db_path: &Path, task_id: &str) -> Result<bool, String> {
             params![task_id],
         )
         .map_err(|e| e.to_string())?;
+    if changed > 0 && was_visible_latest != 0 {
+        tx.execute(
+            "UPDATE scan_tasks
+             SET visible_latest = 1
+             WHERE task_id = (
+                SELECT task_id
+                FROM scan_tasks
+                WHERE root_path_key = ?1
+                ORDER BY datetime(updated_at) DESC, task_id DESC
+                LIMIT 1
+             )",
+            params![root_path_key],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(changed > 0)
 }
@@ -577,12 +747,12 @@ pub fn load_scan_children(
 ) -> Result<Vec<ScanNode>, String> {
     let conn = open_db(db_path)?;
     let sql = if dirs_only {
-        "SELECT node_id, path, name, type, depth, total_size
+        "SELECT node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms
          FROM scan_nodes
          WHERE task_id = ?1 AND parent_id = ?2 AND type = 'directory'
          ORDER BY total_size DESC, path COLLATE NOCASE ASC"
     } else {
-        "SELECT node_id, path, name, type, depth, total_size
+        "SELECT node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms
          FROM scan_nodes
          WHERE task_id = ?1 AND parent_id = ?2
          ORDER BY total_size DESC, path COLLATE NOCASE ASC"
@@ -592,11 +762,144 @@ pub fn load_scan_children(
         .query_map(params![task_id, node_id], |row| {
             Ok(ScanNode {
                 id: row.get(0)?,
-                path: row.get(1)?,
-                name: row.get(2)?,
-                node_type: row.get(3)?,
-                depth: row.get::<_, i64>(4)? as u32,
-                size: row.get::<_, i64>(5)? as u64,
+                parent_id: row.get(1)?,
+                path: row.get(2)?,
+                name: row.get(3)?,
+                node_type: row.get(4)?,
+                depth: row.get::<_, i64>(5)? as u32,
+                self_size: row.get::<_, i64>(6)? as u64,
+                size: row.get::<_, i64>(7)? as u64,
+                child_count: row.get::<_, i64>(8)? as u64,
+                mtime_ms: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn load_scan_node_map(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<std::collections::HashMap<String, ScanNode>, String> {
+    let conn = open_db(db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms
+             FROM scan_nodes
+             WHERE task_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id], |row| {
+            Ok(ScanNode {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                path: row.get(2)?,
+                name: row.get(3)?,
+                node_type: row.get(4)?,
+                depth: row.get::<_, i64>(5)? as u32,
+                self_size: row.get::<_, i64>(6)? as u64,
+                size: row.get::<_, i64>(7)? as u64,
+                child_count: row.get::<_, i64>(8)? as u64,
+                mtime_ms: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .map(|node| (node.path.to_lowercase(), node))
+        .collect())
+}
+
+pub fn clone_scan_task_data(db_path: &Path, from_task_id: &str, to_task_id: &str) -> Result<(), String> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        "INSERT INTO scan_nodes (task_id, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext)
+         SELECT ?2, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext
+         FROM scan_nodes WHERE task_id = ?1",
+        params![from_task_id, to_task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO scan_findings (task_id, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at)
+         SELECT ?2, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at
+         FROM scan_findings WHERE task_id = ?1",
+        params![from_task_id, to_task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    refresh_scan_stats(db_path, to_task_id)
+}
+
+pub fn delete_scan_data_for_paths(
+    db_path: &Path,
+    task_id: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for path in paths {
+        let variants = [path.clone(), format!("{path}\\%"), format!("{path}/%")];
+        tx.execute(
+            "DELETE FROM scan_findings WHERE task_id = ?1 AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![task_id, variants[0], variants[1], variants[2]],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM scan_nodes WHERE task_id = ?1 AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![task_id, variants[0], variants[1], variants[2]],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    refresh_scan_stats(db_path, task_id)
+}
+
+pub fn find_latest_visible_scan_task_id_for_path(
+    db_path: &Path,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        "SELECT task_id
+         FROM scan_tasks
+         WHERE root_path_key = ?1 AND visible_latest = 1
+         ORDER BY datetime(updated_at) DESC, task_id DESC
+         LIMIT 1",
+        params![create_root_path_key(path)],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+pub fn list_boundary_scan_nodes(db_path: &Path, task_id: &str, depth: u32) -> Result<Vec<ScanNode>, String> {
+    let conn = open_db(db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.node_id, n.parent_id, n.path, n.name, n.type, n.depth, n.self_size, n.total_size, n.child_count, n.mtime_ms
+             FROM scan_nodes n
+             LEFT JOIN scan_findings f ON f.task_id = n.task_id AND f.path = n.path
+             WHERE n.task_id = ?1
+               AND n.type = 'directory'
+               AND n.depth = ?2
+               AND COALESCE(f.classification, '') <> 'safe_to_delete'
+               AND COALESCE(f.should_expand, 1) <> 0
+             ORDER BY n.total_size DESC, n.path COLLATE NOCASE ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![task_id, depth as i64], |row| {
+            Ok(ScanNode {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                path: row.get(2)?,
+                name: row.get(3)?,
+                node_type: row.get(4)?,
+                depth: row.get::<_, i64>(5)? as u32,
+                self_size: row.get::<_, i64>(6)? as u64,
+                size: row.get::<_, i64>(7)? as u64,
+                child_count: row.get::<_, i64>(8)? as u64,
+                mtime_ms: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -735,7 +1038,7 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
             row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
             row.get("category")
                 .and_then(Value::as_str)
-                .unwrap_or("鍏朵粬寰呭畾"),
+                .unwrap_or("其他待定"),
             bool_to_i64(
                 row.get("createdCategory")
                     .and_then(Value::as_bool)

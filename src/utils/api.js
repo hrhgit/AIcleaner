@@ -88,6 +88,10 @@ export async function listScanHistory(limit = 20) {
   return call('scan_list_history', { limit });
 }
 
+export async function findLatestScanForPath(path) {
+  return call('scan_find_latest_for_path', { path });
+}
+
 export async function deleteScanHistory(taskId) {
   return call('scan_delete_history', { task_id: taskId });
 }
@@ -110,6 +114,7 @@ export function connectScanStream(taskId, handlers) {
     ['scan_found', (p) => handlers.onFound?.(p)],
     ['scan_agent_call', (p) => handlers.onAgentCall?.(p)],
     ['scan_agent_response', (p) => handlers.onAgentResponse?.(p)],
+    ['scan_cache', (p) => handlers.onCache?.(p)],
     ['scan_warning', (p) => handlers.onWarning?.(p)],
     ['scan_done', (p) => { handlers.onDone?.(p); stream.close(); }],
     ['scan_error', (p) => { handlers.onError?.(p); stream.close(); }],

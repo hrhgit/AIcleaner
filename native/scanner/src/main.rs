@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection, Transaction};
 use serde_json::json;
 use sha1::{Digest, Sha1};
-use std::cmp::max;
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -33,9 +32,20 @@ struct ScanArgs {
     #[arg(long = "task-id")]
     task_id: String,
     #[arg(long)]
-    root: String,
+    root: Option<String>,
+    #[arg(long = "roots-json")]
+    roots_json: Option<String>,
+    #[arg(long = "ignore-json")]
+    ignore_json: Option<String>,
     #[arg(long = "max-depth")]
-    max_depth: usize,
+    max_depth: Option<usize>,
+}
+
+#[derive(Clone)]
+struct ScanRootInput {
+    path: String,
+    parent_id: Option<String>,
+    depth: usize,
 }
 
 #[derive(Clone)]
@@ -57,18 +67,25 @@ struct NodeRecord {
 struct ScanContext {
     conn: Connection,
     task_id: String,
-    max_depth: usize,
+    max_depth: Option<usize>,
+    ignored_paths: Vec<String>,
     scanned_count: u64,
     buffered: Vec<NodeRecord>,
     last_progress_mark: u64,
 }
 
 impl ScanContext {
-    fn new(conn: Connection, task_id: String, max_depth: usize) -> Self {
+    fn new(
+        conn: Connection,
+        task_id: String,
+        max_depth: Option<usize>,
+        ignored_paths: Vec<String>,
+    ) -> Self {
         Self {
             conn,
             task_id,
             max_depth,
+            ignored_paths,
             scanned_count: 0,
             buffered: Vec::with_capacity(BATCH_SIZE),
             last_progress_mark: 0,
@@ -127,6 +144,13 @@ impl ScanContext {
         )?;
         Ok(())
     }
+
+    fn is_ignored(&self, path: &Path) -> bool {
+        let path_key = normalize_path_key(&path_to_string(path));
+        self.ignored_paths
+            .iter()
+            .any(|ignored| is_same_or_descendant_path(&path_key, ignored))
+    }
 }
 
 fn main() {
@@ -148,8 +172,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let root = absolutize_path(Path::new(&args.root))?;
-    let root_string = path_to_string(&root);
+    let roots = if let Some(roots_json_path) = args.roots_json.as_deref() {
+        let raw = fs::read_to_string(roots_json_path)?;
+        let raw_values = serde_json::from_str::<Vec<serde_json::Value>>(&raw)?;
+        let mut parsed = raw_values
+            .into_iter()
+            .map(|value| ScanRootInput {
+                path: value
+                    .get("path")
+                    .and_then(|entry| entry.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                parent_id: value
+                    .get("parent_id")
+                    .and_then(|entry| entry.as_str())
+                    .map(|entry| entry.to_string()),
+                depth: value
+                    .get("depth")
+                    .and_then(|entry| entry.as_u64())
+                    .unwrap_or(0) as usize,
+            })
+            .collect::<Vec<_>>();
+        for item in &mut parsed {
+            item.path = path_to_string(&absolutize_path(Path::new(&item.path))?);
+        }
+        parsed
+    } else {
+        let root = absolutize_path(Path::new(
+            args.root
+                .as_deref()
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--root is required"))?,
+        ))?;
+        vec![ScanRootInput {
+            path: path_to_string(&root),
+            parent_id: None,
+            depth: 0,
+        }]
+    };
+    let root_string = roots
+        .first()
+        .map(|item| item.path.clone())
+        .unwrap_or_default();
+    let ignored_paths = load_ignored_paths(args.ignore_json.as_deref())?;
 
     let conn = Connection::open(&args.db)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -170,8 +234,14 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         "total_entries": 0,
     }));
 
-    let mut ctx = ScanContext::new(conn, args.task_id.clone(), max(args.max_depth, 0));
-    let _ = scan_dir(&mut ctx, &root, None, 0)?;
+    let mut ctx = ScanContext::new(conn, args.task_id.clone(), args.max_depth, ignored_paths);
+    for root in &roots {
+        let abs = absolutize_path(Path::new(&root.path))?;
+        if ctx.is_ignored(&abs) {
+            continue;
+        }
+        let _ = scan_dir(&mut ctx, &abs, root.parent_id.clone(), root.depth)?;
+    }
     ctx.flush_nodes()?;
     ctx.update_scan_progress(&root_string, 0)?;
     ctx.conn.execute(
@@ -209,6 +279,9 @@ fn scan_dir(
     depth: usize,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let dir_abs = absolutize_path(dir_path)?;
+    if ctx.is_ignored(&dir_abs) {
+        return Ok(0);
+    }
     let dir_string = path_to_string(&dir_abs);
     let dir_id = node_id_for(&dir_string);
     let metadata = fs::metadata(&dir_abs).ok();
@@ -216,7 +289,7 @@ fn scan_dir(
     let mut total_size = 0_i64;
     let mut child_count = 0_i64;
 
-    if depth < ctx.max_depth {
+    if ctx.max_depth.map(|limit| depth < limit).unwrap_or(true) {
         let read_dir = match fs::read_dir(&dir_abs) {
             Ok(value) => value,
             Err(err) if is_permission_denied(&err) => {
@@ -251,6 +324,9 @@ fn scan_dir(
                 Ok(value) => value,
                 Err(_) => continue,
             };
+            if ctx.is_ignored(&child_abs) {
+                continue;
+            }
             let child_string = path_to_string(&child_abs);
             let file_type = match entry.file_type() {
                 Ok(value) => value,
@@ -292,8 +368,8 @@ fn scan_dir(
             }
         }
     } else {
-        total_size = compute_hidden_dir_size(&dir_abs)?;
-        child_count = count_children(&dir_abs)? as i64;
+        total_size = compute_hidden_dir_size(ctx, &dir_abs)?;
+        child_count = count_children(ctx, &dir_abs)? as i64;
     }
 
     let record = NodeRecord {
@@ -315,7 +391,10 @@ fn scan_dir(
     Ok(total_size)
 }
 
-fn compute_hidden_dir_size(path: &Path) -> Result<i64, Box<dyn std::error::Error>> {
+fn compute_hidden_dir_size(
+    ctx: &ScanContext,
+    path: &Path,
+) -> Result<i64, Box<dyn std::error::Error>> {
     let mut total = 0_i64;
     let read_dir = match fs::read_dir(path) {
         Ok(value) => value,
@@ -331,13 +410,16 @@ fn compute_hidden_dir_size(path: &Path) -> Result<i64, Box<dyn std::error::Error
             Err(_) => continue,
         };
         let child_path = entry.path();
+        if ctx.is_ignored(&child_path) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(value) => value,
             Err(_) => continue,
         };
 
         if file_type.is_dir() {
-            total += compute_hidden_dir_size(&child_path)?;
+            total += compute_hidden_dir_size(ctx, &child_path)?;
         } else if file_type.is_file() {
             if let Ok(meta) = entry.metadata() {
                 total += meta.len() as i64;
@@ -347,7 +429,7 @@ fn compute_hidden_dir_size(path: &Path) -> Result<i64, Box<dyn std::error::Error
     Ok(total)
 }
 
-fn count_children(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+fn count_children(ctx: &ScanContext, path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
     let mut count = 0_usize;
     let read_dir = match fs::read_dir(path) {
         Ok(value) => value,
@@ -355,11 +437,36 @@ fn count_children(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
         Err(err) => return Err(Box::new(err)),
     };
     for entry_result in read_dir {
-        if entry_result.is_ok() {
+        if let Ok(entry) = entry_result {
+            if ctx.is_ignored(&entry.path()) {
+                continue;
+            }
             count += 1;
         }
     }
     Ok(count)
+}
+
+fn load_ignored_paths(path: Option<&str>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let raw = fs::read_to_string(path)?;
+    let values = serde_json::from_str::<Vec<String>>(&raw)?;
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let absolute = absolutize_path(Path::new(trimmed))?;
+        let normalized = normalize_path_key(&path_to_string(&absolute));
+        if normalized.is_empty() || out.iter().any(|item| item == &normalized) {
+            continue;
+        }
+        out.push(normalized);
+    }
+    Ok(out)
 }
 
 fn insert_nodes(tx: &Transaction<'_>, nodes: &[NodeRecord]) -> rusqlite::Result<()> {
@@ -405,7 +512,11 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS scan_tasks (
             task_id TEXT PRIMARY KEY,
             root_path TEXT NOT NULL,
+            root_path_key TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
+            scan_mode TEXT NOT NULL DEFAULT 'full_rescan_incremental',
+            baseline_task_id TEXT,
+            visible_latest INTEGER NOT NULL DEFAULT 1,
             target_size INTEGER,
             max_depth INTEGER,
             auto_analyze INTEGER NOT NULL DEFAULT 1,
@@ -419,6 +530,8 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             token_prompt INTEGER NOT NULL DEFAULT 0,
             token_completion INTEGER NOT NULL DEFAULT 0,
             token_total INTEGER NOT NULL DEFAULT 0,
+            permission_denied_count INTEGER NOT NULL DEFAULT 0,
+            permission_denied_paths TEXT NOT NULL DEFAULT '[]',
             error_message TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -450,6 +563,7 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             type TEXT NOT NULL,
             size INTEGER NOT NULL DEFAULT 0,
             classification TEXT NOT NULL,
+            should_expand INTEGER NOT NULL DEFAULT 0,
             purpose TEXT,
             reason TEXT,
             risk TEXT,
@@ -488,6 +602,18 @@ fn node_id_for(path_value: &str) -> String {
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn normalize_path_key(value: &str) -> String {
+    let mut normalized = value.trim().replace('/', "\\").to_lowercase();
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn is_same_or_descendant_path(path: &str, parent: &str) -> bool {
+    path == parent || path.starts_with(&format!("{parent}\\"))
 }
 
 fn directory_name(path: &Path) -> String {
@@ -560,4 +686,24 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if m <= 2 { 1 } else { 0 };
     (year, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_same_or_descendant_path;
+    use super::normalize_path_key;
+
+    #[test]
+    fn normalized_paths_compare_case_insensitively() {
+        let ignored = normalize_path_key("C:/Temp/Test/");
+        let child = normalize_path_key("c:\\temp\\test\\child.log");
+        assert!(is_same_or_descendant_path(&child, &ignored));
+    }
+
+    #[test]
+    fn sibling_paths_do_not_match_ignore_prefix() {
+        let ignored = normalize_path_key("C:\\Temp\\foo");
+        let sibling = normalize_path_key("C:\\Temp\\foobar.txt");
+        assert!(!is_same_or_descendant_path(&sibling, &ignored));
+    }
 }

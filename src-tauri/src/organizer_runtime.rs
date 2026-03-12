@@ -2,13 +2,13 @@ use crate::backend::{
     AppState, OrganizeSnapshot, OrganizeStartInput, OrganizeSuggestInput, TokenUsage,
 };
 use crate::persist;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use uuid::Uuid;
@@ -295,7 +295,11 @@ fn summarize_directory_tree(
     let mut file_count = 0_u64;
     let mut dir_count = 0_u64;
     let mut ext_counts = HashMap::new();
-    for entry in WalkDir::new(path).min_depth(1).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(path)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -567,8 +571,8 @@ fn parse_category_response(
     categories: &[String],
     allow_new_categories: bool,
 ) -> (String, bool) {
-    let parsed: Value = serde_json::from_str(&sanitize_json_block(content))
-        .unwrap_or_else(|_| json!({}));
+    let parsed: Value =
+        serde_json::from_str(&sanitize_json_block(content)).unwrap_or_else(|_| json!({}));
     let candidate = parsed
         .get("category")
         .and_then(Value::as_str)
@@ -1167,10 +1171,7 @@ pub async fn organize_start<R: Runtime>(
             drop(snap);
             let _ = app_clone.emit("organize_error", payload);
         }
-        state_clone
-            .organize_tasks
-            .lock()
-            .remove(&task_id_clone);
+        state_clone.organize_tasks.lock().remove(&task_id_clone);
     });
     *task.job.lock() = Some(handle);
     Ok(json!({

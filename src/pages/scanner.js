@@ -5,6 +5,7 @@
 import {
   browseFolder,
   connectScanStream,
+  findLatestScanForPath,
   getActiveScan,
   getProviderModels,
   getScanResult,
@@ -30,8 +31,8 @@ let nextLogEntryId = 0;
 let currentSettings = null;
 let renderVersion = 0;
 const expandedDetailLogIds = new Set();
-const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v1';
-const SCANNER_FORM_DRAFT_VERSION = 1;
+const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v2';
+const SCANNER_FORM_DRAFT_VERSION = 2;
 const SCAN_LOG_COLLAPSED_KEY = 'wipeout.scanner.log.collapsed.v1';
 const SCAN_RECORD_GROUP_COLLAPSED_KEY = 'wipeout.scanner.record-group.collapsed.v1';
 const SCAN_LOG_CACHE_KEY = 'wipeout.scanner.global.log.v1';
@@ -77,6 +78,8 @@ let scanProviderApiKeyMap = {};
 const scanRemoteModelsCache = new Map();
 let scanModelsRequestToken = 0;
 let scannerProviderSettingsUpdatedHandler = null;
+let latestBaselineSnapshot = null;
+let baselineLookupToken = 0;
 
 function clampNumber(value, min, max, fallback) {
   const n = Number(value);
@@ -130,6 +133,7 @@ function collectScannerForm() {
     100,
     1
   );
+  const maxDepthUnlimited = !!document.getElementById('max-depth-unlimited')?.checked;
   const maxDepth = Math.floor(clampNumber(
     document.getElementById('max-depth-input')?.value ?? document.getElementById('max-depth')?.value,
     1,
@@ -144,6 +148,7 @@ function collectScannerForm() {
     scanPath,
     targetSizeGB: targetSize,
     maxDepth,
+    maxDepthUnlimited,
     scanWebSearchEnabled,
     scanProviderEndpoint,
     scanModel,
@@ -155,6 +160,7 @@ function normalizeScannerFormDraft(raw = {}) {
     scanPath: String(raw?.scanPath || '').trim(),
     targetSizeGB: clampNumber(raw?.targetSizeGB, 0.1, 100, 1),
     maxDepth: Math.floor(clampNumber(raw?.maxDepth, 1, 10, 5)),
+    maxDepthUnlimited: !!raw?.maxDepthUnlimited,
     scanWebSearchEnabled: !!raw?.scanWebSearchEnabled,
     scanProviderEndpoint: String(raw?.scanProviderEndpoint || '').trim(),
     scanModel: String(raw?.scanModel || '').trim(),
@@ -171,6 +177,7 @@ function extractScannerFormFromSettings(settings = {}) {
     scanPath: settings?.scanPath,
     targetSizeGB: settings?.targetSizeGB,
     maxDepth: settings?.maxDepth,
+    maxDepthUnlimited: settings?.maxDepthUnlimited,
     scanWebSearchEnabled,
     scanProviderEndpoint: settings?.apiEndpoint || settings?.defaultProviderEndpoint || '',
     scanModel: settings?.model || '',
@@ -251,16 +258,38 @@ function setScanLogCollapsed(collapsed) {
   storage.set(SCAN_LOG_COLLAPSED_KEY, !!collapsed);
 }
 
+function expandScanLogPreview() {
+  if (!isScanLogCollapsed() || !logEntries.length) return;
+  setScanLogCollapsed(false);
+  refreshScanLogPanel();
+}
+
 function refreshScanLogPanel() {
   const collapsed = isScanLogCollapsed();
   const panel = document.getElementById('scan-log-panel');
   const toggleBtn = document.getElementById('toggle-log-btn');
+  const hint = document.getElementById('scan-log-collapsed-hint');
+  const hasPreview = logEntries.length > 0;
   if (panel) {
     panel.classList.toggle('is-collapsed', collapsed);
+    panel.classList.toggle('is-clickable-preview', collapsed && hasPreview);
+    panel.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    if (collapsed && hasPreview) {
+      panel.setAttribute('role', 'button');
+      panel.setAttribute('tabindex', '0');
+      panel.setAttribute('aria-label', t('scanner.log_preview_hint'));
+    } else {
+      panel.removeAttribute('role');
+      panel.removeAttribute('tabindex');
+      panel.removeAttribute('aria-label');
+    }
   }
   if (toggleBtn) {
     toggleBtn.textContent = collapsed ? t('scanner.log_expand') : t('scanner.log_collapse');
     toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  if (hint) {
+    hint.style.display = collapsed && hasPreview ? '' : 'none';
   }
 }
 
@@ -303,8 +332,8 @@ function createSimpleLogEntryElement(entry) {
   el.className = `scan-log-entry ${entry.type}`;
   el.innerHTML = `
     <span class="log-icon">${getLogIcon(entry.type)}</span>
-    <span style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
-    <span>${entry.text}</span>
+    <span class="log-time" style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
+    <span class="log-text">${entry.text}</span>
   `;
   return el;
 }
@@ -315,11 +344,11 @@ function createDetailLogEntryElement(entry) {
   wrapper.className = `scan-log-entry ${entry.type}`;
   wrapper.innerHTML = `
     <span class="log-icon">${getLogIcon(entry.type)}</span>
-    <div style="flex: 1; min-width: 0;">
+    <div class="log-content">
       <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
-        <span style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
+        <span class="log-time" style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
         <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">></span>
-        <span>${entry.summary}</span>
+        <span class="log-summary">${entry.summary}</span>
       </div>
       <div class="log-detail-body" style="display: ${expanded ? 'block' : 'none'}; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
         ${entry.detailHtml}
@@ -633,6 +662,7 @@ function mergeSettingsWithDraft(settings = {}, draftState = { dirty: false, data
     scanPath: draft.scanPath,
     targetSizeGB: draft.targetSizeGB,
     maxDepth: draft.maxDepth,
+    maxDepthUnlimited: draft.maxDepthUnlimited,
     apiEndpoint: draft.scanProviderEndpoint || settings?.apiEndpoint,
     defaultProviderEndpoint: draft.scanProviderEndpoint || settings?.defaultProviderEndpoint,
     model: draft.scanModel || settings?.model,
@@ -651,6 +681,7 @@ function applySettingsToForm(settings = {}) {
   const targetSizeInput = document.getElementById('target-size-input');
   const maxDepthSlider = document.getElementById('max-depth');
   const maxDepthInput = document.getElementById('max-depth-input');
+  const maxDepthUnlimitedToggle = document.getElementById('max-depth-unlimited');
   const scanToggle = document.getElementById('scan-enable-web-search');
   const providerSelect = document.getElementById('scan-provider');
   const modelSelect = document.getElementById('scan-model');
@@ -660,6 +691,8 @@ function applySettingsToForm(settings = {}) {
   if (targetSizeInput) targetSizeInput.value = form.targetSizeGB.toFixed(1);
   if (maxDepthSlider) maxDepthSlider.value = String(form.maxDepth);
   if (maxDepthInput) maxDepthInput.value = String(form.maxDepth);
+  if (maxDepthUnlimitedToggle) maxDepthUnlimitedToggle.checked = !!form.maxDepthUnlimited;
+  updateScannerMaxDepthControls(!!form.maxDepthUnlimited);
   if (scanToggle) scanToggle.checked = !!form.scanWebSearchEnabled;
   if (providerSelect) {
     ensureSelectOptionExists(providerSelect, form.scanProviderEndpoint, getProviderLabel(form.scanProviderEndpoint));
@@ -672,6 +705,21 @@ function applySettingsToForm(settings = {}) {
 
   updatePathDisplay(form.scanPath);
   refreshScanApiConfigHint(form.scanProviderEndpoint);
+  refreshLatestBaselineForPath(form.scanPath);
+}
+
+function updateScannerMaxDepthControls(unlimited) {
+  const maxDepthSlider = document.getElementById('max-depth');
+  const maxDepthInput = document.getElementById('max-depth-input');
+  const maxDepthHint = document.getElementById('max-depth-hint');
+  const disabled = !!unlimited;
+  if (maxDepthSlider) maxDepthSlider.disabled = disabled;
+  if (maxDepthInput) maxDepthInput.disabled = disabled;
+  if (maxDepthHint) {
+    maxDepthHint.textContent = disabled
+      ? t('settings.max_depth_unlimited_hint')
+      : t('settings.max_depth_hint');
+  }
 }
 
 function updatePathDisplay(pathValue) {
@@ -680,9 +728,52 @@ function updatePathDisplay(pathValue) {
   const path = String(pathValue || '').trim();
   if (path) {
     pathDisplay.textContent = `${t('settings.scan_path')}: ${path}`;
+    pathDisplay.title = pathDisplay.textContent;
   } else {
     pathDisplay.textContent = t('scanner.path_not_configured');
+    pathDisplay.title = pathDisplay.textContent;
   }
+}
+
+function refreshScanActionHint() {
+  const hintEl = document.getElementById('scan-incremental-hint');
+  const startBtn = document.getElementById('start-btn');
+  const baseline = latestBaselineSnapshot;
+  if (hintEl) {
+    if (baseline?.id) {
+      hintEl.textContent = t('scanner.incremental_hint', {
+        depth: baseline.configuredMaxDepth ?? baseline.maxScannedDepth ?? 0,
+        size: formatSize(baseline.totalCleanable || 0),
+      });
+      hintEl.style.display = 'block';
+    } else {
+      hintEl.textContent = '';
+      hintEl.style.display = 'none';
+    }
+  }
+  if (startBtn && !activeTaskId) {
+    startBtn.textContent = baseline?.id ? t('scanner.rescan') : t('scanner.start');
+  }
+}
+
+async function refreshLatestBaselineForPath(pathValue) {
+  const path = String(pathValue || '').trim();
+  const token = ++baselineLookupToken;
+  if (!path) {
+    latestBaselineSnapshot = null;
+    refreshScanActionHint();
+    return;
+  }
+  try {
+    const snapshot = await findLatestScanForPath(path);
+    if (token !== baselineLookupToken) return;
+    latestBaselineSnapshot = snapshot && typeof snapshot === 'object' && snapshot.id ? snapshot : null;
+  } catch (err) {
+    if (token !== baselineLookupToken) return;
+    latestBaselineSnapshot = null;
+    console.warn('Failed to resolve latest scan baseline:', err);
+  }
+  refreshScanActionHint();
 }
 
 function setSaveStatus(text, colorToken = '--text-muted') {
@@ -745,6 +836,7 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
       scanPath: form.scanPath,
       targetSizeGB: form.targetSizeGB,
       maxDepth: form.maxDepth,
+      maxDepthUnlimited: !!form.maxDepthUnlimited,
       enableWebSearch: !!form.scanWebSearchEnabled,
       enableWebSearchClassify: classifyEnabled,
       enableWebSearchOrganizer: classifyEnabled,
@@ -838,6 +930,7 @@ function bindSettingsEvents() {
   const sizeInput = document.getElementById('target-size-input');
   const depthSlider = document.getElementById('max-depth');
   const depthInput = document.getElementById('max-depth-input');
+  const depthUnlimitedToggle = document.getElementById('max-depth-unlimited');
   const handleFormMutation = () => {
     persistScannerFormDraft();
   };
@@ -873,10 +966,15 @@ function bindSettingsEvents() {
     if (depthSlider) depthSlider.value = String(val);
     handleFormMutation();
   });
+  depthUnlimitedToggle?.addEventListener('change', () => {
+    updateScannerMaxDepthControls(depthUnlimitedToggle.checked);
+    handleFormMutation();
+  });
 
   document.getElementById('scan-path')?.addEventListener('input', (event) => {
     updatePathDisplay(event.target?.value || '');
     handleFormMutation();
+    refreshLatestBaselineForPath(event.target?.value || '');
   });
 
   document.getElementById('scan-enable-web-search')?.addEventListener('change', () => {
@@ -904,6 +1002,7 @@ function bindSettingsEvents() {
         if (input) input.value = result.path;
         updatePathDisplay(result.path);
         handleFormMutation();
+        refreshLatestBaselineForPath(result.path);
         showToast(t('settings.toast_path_selected') + result.path, 'success');
       }
     } catch (err) {
@@ -969,7 +1068,10 @@ function applySnapshotToUI(data) {
   if (activityEl) activityEl.style.display = '';
   if (emptyEl) emptyEl.style.display = 'none';
   if (breadcrumb) breadcrumb.style.display = '';
-  if (pathEl && data.currentPath) pathEl.textContent = data.currentPath;
+  if (pathEl) {
+    pathEl.textContent = data.currentPath || '...';
+    pathEl.title = data.currentPath || '';
+  }
   if (depthEl) depthEl.textContent = `Depth ${data.currentDepth || 0}`;
 
   const scanPct = data.totalEntries > 0
@@ -1023,12 +1125,13 @@ export async function renderScanner(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.scan_path')}</label>
         <div style="display:flex; gap:8px; align-items:center;">
-          <input type="text" id="scan-path" class="form-input" style="flex: 1;" placeholder="C:\\Users\\YourName\\Downloads" />
+          <input type="text" id="scan-path" class="form-input" style="flex: 1; min-width: 0;" placeholder="C:\\Users\\YourName\\Downloads" />
           <button type="button" id="browse-folder-btn" class="btn btn-secondary" style="white-space: nowrap; flex-shrink: 0;">
             ${t('settings.browse')}
           </button>
         </div>
         <div class="form-hint">${t('settings.browse_hint')}</div>
+        <div id="scan-incremental-hint" class="form-hint" style="display:none; color: var(--accent-info); margin-top: 6px;"></div>
       </div>
 
       <div class="form-group">
@@ -1052,7 +1155,11 @@ export async function renderScanner(container) {
             <span class="range-value" style="min-width: unset;">${t('settings.depth_unit')}</span>
           </div>
         </div>
-        <div class="form-hint">${t('settings.max_depth_hint')}</div>
+        <label style="display:flex; align-items:center; gap:10px; cursor:pointer; margin-top:10px;">
+          <input type="checkbox" id="max-depth-unlimited" class="toggle-checkbox" style="width: 18px; height: 18px;" />
+          <span>${t('settings.max_depth_unlimited')}</span>
+        </label>
+        <div id="max-depth-hint" class="form-hint">${t('settings.max_depth_hint')}</div>
       </div>
 
       <div class="form-group">
@@ -1139,6 +1246,7 @@ export async function renderScanner(container) {
       <div id="scan-log-panel" class="scan-log-panel">
         <div class="scan-activity" id="scan-activity-hidden" style="display:none;">
           <div class="scan-log" id="scan-log"></div>
+          <div id="scan-log-collapsed-hint" class="scan-log-collapsed-hint" style="display:none;">${t('scanner.log_preview_hint')}</div>
         </div>
         <div id="scan-empty" class="empty-state" style="padding:30px;">
           <div class="empty-state-icon">...</div>
@@ -1148,9 +1256,9 @@ export async function renderScanner(container) {
       </div>
     </div>
 
-    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s">
-      <div><span id="scan-path-display" class="form-hint mono"></span></div>
-      <div class="flex gap-16">
+    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s; gap: 16px; flex-wrap: wrap;">
+      <div class="path-inline-display"><span id="scan-path-display" class="form-hint mono"></span></div>
+      <div class="flex gap-16" style="flex-shrink: 0;">
         <button id="stop-btn" class="btn btn-danger" style="display: none;">${t('scanner.stop')}</button>
         <button id="start-btn" class="btn btn-primary btn-lg">${t('scanner.start')}</button>
       </div>
@@ -1209,6 +1317,20 @@ export async function renderScanner(container) {
     setScanLogCollapsed(!isScanLogCollapsed());
     refreshScanLogPanel();
   });
+  document.getElementById('scan-log-panel')?.addEventListener('click', (event) => {
+    if (!isScanLogCollapsed() || !logEntries.length) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest('button, a, input, textarea, select, label')) {
+      return;
+    }
+    expandScanLogPreview();
+  });
+  document.getElementById('scan-log-panel')?.addEventListener('keydown', (event) => {
+    if (!isScanLogCollapsed() || !logEntries.length) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    expandScanLogPreview();
+  });
   document.getElementById('clear-log-btn')?.addEventListener('click', () => {
     logEntries = [];
     nextLogEntryId = 0;
@@ -1216,6 +1338,7 @@ export async function renderScanner(container) {
     persistScanLog();
     const logEl = document.getElementById('scan-log');
     if (logEl) logEl.innerHTML = '';
+    refreshScanLogPanel();
   });
   refreshScanLogPanel();
   if (logEntries.length > 0) {
@@ -1295,7 +1418,10 @@ function restoreActiveState() {
 
     const pathEl = document.getElementById('breadcrumb-path');
     const depthEl = document.getElementById('breadcrumb-depth');
-    if (pathEl && lastScan.currentPath) pathEl.textContent = lastScan.currentPath;
+    if (pathEl) {
+      pathEl.textContent = lastScan.currentPath || '...';
+      pathEl.title = lastScan.currentPath || '';
+    }
     if (depthEl) depthEl.textContent = `Depth ${lastScan.currentDepth || 0}`;
 
     const scanPct = lastScan.totalEntries > 0
@@ -1316,6 +1442,7 @@ function restoreActiveState() {
     onFound: handleFound,
     onAgentCall: handleAgentCall,
     onAgentResponse: handleAgentResponse,
+    onCache: handleCache,
     onWarning: handleWarning,
     onDone: handleDone,
     onError: handleError,
@@ -1356,7 +1483,9 @@ async function handleStart() {
     const result = await startScan({
       targetPath: form.scanPath,
       targetSizeGB: form.targetSizeGB,
-      maxDepth: form.maxDepth,
+      baselineTaskId: latestBaselineSnapshot?.id || null,
+      maxDepth: form.maxDepthUnlimited ? null : form.maxDepth,
+      scanMode: 'full_rescan_incremental',
       autoAnalyze: true,
       responseLanguage: getLang(),
     });
@@ -1382,6 +1511,7 @@ async function handleStart() {
       onFound: handleFound,
       onAgentCall: handleAgentCall,
       onAgentResponse: handleAgentResponse,
+      onCache: handleCache,
       onWarning: handleWarning,
       onDone: handleDone,
       onError: handleError,
@@ -1418,7 +1548,10 @@ function handleProgress(data) {
 
   const pathEl = document.getElementById('breadcrumb-path');
   const depthEl = document.getElementById('breadcrumb-depth');
-  if (pathEl && data.currentPath) pathEl.textContent = data.currentPath;
+  if (pathEl) {
+    pathEl.textContent = data.currentPath || '...';
+    pathEl.title = data.currentPath || '';
+  }
   if (depthEl) depthEl.textContent = `Depth ${data.currentDepth || 0}`;
 
   const scanPct = data.totalEntries > 0
@@ -1446,6 +1579,22 @@ function handleWarning(info) {
   addLog('analyzing', `${t('scanner.permission_denied_skip')}${path || info.message || ''}`);
 }
 
+function handleCache(info) {
+  if (!info || typeof info !== 'object') return;
+  const action = String(info.action || '').trim();
+  if (action === 'reuse') {
+    addLog('analyzing', `${t('scanner.cache_reuse')}: ${info.path || info.name || ''}`);
+    return;
+  }
+  if (action === 'rescan_changed') {
+    addLog('analyzing', `${t('scanner.cache_rescan')}: ${info.path || info.name || ''}`);
+    return;
+  }
+  if (action === 'skip_deleted') {
+    addLog('analyzing', t('scanner.cache_deleted', { count: info.count || 0 }));
+  }
+}
+
 function handleDone(data) {
   if (data?.id) {
     latestTaskId = data.id;
@@ -1471,6 +1620,7 @@ function handleDone(data) {
   } else {
     showToast(doneText, 'success');
   }
+  refreshLatestBaselineForPath(data?.targetPath || collectScannerForm().scanPath);
   window.location.hash = '#/results';
 }
 
@@ -1492,6 +1642,7 @@ function handleStopped(data) {
   storage.set('lastScan', data);
   resetButtons();
   addLog('scanning', t('scanner.stopped'));
+  refreshLatestBaselineForPath(data?.targetPath || collectScannerForm().scanPath);
 }
 
 function resetButtons() {
@@ -1509,6 +1660,7 @@ function resetButtons() {
     activeEventSource.close();
     activeEventSource = null;
   }
+  refreshScanActionHint();
 }
 
 function updateStats(data) {
@@ -1524,6 +1676,7 @@ function addLog(type, text) {
   logEntries.push(entry);
   persistScanLog();
   const trimmed = trimLogEntries();
+  refreshScanLogPanel();
   if (trimmed) {
     renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
     return;
@@ -1537,6 +1690,7 @@ function addDetailLog(type, summary, detailHtml) {
   logEntries.push(entry);
   persistScanLog();
   const trimmed = trimLogEntries();
+  refreshScanLogPanel();
   if (trimmed) {
     renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
     return;

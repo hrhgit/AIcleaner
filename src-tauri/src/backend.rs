@@ -1,11 +1,11 @@
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tauri::{Runtime, State};
@@ -104,7 +104,6 @@ impl CredentialStore for InMemoryCredentialStore {
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
         self.values
             .lock()
-            .unwrap()
             .insert(account.to_string(), value.to_string());
         Ok(())
     }
@@ -182,9 +181,15 @@ pub struct ScanResultItem {
 pub struct ScanSnapshot {
     pub id: String,
     pub status: String,
+    pub scan_mode: String,
+    pub baseline_task_id: Option<String>,
+    pub visible_latest: bool,
+    pub root_path_key: String,
     pub target_path: String,
     pub auto_analyze: bool,
     pub root_node_id: String,
+    pub configured_max_depth: Option<u32>,
+    pub max_scanned_depth: u32,
     pub current_path: String,
     pub current_depth: u32,
     pub scanned_count: u64,
@@ -253,6 +258,8 @@ fn default_settings() -> Value {
         "scanPath": "",
         "targetSizeGB": 1,
         "maxDepth": 5,
+        "maxDepthUnlimited": false,
+        "scanIgnorePaths": [],
         "lastScanTime": null,
         "enableWebSearch": false,
         "enableWebSearchClassify": false,
@@ -298,6 +305,33 @@ pub(crate) fn read_settings(path: &Path) -> Value {
     merged
 }
 
+pub(crate) fn normalize_scan_ignore_paths(value: Option<&Value>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let path = PathBuf::from(trimmed).to_string_lossy().to_string();
+            let key = path.trim().to_lowercase();
+            if key.is_empty() || !seen.insert(key) {
+                return None;
+            }
+            Some(path)
+        })
+        .collect()
+}
+
+pub(crate) fn read_scan_ignore_paths(path: &Path) -> Vec<String> {
+    let settings = read_settings(path);
+    normalize_scan_ignore_paths(settings.get("scanIgnorePaths"))
+}
+
 fn strip_secret_fields(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("secretStatus");
@@ -327,6 +361,18 @@ fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
         default_settings()
     };
     merge_json(&mut merged, value);
+    let normalized_ignore_paths = normalize_scan_ignore_paths(merged.get("scanIgnorePaths"));
+    if let Some(obj) = merged.as_object_mut() {
+        obj.insert(
+            "scanIgnorePaths".to_string(),
+            Value::Array(
+                normalized_ignore_paths
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
     strip_secret_fields(&mut merged);
     fs::write(
         path,
@@ -848,7 +894,7 @@ pub async fn files_clean(
     }
     let mut scan_snapshot = Value::Null;
     if let Some(task_id) = data.scan_task_id.as_deref() {
-        let _ = crate::persist::delete_scan_findings_by_paths(&state.db_path, task_id, &cleaned);
+        let _ = crate::persist::delete_scan_data_for_paths(&state.db_path, task_id, &cleaned);
         if let Ok(Some(snapshot)) = crate::persist::load_scan_snapshot(&state.db_path, task_id) {
             scan_snapshot = serde_json::to_value(snapshot).unwrap_or(Value::Null);
         }
@@ -864,6 +910,8 @@ pub struct ScanStartInput {
     pub target_path: String,
     pub target_size_gb: Option<f64>,
     pub max_depth: Option<u32>,
+    pub baseline_task_id: Option<String>,
+    pub scan_mode: Option<String>,
     pub auto_analyze: Option<bool>,
     pub api_endpoint: Option<String>,
     pub api_key: Option<String>,
@@ -964,6 +1012,14 @@ pub async fn scan_list_history(
     limit: Option<u32>,
 ) -> Result<Vec<Value>, String> {
     crate::scan_runtime::scan_list_history(state, limit).await
+}
+
+#[tauri::command]
+pub async fn scan_find_latest_for_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Value, String> {
+    crate::scan_runtime::scan_find_latest_for_path(state, path).await
 }
 
 #[tauri::command]

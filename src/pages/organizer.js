@@ -606,11 +606,11 @@ function renderPreview(snapshot) {
       return `
         <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(rowIdx * 0.01, 0.2)}s both;">
           <td>
-            <div class="file-name">${escapeHtml(row?.name || '')}</div>
-            <div class="file-path">${escapeHtml(item.sourcePath)}</div>
+            <div class="file-name" title="${escapeHtml(row?.name || '')}">${escapeHtml(row?.name || '')}</div>
+            <div class="file-path" title="${escapeHtml(item.sourcePath)}">${escapeHtml(item.sourcePath)}</div>
             ${degraded}
           </td>
-          <td><div class="file-path">${escapeHtml(item.targetPath)}</div></td>
+          <td><div class="file-path" title="${escapeHtml(item.targetPath)}">${escapeHtml(item.targetPath)}</div></td>
         </tr>
       `;
     }).join('');
@@ -661,8 +661,8 @@ function renderDegradedPanel(snapshot) {
     return `
       <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(idx * 0.01, 0.3)}s both;">
         <td>
-          <div class="file-name">${escapeHtml(row.name || '')}</div>
-          <div class="file-path">${escapeHtml(row.path || '')}</div>
+          <div class="file-name" title="${escapeHtml(row.name || '')}">${escapeHtml(row.name || '')}</div>
+          <div class="file-path" title="${escapeHtml(row.path || '')}">${escapeHtml(row.path || '')}</div>
         </td>
         <td><div class="file-purpose">${escapeHtml(reason)}</div></td>
       </tr>

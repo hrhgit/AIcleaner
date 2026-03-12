@@ -30,6 +30,7 @@ pub fn run() {
             backend::files_clean,
             backend::scan_get_active,
             backend::scan_list_history,
+            backend::scan_find_latest_for_path,
             backend::scan_delete_history,
             backend::scan_start,
             backend::scan_stop,

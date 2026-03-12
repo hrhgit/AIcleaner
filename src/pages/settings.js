@@ -173,7 +173,7 @@ export async function renderSettings(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.scan_path')}</label>
         <div style="display: flex; gap: 8px; align-items: center;">
-          <input type="text" id="scan-path" class="form-input" style="flex: 1;" placeholder="C:\\Users\\YourName\\Downloads" />
+          <input type="text" id="scan-path" class="form-input" style="flex: 1; min-width: 0;" placeholder="C:\\Users\\YourName\\Downloads" />
           <button type="button" id="browse-folder-btn" class="btn btn-secondary" style="white-space: nowrap; flex-shrink: 0;">
             ${t('settings.browse')}
           </button>
@@ -202,7 +202,11 @@ export async function renderSettings(container) {
             <span class="range-value" style="min-width: unset;">${t('settings.depth_unit')}</span>
           </div>
         </div>
-        <div class="form-hint">${t('settings.max_depth_hint')}</div>
+        <label style="display:flex; align-items:center; gap:10px; cursor:pointer; margin-top:10px;">
+          <input type="checkbox" id="max-depth-unlimited" class="toggle-checkbox" style="width: 18px; height: 18px;" />
+          <span>${t('settings.max_depth_unlimited')}</span>
+        </label>
+        <div id="max-depth-hint" class="form-hint">${t('settings.max_depth_hint')}</div>
       </div>
     </div>
 
@@ -375,6 +379,16 @@ export async function renderSettings(container) {
 
   const depthSlider = document.getElementById('max-depth');
   const depthInput = document.getElementById('max-depth-input');
+  const depthUnlimitedToggle = document.getElementById('max-depth-unlimited');
+  const depthHint = document.getElementById('max-depth-hint');
+  function updateMaxDepthControls(unlimited) {
+    const disabled = !!unlimited;
+    depthSlider.disabled = disabled;
+    depthInput.disabled = disabled;
+    depthHint.textContent = disabled
+      ? t('settings.max_depth_unlimited_hint')
+      : t('settings.max_depth_hint');
+  }
   depthSlider.addEventListener('input', () => {
     depthInput.value = String(parseInt(depthSlider.value, 10));
   });
@@ -388,6 +402,9 @@ export async function renderSettings(container) {
     if (val > 10) val = 10;
     depthInput.value = String(val);
     depthSlider.value = String(val);
+  });
+  depthUnlimitedToggle.addEventListener('change', () => {
+    updateMaxDepthControls(depthUnlimitedToggle.checked);
   });
 
   document.getElementById('browse-folder-btn')?.addEventListener('click', async () => {
@@ -451,6 +468,8 @@ export async function renderSettings(container) {
       el('max-depth').value = s.maxDepth;
       el('max-depth-input').value = s.maxDepth;
     }
+    el('max-depth-unlimited').checked = !!s.maxDepthUnlimited;
+    updateMaxDepthControls(!!s.maxDepthUnlimited);
     const searchApiEnabled = s?.searchApi?.enabled != null ? !!s.searchApi.enabled : true;
     const scanWebSearchEnabled = typeof s?.searchApi?.scopes?.scan === 'boolean'
       ? (searchApiEnabled && !!s.searchApi.scopes.scan)
@@ -499,6 +518,7 @@ function collectForm(currentSettings) {
   const targetSizeVal = targetSizeInputVal || document.getElementById('target-size').value;
   const maxDepthInputVal = document.getElementById('max-depth-input')?.value;
   const maxDepthVal = maxDepthInputVal || document.getElementById('max-depth').value;
+  const maxDepthUnlimited = !!document.getElementById('max-depth-unlimited')?.checked;
   const providerConfigs = currentSettings?.providerConfigs && typeof currentSettings.providerConfigs === 'object'
     ? { ...currentSettings.providerConfigs }
     : {};
@@ -535,6 +555,7 @@ function collectForm(currentSettings) {
     scanPath: document.getElementById('scan-path').value.trim(),
     targetSizeGB: parseFloat(targetSizeVal),
     maxDepth: parseInt(maxDepthVal, 10),
+    maxDepthUnlimited,
     enableWebSearch: scanWebSearchEnabled,
     enableWebSearchClassify: organizerWebSearchEnabled,
     enableWebSearchOrganizer: organizerWebSearchEnabled,
