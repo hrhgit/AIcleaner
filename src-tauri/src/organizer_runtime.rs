@@ -46,12 +46,47 @@ struct RouteConfig {
 }
 
 #[derive(Clone)]
-struct FileEntry {
+struct DirectoryHint {
+    marker_files: Vec<String>,
+    app_signals: Vec<String>,
+    top_level_entries: Vec<String>,
+    dominant_extensions: Vec<String>,
+    total_size: u64,
+    file_count: u64,
+    dir_count: u64,
+}
+
+#[derive(Clone)]
+struct OrganizeUnit {
     name: String,
     path: String,
     relative_path: String,
     size: u64,
+    modified_at: Option<String>,
+    item_type: String,
+    modality: String,
+    directory_hint: Option<DirectoryHint>,
 }
+
+const PROJECT_MARKER_NAMES: [&str; 17] = [
+    ".git",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".sln",
+];
 
 pub struct OrganizeTaskRuntime {
     pub stop: AtomicBool,
@@ -64,6 +99,11 @@ pub struct OrganizeTaskRuntime {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn system_time_to_iso(value: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(value)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn is_zh_language(value: &str) -> bool {
@@ -240,50 +280,322 @@ fn should_exclude(name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| lower == *p || lower.contains(p))
 }
 
-fn collect_files(
-    root: &Path,
-    recursive: bool,
-    excluded: &[String],
+fn extension_key(path: &Path) -> String {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .map(|x| format!(".{}", x.to_ascii_lowercase()))
+        .unwrap_or_else(|| "(no_ext)".to_string())
+}
+
+fn summarize_directory_tree(
+    path: &Path,
     stop: &AtomicBool,
-) -> Vec<FileEntry> {
-    let mut out = Vec::new();
-    let walker = if recursive {
-        WalkDir::new(root)
-    } else {
-        WalkDir::new(root).max_depth(1)
-    };
-    for entry in walker.into_iter().filter_map(Result::ok) {
+) -> (u64, u64, u64, HashMap<String, u64>) {
+    let mut total_size = 0_u64;
+    let mut file_count = 0_u64;
+    let mut dir_count = 0_u64;
+    let mut ext_counts = HashMap::new();
+    for entry in WalkDir::new(path).min_depth(1).into_iter().filter_map(Result::ok) {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if should_exclude(&name, excluded) {
-            continue;
-        }
+        let entry_path = entry.path();
         if entry.file_type().is_dir() {
+            dir_count = dir_count.saturating_add(1);
             continue;
         }
         if !entry.file_type().is_file() {
             continue;
         }
+        file_count = file_count.saturating_add(1);
         if let Ok(meta) = entry.metadata() {
-            out.push(FileEntry {
+            total_size = total_size.saturating_add(meta.len());
+        }
+        let key = extension_key(entry_path);
+        *ext_counts.entry(key).or_insert(0) += 1;
+    }
+    (total_size, file_count, dir_count, ext_counts)
+}
+
+fn inspect_directory_hint(path: &Path, stop: &AtomicBool) -> Option<DirectoryHint> {
+    let mut marker_files = Vec::new();
+    let mut app_signals = Vec::new();
+    let mut top_level_entries = Vec::new();
+    let mut direct_ext_counts = HashMap::new();
+    let mut has_readme = false;
+    let mut has_src = false;
+    let mut has_bin = false;
+    let mut has_lib = false;
+    let mut has_resources = false;
+    let mut direct_exe_count = 0_u32;
+    let mut direct_dll_count = 0_u32;
+
+    let entries = fs::read_dir(path).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        if top_level_entries.len() < 18 {
+            top_level_entries.push(name.clone());
+        }
+
+        if PROJECT_MARKER_NAMES.iter().any(|marker| lower == *marker) {
+            marker_files.push(name.clone());
+        }
+
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            match lower.as_str() {
+                "src" | "app" => has_src = true,
+                "bin" => has_bin = true,
+                "lib" => has_lib = true,
+                "resources" | "resource" => has_resources = true,
+                _ => {}
+            }
+            continue;
+        }
+
+        if lower == "readme.md" || lower == "readme.txt" || lower == "readme" {
+            has_readme = true;
+        }
+        if lower.ends_with(".exe") {
+            direct_exe_count += 1;
+        }
+        if lower.ends_with(".dll") {
+            direct_dll_count += 1;
+        }
+        let key = extension_key(&entry_path);
+        *direct_ext_counts.entry(key).or_insert(0) += 1;
+    }
+
+    if has_readme && has_src {
+        app_signals.push("readme+src".to_string());
+    }
+    if has_bin && has_lib {
+        app_signals.push("bin+lib".to_string());
+    }
+    if has_resources {
+        app_signals.push("resources".to_string());
+    }
+    if direct_exe_count > 0 {
+        app_signals.push(format!("exe:{direct_exe_count}"));
+    }
+    if direct_dll_count > 0 {
+        app_signals.push(format!("dll:{direct_dll_count}"));
+    }
+
+    let project_like = !marker_files.is_empty()
+        || (has_readme && has_src)
+        || (direct_exe_count > 0 && (direct_dll_count > 0 || has_resources || has_bin || has_lib))
+        || (has_bin && has_lib);
+    if !project_like {
+        return None;
+    }
+
+    let (total_size, file_count, dir_count, ext_counts) = summarize_directory_tree(path, stop);
+    let mut dominant_extensions = ext_counts.into_iter().collect::<Vec<_>>();
+    dominant_extensions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Some(DirectoryHint {
+        marker_files,
+        app_signals,
+        top_level_entries,
+        dominant_extensions: dominant_extensions
+            .into_iter()
+            .take(8)
+            .map(|(ext, count)| format!("{ext}:{count}"))
+            .collect(),
+        total_size,
+        file_count,
+        dir_count,
+    })
+}
+
+fn collect_units_inner(
+    scan_root: &Path,
+    current_dir: &Path,
+    recursive: bool,
+    excluded: &[String],
+    stop: &AtomicBool,
+    out: &mut Vec<OrganizeUnit>,
+) {
+    let entries = match fs::read_dir(current_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if should_exclude(&name, excluded) {
+            continue;
+        }
+        if path.is_dir() {
+            if let Some(hint) = inspect_directory_hint(&path, stop) {
+                out.push(OrganizeUnit {
+                    name: name.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    relative_path: path
+                        .strip_prefix(scan_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                    size: hint.total_size,
+                    modified_at: entry
+                        .metadata()
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .map(system_time_to_iso),
+                    item_type: "directory".to_string(),
+                    modality: "directory".to_string(),
+                    directory_hint: Some(hint),
+                });
+                continue;
+            }
+            if recursive {
+                collect_units_inner(scan_root, &path, true, excluded, stop, out);
+            }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            out.push(OrganizeUnit {
                 name: name.clone(),
                 path: path.to_string_lossy().to_string(),
                 relative_path: path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
+                    .strip_prefix(scan_root)
+                    .unwrap_or(&path)
                     .to_string_lossy()
                     .to_string(),
                 size: meta.len(),
+                modified_at: meta.modified().ok().map(system_time_to_iso),
+                item_type: "file".to_string(),
+                modality: pick_modality(&path.to_string_lossy()).to_string(),
+                directory_hint: None,
             });
         }
     }
+}
+
+fn collect_units(
+    root: &Path,
+    recursive: bool,
+    excluded: &[String],
+    stop: &AtomicBool,
+) -> Vec<OrganizeUnit> {
+    let mut out = Vec::new();
+    collect_units_inner(root, root, recursive, excluded, stop, &mut out);
+    out.sort_by(|a, b| {
+        a.relative_path
+            .to_lowercase()
+            .cmp(&b.relative_path.to_lowercase())
+            .then_with(|| a.item_type.cmp(&b.item_type))
+    });
     out
+}
+
+fn summarize_directory_for_prompt(unit: &OrganizeUnit) -> String {
+    let Some(hint) = unit.directory_hint.as_ref() else {
+        return "No directory summary available.".to_string();
+    };
+    [
+        format!("relativePath={}", unit.relative_path),
+        format!("totalSize={}", unit.size),
+        format!(
+            "modifiedAt={}",
+            unit.modified_at
+                .clone()
+                .unwrap_or_else(|| "(unknown)".to_string())
+        ),
+        format!("totalFiles={}", hint.file_count),
+        format!("totalDirectories={}", hint.dir_count),
+        format!(
+            "markerFiles={}",
+            if hint.marker_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                hint.marker_files.join(", ")
+            }
+        ),
+        format!(
+            "appSignals={}",
+            if hint.app_signals.is_empty() {
+                "(none)".to_string()
+            } else {
+                hint.app_signals.join(", ")
+            }
+        ),
+        format!(
+            "topLevelEntries={}",
+            if hint.top_level_entries.is_empty() {
+                "(none)".to_string()
+            } else {
+                hint.top_level_entries.join(", ")
+            }
+        ),
+        format!(
+            "dominantExtensions={}",
+            if hint.dominant_extensions.is_empty() {
+                "(none)".to_string()
+            } else {
+                hint.dominant_extensions.join(", ")
+            }
+        ),
+    ]
+    .join("\n")
+}
+
+fn sanitize_json_block(content: &str) -> String {
+    content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string()
+}
+
+fn parse_category_response(
+    content: &str,
+    categories: &[String],
+    allow_new_categories: bool,
+) -> (String, bool) {
+    let parsed: Value = serde_json::from_str(&sanitize_json_block(content))
+        .unwrap_or_else(|_| json!({}));
+    let candidate = parsed
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("鍏朵粬寰呭畾")
+        .trim();
+    let normalized = if categories.iter().any(|x| x == candidate) {
+        candidate.to_string()
+    } else if allow_new_categories && !candidate.is_empty() {
+        candidate.to_string()
+    } else {
+        "鍏朵粬寰呭畾".to_string()
+    };
+    (
+        normalized.clone(),
+        normalized != "鍏朵粬寰呭畾" && !categories.iter().any(|x| x == &normalized),
+    )
+}
+
+fn estimate_unit_total_size(unit: &OrganizeUnit) -> u64 {
+    if unit.item_type == "directory" {
+        unit.directory_hint
+            .as_ref()
+            .map(|hint| hint.total_size)
+            .unwrap_or(unit.size)
+    } else {
+        unit.size
+    }
 }
 
 async fn chat_completion(
@@ -378,7 +690,7 @@ async fn tavily_search(api_key: &str, query: &str) -> Result<Option<String>, Str
 
 async fn classify_file(
     route: &RouteConfig,
-    file: &FileEntry,
+    file: &OrganizeUnit,
     categories: &[String],
     allow_new_categories: bool,
     use_web_search: bool,
@@ -401,13 +713,16 @@ async fn classify_file(
         prompt_language_name(response_language),
     );
     let mut user_prompt = format!(
-        "name={}\nrelativePath={}\nsize={}\nmodality={}\nChoose the best category.",
+        "name={}\nrelativePath={}\nsize={}\nmodifiedAt={}\nmodality={}\nChoose the best category.",
         file.name,
         file.relative_path,
-        file.size,
-        pick_modality(&file.path)
+        estimate_unit_total_size(file),
+        file.modified_at
+            .clone()
+            .unwrap_or_else(|| "(unknown)".to_string()),
+        file.modality
     );
-    if pick_modality(&file.path) == "text" {
+    if file.modality == "text" {
         if let Ok(text) = fs::read_to_string(&file.path) {
             let snippet = text.chars().take(4000).collect::<String>();
             if !snippet.trim().is_empty() {
@@ -419,7 +734,7 @@ async fn classify_file(
     }
     let mut warnings = Vec::new();
     let mut total_usage = TokenUsage::default();
-    let parse_category = |content: &str, categories: &[String], allow_new_categories: bool| {
+    let _parse_category = |content: &str, categories: &[String], allow_new_categories: bool| {
         let clean = content
             .trim()
             .trim_start_matches("```json")
@@ -449,7 +764,7 @@ async fn classify_file(
         match chat_completion(route, &system_prompt, &user_prompt).await {
             Ok((content, usage)) => {
                 total_usage = usage;
-                parse_category(&content, categories, allow_new_categories)
+                parse_category_response(&content, categories, allow_new_categories)
             }
             Err(err) => {
                 warnings.push(format!("classify_failed:{err}"));
@@ -476,7 +791,8 @@ async fn classify_file(
                     total_usage.prompt += usage.prompt;
                     total_usage.completion += usage.completion;
                     total_usage.total += usage.total;
-                    let parsed = parse_category(&content, categories, allow_new_categories);
+                    let parsed =
+                        parse_category_response(&content, categories, allow_new_categories);
                     category = parsed.0;
                     created = parsed.1;
                     warnings.push("web_search_refined".to_string());
@@ -485,6 +801,50 @@ async fn classify_file(
         }
     }
     (category, created, false, warnings, total_usage)
+}
+
+async fn classify_directory(
+    route: &RouteConfig,
+    unit: &OrganizeUnit,
+    categories: &[String],
+    allow_new_categories: bool,
+    response_language: &str,
+) -> (String, bool, bool, Vec<String>, TokenUsage) {
+    if route.api_key.trim().is_empty() {
+        return (
+            fallback_category(&unit.name, categories),
+            false,
+            true,
+            vec!["missing_api_key_fallback".to_string()],
+            TokenUsage::default(),
+        );
+    }
+    let system_prompt = format!(
+        "You classify one application or project directory into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} Treat the directory as one bundle and do not split its children. If unsure choose 鍏朵粬寰呭畾. If you create a new category, its name must be in {}.",
+        categories.join(" | "),
+        if allow_new_categories { "You may create one short new category if none fits." } else { "You must choose from the preferred categories." },
+        prompt_language_name(response_language),
+    );
+    let user_prompt = format!(
+        "name={}\npath={}\nentryType=directory\n{}\nChoose the best category for moving the whole directory as one unit.",
+        unit.name,
+        unit.path,
+        summarize_directory_for_prompt(unit)
+    );
+    match chat_completion(route, &system_prompt, &user_prompt).await {
+        Ok((content, usage)) => {
+            let (category, created) =
+                parse_category_response(&content, categories, allow_new_categories);
+            (category, created, false, Vec::new(), usage)
+        }
+        Err(err) => (
+            fallback_category(&unit.name, categories),
+            false,
+            true,
+            vec![format!("directory_classify_failed:{err}")],
+            TokenUsage::default(),
+        ),
+    }
 }
 
 fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
@@ -521,7 +881,8 @@ fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
         out.push(json!({
             "sourcePath": row.get("path").and_then(Value::as_str).unwrap_or(""),
             "category": row.get("category").and_then(Value::as_str).unwrap_or("其他待定"),
-            "targetPath": target.to_string_lossy().to_string()
+            "targetPath": target.to_string_lossy().to_string(),
+            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file")
         }));
     }
     out
@@ -562,22 +923,26 @@ async fn run_organize_task<R: Runtime>(
     }
     emit_snapshot(app, state, task).await?;
 
-    let files = collect_files(Path::new(&root_path), recursive, &excluded, &task.stop);
+    let units = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
     {
         let mut snap = task.snapshot.lock();
         snap.status = "classifying".to_string();
-        snap.total_files = files.len() as u64;
+        snap.total_files = units.len() as u64;
     }
     emit_snapshot(app, state, task).await?;
 
-    for (idx, file) in files.iter().enumerate() {
+    for (idx, unit) in units.iter().enumerate() {
         if task.stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let modality = pick_modality(&file.path).to_string();
+        let route_key = if unit.item_type == "directory" {
+            "text".to_string()
+        } else {
+            unit.modality.clone()
+        };
         let route = task
             .routes
-            .get(&modality)
+            .get(&route_key)
             .or_else(|| task.routes.get("text"))
             .cloned()
             .unwrap_or(RouteConfig {
@@ -586,30 +951,43 @@ async fn run_organize_task<R: Runtime>(
                 model: "gpt-4o-mini".to_string(),
             });
         let categories = task.snapshot.lock().categories.clone();
-        let (category, created_category, degraded, warnings, usage) = classify_file(
-            &route,
-            file,
-            &categories,
-            allow_new_categories,
-            use_web_search,
-            task.search_api_key.as_deref(),
-            &task.response_language,
-        )
-        .await;
+        let (category, created_category, degraded, warnings, usage) =
+            if unit.item_type == "directory" {
+                classify_directory(
+                    &route,
+                    unit,
+                    &categories,
+                    allow_new_categories,
+                    &task.response_language,
+                )
+                .await
+            } else {
+                classify_file(
+                    &route,
+                    unit,
+                    &categories,
+                    allow_new_categories,
+                    use_web_search,
+                    task.search_api_key.as_deref(),
+                    &task.response_language,
+                )
+                .await
+            };
         let row = json!({
             "taskId": task.snapshot.lock().id,
             "index": idx + 1,
-            "name": file.name,
-            "path": file.path,
-            "relativePath": file.relative_path,
-            "size": file.size,
+            "name": unit.name,
+            "path": unit.path,
+            "relativePath": unit.relative_path,
+            "size": estimate_unit_total_size(unit),
+            "itemType": unit.item_type,
             "category": category,
             "createdCategory": created_category,
             "degraded": degraded,
             "warnings": warnings,
-            "modality": modality,
-            "provider": route.endpoint,
-            "model": route.model,
+            "modality": unit.modality,
+            "provider": route.endpoint.clone(),
+            "model": route.model.clone(),
         });
         persist::upsert_organize_result(&state.db_path, &task.snapshot.lock().id, &row)?;
         {
@@ -681,7 +1059,7 @@ pub async fn organize_suggest_categories(input: OrganizeSuggestInput) -> Result<
         return Err("rootPath is required".to_string());
     }
     let excluded = normalize_excluded(input.excluded_patterns);
-    let files = collect_files(
+    let files = collect_units(
         &root,
         input.recursive.unwrap_or(true),
         &excluded,
@@ -843,6 +1221,11 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
     let mut entries = Vec::new();
     for row in &snapshot.results {
         let source = PathBuf::from(row.get("path").and_then(Value::as_str).unwrap_or(""));
+        let item_type = row
+            .get("itemType")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_string();
         let category = sanitize_category_name(
             row.get("category")
                 .and_then(Value::as_str)
@@ -854,6 +1237,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target_base.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "category": category,
                 "status": "failed",
                 "error": "source_not_found"
@@ -864,6 +1248,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target_base.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "category": category,
                 "status": "failed",
                 "error": err.to_string()
@@ -890,6 +1275,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             Ok(_) => entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "category": category,
                 "status": "moved",
                 "error": Value::Null
@@ -897,6 +1283,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             Err(err) => entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "category": category,
                 "status": "failed",
                 "error": err.to_string()
@@ -947,6 +1334,11 @@ pub async fn organize_rollback(
     entries.reverse();
     let mut rollback_entries = Vec::new();
     for entry in entries {
+        let item_type = entry
+            .get("itemType")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_string();
         let source = PathBuf::from(
             entry
                 .get("sourcePath")
@@ -963,6 +1355,7 @@ pub async fn organize_rollback(
             rollback_entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "status": "skipped",
                 "error": "not_moved_in_apply"
             }));
@@ -972,6 +1365,7 @@ pub async fn organize_rollback(
             rollback_entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "status": "failed",
                 "error": "target_not_found"
             }));
@@ -981,6 +1375,7 @@ pub async fn organize_rollback(
             rollback_entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "status": "failed",
                 "error": "source_already_exists"
             }));
@@ -993,12 +1388,14 @@ pub async fn organize_rollback(
             Ok(_) => rollback_entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "status": "rolled_back",
                 "error": Value::Null
             })),
             Err(err) => rollback_entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
                 "status": "failed",
                 "error": err.to_string()
             })),

@@ -155,6 +155,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             path TEXT NOT NULL,
             relative_path TEXT NOT NULL,
             size INTEGER NOT NULL DEFAULT 0,
+            item_type TEXT NOT NULL DEFAULT 'file',
             category TEXT NOT NULL,
             created_category INTEGER NOT NULL DEFAULT 0,
             degraded INTEGER NOT NULL DEFAULT 0,
@@ -180,6 +181,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             idx INTEGER NOT NULL,
             source_path TEXT NOT NULL,
             target_path TEXT NOT NULL,
+            entry_type TEXT NOT NULL DEFAULT 'file',
             category TEXT NOT NULL,
             status TEXT NOT NULL,
             error TEXT,
@@ -187,7 +189,39 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         );
         "#,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let organize_results_columns = conn
+        .prepare("PRAGMA table_info(organize_results)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !organize_results_columns.iter().any(|col| col == "item_type") {
+        conn.execute(
+            "ALTER TABLE organize_results ADD COLUMN item_type TEXT NOT NULL DEFAULT 'file'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let organize_job_entry_columns = conn
+        .prepare("PRAGMA table_info(organize_job_entries)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !organize_job_entry_columns
+        .iter()
+        .any(|col| col == "entry_type")
+    {
+        conn.execute(
+            "ALTER TABLE organize_job_entries ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'file'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
@@ -673,14 +707,15 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
     let conn = open_db(db_path)?;
     conn.execute(
         "INSERT INTO organize_results (
-            task_id, idx, name, path, relative_path, size, category, created_category, degraded,
-            warnings_json, modality, provider, model
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            task_id, idx, name, path, relative_path, size, item_type, category, created_category,
+            degraded, warnings_json, modality, provider, model
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(task_id, idx) DO UPDATE SET
             name = excluded.name,
             path = excluded.path,
             relative_path = excluded.relative_path,
             size = excluded.size,
+            item_type = excluded.item_type,
             category = excluded.category,
             created_category = excluded.created_category,
             degraded = excluded.degraded,
@@ -697,9 +732,10 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             row.get("size").and_then(Value::as_u64).unwrap_or(0) as i64,
+            row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
             row.get("category")
                 .and_then(Value::as_str)
-                .unwrap_or("其他待定"),
+                .unwrap_or("鍏朵粬寰呭畾"),
             bool_to_i64(
                 row.get("createdCategory")
                     .and_then(Value::as_bool)
@@ -774,8 +810,8 @@ pub fn load_organize_snapshot(
 
     let mut stmt = conn
         .prepare(
-            "SELECT idx, name, path, relative_path, size, category, created_category, degraded,
-                    warnings_json, modality, provider, model
+            "SELECT idx, name, path, relative_path, size, item_type, category, created_category,
+                    degraded, warnings_json, modality, provider, model
              FROM organize_results
              WHERE task_id = ?1
              ORDER BY idx ASC",
@@ -789,13 +825,14 @@ pub fn load_organize_snapshot(
                 "path": r.get::<_, String>(2)?,
                 "relativePath": r.get::<_, String>(3)?,
                 "size": r.get::<_, i64>(4)? as u64,
-                "category": r.get::<_, String>(5)?,
-                "createdCategory": r.get::<_, i64>(6)? != 0,
-                "degraded": r.get::<_, i64>(7)? != 0,
-                "warnings": parse_json_or_default::<Vec<String>>(Some(r.get::<_, String>(8)?)),
-                "modality": r.get::<_, String>(9)?,
-                "provider": r.get::<_, String>(10)?,
-                "model": r.get::<_, String>(11)?,
+                "itemType": r.get::<_, String>(5)?,
+                "category": r.get::<_, String>(6)?,
+                "createdCategory": r.get::<_, i64>(7)? != 0,
+                "degraded": r.get::<_, i64>(8)? != 0,
+                "warnings": parse_json_or_default::<Vec<String>>(Some(r.get::<_, String>(9)?)),
+                "modality": r.get::<_, String>(10)?,
+                "provider": r.get::<_, String>(11)?,
+                "model": r.get::<_, String>(12)?,
             }))
         })
         .map_err(|e| e.to_string())?
@@ -871,13 +908,14 @@ pub fn save_organize_manifest(db_path: &Path, manifest: &Value) -> Result<(), St
     .map_err(|e| e.to_string())?;
     for (idx, entry) in entries.iter().enumerate() {
         tx.execute(
-            "INSERT INTO organize_job_entries (job_id, idx, source_path, target_path, category, status, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO organize_job_entries (job_id, idx, source_path, target_path, entry_type, category, status, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 job_id,
                 idx as i64,
                 entry.get("sourcePath").and_then(Value::as_str).unwrap_or(""),
                 entry.get("targetPath").and_then(Value::as_str).unwrap_or(""),
+                entry.get("itemType").and_then(Value::as_str).unwrap_or("file"),
                 entry.get("category").and_then(Value::as_str).unwrap_or(""),
                 entry.get("status").and_then(Value::as_str).unwrap_or(""),
                 entry.get("error").and_then(Value::as_str),
@@ -915,7 +953,7 @@ pub fn load_organize_job_entries(db_path: &Path, job_id: &str) -> Result<Vec<Val
     let conn = open_db(db_path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT idx, source_path, target_path, category, status, error
+            "SELECT idx, source_path, target_path, entry_type, category, status, error
              FROM organize_job_entries
              WHERE job_id = ?1
              ORDER BY idx ASC",
@@ -926,9 +964,10 @@ pub fn load_organize_job_entries(db_path: &Path, job_id: &str) -> Result<Vec<Val
             Ok(json!({
                 "sourcePath": row.get::<_, String>(1)?,
                 "targetPath": row.get::<_, String>(2)?,
-                "category": row.get::<_, String>(3)?,
-                "status": row.get::<_, String>(4)?,
-                "error": row.get::<_, Option<String>>(5)?,
+                "itemType": row.get::<_, String>(3)?,
+                "category": row.get::<_, String>(4)?,
+                "status": row.get::<_, String>(5)?,
+                "error": row.get::<_, Option<String>>(6)?,
             }))
         })
         .map_err(|e| e.to_string())?;
