@@ -118,6 +118,17 @@ fn provider_secret_key(endpoint: &str) -> String {
     format!("provider:{}:apiKey", endpoint.trim())
 }
 
+fn default_model_for_endpoint(endpoint: &str) -> &'static str {
+    match endpoint.trim() {
+        "https://api.deepseek.com" => "deepseek-chat",
+        "https://generativelanguage.googleapis.com/v1beta/openai/" => "gemini-2.5-flash",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1" => "qwen-plus",
+        "https://open.bigmodel.cn/api/paas/v4" => "glm-4-flash",
+        "https://api.moonshot.cn/v1" => "moonshot-v1-8k",
+        _ => "gpt-4o-mini",
+    }
+}
+
 impl AppState {
     pub fn bootstrap(data_dir: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
@@ -213,6 +224,7 @@ pub struct OrganizeSnapshot {
     pub error: Option<String>,
     pub root_path: String,
     pub recursive: bool,
+    pub reference_original_structure: bool,
     pub mode: String,
     pub categories: Vec<String>,
     pub allow_new_categories: bool,
@@ -243,9 +255,6 @@ pub struct CredentialsSaveInput {
 
 fn default_settings() -> Value {
     json!({
-        "apiEndpoint": "https://api.openai.com/v1",
-        "apiKey": "",
-        "model": "gpt-4o-mini",
         "defaultProviderEndpoint": "https://api.openai.com/v1",
         "providerConfigs": {
             "https://api.openai.com/v1": { "name": "OpenAI", "endpoint": "https://api.openai.com/v1", "apiKey": "", "model": "gpt-4o-mini" },
@@ -261,10 +270,6 @@ fn default_settings() -> Value {
         "maxDepthUnlimited": false,
         "scanIgnorePaths": [],
         "lastScanTime": null,
-        "enableWebSearch": false,
-        "enableWebSearchClassify": false,
-        "enableWebSearchOrganizer": false,
-        "tavilyApiKey": "",
         "searchApi": {
             "provider": "tavily",
             "enabled": false,
@@ -276,6 +281,268 @@ fn default_settings() -> Value {
             "searchApi": false
         }
     })
+}
+
+fn value_as_non_empty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn legacy_provider_api_key_from_settings(settings: &Value, endpoint: &str) -> Option<String> {
+    value_as_non_empty_string(
+        settings
+            .get("providerConfigs")
+            .and_then(|configs| configs.get(endpoint))
+            .and_then(|config| config.get("apiKey")),
+    )
+}
+
+fn legacy_search_api_key_from_settings(settings: &Value) -> Option<String> {
+    value_as_non_empty_string(settings.pointer("/searchApi/apiKey"))
+        .or_else(|| value_as_non_empty_string(settings.get("tavilyApiKey")))
+}
+
+fn migrate_legacy_settings_fields(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+
+    let legacy_endpoint = value_as_non_empty_string(obj.get("apiEndpoint"));
+    let legacy_model = value_as_non_empty_string(obj.get("model"));
+    let legacy_scan_enabled = obj.get("enableWebSearch").and_then(Value::as_bool);
+    let legacy_classify_enabled = obj.get("enableWebSearchClassify").and_then(Value::as_bool);
+    let legacy_organizer_enabled = obj.get("enableWebSearchOrganizer").and_then(Value::as_bool);
+    let legacy_search_api_key = value_as_non_empty_string(obj.get("tavilyApiKey")).or_else(|| {
+        value_as_non_empty_string(obj.get("searchApi").and_then(|search| search.get("apiKey")))
+    });
+
+    if let Some(endpoint) = legacy_endpoint.clone() {
+        if value_as_non_empty_string(obj.get("defaultProviderEndpoint")).is_none() {
+            obj.insert(
+                "defaultProviderEndpoint".to_string(),
+                Value::String(endpoint.clone()),
+            );
+        }
+
+        let provider_configs = obj
+            .entry("providerConfigs".to_string())
+            .or_insert_with(|| json!({}));
+        if !provider_configs.is_object() {
+            *provider_configs = json!({});
+        }
+        if let Some(configs) = provider_configs.as_object_mut() {
+            let entry = configs.entry(endpoint.clone()).or_insert_with(|| json!({}));
+            if !entry.is_object() {
+                *entry = json!({});
+            }
+            if let Some(config) = entry.as_object_mut() {
+                if value_as_non_empty_string(config.get("endpoint")).is_none() {
+                    config.insert("endpoint".to_string(), Value::String(endpoint.clone()));
+                }
+                if value_as_non_empty_string(config.get("name")).is_none() {
+                    config.insert("name".to_string(), Value::String(endpoint.clone()));
+                }
+                if value_as_non_empty_string(config.get("model")).is_none() {
+                    config.insert(
+                        "model".to_string(),
+                        Value::String(
+                            legacy_model.clone().unwrap_or_else(|| {
+                                default_model_for_endpoint(&endpoint).to_string()
+                            }),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    let has_legacy_search_settings = legacy_scan_enabled.is_some()
+        || legacy_classify_enabled.is_some()
+        || legacy_organizer_enabled.is_some()
+        || legacy_search_api_key.is_some();
+    if has_legacy_search_settings {
+        let search_api = obj
+            .entry("searchApi".to_string())
+            .or_insert_with(|| json!({}));
+        if !search_api.is_object() {
+            *search_api = json!({});
+        }
+        if let Some(search) = search_api.as_object_mut() {
+            if value_as_non_empty_string(search.get("provider")).is_none() {
+                search.insert("provider".to_string(), Value::String("tavily".to_string()));
+            }
+            if !search.contains_key("enabled") {
+                let enabled = legacy_scan_enabled.unwrap_or(false)
+                    || legacy_classify_enabled.unwrap_or(false)
+                    || legacy_organizer_enabled.unwrap_or(false);
+                search.insert("enabled".to_string(), Value::Bool(enabled));
+            }
+            if value_as_non_empty_string(search.get("apiKey")).is_none() {
+                if let Some(api_key) = legacy_search_api_key {
+                    search.insert("apiKey".to_string(), Value::String(api_key));
+                }
+            }
+
+            let scopes = search
+                .entry("scopes".to_string())
+                .or_insert_with(|| json!({}));
+            if !scopes.is_object() {
+                *scopes = json!({});
+            }
+            if let Some(scopes_obj) = scopes.as_object_mut() {
+                if !scopes_obj.contains_key("scan") {
+                    scopes_obj.insert(
+                        "scan".to_string(),
+                        Value::Bool(legacy_scan_enabled.unwrap_or(false)),
+                    );
+                }
+                if !scopes_obj.contains_key("classify") {
+                    scopes_obj.insert(
+                        "classify".to_string(),
+                        Value::Bool(
+                            legacy_classify_enabled
+                                .unwrap_or(legacy_organizer_enabled.unwrap_or(false)),
+                        ),
+                    );
+                }
+                if !scopes_obj.contains_key("organizer") {
+                    scopes_obj.insert(
+                        "organizer".to_string(),
+                        Value::Bool(
+                            legacy_organizer_enabled
+                                .unwrap_or(legacy_classify_enabled.unwrap_or(false)),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn normalize_settings_shape(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        *value = default_settings();
+        return;
+    };
+
+    let mut default_provider_endpoint = obj
+        .get("defaultProviderEndpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if let Some(configs) = obj
+        .get_mut("providerConfigs")
+        .and_then(Value::as_object_mut)
+    {
+        let mut first_endpoint = String::new();
+        for (key, config) in configs.iter_mut() {
+            let endpoint = config
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or(key)
+                .trim()
+                .to_string();
+            if endpoint.is_empty() {
+                continue;
+            }
+            if first_endpoint.is_empty() {
+                first_endpoint = endpoint.clone();
+            }
+            if let Some(config_obj) = config.as_object_mut() {
+                config_obj.insert("endpoint".to_string(), Value::String(endpoint.clone()));
+                let current_model = config_obj
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if current_model.is_empty() {
+                    config_obj.insert(
+                        "model".to_string(),
+                        Value::String(default_model_for_endpoint(&endpoint).to_string()),
+                    );
+                }
+                if !config_obj.contains_key("name") {
+                    config_obj.insert("name".to_string(), Value::String(endpoint.clone()));
+                }
+            }
+        }
+        if default_provider_endpoint.is_empty() {
+            default_provider_endpoint = first_endpoint;
+        }
+        if default_provider_endpoint.is_empty() {
+            default_provider_endpoint = "https://api.openai.com/v1".to_string();
+        }
+        let default_provider_endpoint_for_insert = default_provider_endpoint.clone();
+        configs
+            .entry(default_provider_endpoint.clone())
+            .or_insert_with(|| {
+                json!({
+                    "name": default_provider_endpoint_for_insert.clone(),
+                    "endpoint": default_provider_endpoint_for_insert.clone(),
+                    "apiKey": "",
+                    "model": default_model_for_endpoint(&default_provider_endpoint_for_insert).to_string()
+                })
+            });
+    }
+    obj.insert(
+        "defaultProviderEndpoint".to_string(),
+        Value::String(default_provider_endpoint.clone()),
+    );
+
+    let search_api = obj
+        .get("searchApi")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let search_scopes = search_api
+        .get("scopes")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let scan_enabled = search_scopes
+        .get("scan")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let classify_enabled = search_scopes
+        .get("classify")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let organizer_enabled = search_scopes
+        .get("organizer")
+        .and_then(Value::as_bool)
+        .unwrap_or(classify_enabled);
+    let search_enabled = search_api
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(scan_enabled || classify_enabled || organizer_enabled);
+    obj.insert(
+        "searchApi".to_string(),
+        json!({
+            "provider": "tavily",
+            "enabled": search_enabled,
+            "apiKey": search_api
+                .get("apiKey")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "scopes": {
+                "scan": scan_enabled,
+                "classify": classify_enabled,
+                "organizer": organizer_enabled
+            }
+        }),
+    );
+    obj.remove("apiEndpoint");
+    obj.remove("model");
+    obj.remove("enableWebSearch");
+    obj.remove("enableWebSearchClassify");
+    obj.remove("enableWebSearchOrganizer");
+    obj.remove("tavilyApiKey");
 }
 
 fn merge_json(base: &mut Value, patch: &Value) {
@@ -296,12 +563,14 @@ fn merge_json(base: &mut Value, patch: &Value) {
 
 pub(crate) fn read_settings(path: &Path) -> Value {
     let mut merged = default_settings();
-    if let Some(parsed) = fs::read_to_string(path)
+    if let Some(mut parsed) = fs::read_to_string(path)
         .ok()
         .and_then(|x| serde_json::from_str::<Value>(&x).ok())
     {
+        migrate_legacy_settings_fields(&mut parsed);
         merge_json(&mut merged, &parsed);
     }
+    normalize_settings_shape(&mut merged);
     merged
 }
 
@@ -336,8 +605,6 @@ fn strip_secret_fields(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("secretStatus");
         obj.remove("credentialsStatus");
-        obj.insert("apiKey".to_string(), Value::String(String::new()));
-        obj.insert("tavilyApiKey".to_string(), Value::String(String::new()));
         if let Some(search) = obj.get_mut("searchApi").and_then(Value::as_object_mut) {
             search.insert("apiKey".to_string(), Value::String(String::new()));
         }
@@ -373,6 +640,7 @@ fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
             ),
         );
     }
+    normalize_settings_shape(&mut merged);
     strip_secret_fields(&mut merged);
     fs::write(
         path,
@@ -413,16 +681,14 @@ fn collect_provider_endpoints(settings: &Value) -> Vec<String> {
             }
         }
     }
-    for field in ["defaultProviderEndpoint", "apiEndpoint"] {
-        let endpoint = settings
-            .get(field)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if !endpoint.is_empty() && !endpoints.contains(&endpoint) {
-            endpoints.push(endpoint);
-        }
+    let endpoint = settings
+        .get("defaultProviderEndpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !endpoint.is_empty() && !endpoints.contains(&endpoint) {
+        endpoints.push(endpoint);
     }
     endpoints
 }
@@ -442,11 +708,12 @@ fn build_credentials_status_value(state: &AppState, settings: &Value) -> Value {
     for endpoint in endpoints {
         let account = provider_secret_key(&endpoint);
         provider_meta.insert(
-            endpoint,
+            endpoint.clone(),
             values
                 .get(&account)
                 .map(|value| !value.trim().is_empty())
-                .unwrap_or(false),
+                .unwrap_or(false)
+                || legacy_provider_api_key_from_settings(settings, &endpoint).is_some(),
         );
     }
     json!({
@@ -455,6 +722,7 @@ fn build_credentials_status_value(state: &AppState, settings: &Value) -> Value {
             .get(SEARCH_SECRET_KEY)
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
+            || legacy_search_api_key_from_settings(settings).is_some()
     })
 }
 
@@ -524,7 +792,7 @@ pub(crate) fn resolve_provider_endpoint_and_model(
         .to_string()
         .if_empty_then(|| {
             settings
-                .get("apiEndpoint")
+                .get("defaultProviderEndpoint")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
@@ -532,11 +800,18 @@ pub(crate) fn resolve_provider_endpoint_and_model(
         })
         .if_empty_then(|| {
             settings
-                .get("defaultProviderEndpoint")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string()
+                .get("providerConfigs")
+                .and_then(Value::as_object)
+                .and_then(|configs| configs.iter().next())
+                .map(|(key, config)| {
+                    config
+                        .get("endpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or(key)
+                        .trim()
+                        .to_string()
+                })
+                .unwrap_or_default()
         })
         .if_empty_then(|| "https://api.openai.com/v1".to_string());
     let model = model_hint
@@ -555,27 +830,46 @@ pub(crate) fn resolve_provider_endpoint_and_model(
         })
         .if_empty_then(|| {
             settings
-                .get("model")
+                .get("providerConfigs")
+                .and_then(|v| {
+                    v.get(
+                        settings
+                            .get("defaultProviderEndpoint")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    )
+                })
+                .and_then(|v| v.get("model"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
                 .to_string()
         })
-        .if_empty_then(|| "gpt-4o-mini".to_string());
+        .if_empty_then(|| default_model_for_endpoint(&endpoint).to_string());
     (endpoint, model)
 }
 
 pub(crate) fn resolve_provider_api_key(state: &AppState, endpoint: &str) -> Result<String, String> {
-    state
+    if let Some(api_key) = state
         .credential_store
         .get(&provider_secret_key(endpoint))?
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(api_key);
+    }
+    legacy_provider_api_key_from_settings(&read_settings(&state.settings_path), endpoint)
         .ok_or_else(|| "Credential not found.".to_string())
 }
 
 pub(crate) fn resolve_search_api_key(state: &AppState) -> Result<String, String> {
-    state
+    if let Some(api_key) = state
         .credential_store
         .get(SEARCH_SECRET_KEY)?
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(api_key);
+    }
+    legacy_search_api_key_from_settings(&read_settings(&state.settings_path))
         .ok_or_else(|| "Credential not found.".to_string())
 }
 
@@ -923,7 +1217,7 @@ pub struct ScanStartInput {
 #[serde(rename_all = "camelCase")]
 pub struct OrganizeStartInput {
     pub root_path: String,
-    pub recursive: Option<bool>,
+    pub reference_original_structure: Option<bool>,
     pub mode: Option<String>,
     pub categories: Option<Vec<String>>,
     pub allow_new_categories: Option<bool>,
@@ -939,7 +1233,6 @@ pub struct OrganizeStartInput {
 #[serde(rename_all = "camelCase")]
 pub struct OrganizeSuggestInput {
     pub root_path: String,
-    pub recursive: Option<bool>,
     pub excluded_patterns: Option<Vec<String>>,
     pub manual_categories: Option<Vec<String>>,
     pub model_routing: Option<Value>,
@@ -1165,6 +1458,102 @@ mod tests {
             saved["providerConfigs"][custom_endpoint]["model"],
             Value::String("custom-model".to_string())
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_settings_migrates_legacy_provider_and_search_fields() {
+        let path = temp_settings_path();
+        let legacy = json!({
+            "apiEndpoint": "https://api.deepseek.com",
+            "model": "deepseek-reasoner",
+            "enableWebSearch": true,
+            "enableWebSearchOrganizer": true,
+            "providerConfigs": {
+                "https://api.deepseek.com": {
+                    "apiKey": "sk-legacy-inline"
+                }
+            },
+            "tavilyApiKey": "tvly-legacy-inline"
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&legacy).expect("serialize legacy settings"),
+        )
+        .expect("write legacy settings");
+
+        let saved = read_settings(&path);
+
+        assert_eq!(
+            saved["defaultProviderEndpoint"],
+            Value::String("https://api.deepseek.com".to_string())
+        );
+        assert_eq!(
+            saved["providerConfigs"]["https://api.deepseek.com"]["model"],
+            Value::String("deepseek-reasoner".to_string())
+        );
+        assert_eq!(saved["searchApi"]["enabled"], Value::Bool(true));
+        assert_eq!(saved["searchApi"]["scopes"]["scan"], Value::Bool(true));
+        assert_eq!(saved["searchApi"]["scopes"]["classify"], Value::Bool(true));
+        assert_eq!(saved["searchApi"]["scopes"]["organizer"], Value::Bool(true));
+        assert!(saved.get("apiEndpoint").is_none());
+        assert!(saved.get("model").is_none());
+        assert!(saved.get("enableWebSearch").is_none());
+        assert!(saved.get("enableWebSearchOrganizer").is_none());
+        assert!(saved.get("tavilyApiKey").is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolve_credentials_fall_back_to_legacy_inline_values() {
+        let path = temp_settings_path();
+        let settings = json!({
+            "defaultProviderEndpoint": "https://api.deepseek.com",
+            "providerConfigs": {
+                "https://api.deepseek.com": {
+                    "endpoint": "https://api.deepseek.com",
+                    "model": "deepseek-chat",
+                    "apiKey": "sk-inline"
+                }
+            },
+            "searchApi": {
+                "provider": "tavily",
+                "enabled": true,
+                "apiKey": "tvly-inline",
+                "scopes": {
+                    "scan": true,
+                    "classify": true,
+                    "organizer": true
+                }
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&settings).expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        let state =
+            AppState::with_store(path.clone(), Arc::new(InMemoryCredentialStore::default()));
+        let raw = read_settings(&state.settings_path);
+        let status = build_credentials_status_value(&state, &raw);
+
+        assert_eq!(
+            resolve_provider_api_key(&state, "https://api.deepseek.com")
+                .expect("fallback provider secret"),
+            "sk-inline".to_string()
+        );
+        assert_eq!(
+            resolve_search_api_key(&state).expect("fallback search secret"),
+            "tvly-inline".to_string()
+        );
+        assert_eq!(
+            status["providerHasApiKey"]["https://api.deepseek.com"],
+            Value::Bool(true)
+        );
+        assert_eq!(status["searchApiHasKey"], Value::Bool(true));
 
         let _ = fs::remove_file(path);
     }

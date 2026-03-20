@@ -15,6 +15,17 @@ import { showToast } from '../main.js';
 import { t } from '../utils/i18n.js';
 import { getProviderCredentialPresence } from '../utils/secret-ui.js';
 
+const TARGET_SIZE_MIN_GB = 0.1;
+const TARGET_SIZE_MAX_GB = 20;
+
+function clampTargetSizeGb(value, fallback = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < TARGET_SIZE_MIN_GB) return TARGET_SIZE_MIN_GB;
+  if (parsed > TARGET_SIZE_MAX_GB) return TARGET_SIZE_MAX_GB;
+  return parsed;
+}
+
 const PROVIDER_MODELS = {
   'https://api.openai.com/v1': [
     { value: 'gpt-4o-mini', label: 'gpt-4o-mini (推荐)' },
@@ -81,9 +92,6 @@ function syncProviderApiKeyMap(targetMap, settings = {}) {
     for (const [endpoint] of Object.entries(settings.providerConfigs)) {
       targetMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
-  }
-  if (settings?.apiEndpoint && !targetMap[settings.apiEndpoint]) {
-    targetMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -184,9 +192,9 @@ export async function renderSettings(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.target_size')}</label>
         <div class="range-container">
-          <input type="range" id="target-size" class="range-slider" min="0.1" max="100" step="0.1" value="1" />
+          <input type="range" id="target-size" class="range-slider" min="0.1" max="20" step="0.1" value="1" />
           <div style="display: flex; align-items: center; gap: 8px;">
-            <input type="number" id="target-size-input" class="form-input no-spin" style="width: 80px; height: 32px; padding: 4px 8px; text-align: center;" min="0.1" max="100" step="0.1" value="1" />
+            <input type="number" id="target-size-input" class="form-input no-spin" style="width: 80px; height: 32px; padding: 4px 8px; text-align: center;" min="0.1" max="20" step="0.1" value="1" />
             <span class="range-value" style="min-width: unset;">GB</span>
           </div>
         </div>
@@ -366,13 +374,13 @@ export async function renderSettings(container) {
     sizeInput.value = parseFloat(sizeSlider.value).toFixed(1);
   });
   sizeInput.addEventListener('input', () => {
-    const val = parseFloat(sizeInput.value);
+    const val = clampTargetSizeGb(sizeInput.value, 1);
     if (!Number.isNaN(val)) sizeSlider.value = String(val);
   });
   sizeInput.addEventListener('blur', () => {
     let val = parseFloat(sizeInput.value);
-    if (Number.isNaN(val) || val < 0.1) val = 0.1;
-    if (val > 100) val = 100;
+    if (Number.isNaN(val) || val < TARGET_SIZE_MIN_GB) val = TARGET_SIZE_MIN_GB;
+    if (val > TARGET_SIZE_MAX_GB) val = TARGET_SIZE_MAX_GB;
     sizeInput.value = val.toFixed(1);
     sizeSlider.value = String(val);
   });
@@ -451,18 +459,20 @@ export async function renderSettings(container) {
 
   async function fillForm(s) {
     const el = (id) => document.getElementById(id);
-    if (s.apiEndpoint) {
+    const selectedEndpoint = String(s?.defaultProviderEndpoint || '').trim();
+    if (selectedEndpoint) {
       const endpointEl = el('api-endpoint');
-      const exists = Array.from(endpointEl.options).some((opt) => opt.value === s.apiEndpoint);
-      if (!exists) endpointEl.add(new Option(s.apiEndpoint, s.apiEndpoint));
-      endpointEl.value = s.apiEndpoint;
+      const exists = Array.from(endpointEl.options).some((opt) => opt.value === selectedEndpoint);
+      if (!exists) endpointEl.add(new Option(selectedEndpoint, selectedEndpoint));
+      endpointEl.value = selectedEndpoint;
     }
-    await updateModelsDropdown(String(s.model || ''));
+    await updateModelsDropdown(String(s?.providerConfigs?.[selectedEndpoint]?.model || ''));
 
     if (s.scanPath) el('scan-path').value = s.scanPath;
     if (s.targetSizeGB != null) {
-      el('target-size').value = s.targetSizeGB;
-      el('target-size-input').value = parseFloat(s.targetSizeGB).toFixed(1);
+      const targetSize = clampTargetSizeGb(s.targetSizeGB, 1);
+      el('target-size').value = String(targetSize);
+      el('target-size-input').value = targetSize.toFixed(1);
     }
     if (s.maxDepth != null) {
       el('max-depth').value = s.maxDepth;
@@ -470,13 +480,9 @@ export async function renderSettings(container) {
     }
     el('max-depth-unlimited').checked = !!s.maxDepthUnlimited;
     updateMaxDepthControls(!!s.maxDepthUnlimited);
-    const searchApiEnabled = s?.searchApi?.enabled != null ? !!s.searchApi.enabled : true;
-    const scanWebSearchEnabled = typeof s?.searchApi?.scopes?.scan === 'boolean'
-      ? (searchApiEnabled && !!s.searchApi.scopes.scan)
-      : !!s.enableWebSearch;
-    const organizerWebSearchEnabled = typeof s?.searchApi?.scopes?.organizer === 'boolean'
-      ? (searchApiEnabled && !!s.searchApi.scopes.organizer)
-      : (s.enableWebSearchOrganizer != null ? !!s.enableWebSearchOrganizer : scanWebSearchEnabled);
+    const searchApiEnabled = !!s?.searchApi?.enabled;
+    const scanWebSearchEnabled = searchApiEnabled && !!s?.searchApi?.scopes?.scan;
+    const organizerWebSearchEnabled = searchApiEnabled && !!s?.searchApi?.scopes?.organizer;
     el('enable-web-search').checked = scanWebSearchEnabled;
     el('enable-organizer-web-search').checked = organizerWebSearchEnabled;
     searchApiSettings = {
@@ -549,16 +555,11 @@ function collectForm(currentSettings) {
 
   return {
     providerConfigs,
-    defaultProviderEndpoint: endpoint || currentSettings?.defaultProviderEndpoint || currentSettings?.apiEndpoint || '',
-    apiEndpoint: endpoint,
-    model,
+    defaultProviderEndpoint: endpoint || currentSettings?.defaultProviderEndpoint || '',
     scanPath: document.getElementById('scan-path').value.trim(),
-    targetSizeGB: parseFloat(targetSizeVal),
+    targetSizeGB: clampTargetSizeGb(targetSizeVal, 1),
     maxDepth: parseInt(maxDepthVal, 10),
     maxDepthUnlimited,
-    enableWebSearch: scanWebSearchEnabled,
-    enableWebSearchClassify: organizerWebSearchEnabled,
-    enableWebSearchOrganizer: organizerWebSearchEnabled,
     searchApi,
   };
 }

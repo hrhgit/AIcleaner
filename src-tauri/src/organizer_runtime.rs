@@ -14,14 +14,22 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+const CATEGORY_WORK_STUDY: &str = "\u{5DE5}\u{4F5C}\u{5B66}\u{4E60}";
+const CATEGORY_FINANCE_RECEIPTS: &str = "\u{8D22}\u{52A1}\u{7968}\u{636E}";
+const CATEGORY_MEDIA_ASSETS: &str = "\u{5A92}\u{4F53}\u{7D20}\u{6750}";
+const CATEGORY_DEV_PROJECTS: &str = "\u{5F00}\u{53D1}\u{9879}\u{76EE}";
+const CATEGORY_INSTALL_ARCHIVES: &str = "\u{5B89}\u{88C5}\u{4E0E}\u{538B}\u{7F29}";
+const CATEGORY_TEMP_DOWNLOADS: &str = "\u{4E34}\u{65F6}\u{4E0B}\u{8F7D}";
+const CATEGORY_OTHER_PENDING: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
+
 const DEFAULT_CATEGORY_LIST: [&str; 7] = [
-    "工作学习",
-    "财务票据",
-    "媒体素材",
-    "开发项目",
-    "安装与压缩",
-    "临时下载",
-    "其他待定",
+    CATEGORY_WORK_STUDY,
+    CATEGORY_FINANCE_RECEIPTS,
+    CATEGORY_MEDIA_ASSETS,
+    CATEGORY_DEV_PROJECTS,
+    CATEGORY_INSTALL_ARCHIVES,
+    CATEGORY_TEMP_DOWNLOADS,
+    CATEGORY_OTHER_PENDING,
 ];
 
 const DEFAULT_EXCLUDED_PATTERNS: [&str; 11] = [
@@ -132,8 +140,8 @@ fn normalize_categories(categories: Option<Vec<String>>) -> Vec<String> {
             .map(|x| (*x).to_string())
             .collect();
     }
-    if !out.iter().any(|x| x == "其他待定") {
-        out.push("其他待定".to_string());
+    if !out.iter().any(|x| x == CATEGORY_OTHER_PENDING) {
+        out.push(CATEGORY_OTHER_PENDING.to_string());
     }
     out
 }
@@ -158,7 +166,7 @@ fn fallback_category(name: &str, categories: &[String]) -> String {
         if categories.iter().any(|x| x == value) {
             value.to_string()
         } else {
-            "其他待定".to_string()
+            CATEGORY_OTHER_PENDING.to_string()
         }
     };
     if [
@@ -167,27 +175,27 @@ fn fallback_category(name: &str, categories: &[String]) -> String {
     .iter()
     .any(|x| lower.ends_with(x))
     {
-        return pick("媒体素材");
+        return pick(CATEGORY_MEDIA_ASSETS);
     }
     if [".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf"]
         .iter()
         .any(|x| lower.ends_with(x))
     {
-        return pick("工作学习");
+        return pick(CATEGORY_WORK_STUDY);
     }
     if [".zip", ".rar", ".7z", ".msi", ".exe", ".dmg"]
         .iter()
         .any(|x| lower.ends_with(x))
     {
-        return pick("安装与压缩");
+        return pick(CATEGORY_INSTALL_ARCHIVES);
     }
     if [".js", ".ts", ".py", ".java", ".go", ".rs", ".cpp"]
         .iter()
         .any(|x| lower.ends_with(x))
     {
-        return pick("开发项目");
+        return pick(CATEGORY_DEV_PROJECTS);
     }
-    "其他待定".to_string()
+    CATEGORY_OTHER_PENDING.to_string()
 }
 
 fn supports_multimodal(model: &str, endpoint: &str) -> bool {
@@ -223,10 +231,28 @@ fn sanitize_category_name(value: &str) -> String {
     let cleaned = value.replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
-        "其他待定".to_string()
+        CATEGORY_OTHER_PENDING.to_string()
     } else {
         trimmed.to_string()
     }
+}
+
+fn normalize_candidate_category(
+    candidate: &str,
+    categories: &[String],
+    allow_new_categories: bool,
+) -> (String, bool) {
+    let candidate = candidate.trim();
+    let normalized = if categories.iter().any(|x| x == candidate) {
+        candidate.to_string()
+    } else if allow_new_categories && !candidate.is_empty() {
+        candidate.to_string()
+    } else {
+        CATEGORY_OTHER_PENDING.to_string()
+    };
+    let created =
+        normalized != CATEGORY_OTHER_PENDING && !categories.iter().any(|x| x == &normalized);
+    (normalized, created)
 }
 
 fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
@@ -556,6 +582,76 @@ fn summarize_directory_for_prompt(unit: &OrganizeUnit) -> String {
     .join("\n")
 }
 
+fn build_reference_structure_context(
+    root: &Path,
+    excluded: &[String],
+    stop: &AtomicBool,
+) -> String {
+    let mut lines = Vec::new();
+    let mut total_dirs = 0_u64;
+    let mut total_files = 0_u64;
+    let mut truncated = false;
+    let max_lines = 240_usize;
+    let max_depth = 10_usize;
+
+    let walker = WalkDir::new(root)
+        .min_depth(1)
+        .max_depth(max_depth)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            !should_exclude(&name, excluded)
+        });
+
+    for entry in walker.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            truncated = true;
+            break;
+        }
+        if lines.len() >= max_lines {
+            truncated = true;
+            break;
+        }
+
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or_else(|_| entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let depth = entry.depth().saturating_sub(1);
+        let indent = "  ".repeat(depth);
+
+        if entry.file_type().is_dir() {
+            total_dirs = total_dirs.saturating_add(1);
+            lines.push(format!("{indent}[D] {relative}/"));
+            continue;
+        }
+        if entry.file_type().is_file() {
+            total_files = total_files.saturating_add(1);
+            let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            lines.push(format!("{indent}[F] {relative} ({size} bytes)"));
+        }
+    }
+
+    let mut out = vec![
+        format!("rootPath={}", root.to_string_lossy()),
+        format!("referenceTreeMaxDepth={max_depth}"),
+        format!("referenceTreeLinesShown={}", lines.len()),
+        format!("referenceTreeDirectoriesShown={total_dirs}"),
+        format!("referenceTreeFilesShown={total_files}"),
+        format!("referenceTreeTruncated={truncated}"),
+        "referenceTreeStart".to_string(),
+    ];
+    out.extend(lines);
+    out.push("referenceTreeEnd".to_string());
+    out.join("\n")
+}
+
 fn sanitize_json_block(content: &str) -> String {
     content
         .trim()
@@ -576,19 +672,8 @@ fn parse_category_response(
     let candidate = parsed
         .get("category")
         .and_then(Value::as_str)
-        .unwrap_or("鍏朵粬寰呭畾")
-        .trim();
-    let normalized = if categories.iter().any(|x| x == candidate) {
-        candidate.to_string()
-    } else if allow_new_categories && !candidate.is_empty() {
-        candidate.to_string()
-    } else {
-        "鍏朵粬寰呭畾".to_string()
-    };
-    (
-        normalized.clone(),
-        normalized != "鍏朵粬寰呭畾" && !categories.iter().any(|x| x == &normalized),
-    )
+        .unwrap_or(CATEGORY_OTHER_PENDING);
+    normalize_candidate_category(candidate, categories, allow_new_categories)
 }
 
 fn estimate_unit_total_size(unit: &OrganizeUnit) -> u64 {
@@ -699,6 +784,7 @@ async fn classify_file(
     allow_new_categories: bool,
     use_web_search: bool,
     search_api_key: Option<&str>,
+    reference_structure: Option<&str>,
     response_language: &str,
 ) -> (String, bool, bool, Vec<String>, TokenUsage) {
     if route.api_key.trim().is_empty() {
@@ -711,9 +797,10 @@ async fn classify_file(
         );
     }
     let system_prompt = format!(
-        "You classify one file into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} If unsure choose 其他待定. If you create a new category, its name must be in {}.",
+        "You classify one file into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} If unsure choose {}. If you create a new category, its name must be in {}. If original structure context is provided, use it only as supporting context to preserve grouping intent while still classifying the current item only.",
         categories.join(" | "),
         if allow_new_categories { "You may create one short new category if none fits." } else { "You must choose from the preferred categories." },
+        CATEGORY_OTHER_PENDING,
         prompt_language_name(response_language),
     );
     let mut user_prompt = format!(
@@ -736,34 +823,15 @@ async fn classify_file(
             }
         }
     }
+    if let Some(structure) = reference_structure.filter(|value| !value.trim().is_empty()) {
+        user_prompt.push_str("\noriginalStructureContext\n");
+        user_prompt.push_str(structure);
+        user_prompt.push_str(
+            "\nUse the original structure only as context. Do not classify siblings; classify the current file only.\noriginalStructureContextEnd",
+        );
+    }
     let mut warnings = Vec::new();
     let mut total_usage = TokenUsage::default();
-    let _parse_category = |content: &str, categories: &[String], allow_new_categories: bool| {
-        let clean = content
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim()
-            .to_string();
-        let parsed: Value = serde_json::from_str(&clean).unwrap_or_else(|_| json!({}));
-        let candidate = parsed
-            .get("category")
-            .and_then(Value::as_str)
-            .unwrap_or("其他待定")
-            .trim();
-        let normalized = if categories.iter().any(|x| x == candidate) {
-            candidate.to_string()
-        } else if allow_new_categories && !candidate.is_empty() {
-            candidate.to_string()
-        } else {
-            "其他待定".to_string()
-        };
-        (
-            normalized.clone(),
-            normalized != "其他待定" && !categories.iter().any(|x| x == &normalized),
-        )
-    };
     let (mut category, mut created) =
         match chat_completion(route, &system_prompt, &user_prompt).await {
             Ok((content, usage)) => {
@@ -781,7 +849,7 @@ async fn classify_file(
                 );
             }
         };
-    if use_web_search && category == "其他待定" {
+    if use_web_search && category == CATEGORY_OTHER_PENDING {
         if let Some(api_key) = search_api_key {
             if let Ok(Some(context)) = tavily_search(api_key, &file.name).await {
                 let second_prompt = format!(
@@ -812,6 +880,7 @@ async fn classify_directory(
     unit: &OrganizeUnit,
     categories: &[String],
     allow_new_categories: bool,
+    reference_structure: Option<&str>,
     response_language: &str,
 ) -> (String, bool, bool, Vec<String>, TokenUsage) {
     if route.api_key.trim().is_empty() {
@@ -824,17 +893,25 @@ async fn classify_directory(
         );
     }
     let system_prompt = format!(
-        "You classify one application or project directory into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} Treat the directory as one bundle and do not split its children. If unsure choose 鍏朵粬寰呭畾. If you create a new category, its name must be in {}.",
+        "You classify one application or project directory into one category. Return JSON only. Schema: {{\"category\":\"...\"}}. Preferred categories: {}. {} Treat the directory as one bundle and do not split its children. If unsure choose {}. If you create a new category, its name must be in {}. If original structure context is provided, use it only as supporting context to preserve grouping intent while still classifying the current directory only.",
         categories.join(" | "),
         if allow_new_categories { "You may create one short new category if none fits." } else { "You must choose from the preferred categories." },
+        CATEGORY_OTHER_PENDING,
         prompt_language_name(response_language),
     );
-    let user_prompt = format!(
+    let mut user_prompt = format!(
         "name={}\npath={}\nentryType=directory\n{}\nChoose the best category for moving the whole directory as one unit.",
         unit.name,
         unit.path,
         summarize_directory_for_prompt(unit)
     );
+    if let Some(structure) = reference_structure.filter(|value| !value.trim().is_empty()) {
+        user_prompt.push_str("\noriginalStructureContext\n");
+        user_prompt.push_str(structure);
+        user_prompt.push_str(
+            "\nUse the original structure only as context. Do not classify siblings; classify the current directory bundle only.\noriginalStructureContextEnd",
+        );
+    }
     match chat_completion(route, &system_prompt, &user_prompt).await {
         Ok((content, usage)) => {
             let (category, created) =
@@ -892,6 +969,127 @@ fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
     out
 }
 
+fn normalize_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
+fn next_conflict_target_path(target: &Path, target_dir: &Path, suffix: u32) -> PathBuf {
+    let stem = target
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("file");
+    let ext = target.extension().and_then(|x| x.to_str()).unwrap_or("");
+    let next_name = if ext.is_empty() {
+        format!("{stem} ({suffix})")
+    } else {
+        format!("{stem} ({suffix}).{ext}")
+    };
+    target_dir.join(next_name)
+}
+
+fn resolve_apply_target_path(source: &Path, planned_target: &Path) -> PathBuf {
+    if normalize_path_key(source) == normalize_path_key(planned_target) {
+        return planned_target.to_path_buf();
+    }
+
+    let target_dir = planned_target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut resolved = planned_target.to_path_buf();
+    let mut suffix = 1_u32;
+    while resolved.exists() {
+        if normalize_path_key(source) == normalize_path_key(&resolved) {
+            return resolved;
+        }
+        resolved = next_conflict_target_path(planned_target, &target_dir, suffix);
+        suffix = suffix.saturating_add(1);
+    }
+    resolved
+}
+
+fn build_apply_plan(snapshot: &OrganizeSnapshot) -> Vec<Value> {
+    let preview_rows = if snapshot.preview.is_empty() {
+        build_preview(&snapshot.root_path, &snapshot.results)
+    } else {
+        snapshot.preview.clone()
+    };
+
+    let mut plan = preview_rows
+        .into_iter()
+        .map(|entry| {
+            let source_path = entry
+                .get("sourcePath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let item_type = entry
+                .get("itemType")
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .to_string();
+            let category = sanitize_category_name(
+                entry
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .unwrap_or(CATEGORY_OTHER_PENDING),
+            );
+            let fallback_name = Path::new(&source_path)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("item")
+                .to_string();
+            let fallback_target = PathBuf::from(&snapshot.root_path)
+                .join(&category)
+                .join(&fallback_name);
+            let planned_target = entry
+                .get("targetPath")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(fallback_target);
+
+            json!({
+                "sourcePath": source_path,
+                "targetPath": planned_target.to_string_lossy().to_string(),
+                "itemType": item_type,
+                "category": category,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Move deeper children first so parent-directory moves do not invalidate nested source paths.
+    plan.sort_by(|left, right| {
+        let left_source = Path::new(left.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
+        let right_source = Path::new(
+            right
+                .get("sourcePath")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        path_depth(right_source)
+            .cmp(&path_depth(left_source))
+            .then_with(|| {
+                let left_type = left
+                    .get("itemType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file");
+                let right_type = right
+                    .get("itemType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file");
+                left_type.cmp(right_type)
+            })
+            .then_with(|| normalize_path_key(left_source).cmp(&normalize_path_key(right_source)))
+    });
+
+    plan
+}
+
 async fn emit_snapshot<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -911,7 +1109,14 @@ async fn run_organize_task<R: Runtime>(
     state: &AppState,
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
-    let (root_path, recursive, excluded, allow_new_categories, use_web_search) = {
+    let (
+        root_path,
+        recursive,
+        excluded,
+        allow_new_categories,
+        use_web_search,
+        reference_original_structure,
+    ) = {
         let snap = task.snapshot.lock();
         (
             snap.root_path.clone(),
@@ -919,6 +1124,7 @@ async fn run_organize_task<R: Runtime>(
             snap.excluded_patterns.clone(),
             snap.allow_new_categories,
             snap.use_web_search,
+            snap.reference_original_structure,
         )
     };
     {
@@ -928,6 +1134,15 @@ async fn run_organize_task<R: Runtime>(
     emit_snapshot(app, state, task).await?;
 
     let units = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
+    let reference_structure = if reference_original_structure {
+        Some(build_reference_structure_context(
+            Path::new(&root_path),
+            &excluded,
+            &task.stop,
+        ))
+    } else {
+        None
+    };
     {
         let mut snap = task.snapshot.lock();
         snap.status = "classifying".to_string();
@@ -962,6 +1177,7 @@ async fn run_organize_task<R: Runtime>(
                     unit,
                     &categories,
                     allow_new_categories,
+                    reference_structure.as_deref(),
                     &task.response_language,
                 )
                 .await
@@ -973,6 +1189,7 @@ async fn run_organize_task<R: Runtime>(
                     allow_new_categories,
                     use_web_search,
                     task.search_api_key.as_deref(),
+                    reference_structure.as_deref(),
                     &task.response_language,
                 )
                 .await
@@ -1038,20 +1255,13 @@ async fn run_organize_task<R: Runtime>(
 
 pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
     let settings = crate::backend::read_settings(&state.settings_path);
-    let endpoint = settings
-        .get("apiEndpoint")
-        .and_then(Value::as_str)
-        .unwrap_or("https://api.openai.com/v1");
-    let model = settings
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("gpt-4o-mini");
+    let (endpoint, model) =
+        crate::backend::resolve_provider_endpoint_and_model(state.inner(), None, None);
     Ok(json!({
         "selectedModel": model,
         "selectedModels": { "text": model, "image": model, "video": model, "audio": model },
         "selectedProviders": { "text": endpoint, "image": endpoint, "video": endpoint, "audio": endpoint },
-        "supportsMultimodal": supports_multimodal(model, endpoint),
-        "apiEndpoint": endpoint,
+        "supportsMultimodal": supports_multimodal(&model, &endpoint),
         "useWebSearch": settings.pointer("/searchApi/scopes/organizer").and_then(Value::as_bool).unwrap_or(false),
         "webSearchEnabled": settings.pointer("/searchApi/enabled").and_then(Value::as_bool).unwrap_or(false),
     }))
@@ -1063,19 +1273,14 @@ pub async fn organize_suggest_categories(input: OrganizeSuggestInput) -> Result<
         return Err("rootPath is required".to_string());
     }
     let excluded = normalize_excluded(input.excluded_patterns);
-    let files = collect_units(
-        &root,
-        input.recursive.unwrap_or(true),
-        &excluded,
-        &AtomicBool::new(false),
-    );
+    let files = collect_units(&root, true, &excluded, &AtomicBool::new(false));
     let mut set = input.manual_categories.unwrap_or_default();
-    if !set.iter().any(|x| x == "其他待定") {
-        set.push("其他待定".to_string());
+    if !set.iter().any(|x| x == CATEGORY_OTHER_PENDING) {
+        set.push(CATEGORY_OTHER_PENDING.to_string());
     }
     for file in files.iter().take(400) {
         let cat = fallback_category(&file.name, &set);
-        if cat != "其他待定" && !set.contains(&cat) {
+        if cat != CATEGORY_OTHER_PENDING && !set.contains(&cat) {
             set.push(cat);
         }
     }
@@ -1102,7 +1307,8 @@ pub async fn organize_start<R: Runtime>(
         status: "idle".to_string(),
         error: None,
         root_path: input.root_path.clone(),
-        recursive: input.recursive.unwrap_or(true),
+        recursive: true,
+        reference_original_structure: input.reference_original_structure.unwrap_or(false),
         mode: input.mode.clone().unwrap_or_else(|| "fast".to_string()),
         categories: normalize_categories(input.categories.clone()),
         allow_new_categories: input.allow_new_categories.unwrap_or(true),
@@ -1219,9 +1425,10 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
     snapshot.status = "moving".to_string();
     persist::save_organize_snapshot(&state.db_path, &snapshot)?;
 
+    let plan = build_apply_plan(&snapshot);
     let mut entries = Vec::new();
-    for row in &snapshot.results {
-        let source = PathBuf::from(row.get("path").and_then(Value::as_str).unwrap_or(""));
+    for row in &plan {
+        let source = PathBuf::from(row.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
         let item_type = row
             .get("itemType")
             .and_then(Value::as_str)
@@ -1230,10 +1437,25 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         let category = sanitize_category_name(
             row.get("category")
                 .and_then(Value::as_str)
-                .unwrap_or("其他待定"),
+                .unwrap_or(CATEGORY_OTHER_PENDING),
         );
-        let target_dir = PathBuf::from(&snapshot.root_path).join(&category);
-        let target_base = target_dir.join(row.get("name").and_then(Value::as_str).unwrap_or(""));
+        let planned_target =
+            PathBuf::from(row.get("targetPath").and_then(Value::as_str).unwrap_or(""));
+        let target_base = if planned_target.as_os_str().is_empty() {
+            let fallback_name = source
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("item");
+            PathBuf::from(&snapshot.root_path)
+                .join(&category)
+                .join(fallback_name)
+        } else {
+            planned_target
+        };
+        let target_dir = target_base
+            .parent()
+            .unwrap_or_else(|| Path::new(&snapshot.root_path))
+            .to_path_buf();
         if !source.exists() {
             entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
@@ -1256,21 +1478,17 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             }));
             continue;
         }
-        let mut target = target_base.clone();
-        let mut suffix = 1_u32;
-        while target.exists() {
-            let stem = target
-                .file_stem()
-                .and_then(|x| x.to_str())
-                .unwrap_or("file");
-            let ext = target.extension().and_then(|x| x.to_str()).unwrap_or("");
-            let next = if ext.is_empty() {
-                format!("{stem} ({suffix})")
-            } else {
-                format!("{stem} ({suffix}).{ext}")
-            };
-            target = target.parent().unwrap_or(&target_dir).join(next);
-            suffix += 1;
+        let target = resolve_apply_target_path(&source, &target_base);
+        if normalize_path_key(&source) == normalize_path_key(&target) {
+            entries.push(json!({
+                "sourcePath": source.to_string_lossy().to_string(),
+                "targetPath": target.to_string_lossy().to_string(),
+                "itemType": item_type,
+                "category": category,
+                "status": "skipped",
+                "error": Value::Null
+            }));
+            continue;
         }
         match fs::rename(&source, &target) {
             Ok(_) => entries.push(json!({
@@ -1295,7 +1513,14 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         .iter()
         .filter(|x| x.get("status").and_then(Value::as_str) == Some("moved"))
         .count();
-    let failed = entries.len().saturating_sub(moved);
+    let skipped = entries
+        .iter()
+        .filter(|x| x.get("status").and_then(Value::as_str) == Some("skipped"))
+        .count();
+    let failed = entries
+        .iter()
+        .filter(|x| x.get("status").and_then(Value::as_str) == Some("failed"))
+        .count();
     let job_id = format!("job_{}", Uuid::new_v4().simple());
     let manifest = json!({
         "jobId": job_id,
@@ -1304,10 +1529,12 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         "createdAt": now_iso(),
         "mode": snapshot.mode,
         "recursive": snapshot.recursive,
+        "referenceOriginalStructure": snapshot.reference_original_structure,
         "categories": snapshot.categories,
         "entries": entries,
         "summary": {
             "moved": moved,
+            "skipped": skipped,
             "failed": failed,
             "total": entries.len()
         }
@@ -1418,4 +1645,92 @@ pub async fn organize_rollback(
         "jobId": manifest.get("jobId").and_then(Value::as_str).unwrap_or(&job_id),
         "rollback": rollback
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::TokenUsage;
+    use std::fs::File;
+
+    #[test]
+    fn normalize_categories_keeps_other_pending_bucket() {
+        let categories = normalize_categories(Some(vec![CATEGORY_WORK_STUDY.to_string()]));
+        assert!(categories.iter().any(|item| item == CATEGORY_OTHER_PENDING));
+    }
+
+    #[test]
+    fn parse_category_response_falls_back_to_other_pending() {
+        let categories = normalize_categories(Some(vec![CATEGORY_WORK_STUDY.to_string()]));
+        let (category, created) = parse_category_response("{}", &categories, false);
+        assert_eq!(category, CATEGORY_OTHER_PENDING.to_string());
+        assert!(!created);
+    }
+
+    fn sample_snapshot() -> OrganizeSnapshot {
+        OrganizeSnapshot {
+            id: "org_test".to_string(),
+            status: "completed".to_string(),
+            error: None,
+            root_path: "C:\\root".to_string(),
+            recursive: true,
+            reference_original_structure: false,
+            mode: "fast".to_string(),
+            categories: vec![
+                CATEGORY_WORK_STUDY.to_string(),
+                CATEGORY_OTHER_PENDING.to_string(),
+            ],
+            allow_new_categories: true,
+            excluded_patterns: Vec::new(),
+            parallelism: 1,
+            use_web_search: false,
+            web_search_enabled: false,
+            selected_model: "gpt-4o-mini".to_string(),
+            selected_models: json!({}),
+            selected_providers: json!({}),
+            supports_multimodal: false,
+            total_files: 1,
+            processed_files: 1,
+            token_usage: TokenUsage::default(),
+            results: vec![json!({
+                "path": "C:\\root\\foo.txt",
+                "name": "foo.txt",
+                "category": CATEGORY_WORK_STUDY,
+                "itemType": "file"
+            })],
+            preview: vec![json!({
+                "sourcePath": "C:\\root\\foo.txt",
+                "targetPath": "C:\\root\\工作学习\\子目录\\foo.txt",
+                "category": CATEGORY_WORK_STUDY,
+                "itemType": "file"
+            })],
+            created_at: "2026-03-20T00:00:00Z".to_string(),
+            completed_at: Some("2026-03-20T00:00:01Z".to_string()),
+            job_id: None,
+        }
+    }
+
+    #[test]
+    fn build_apply_plan_prefers_preview_target_path() {
+        let snapshot = sample_snapshot();
+        let plan = build_apply_plan(&snapshot);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].get("targetPath").and_then(Value::as_str),
+            Some("C:\\root\\工作学习\\子目录\\foo.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_apply_target_path_keeps_same_source_target_path() {
+        let temp_dir = std::env::temp_dir().join(format!("wipeout-organize-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let source = temp_dir.join("same.txt");
+        File::create(&source).expect("create source file");
+
+        let resolved = resolve_apply_target_path(&source, &source);
+        assert_eq!(resolved, source);
+
+        fs::remove_dir_all(&temp_dir).expect("cleanup temp dir");
+    }
 }

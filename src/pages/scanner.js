@@ -4,17 +4,13 @@
  */
 import {
   browseFolder,
-  connectScanStream,
   findLatestScanForPath,
-  getActiveScan,
   getProviderModels,
-  getScanResult,
   getPrivilegeStatus,
   getSettings,
+  openFileLocation,
   requestElevation,
   saveSettings,
-  startScan,
-  stopScan,
 } from '../utils/api.js';
 import { handleElevationTransition } from '../utils/elevation.js';
 import { formatSize } from '../utils/storage.js';
@@ -22,20 +18,23 @@ import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
 import { ensureRequiredCredentialsConfigured, getProviderCredentialPresence } from '../utils/secret-ui.js';
+import { scanTaskController } from '../utils/scan-task-controller.js';
 
 let activeTaskId = null;
 let latestTaskId = null;
-let activeEventSource = null;
 let logEntries = [];
-let nextLogEntryId = 0;
 let currentSettings = null;
+let scannerIgnoredPaths = [];
+let scannerWhitelistExpanded = false;
 let renderVersion = 0;
+let scannerTaskUnsubscribe = null;
 const expandedDetailLogIds = new Set();
 const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v2';
 const SCANNER_FORM_DRAFT_VERSION = 2;
 const SCAN_LOG_COLLAPSED_KEY = 'wipeout.scanner.log.collapsed.v1';
 const SCAN_RECORD_GROUP_COLLAPSED_KEY = 'wipeout.scanner.record-group.collapsed.v1';
-const SCAN_LOG_CACHE_KEY = 'wipeout.scanner.global.log.v1';
+const TARGET_SIZE_MIN_GB = 0.1;
+const TARGET_SIZE_MAX_GB = 20;
 const PROVIDER_OPTIONS = [
   { value: 'https://api.deepseek.com', label: 'DeepSeek' },
   { value: 'https://api.openai.com/v1', label: 'OpenAI' },
@@ -89,6 +88,12 @@ function clampNumber(value, min, max, fallback) {
   return n;
 }
 
+function escapeHtml(value) {
+  const div = document.createElement('div');
+  div.textContent = String(value ?? '');
+  return div.innerHTML;
+}
+
 function resolveSearchApi(settings) {
   const source = settings?.searchApi && typeof settings.searchApi === 'object'
     ? settings.searchApi
@@ -97,40 +102,145 @@ function resolveSearchApi(settings) {
     ? source.scopes
     : {};
 
-  const scanEnabled = typeof scopes.scan === 'boolean'
-    ? scopes.scan
-    : !!settings?.enableWebSearch;
-  const classifyEnabled = typeof scopes.classify === 'boolean'
-    ? scopes.classify
-    : (typeof scopes.organizer === 'boolean'
-      ? scopes.organizer
-      : (settings?.enableWebSearchClassify != null
-        ? !!settings.enableWebSearchClassify
-        : (settings?.enableWebSearchOrganizer != null
-          ? !!settings.enableWebSearchOrganizer
-          : scanEnabled)));
-  const enabled = typeof source.enabled === 'boolean'
-    ? source.enabled
-    : (scanEnabled || classifyEnabled);
-  const apiKey = String(source.apiKey || settings?.tavilyApiKey || '').trim();
-
   return {
-    enabled: !!enabled,
-    apiKey,
+    enabled: !!source.enabled,
+    apiKey: String(source.apiKey || '').trim(),
     scopes: {
-      scan: !!scanEnabled,
-      classify: !!classifyEnabled,
-      organizer: !!classifyEnabled,
+      scan: !!scopes.scan,
+      classify: !!scopes.classify,
+      organizer: !!scopes.organizer,
     },
   };
+}
+
+function normalizeIgnoredPaths(paths) {
+  const seen = new Set();
+  const normalized = [];
+  for (const raw of Array.isArray(paths) ? paths : []) {
+    const path = String(raw || '').trim();
+    const key = path.replace(/\//g, '\\').toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(path);
+  }
+  return normalized;
+}
+
+function removeIgnoredPath(existingPaths, targetPath) {
+  const targetKey = String(targetPath || '').trim().replace(/\//g, '\\').toLowerCase();
+  return normalizeIgnoredPaths(existingPaths).filter((entry) => String(entry || '').trim().replace(/\//g, '\\').toLowerCase() !== targetKey);
+}
+
+function setScannerWhitelistButtonBusy(btn, busy) {
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.classList.toggle('is-busy', !!busy);
+}
+
+function syncScannerIgnoredPaths(settings = {}) {
+  scannerIgnoredPaths = normalizeIgnoredPaths(settings?.scanIgnorePaths);
+}
+
+function renderScannerWhitelistPanel() {
+  const panel = document.getElementById('scanner-whitelist-panel');
+  const listEl = document.getElementById('scanner-whitelist-list');
+  const emptyEl = document.getElementById('scanner-whitelist-empty');
+  const countEl = document.getElementById('scanner-whitelist-count');
+  const toggleBtn = document.getElementById('scanner-whitelist-toggle-btn');
+  if (!panel || !listEl || !emptyEl || !countEl || !toggleBtn) return;
+
+  const items = [...scannerIgnoredPaths].sort((a, b) => String(a).localeCompare(String(b), undefined, { sensitivity: 'base' }));
+  countEl.textContent = String(items.length);
+  toggleBtn.textContent = scannerWhitelistExpanded ? t('scanner.whitelist_hide') : t('scanner.whitelist_show');
+  panel.hidden = !scannerWhitelistExpanded;
+
+  if (!scannerWhitelistExpanded) {
+    return;
+  }
+
+  if (!items.length) {
+    listEl.innerHTML = '';
+    emptyEl.style.display = '';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  listEl.innerHTML = items.map((path) => `
+    <div class="results-whitelist-item">
+      <div class="results-whitelist-path-wrap">
+        <div class="results-whitelist-path-label">${t('scanner.whitelist_path_label')}</div>
+        <div class="results-whitelist-path" title="${escapeHtml(path)}">${escapeHtml(path)}</div>
+      </div>
+      <div class="results-whitelist-actions">
+        <button class="btn btn-ghost scanner-whitelist-open-btn" type="button" data-path="${escapeHtml(path)}">
+          ${t('results.open_folder')}
+        </button>
+        <button class="btn btn-secondary scanner-whitelist-remove-btn" type="button" data-path="${escapeHtml(path)}">
+          ${t('scanner.whitelist_remove')}
+        </button>
+      </div>
+    </div>
+  `).join('');
+
+  document.querySelectorAll('.scanner-whitelist-open-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        setScannerWhitelistButtonBusy(btn, true);
+        const res = await openFileLocation(btn.dataset.path);
+        if (!res.success) {
+          showToast(t('results.toast_open_failed') + res.error, 'error');
+        }
+      } catch (err) {
+        showToast(t('results.toast_open_failed') + err.message, 'error');
+      } finally {
+        setScannerWhitelistButtonBusy(btn, false);
+      }
+    });
+  });
+
+  document.querySelectorAll('.scanner-whitelist-remove-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const path = String(btn.dataset.path || '').trim();
+      if (!path) return;
+      try {
+        setScannerWhitelistButtonBusy(btn, true);
+        await removePathFromScannerWhitelist(path);
+      } finally {
+        setScannerWhitelistButtonBusy(btn, false);
+      }
+    });
+  });
+}
+
+function setScannerWhitelistExpanded(expanded) {
+  scannerWhitelistExpanded = !!expanded;
+  renderScannerWhitelistPanel();
+}
+
+async function removePathFromScannerWhitelist(path) {
+  const nextIgnoredPaths = removeIgnoredPath(scannerIgnoredPaths, path);
+  if (nextIgnoredPaths.length === scannerIgnoredPaths.length) {
+    showToast(t('scanner.whitelist_removed'), 'info');
+    return;
+  }
+
+  try {
+    const result = await saveSettings({ scanIgnorePaths: nextIgnoredPaths });
+    currentSettings = result?.settings || { ...(currentSettings || {}), scanIgnorePaths: nextIgnoredPaths };
+    syncScannerIgnoredPaths(currentSettings);
+    renderScannerWhitelistPanel();
+    showToast(t('scanner.whitelist_removed'), 'success');
+  } catch (err) {
+    showToast(t('scanner.whitelist_remove_failed') + err.message, 'error');
+  }
 }
 
 function collectScannerForm() {
   const scanPath = String(document.getElementById('scan-path')?.value || '').trim();
   const targetSize = clampNumber(
     document.getElementById('target-size-input')?.value ?? document.getElementById('target-size')?.value,
-    0.1,
-    100,
+    TARGET_SIZE_MIN_GB,
+    TARGET_SIZE_MAX_GB,
     1
   );
   const maxDepthUnlimited = !!document.getElementById('max-depth-unlimited')?.checked;
@@ -158,7 +268,7 @@ function collectScannerForm() {
 function normalizeScannerFormDraft(raw = {}) {
   return {
     scanPath: String(raw?.scanPath || '').trim(),
-    targetSizeGB: clampNumber(raw?.targetSizeGB, 0.1, 100, 1),
+    targetSizeGB: clampNumber(raw?.targetSizeGB, TARGET_SIZE_MIN_GB, TARGET_SIZE_MAX_GB, 1),
     maxDepth: Math.floor(clampNumber(raw?.maxDepth, 1, 10, 5)),
     maxDepthUnlimited: !!raw?.maxDepthUnlimited,
     scanWebSearchEnabled: !!raw?.scanWebSearchEnabled,
@@ -169,18 +279,17 @@ function normalizeScannerFormDraft(raw = {}) {
 
 function extractScannerFormFromSettings(settings = {}) {
   const searchApi = resolveSearchApi(settings);
-  const scanWebSearchEnabled = typeof settings?.scanWebSearchEnabled === 'boolean'
-    ? settings.scanWebSearchEnabled
-    : !!searchApi.scopes.scan;
+  const defaultEndpoint = String(settings?.defaultProviderEndpoint || '').trim();
+  const defaultModel = String(settings?.providerConfigs?.[defaultEndpoint]?.model || '').trim();
 
   return normalizeScannerFormDraft({
     scanPath: settings?.scanPath,
     targetSizeGB: settings?.targetSizeGB,
     maxDepth: settings?.maxDepth,
     maxDepthUnlimited: settings?.maxDepthUnlimited,
-    scanWebSearchEnabled,
-    scanProviderEndpoint: settings?.apiEndpoint || settings?.defaultProviderEndpoint || '',
-    scanModel: settings?.model || '',
+    scanWebSearchEnabled: !!searchApi.scopes.scan,
+    scanProviderEndpoint: defaultEndpoint,
+    scanModel: defaultModel,
   });
 }
 
@@ -215,39 +324,19 @@ function persistScannerFormDraft({ dirty = true } = {}) {
   writeScannerFormDraft(collectScannerForm(), { dirty });
 }
 
-function normalizePersistedLogEntries(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((entry) => entry && typeof entry === 'object')
-    .map((entry) => ({
-      id: Number.isFinite(Number(entry.id)) ? Number(entry.id) : undefined,
-      kind: entry.kind === 'detail' ? 'detail' : 'simple',
-      type: String(entry.type || 'scanning'),
-      text: String(entry.text || ''),
-      summary: String(entry.summary || ''),
-      detailHtml: String(entry.detailHtml || ''),
-      time: String(entry.time || ''),
-    }))
-    .slice(-200);
-}
-
-function readPersistedScanLog() {
-  const raw = storage.get(SCAN_LOG_CACHE_KEY, null);
-  if (!raw || typeof raw !== 'object') return { entries: [], nextId: 0 };
-  const entries = normalizePersistedLogEntries(raw.entries);
-  const maxId = entries.reduce((acc, entry) => Math.max(acc, Number.isFinite(entry.id) ? entry.id : -1), -1);
-  return {
-    entries,
-    nextId: Math.max(Number(raw.nextId) || 0, maxId + 1),
-  };
-}
-
-function persistScanLog() {
-  storage.set(SCAN_LOG_CACHE_KEY, {
-    entries: logEntries,
-    nextId: nextLogEntryId,
-    updatedAt: Date.now(),
-  });
+function replaceLogEntries(nextEntries = [], { persist = true } = {}) {
+  scanTaskController.replaceLogEntries(nextEntries, { persist });
+  logEntries = scanTaskController.getState().logEntries;
+  expandedDetailLogIds.clear();
+  const logEl = document.getElementById('scan-log');
+  if (logEl) {
+    if (logEntries.length > 0) {
+      renderLogEntries();
+    } else {
+      logEl.innerHTML = '';
+    }
+  }
+  refreshScanLogPanel();
 }
 
 function isScanLogCollapsed() {
@@ -400,21 +489,6 @@ function createScanRecordGroupElement(entries) {
   return wrapper;
 }
 
-function trimLogEntries() {
-  let trimmed = false;
-  while (logEntries.length > 200) {
-    trimmed = true;
-    const removed = logEntries.shift();
-    if (removed?.kind === 'detail') {
-      expandedDetailLogIds.delete(removed.id);
-    }
-  }
-  if (trimmed) {
-    persistScanLog();
-  }
-  return trimmed;
-}
-
 function applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight }) {
   if (shouldStickToBottom) {
     log.scrollTop = log.scrollHeight;
@@ -535,9 +609,6 @@ function syncScanProviderApiKeyMap(settings = {}) {
       scanProviderApiKeyMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
   }
-  if (settings?.apiEndpoint && !scanProviderApiKeyMap[settings.apiEndpoint]) {
-    scanProviderApiKeyMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
-  }
 }
 
 function refreshScanApiConfigHint(endpoint = document.getElementById('scan-provider')?.value) {
@@ -620,8 +691,8 @@ async function initScanProviderFields(settings = {}) {
   }
 
   const form = extractScannerFormFromSettings(settings);
-  const endpoint = String(form.scanProviderEndpoint || settings?.apiEndpoint || 'https://api.deepseek.com').trim();
-  const model = String(form.scanModel || settings?.model || 'deepseek-chat').trim();
+  const endpoint = String(form.scanProviderEndpoint || 'https://api.deepseek.com').trim();
+  const model = String(form.scanModel || PROVIDER_MODELS[endpoint]?.[0]?.value || 'deepseek-chat').trim();
   ensureSelectOptionExists(providerSelect, endpoint, getProviderLabel(endpoint));
   providerSelect.value = endpoint;
   await initScanModelSelectors({ endpoint, model });
@@ -652,12 +723,20 @@ function mergeSettingsWithDraft(settings = {}, draftState = { dirty: false, data
     targetSizeGB: draft.targetSizeGB,
     maxDepth: draft.maxDepth,
     maxDepthUnlimited: draft.maxDepthUnlimited,
-    apiEndpoint: draft.scanProviderEndpoint || settings?.apiEndpoint,
+    providerConfigs: {
+      ...(settings?.providerConfigs && typeof settings.providerConfigs === 'object' ? settings.providerConfigs : {}),
+      ...(draft.scanProviderEndpoint
+        ? {
+          [draft.scanProviderEndpoint]: {
+            ...(settings?.providerConfigs?.[draft.scanProviderEndpoint] || {}),
+            endpoint: draft.scanProviderEndpoint,
+            name: String(settings?.providerConfigs?.[draft.scanProviderEndpoint]?.name || getProviderLabel(draft.scanProviderEndpoint)),
+            model: draft.scanModel || settings?.providerConfigs?.[draft.scanProviderEndpoint]?.model || PROVIDER_MODELS[draft.scanProviderEndpoint]?.[0]?.value || 'deepseek-chat',
+          },
+        }
+        : {}),
+    },
     defaultProviderEndpoint: draft.scanProviderEndpoint || settings?.defaultProviderEndpoint,
-    model: draft.scanModel || settings?.model,
-    enableWebSearch: !!draft.scanWebSearchEnabled,
-    enableWebSearchClassify: classifyEnabled,
-    enableWebSearchOrganizer: classifyEnabled,
     searchApi: mergedSearchApi,
   };
 }
@@ -724,6 +803,57 @@ function updatePathDisplay(pathValue) {
   }
 }
 
+function resetScanPreview({ clearLog = true } = {}) {
+  updateStats({ scannedCount: 0, totalCleanable: 0, tokenUsage: { total: 0 } });
+  setScanStatus('idle');
+
+  const fill = document.getElementById('progress-fill');
+  const label = document.getElementById('progress-pct');
+  const pathEl = document.getElementById('breadcrumb-path');
+  const depthEl = document.getElementById('breadcrumb-depth');
+  const activityEl = document.getElementById('scan-activity-hidden');
+  const emptyEl = document.getElementById('scan-empty');
+  const breadcrumb = document.getElementById('scan-breadcrumb');
+
+  if (fill) fill.style.width = '0%';
+  if (label) label.textContent = '0.0%';
+  if (pathEl) {
+    pathEl.textContent = '...';
+    pathEl.title = '';
+  }
+  if (depthEl) depthEl.textContent = t('scanner.not_set');
+  if (activityEl) activityEl.style.display = 'none';
+  if (emptyEl) emptyEl.style.display = '';
+  if (breadcrumb) breadcrumb.style.display = 'none';
+
+  latestTaskId = null;
+
+  if (clearLog) {
+    replaceLogEntries([], { persist: false });
+  }
+}
+
+function previewSnapshotForPath(snapshot) {
+  if (!snapshot?.id) {
+    resetScanPreview({ clearLog: true });
+    return;
+  }
+
+  latestTaskId = snapshot.id;
+  applySnapshotToUI(snapshot, { persist: false });
+
+  const cachedLastScan = storage.get('lastScan', null);
+  const shouldKeepCurrentLog = String(cachedLastScan?.id || '') === String(snapshot.id || '');
+  if (!shouldKeepCurrentLog) {
+    replaceLogEntries([], { persist: false });
+  } else {
+    refreshScanLogPanel();
+    if (logEntries.length > 0) {
+      renderLogEntries();
+    }
+  }
+}
+
 function refreshScanActionHint() {
   const hintEl = document.getElementById('scan-incremental-hint');
   const startBtn = document.getElementById('start-btn');
@@ -745,12 +875,16 @@ function refreshScanActionHint() {
   }
 }
 
-async function refreshLatestBaselineForPath(pathValue) {
+async function refreshLatestBaselineForPath(pathValue, { syncPreview = true } = {}) {
   const path = String(pathValue || '').trim();
   const token = ++baselineLookupToken;
   if (!path) {
     latestBaselineSnapshot = null;
     refreshScanActionHint();
+    if (syncPreview && !activeTaskId) {
+      resetButtons();
+      resetScanPreview({ clearLog: true });
+    }
     return;
   }
   try {
@@ -763,6 +897,13 @@ async function refreshLatestBaselineForPath(pathValue) {
     console.warn('Failed to resolve latest scan baseline:', err);
   }
   refreshScanActionHint();
+  if (!syncPreview || activeTaskId || token !== baselineLookupToken) return;
+  resetButtons();
+  if (latestBaselineSnapshot?.id) {
+    previewSnapshotForPath(latestBaselineSnapshot);
+  } else {
+    resetScanPreview({ clearLog: true });
+  }
 }
 
 function setSaveStatus(text, colorToken = '--text-muted') {
@@ -791,13 +932,17 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
     writeScannerFormDraft(form, { dirty: true });
     const existingSearchApi = resolveSearchApi(currentSettings);
     const classifyEnabled = !!existingSearchApi.scopes.classify;
-    const selectedEndpoint = String(
-      form.scanProviderEndpoint
-      || currentSettings?.defaultProviderEndpoint
-      || currentSettings?.apiEndpoint
-      || 'https://api.deepseek.com'
-    ).trim();
-    const selectedModel = String(form.scanModel || currentSettings?.model || 'deepseek-chat').trim();
+      const selectedEndpoint = String(
+        form.scanProviderEndpoint
+        || currentSettings?.defaultProviderEndpoint
+        || 'https://api.deepseek.com'
+      ).trim();
+      const selectedModel = String(
+        form.scanModel
+        || currentSettings?.providerConfigs?.[selectedEndpoint]?.model
+        || PROVIDER_MODELS[selectedEndpoint]?.[0]?.value
+        || 'deepseek-chat'
+      ).trim();
     const providerConfigs = currentSettings?.providerConfigs && typeof currentSettings.providerConfigs === 'object'
       ? { ...currentSettings.providerConfigs }
       : {};
@@ -826,20 +971,17 @@ async function persistScannerSettings({ showSuccessToast = true } = {}) {
       targetSizeGB: form.targetSizeGB,
       maxDepth: form.maxDepth,
       maxDepthUnlimited: !!form.maxDepthUnlimited,
-      enableWebSearch: !!form.scanWebSearchEnabled,
-      enableWebSearchClassify: classifyEnabled,
-      enableWebSearchOrganizer: classifyEnabled,
       providerConfigs,
       defaultProviderEndpoint: selectedEndpoint,
-      apiEndpoint: selectedEndpoint,
-      model: selectedModel,
       searchApi,
     };
 
     const result = await saveSettings(payload);
     currentSettings = result?.settings || await getSettings();
+    syncScannerIgnoredPaths(currentSettings);
     applySettingsToForm(currentSettings);
     await initScanProviderFields(currentSettings);
+    renderScannerWhitelistPanel();
     writeScannerFormDraft(extractScannerFormFromSettings(currentSettings), { dirty: false });
 
     setSaveStatus(t('settings.saved'), '--accent-success');
@@ -925,16 +1067,16 @@ function bindSettingsEvents() {
   };
 
   sizeSlider?.addEventListener('input', () => {
-    if (sizeInput) sizeInput.value = clampNumber(sizeSlider.value, 0.1, 100, 1).toFixed(1);
+    if (sizeInput) sizeInput.value = clampNumber(sizeSlider.value, TARGET_SIZE_MIN_GB, TARGET_SIZE_MAX_GB, 1).toFixed(1);
     handleFormMutation();
   });
   sizeInput?.addEventListener('input', () => {
-    const val = clampNumber(sizeInput.value, 0.1, 100, 1);
+    const val = clampNumber(sizeInput.value, TARGET_SIZE_MIN_GB, TARGET_SIZE_MAX_GB, 1);
     if (sizeSlider) sizeSlider.value = String(val);
     handleFormMutation();
   });
   sizeInput?.addEventListener('blur', () => {
-    const val = clampNumber(sizeInput.value, 0.1, 100, 1);
+    const val = clampNumber(sizeInput.value, TARGET_SIZE_MIN_GB, TARGET_SIZE_MAX_GB, 1);
     sizeInput.value = val.toFixed(1);
     if (sizeSlider) sizeSlider.value = String(val);
     handleFormMutation();
@@ -976,6 +1118,9 @@ function bindSettingsEvents() {
   });
   document.getElementById('scan-model')?.addEventListener('change', () => {
     handleFormMutation();
+  });
+  document.getElementById('scanner-whitelist-toggle-btn')?.addEventListener('click', () => {
+    setScannerWhitelistExpanded(!scannerWhitelistExpanded);
   });
 
   document.getElementById('browse-folder-btn')?.addEventListener('click', async () => {
@@ -1039,12 +1184,14 @@ function bindSettingsEvents() {
   });
 }
 
-function applySnapshotToUI(data) {
+function applySnapshotToUI(data, { persist = true } = {}) {
   if (!data) return;
 
   updateStats(data);
   setScanStatus(data.status);
-  storage.set('lastScan', data);
+  if (persist) {
+    storage.set('lastScan', data);
+  }
 
   const pathEl = document.getElementById('breadcrumb-path');
   const depthEl = document.getElementById('breadcrumb-depth');
@@ -1070,17 +1217,107 @@ function applySnapshotToUI(data) {
   if (label) label.textContent = `${scanPct.toFixed(1)}%`;
 }
 
+function syncTaskViewState(state = scanTaskController.getState()) {
+  activeTaskId = state?.activeTaskId || null;
+  latestTaskId = state?.latestTaskId || null;
+  logEntries = Array.isArray(state?.logEntries) ? state.logEntries : [];
+}
+
+function getErrorMessage(err) {
+  if (typeof err === 'string' && err.trim()) {
+    return err.trim();
+  }
+  if (err && typeof err === 'object') {
+    if (typeof err.message === 'string' && err.message.trim()) {
+      return err.message.trim();
+    }
+    if (typeof err.error === 'string' && err.error.trim()) {
+      return err.error.trim();
+    }
+  }
+  const text = String(err ?? '').trim();
+  return text && text !== '[object Object]' ? text : t('toast.error');
+}
+
+function applyTaskControllerState(state = scanTaskController.getState()) {
+  syncTaskViewState(state);
+  refreshScanLogPanel();
+  const log = document.getElementById('scan-log');
+  if (log) {
+    if (logEntries.length > 0) {
+      renderLogEntries();
+    } else {
+      log.innerHTML = '';
+    }
+  }
+
+  if (activeTaskId) {
+    restoreActiveState(state?.snapshot || null);
+    return;
+  }
+
+  if (!activeTaskId) {
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    if (startBtn) {
+      startBtn.style.display = '';
+      startBtn.disabled = false;
+      startBtn.innerHTML = latestBaselineSnapshot?.id ? t('scanner.rescan') : t('scanner.start');
+    }
+    if (stopBtn) stopBtn.style.display = 'none';
+  }
+}
+
+function handleTaskControllerEvent(event) {
+  if (!event || typeof event !== 'object') return;
+
+  if (event.kind === 'state') {
+    applyTaskControllerState(event.state);
+    return;
+  }
+
+  applyTaskControllerState(event.state);
+
+  if (event.kind === 'done') {
+    const doneText = event.doneText || t('scanner.completed', { count: event.data?.deletableCount ?? 0 });
+    if (event.permissionText) {
+      showToast(`${doneText} ${event.permissionText}`, 'info');
+    } else {
+      showToast(doneText, 'success');
+    }
+    refreshLatestBaselineForPath(event.data?.targetPath || collectScannerForm().scanPath);
+    window.location.hash = '#/results';
+    return;
+  }
+
+  if (event.kind === 'error') {
+    showToast(`${t('scanner.toast_failed_detail')}${getErrorMessage(event.error || event.message)}`, 'error');
+    return;
+  }
+
+  if (event.kind === 'stopped') {
+    showToast(t('scanner.stopped'), 'info');
+    refreshLatestBaselineForPath(event.data?.targetPath || collectScannerForm().scanPath);
+  }
+}
+
+async function restoreActiveTaskById(taskId) {
+  try {
+    return await scanTaskController.restoreTaskById(taskId);
+  } catch (err) {
+    console.warn('Failed to restore active scan by task id:', err);
+    return false;
+  }
+}
+
 export async function renderScanner(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
-  const cachedLastScan = storage.get('lastScan', null);
   const draftState = readScannerFormDraft();
-  const persistedLog = readPersistedScanLog();
-  if (!logEntries.length && persistedLog.entries.length) {
-    logEntries = persistedLog.entries;
-    nextLogEntryId = persistedLog.nextId;
-  }
-  latestTaskId = storage.get('lastScanTaskId', null) || cachedLastScan?.id || null;
+  const preferredTaskId = String(storage.get('lastScanTaskId', null) || '').trim();
+  scannerIgnoredPaths = [];
+  scannerWhitelistExpanded = false;
+  syncTaskViewState(scanTaskController.getState());
 
   container.innerHTML = `
     <style>
@@ -1126,9 +1363,9 @@ export async function renderScanner(container) {
       <div class="form-group">
         <label class="form-label">${t('settings.target_size')}</label>
         <div class="range-container">
-          <input type="range" id="target-size" class="range-slider" min="0.1" max="100" step="0.1" value="1" />
+          <input type="range" id="target-size" class="range-slider" min="0.1" max="20" step="0.1" value="1" />
           <div style="display:flex; align-items:center; gap:8px;">
-            <input type="number" id="target-size-input" class="form-input no-spin" style="width:80px; height:32px; padding:4px 8px; text-align:center;" min="0.1" max="100" step="0.1" value="1" />
+          <input type="number" id="target-size-input" class="form-input no-spin" style="width:80px; height:32px; padding:4px 8px; text-align:center;" min="0.1" max="20" step="0.1" value="1" />
             <span class="range-value" style="min-width: unset;">GB</span>
           </div>
         </div>
@@ -1177,6 +1414,26 @@ export async function renderScanner(container) {
 
     <div class="card animate-in mb-24" style="animation-delay: 0.08s">
       <div class="card-header">
+        <div>
+          <h2 class="card-title">${t('scanner.whitelist_title')}</h2>
+          <div class="form-hint">${t('scanner.whitelist_hint')}</div>
+        </div>
+        <div class="scanner-whitelist-toolbar">
+          <span class="badge badge-info">${t('scanner.whitelist_count')} <span id="scanner-whitelist-count">0</span></span>
+          <button id="scanner-whitelist-toggle-btn" class="btn btn-ghost" type="button">${t('scanner.whitelist_show')}</button>
+        </div>
+      </div>
+      <div id="scanner-whitelist-panel" class="scanner-whitelist-panel" hidden>
+        <div id="scanner-whitelist-list" class="results-whitelist-list"></div>
+        <div id="scanner-whitelist-empty" class="empty-state results-whitelist-empty" style="padding: 24px;">
+          <div class="empty-state-text">${t('scanner.whitelist_empty')}</div>
+          <div class="empty-state-hint">${t('scanner.whitelist_empty_hint')}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card animate-in mb-24" style="animation-delay: 0.1s">
+      <div class="card-header">
         <h2 class="card-title">${t('settings.privilege_config')}</h2>
         <span class="badge badge-warning">${t('settings.privilege_required')}</span>
       </div>
@@ -1187,7 +1444,7 @@ export async function renderScanner(container) {
       <div class="form-hint">${t('settings.privilege_hint')}</div>
     </div>
 
-    <div class="stats-grid animate-in" style="animation-delay: 0.1s">
+    <div class="stats-grid animate-in" style="animation-delay: 0.15s">
       <div class="stat-card">
         <span class="stat-label">${t('scanner.progress_scan')}</span>
         <span class="stat-value accent" id="stat-status">${t('scanner.not_set')}</span>
@@ -1206,7 +1463,7 @@ export async function renderScanner(container) {
       </div>
     </div>
 
-    <div class="card animate-in mb-24" style="animation-delay: 0.15s">
+    <div class="card animate-in mb-24" style="animation-delay: 0.2s">
       <div class="card-header">
         <h2 class="card-title">${t('scanner.progress_scan')}</h2>
         <div style="display:flex; gap:8px; align-items:center;">
@@ -1224,7 +1481,7 @@ export async function renderScanner(container) {
       </div>
     </div>
 
-    <div class="card animate-in mb-24" style="animation-delay: 0.2s">
+    <div class="card animate-in mb-24" style="animation-delay: 0.25s">
       <div class="card-header">
         <h2 class="card-title">${t('scanner.activity_log')}</h2>
         <div style="display:flex; gap:8px; align-items:center;">
@@ -1245,7 +1502,7 @@ export async function renderScanner(container) {
       </div>
     </div>
 
-    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.25s; gap: 16px; flex-wrap: wrap;">
+    <div class="flex items-center justify-between animate-in" style="animation-delay: 0.3s; gap: 16px; flex-wrap: wrap;">
       <div class="path-inline-display"><span id="scan-path-display" class="form-hint mono"></span></div>
       <div class="flex gap-16" style="flex-shrink: 0;">
         <button id="stop-btn" class="btn btn-danger" style="display: none;">${t('scanner.stop')}</button>
@@ -1255,6 +1512,7 @@ export async function renderScanner(container) {
   `;
 
   bindSettingsEvents();
+  renderScannerWhitelistPanel();
   if (draftState.data) {
     applySettingsToForm(draftState.data);
     await initScanProviderFields(draftState.data);
@@ -1267,14 +1525,18 @@ export async function renderScanner(container) {
     const remoteSettings = await getSettings();
     if (isStale()) return;
     currentSettings = mergeSettingsWithDraft(remoteSettings, draftState);
+    syncScannerIgnoredPaths(currentSettings);
     applySettingsToForm(currentSettings);
     await initScanProviderFields(currentSettings);
+    renderScannerWhitelistPanel();
     if (isStale()) return;
     if (!draftState.dirty) {
       writeScannerFormDraft(extractScannerFormFromSettings(currentSettings), { dirty: false });
     }
   } catch (err) {
     currentSettings = null;
+    syncScannerIgnoredPaths(null);
+    renderScannerWhitelistPanel();
     console.warn('Failed to load scanner settings:', err);
     if (!draftState.data) {
       updatePathDisplay('');
@@ -1289,16 +1551,26 @@ export async function renderScanner(container) {
       currentSettings = event?.detail && typeof event.detail === 'object'
         ? event.detail
         : await getSettings();
+      syncScannerIgnoredPaths(currentSettings);
       syncScanProviderApiKeyMap(currentSettings);
       const selectedEndpoint = String(document.getElementById('scan-provider')?.value || '').trim();
       const selectedModel = String(document.getElementById('scan-model')?.value || '').trim();
       await initScanModelSelectors({ endpoint: selectedEndpoint, model: selectedModel });
       refreshScanApiConfigHint(selectedEndpoint);
+      renderScannerWhitelistPanel();
     } catch (err) {
       console.warn('Failed to refresh scanner provider settings:', err);
     }
   };
   window.addEventListener('provider-settings-updated', scannerProviderSettingsUpdatedHandler);
+
+  if (scannerTaskUnsubscribe) {
+    scannerTaskUnsubscribe();
+  }
+  scannerTaskUnsubscribe = scanTaskController.subscribe((event) => {
+    if (isStale()) return;
+    handleTaskControllerEvent(event);
+  });
 
   document.getElementById('start-btn')?.addEventListener('click', handleStart);
   document.getElementById('stop-btn')?.addEventListener('click', handleStop);
@@ -1321,68 +1593,34 @@ export async function renderScanner(container) {
     expandScanLogPreview();
   });
   document.getElementById('clear-log-btn')?.addEventListener('click', () => {
-    logEntries = [];
-    nextLogEntryId = 0;
-    expandedDetailLogIds.clear();
-    persistScanLog();
-    const logEl = document.getElementById('scan-log');
-    if (logEl) logEl.innerHTML = '';
-    refreshScanLogPanel();
+    replaceLogEntries([], { persist: true });
   });
-  refreshScanLogPanel();
-  if (logEntries.length > 0) {
-    renderLogEntries();
-  }
+  applyTaskControllerState(scanTaskController.getState());
 
   if (activeTaskId) {
-    restoreActiveState();
+    restoreActiveState(scanTaskController.getState().snapshot);
     return;
   }
 
   try {
-    const activeTasks = await getActiveScan();
+    const restored = await scanTaskController.restoreAnyActiveTask(preferredTaskId);
     if (isStale()) return;
-    if (activeTasks.length > 0) {
-      const task = activeTasks[0];
-      activeTaskId = task.taskId;
-      latestTaskId = task.taskId;
-      storage.set('lastScanTaskId', latestTaskId);
-      applySnapshotToUI(task);
-      restoreActiveState();
+    if (restored) {
       return;
     }
   } catch {
     // ignore
   }
 
-  if (!latestTaskId) return;
-
-  try {
-    const snapshot = await getScanResult(latestTaskId);
+  if (await restoreActiveTaskById(preferredTaskId)) {
     if (isStale()) return;
-    storage.set('lastScanTaskId', snapshot.id);
-    applySnapshotToUI(snapshot);
-    if (['idle', 'scanning', 'analyzing'].includes(snapshot.status)) {
-      activeTaskId = snapshot.id;
-      restoreActiveState();
-      return;
-    }
-    resetButtons();
-  } catch (err) {
-    console.warn('Failed to restore latest scan snapshot:', err);
-    if (isStale()) return;
-    if (cachedLastScan?.id) {
-      latestTaskId = cachedLastScan.id;
-      applySnapshotToUI(cachedLastScan);
-      resetButtons();
-      return;
-    }
-    storage.remove('lastScanTaskId');
-    storage.remove('lastScan');
+    return;
   }
+
+  await refreshLatestBaselineForPath(collectScannerForm().scanPath, { syncPreview: true });
 }
 
-function restoreActiveState() {
+function restoreActiveState(initialSnapshot = null) {
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
   const activityEl = document.getElementById('scan-activity-hidden');
@@ -1400,7 +1638,12 @@ function restoreActiveState() {
     renderLogEntries();
   }
 
-  const lastScan = storage.get('lastScan', null);
+  const cachedSnapshot = initialSnapshot?.id
+    ? initialSnapshot
+    : storage.get('lastScan', null);
+  const lastScan = String(cachedSnapshot?.id || '').trim() === String(activeTaskId || '').trim()
+    ? cachedSnapshot
+    : null;
   if (lastScan) {
     updateStats(lastScan);
     setScanStatus(lastScan.status);
@@ -1421,27 +1664,10 @@ function restoreActiveState() {
     if (fill) fill.style.width = `${scanPct}%`;
     if (label) label.textContent = `${scanPct.toFixed(1)}%`;
   }
-
-  if (activeEventSource) {
-    activeEventSource.close();
-    activeEventSource = null;
-  }
-  activeEventSource = connectScanStream(activeTaskId, {
-    onProgress: handleProgress,
-    onFound: handleFound,
-    onAgentCall: handleAgentCall,
-    onAgentResponse: handleAgentResponse,
-    onCache: handleCache,
-    onWarning: handleWarning,
-    onDone: handleDone,
-    onError: handleError,
-    onStopped: handleStopped,
-  });
 }
 
 async function handleStart() {
   const startBtn = document.getElementById('start-btn');
-  const stopBtn = document.getElementById('stop-btn');
 
   try {
     await persistScannerSettings({ showSuccessToast: false });
@@ -1451,7 +1677,7 @@ async function handleStart() {
       showToast(t('scanner.path_not_configured'), 'error');
       return;
     }
-    const selectedEndpoint = String(form.scanProviderEndpoint || currentSettings?.apiEndpoint || '').trim();
+    const selectedEndpoint = String(form.scanProviderEndpoint || currentSettings?.defaultProviderEndpoint || '').trim();
     if (!getApiKeyForScanEndpoint(selectedEndpoint)) {
       try {
         await ensureRequiredCredentialsConfigured({
@@ -1469,7 +1695,7 @@ async function handleStart() {
       startBtn.innerHTML = `<span class="spinner"></span> ${t('scanner.prepare')}`;
     }
 
-    const result = await startScan({
+    await scanTaskController.startTask({
       targetPath: form.scanPath,
       targetSizeGB: form.targetSizeGB,
       baselineTaskId: latestBaselineSnapshot?.id || null,
@@ -1478,36 +1704,8 @@ async function handleStart() {
       autoAnalyze: true,
       responseLanguage: getLang(),
     });
-
-    activeTaskId = result.taskId;
-    latestTaskId = result.taskId;
-    storage.set('lastScanTaskId', latestTaskId);
-
-    const activityEl = document.getElementById('scan-activity-hidden');
-    const emptyEl = document.getElementById('scan-empty');
-    const breadcrumb = document.getElementById('scan-breadcrumb');
-    if (activityEl) activityEl.style.display = '';
-    if (emptyEl) emptyEl.style.display = 'none';
-    if (breadcrumb) breadcrumb.style.display = '';
-
-    if (startBtn) startBtn.style.display = 'none';
-    if (stopBtn) stopBtn.style.display = '';
-
-    addLog('scanning', `${t('scanner.log_start')} [${activeTaskId}]`);
-
-    activeEventSource = connectScanStream(activeTaskId, {
-      onProgress: handleProgress,
-      onFound: handleFound,
-      onAgentCall: handleAgentCall,
-      onAgentResponse: handleAgentResponse,
-      onCache: handleCache,
-      onWarning: handleWarning,
-      onDone: handleDone,
-      onError: handleError,
-      onStopped: handleStopped,
-    });
   } catch (err) {
-    showToast(t('scanner.toast_start_failed') + err.message, 'error');
+    showToast(t('scanner.toast_start_failed') + getErrorMessage(err), 'error');
     if (startBtn) {
       startBtn.disabled = false;
       startBtn.innerHTML = t('scanner.start');
@@ -1518,120 +1716,10 @@ async function handleStart() {
 async function handleStop() {
   if (!activeTaskId) return;
   try {
-    await stopScan(activeTaskId);
-    showToast(t('scanner.stopped'), 'info');
+    await scanTaskController.stopTask();
   } catch (err) {
-    showToast(t('scanner.toast_stop_failed') + err.message, 'error');
+    showToast(t('scanner.toast_stop_failed') + getErrorMessage(err), 'error');
   }
-}
-
-function handleProgress(data) {
-  if (data?.id) {
-    latestTaskId = data.id;
-    storage.set('lastScanTaskId', latestTaskId);
-  }
-
-  updateStats(data);
-  setScanStatus(data.status);
-  storage.set('lastScan', data);
-
-  const pathEl = document.getElementById('breadcrumb-path');
-  const depthEl = document.getElementById('breadcrumb-depth');
-  if (pathEl) {
-    pathEl.textContent = data.currentPath || '...';
-    pathEl.title = data.currentPath || '';
-  }
-  if (depthEl) depthEl.textContent = `Depth ${data.currentDepth || 0}`;
-
-  const scanPct = data.totalEntries > 0
-    ? Math.min(100, (data.processedEntries || 0) / data.totalEntries * 100)
-    : 0;
-  const fill = document.getElementById('progress-fill');
-  const label = document.getElementById('progress-pct');
-  if (fill) fill.style.width = `${scanPct}%`;
-  if (label) label.textContent = `${scanPct.toFixed(1)}%`;
-
-  if (data.status === 'analyzing') {
-    addLog('analyzing', `${t('scanner.analyzing')}: ${data.currentPath}`);
-  } else if (data.status === 'scanning') {
-    addLog('scanning', `${t('scanner.scanning')}: ${data.currentPath}`);
-  }
-}
-
-function handleFound(item) {
-  addLog('found', `${t('results.safe_to_clean')}: ${item.name} (${formatSize(item.size)}) - ${item.reason}`);
-}
-
-function handleWarning(info) {
-  if (info?.type !== 'permission_denied') return;
-  const path = String(info.path || '').trim();
-  addLog('analyzing', `${t('scanner.permission_denied_skip')}${path || info.message || ''}`);
-}
-
-function handleCache(info) {
-  if (!info || typeof info !== 'object') return;
-  const action = String(info.action || '').trim();
-  if (action === 'reuse') {
-    addLog('analyzing', `${t('scanner.cache_reuse')}: ${info.path || info.name || ''}`);
-    return;
-  }
-  if (action === 'rescan_changed') {
-    addLog('analyzing', `${t('scanner.cache_rescan')}: ${info.path || info.name || ''}`);
-    return;
-  }
-  if (action === 'skip_deleted') {
-    addLog('analyzing', t('scanner.cache_deleted', { count: info.count || 0 }));
-  }
-}
-
-function handleDone(data) {
-  if (data?.id) {
-    latestTaskId = data.id;
-    storage.set('lastScanTaskId', latestTaskId);
-  }
-
-  updateStats(data);
-  setScanStatus('done');
-  storage.set('lastScan', data);
-  resetButtons();
-
-  const fill = document.getElementById('progress-fill');
-  const label = document.getElementById('progress-pct');
-  if (fill) fill.style.width = '100%';
-  if (label) label.textContent = '100.0%';
-
-  const doneText = t('scanner.completed', { count: data.deletableCount ?? 0 });
-  addLog('found', doneText);
-  if (data.permissionDeniedCount > 0) {
-    const permissionText = t('scanner.permission_denied_summary', { count: data.permissionDeniedCount ?? 0 });
-    addLog('analyzing', permissionText);
-    showToast(`${doneText} ${permissionText}`, 'info');
-  } else {
-    showToast(doneText, 'success');
-  }
-  refreshLatestBaselineForPath(data?.targetPath || collectScannerForm().scanPath);
-  window.location.hash = '#/results';
-}
-
-function handleError(err) {
-  resetButtons();
-  setScanStatus('error');
-  const message = err?.message || t('toast.error');
-  addLog('analyzing', `${t('scanner.toast_failed_detail')}${message}`);
-  showToast(`${t('scanner.toast_failed_detail')}${message}`, 'error');
-}
-
-function handleStopped(data) {
-  if (data?.id) {
-    latestTaskId = data.id;
-    storage.set('lastScanTaskId', latestTaskId);
-  }
-  updateStats(data);
-  setScanStatus('stopped');
-  storage.set('lastScan', data);
-  resetButtons();
-  addLog('scanning', t('scanner.stopped'));
-  refreshLatestBaselineForPath(data?.targetPath || collectScannerForm().scanPath);
 }
 
 function resetButtons() {
@@ -1644,11 +1732,6 @@ function resetButtons() {
   }
   if (stopBtn) stopBtn.style.display = 'none';
 
-  activeTaskId = null;
-  if (activeEventSource) {
-    activeEventSource.close();
-    activeEventSource = null;
-  }
   refreshScanActionHint();
 }
 
@@ -1657,114 +1740,4 @@ function updateStats(data) {
   if (el('stat-scanned')) el('stat-scanned').textContent = data.scannedCount || 0;
   if (el('stat-cleanable')) el('stat-cleanable').textContent = formatSize(data.totalCleanable || 0);
   if (el('stat-tokens')) el('stat-tokens').textContent = (data.tokenUsage?.total || 0).toLocaleString();
-}
-
-function addLog(type, text) {
-  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const entry = { kind: 'simple', type, text, time };
-  logEntries.push(entry);
-  persistScanLog();
-  const trimmed = trimLogEntries();
-  refreshScanLogPanel();
-  if (trimmed) {
-    renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
-    return;
-  }
-  appendLogEntry(entry);
-}
-
-function addDetailLog(type, summary, detailHtml) {
-  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const entry = { id: nextLogEntryId++, kind: 'detail', type, summary, detailHtml, time };
-  logEntries.push(entry);
-  persistScanLog();
-  const trimmed = trimLogEntries();
-  refreshScanLogPanel();
-  if (trimmed) {
-    renderLogEntries(isGroupedScanLogType(type) ? 'top' : 'bottom');
-    return;
-  }
-  appendLogEntry(entry);
-}
-
-function handleAgentCall(data) {
-  const childDirList = (data.childDirectories || [])
-    .map((entry) => `- ${entry.name} (${formatSize(entry.size)})`)
-    .join('\n');
-
-  let detailHtml = `
-    <div style="margin-bottom: 8px;"><strong>Type:</strong> ${escHtml(data.nodeType)}</div>
-    <div style="margin-bottom: 8px;"><strong>Path:</strong> ${escHtml(data.nodePath)}</div>
-    <div style="margin-bottom: 8px;"><strong>Name:</strong> ${escHtml(data.nodeName)}</div>
-    <div style="margin-bottom: 8px;"><strong>Size:</strong> ${escHtml(formatSize(data.nodeSize || 0))}</div>
-  `;
-
-  if (data.nodeType === 'directory') {
-    detailHtml += `
-      <div style="margin-bottom: 4px;"><strong>Direct Child Directories</strong></div>
-      <div style="padding-left: 8px; border-left: 2px solid rgba(6, 182, 212, 0.3);">${escHtml(childDirList || '(none)')}</div>
-    `;
-  }
-
-  addDetailLog('agent_call', `LLM call - ${data.nodeType}: ${data.nodeName}`, detailHtml);
-}
-
-function handleAgentResponse(data) {
-  const elapsed = Number(data.elapsed || 0) / 1000;
-  const classStr = String(data.classification || 'suspicious');
-  const riskStr = String(data.risk || 'medium');
-  const hasSubfolders = data.nodeType === 'directory'
-    ? (data.hasPotentialDeletableSubfolders ? 'true' : 'false')
-    : 'n/a';
-
-  let detailSections = '';
-  detailSections += `<div style="margin-bottom: 10px;">
-    <strong>Type:</strong> ${escHtml(data.nodeType)} | <strong>Model:</strong> ${escHtml(data.model)} | <strong>Elapsed:</strong> ${elapsed.toFixed(1)}s | <strong>Token:</strong> ${(data.tokenUsage?.total || 0).toLocaleString()}
-  </div>`;
-
-  detailSections += `<div style="margin-bottom: 10px;"><strong>Path:</strong> ${escHtml(data.nodePath)}</div>`;
-  detailSections += `<div style="margin-bottom: 10px;"><strong>Classification:</strong> ${escHtml(classStr)} | <strong>Risk:</strong> ${escHtml(riskStr)} | <strong>HasPotentialDeletableSubfolders:</strong> ${escHtml(hasSubfolders)}</div>`;
-
-  if (data.error) {
-    detailSections += `<div style="margin-bottom: 10px; color: var(--accent-danger);"><strong>Error:</strong> ${escHtml(data.error)}</div>`;
-  }
-
-  if (data.userPrompt) {
-    detailSections += `<div style="margin-bottom: 10px;">
-      <strong>Prompt:</strong>
-      <div style="margin-top: 4px; padding: 8px; background: rgba(0,0,0,0.3); border-radius: 4px; max-height: 300px; overflow-y: auto;">${escHtml(data.userPrompt)}</div>
-    </div>`;
-  }
-
-  if (data.reasoning) {
-    detailSections += `<div style="margin-bottom: 10px;">
-      <strong>Reasoning:</strong>
-      <div style="margin-top: 4px; padding: 8px; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.15); border-radius: 4px; max-height: 400px; overflow-y: auto;">${escHtml(data.reasoning)}</div>
-    </div>`;
-  }
-
-  if (data.rawContent) {
-    const raw = String(data.rawContent);
-    const truncated = raw.length > 2000 ? `${raw.slice(0, 2000)}\n...` : raw;
-    detailSections += `<div>
-      <strong>Raw Response:</strong>
-      <div style="margin-top: 4px; padding: 8px; background: rgba(0,0,0,0.3); border-radius: 4px; max-height: 400px; overflow-y: auto;">${escHtml(truncated)}</div>
-    </div>`;
-  }
-
-  const statusIcon = data.error ? 'X' : 'OK';
-  addDetailLog(
-    'agent_response',
-    `${statusIcon} LLM response - ${data.nodeType}: ${data.nodeName} (${classStr})`,
-    detailSections
-  );
-}
-
-function escHtml(str) {
-  return String(str || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/\n/g, '<br>');
 }

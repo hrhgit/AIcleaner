@@ -49,29 +49,12 @@ if (-not $SkipInstall) {
 }
 
 $scannerTarget = Join-Path $PSScriptRoot "bin\scanner.exe"
-if (-not $SkipScannerBuild -and -not (Test-Path $scannerTarget)) {
-  Write-Step "Building native scanner"
-  Push-Location (Join-Path $PSScriptRoot "native\scanner")
-  try {
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) {
-      throw "native scanner build failed."
-    }
+if (-not $SkipScannerBuild) {
+  Write-Step "Syncing native scanner"
+  npm run scanner:sync
+  if ($LASTEXITCODE -ne 0) {
+    throw "scanner sync failed."
   }
-  finally {
-    Pop-Location
-  }
-
-  $builtScanner = Join-Path $PSScriptRoot "native\scanner\target\release\scanner.exe"
-  if (-not (Test-Path $builtScanner)) {
-    throw "scanner.exe was not produced at $builtScanner"
-  }
-
-  if (-not (Test-Path (Join-Path $PSScriptRoot "bin"))) {
-    New-Item -ItemType Directory -Path (Join-Path $PSScriptRoot "bin") | Out-Null
-  }
-
-  Copy-Item $builtScanner $scannerTarget -Force
 }
 
 if (-not (Test-Path $scannerTarget)) {

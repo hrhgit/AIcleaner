@@ -1,6 +1,7 @@
 use crate::backend::{AppState, ScanResultItem, ScanSnapshot, ScanStartInput, TokenUsage};
 use crate::persist;
 use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,9 +10,15 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::async_runtime::JoinHandle;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use uuid::Uuid;
+
+const TARGET_SIZE_MIN_GB: f64 = 0.1;
+const TARGET_SIZE_DEFAULT_MAX_GB: f64 = 20.0;
+const SCAN_NODE_FLUSH_THRESHOLD: usize = 1024;
+const SCAN_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanMode {
@@ -33,6 +40,10 @@ impl ScanMode {
             Self::DeepenIncremental => "deepen_incremental",
         }
     }
+}
+
+fn round_up_to_tenth(value: f64) -> f64 {
+    (value * 10.0).ceil() / 10.0
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -68,6 +79,8 @@ pub struct ScanTaskRuntime {
     sidecar_roots: Vec<SidecarRoot>,
     ignored_paths: Vec<String>,
     scan_count_offset: u64,
+    pending_sidecar_nodes: Mutex<Vec<persist::ScanNodeUpsert>>,
+    last_progress_persist_at: Mutex<Option<Instant>>,
     ai: ScanAiConfig,
     pub job: Mutex<Option<JoinHandle<()>>>,
 }
@@ -86,6 +99,27 @@ struct ScanReview {
 struct ChatResponse {
     content: String,
     token_usage: TokenUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SidecarNodeBatchEvent {
+    nodes: Vec<SidecarNodeRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SidecarNodeRecord {
+    node_id: String,
+    parent_id: Option<String>,
+    path: String,
+    name: String,
+    node_type: String,
+    depth: u32,
+    self_size: i64,
+    total_size: i64,
+    child_count: i64,
+    mtime_ms: Option<i64>,
+    ext: String,
 }
 
 fn format_size(n: u64) -> String {
@@ -476,13 +510,69 @@ async fn emit_progress<R: Runtime>(
     state: &AppState,
     task: &Arc<ScanTaskRuntime>,
 ) -> Result<(), String> {
+    emit_progress_with_options(app, state, task, true).await
+}
+
+async fn emit_progress_with_options<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    task: &Arc<ScanTaskRuntime>,
+    persist_snapshot: bool,
+) -> Result<(), String> {
+    if persist_snapshot {
+        flush_pending_sidecar_nodes(state, task)?;
+    }
     let snap = task.snapshot.lock().clone();
-    persist::save_scan_snapshot(&state.db_path, &snap)?;
+    if persist_snapshot {
+        persist::save_scan_snapshot(&state.db_path, &snap)?;
+    }
     app.emit(
         "scan_progress",
         serde_json::to_value(&snap).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+fn queue_sidecar_nodes(
+    task: &Arc<ScanTaskRuntime>,
+    mut rows: Vec<persist::ScanNodeUpsert>,
+) -> usize {
+    let mut pending = task.pending_sidecar_nodes.lock();
+    pending.append(&mut rows);
+    pending.len()
+}
+
+fn flush_pending_sidecar_nodes(
+    state: &AppState,
+    task: &Arc<ScanTaskRuntime>,
+) -> Result<usize, String> {
+    let rows = {
+        let mut pending = task.pending_sidecar_nodes.lock();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        std::mem::take(&mut *pending)
+    };
+    let task_id = task.snapshot.lock().id.clone();
+    let row_count = rows.len();
+    persist::upsert_scan_nodes(&state.db_path, &task_id, &rows)?;
+    Ok(row_count)
+}
+
+fn should_persist_scan_progress(task: &Arc<ScanTaskRuntime>, force: bool) -> bool {
+    let mut last_persisted_at = task.last_progress_persist_at.lock();
+    if force {
+        *last_persisted_at = Some(Instant::now());
+        return true;
+    }
+    let now = Instant::now();
+    match *last_persisted_at {
+        Some(previous) if now.duration_since(previous) < SCAN_PROGRESS_PERSIST_INTERVAL => false,
+        _ => {
+            *last_persisted_at = Some(now);
+            true
+        }
+    }
 }
 
 fn prepare_incremental_context(
@@ -710,7 +800,35 @@ async fn handle_sidecar_line<R: Runtime>(
 ) -> Result<(), String> {
     let task_id = task.snapshot.lock().id.clone();
     match payload.get("type").and_then(Value::as_str).unwrap_or("") {
+        "node_batch" => {
+            let batch: SidecarNodeBatchEvent =
+                serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
+            let rows = batch
+                .nodes
+                .into_iter()
+                .map(|node| persist::ScanNodeUpsert {
+                    node_id: node.node_id,
+                    parent_id: node.parent_id,
+                    path: node.path,
+                    name: node.name,
+                    node_type: node.node_type,
+                    depth: node.depth,
+                    self_size: node.self_size.max(0) as u64,
+                    size: node.total_size.max(0) as u64,
+                    child_count: node.child_count.max(0) as u64,
+                    mtime_ms: node.mtime_ms,
+                    ext: node.ext,
+                })
+                .collect::<Vec<_>>();
+            if queue_sidecar_nodes(task, rows) >= SCAN_NODE_FLUSH_THRESHOLD {
+                flush_pending_sidecar_nodes(state, task)?;
+            }
+        }
         "task_started" | "scan_progress" | "scan_completed" => {
+            let force_persist = matches!(
+                payload.get("type").and_then(Value::as_str).unwrap_or(""),
+                "task_started" | "scan_completed"
+            );
             {
                 let mut snap = task.snapshot.lock();
                 snap.status = "scanning".to_string();
@@ -733,7 +851,13 @@ async fn handle_sidecar_line<R: Runtime>(
                 snap.total_entries = task.scan_count_offset.saturating_add(total_delta);
                 snap.max_scanned_depth = snap.max_scanned_depth.max(snap.current_depth);
             }
-            emit_progress(app, state, task).await?;
+            emit_progress_with_options(
+                app,
+                state,
+                task,
+                should_persist_scan_progress(task, force_persist),
+            )
+            .await?;
         }
         "permission_denied" => {
             let warning = {
@@ -760,7 +884,8 @@ async fn handle_sidecar_line<R: Runtime>(
                     "count": snap.permission_denied_count,
                 })
             };
-            emit_progress(app, state, task).await?;
+            emit_progress_with_options(app, state, task, should_persist_scan_progress(task, false))
+                .await?;
             app.emit("scan_warning", warning)
                 .map_err(|e| e.to_string())?;
         }
@@ -860,6 +985,7 @@ async fn run_sidecar_scan<R: Runtime>(
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = stderr_handle.join();
     *task.child_pid.lock() = None;
+    flush_pending_sidecar_nodes(state, task)?;
     if let Some(file_path) = roots_path {
         let _ = fs::remove_file(file_path);
     }
@@ -891,6 +1017,7 @@ async fn run_scan_task<R: Runtime>(
     }
     emit_progress(app, state, task).await?;
     run_sidecar_scan(app, state, task).await?;
+    flush_pending_sidecar_nodes(state, task)?;
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -959,7 +1086,11 @@ pub async fn scan_start<R: Runtime>(
         let boundary_depth = baseline.configured_max_depth.ok_or_else(|| {
             "Current task already uses unlimited depth and cannot deepen".to_string()
         })?;
-        if input.max_depth.map(|value| value <= boundary_depth).unwrap_or(false) {
+        if input
+            .max_depth
+            .map(|value| value <= boundary_depth)
+            .unwrap_or(false)
+        {
             return Err("New maxDepth must be greater than the current depth".to_string());
         }
         let nodes =
@@ -972,6 +1103,22 @@ pub async fn scan_start<R: Runtime>(
         None
     };
     let max_depth = input.max_depth.map(|value| value.clamp(1, 16));
+    let min_target_size_gb = if matches!(scan_mode, ScanMode::DeepenIncremental) {
+        baseline_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                round_up_to_tenth(snapshot.total_cleanable as f64 / 1024.0 / 1024.0 / 1024.0)
+            })
+            .unwrap_or(TARGET_SIZE_MIN_GB)
+            .max(TARGET_SIZE_MIN_GB)
+    } else {
+        TARGET_SIZE_MIN_GB
+    };
+    let max_target_size_gb = TARGET_SIZE_DEFAULT_MAX_GB.max(min_target_size_gb);
+    let target_size_gb = input
+        .target_size_gb
+        .unwrap_or(1.0)
+        .clamp(min_target_size_gb, max_target_size_gb);
     let mut snapshot = ScanSnapshot {
         id: task_id.clone(),
         status: "idle".to_string(),
@@ -994,8 +1141,7 @@ pub async fn scan_start<R: Runtime>(
         processed_entries: 0,
         deletable_count: 0,
         total_cleanable: 0,
-        target_size: ((input.target_size_gb.unwrap_or(1.0).max(0.0)) * 1024.0 * 1024.0 * 1024.0)
-            as u64,
+        target_size: (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
         token_usage: TokenUsage::default(),
         deletable: Vec::new(),
         permission_denied_count: 0,
@@ -1064,6 +1210,8 @@ pub async fn scan_start<R: Runtime>(
         sidecar_roots,
         ignored_paths,
         scan_count_offset: 0,
+        pending_sidecar_nodes: Mutex::new(Vec::new()),
+        last_progress_persist_at: Mutex::new(None),
         ai: ScanAiConfig {
             endpoint: input
                 .api_endpoint
@@ -1083,25 +1231,28 @@ pub async fn scan_start<R: Runtime>(
     let task_id_clone = task_id.clone();
     let app_clone = app.clone();
     let runtime = task.clone();
-    let handle = tauri::async_runtime::spawn(async move {
-        let result = run_scan_task(&app_clone, &state_clone, &runtime).await;
-        if let Err(err) = result {
-            let mut snap = runtime.snapshot.lock();
-            snap.status = "error".to_string();
-            snap.error_message = err.clone();
-            let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
-            let payload = json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
-            drop(snap);
-            let _ = app_clone.emit("scan_error", payload);
-        } else if runtime.stop.load(Ordering::Relaxed) {
-            let mut snap = runtime.snapshot.lock();
-            snap.status = "stopped".to_string();
-            let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
-            let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
-            drop(snap);
-            let _ = app_clone.emit("scan_stopped", payload);
-        }
-        state_clone.scan_tasks.lock().remove(&task_id_clone);
+    let handle = std::thread::spawn(move || {
+        tauri::async_runtime::block_on(async move {
+            let result = run_scan_task(&app_clone, &state_clone, &runtime).await;
+            if let Err(err) = result {
+                let mut snap = runtime.snapshot.lock();
+                snap.status = "error".to_string();
+                snap.error_message = err.clone();
+                let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
+                let payload =
+                    json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
+                drop(snap);
+                let _ = app_clone.emit("scan_error", payload);
+            } else if runtime.stop.load(Ordering::Relaxed) {
+                let mut snap = runtime.snapshot.lock();
+                snap.status = "stopped".to_string();
+                let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
+                let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+                drop(snap);
+                let _ = app_clone.emit("scan_stopped", payload);
+            }
+            state_clone.scan_tasks.lock().remove(&task_id_clone);
+        });
     });
     *task.job.lock() = Some(handle);
     Ok(json!({ "taskId": task_id, "status": "started" }))
@@ -1203,4 +1354,389 @@ pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Res
     let snapshot = persist::load_scan_snapshot(&state.db_path, &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
     serde_json::to_value(snapshot).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::fs;
+    use std::io::{BufRead, BufReader};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use uuid::Uuid;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wipeout-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn create_scan_fixture(root: &Path) {
+        fs::create_dir_all(root.join("A").join("nested")).expect("create nested dir");
+        fs::create_dir_all(root.join("B")).expect("create B dir");
+        fs::write(root.join("root.log"), b"root").expect("write root file");
+        fs::write(root.join("A").join("a.txt"), b"aaa").expect("write a.txt");
+        fs::write(root.join("A").join("nested").join("deep.txt"), b"deep").expect("write deep.txt");
+        fs::write(root.join("B").join("b.txt"), b"bbb").expect("write b.txt");
+    }
+
+    fn test_scanner_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("bin")
+            .join("scanner.exe")
+    }
+
+    fn make_snapshot(
+        task_id: &str,
+        root: &Path,
+        max_depth: Option<u32>,
+        scan_mode: &str,
+        baseline_task_id: Option<String>,
+    ) -> ScanSnapshot {
+        let root_string = root.to_string_lossy().to_string();
+        ScanSnapshot {
+            id: task_id.to_string(),
+            status: "idle".to_string(),
+            scan_mode: scan_mode.to_string(),
+            baseline_task_id,
+            visible_latest: true,
+            root_path_key: persist::create_root_path_key(&root_string),
+            target_path: root_string.clone(),
+            auto_analyze: false,
+            root_node_id: persist::create_node_id(&root_string),
+            configured_max_depth: max_depth,
+            max_scanned_depth: 0,
+            current_path: root_string,
+            current_depth: 0,
+            scanned_count: 0,
+            total_entries: 0,
+            processed_entries: 0,
+            deletable_count: 0,
+            total_cleanable: 0,
+            target_size: 0,
+            token_usage: TokenUsage::default(),
+            deletable: Vec::new(),
+            permission_denied_count: 0,
+            permission_denied_paths: Vec::new(),
+            error_message: String::new(),
+        }
+    }
+
+    fn apply_sidecar_output_to_db(
+        db_path: &Path,
+        task_id: &str,
+        root: &Path,
+        scan_mode: &str,
+        baseline_task_id: Option<String>,
+        max_depth: Option<u32>,
+        stdout_lines: &[String],
+    ) {
+        let mut snapshot = make_snapshot(task_id, root, max_depth, scan_mode, baseline_task_id);
+        let mut pending = Vec::<persist::ScanNodeUpsert>::new();
+
+        for line in stdout_lines {
+            let payload: Value = serde_json::from_str(line).expect("parse sidecar event");
+            match payload.get("type").and_then(Value::as_str).unwrap_or("") {
+                "task_started" | "scan_progress" | "scan_completed" => {
+                    if let Some(path) = payload.get("current_path").and_then(Value::as_str) {
+                        snapshot.current_path = path.to_string();
+                    }
+                    snapshot.current_depth = payload
+                        .get("current_depth")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32;
+                    snapshot.scanned_count = payload
+                        .get("scanned_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(snapshot.scanned_count);
+                    snapshot.total_entries = payload
+                        .get("total_entries")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(snapshot.total_entries);
+                    snapshot.max_scanned_depth =
+                        snapshot.max_scanned_depth.max(snapshot.current_depth);
+                    snapshot.status = "scanning".to_string();
+                }
+                "node_batch" => {
+                    let batch: SidecarNodeBatchEvent =
+                        serde_json::from_value(payload).expect("parse node batch");
+                    pending.extend(batch.nodes.into_iter().map(|node| persist::ScanNodeUpsert {
+                        node_id: node.node_id,
+                        parent_id: node.parent_id,
+                        path: node.path,
+                        name: node.name,
+                        node_type: node.node_type,
+                        depth: node.depth,
+                        self_size: node.self_size.max(0) as u64,
+                        size: node.total_size.max(0) as u64,
+                        child_count: node.child_count.max(0) as u64,
+                        mtime_ms: node.mtime_ms,
+                        ext: node.ext,
+                    }));
+                }
+                "permission_denied" => {
+                    snapshot.permission_denied_count =
+                        snapshot.permission_denied_count.saturating_add(1);
+                    if let Some(path) = payload.get("path").and_then(Value::as_str) {
+                        snapshot.permission_denied_paths.push(path.to_string());
+                    }
+                }
+                other => panic!("unexpected sidecar event: {other}"),
+            }
+        }
+
+        if !pending.is_empty() {
+            persist::upsert_scan_nodes(db_path, task_id, &pending).expect("persist node batch");
+        }
+        snapshot.status = "done".to_string();
+        persist::save_scan_snapshot(db_path, &snapshot).expect("save final snapshot");
+    }
+
+    fn run_scanner_command(args: &[String]) -> Vec<String> {
+        let scanner = test_scanner_path();
+        assert!(
+            scanner.exists(),
+            "scanner.exe missing at {}",
+            scanner.display()
+        );
+
+        let mut child = Command::new(scanner)
+            .args(args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn scanner");
+        let stdout = child.stdout.take().expect("scanner stdout");
+        let lines = BufReader::new(stdout)
+            .lines()
+            .map(|line| line.expect("read scanner line"))
+            .collect::<Vec<_>>();
+        let status = child.wait().expect("wait scanner");
+        assert!(status.success(), "scanner exited with {status}");
+        lines
+    }
+
+    #[test]
+    fn full_scan_sidecar_output_persists_snapshot_and_nodes() {
+        let root = temp_path("scan-root");
+        let db_path = temp_path("scan-db.sqlite");
+        fs::create_dir_all(&root).expect("create root");
+        create_scan_fixture(&root);
+        persist::init_db(&db_path).expect("init db");
+
+        let task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let root_string = root.to_string_lossy().to_string();
+        persist::init_scan_task(
+            &db_path,
+            &task_id,
+            &root_string,
+            0,
+            Some(1),
+            false,
+            None,
+            "full_rescan_incremental",
+        )
+        .expect("init full scan task");
+
+        let lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            task_id.clone(),
+            "--root".to_string(),
+            root_string.clone(),
+            "--max-depth".to_string(),
+            "1".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &task_id,
+            &root,
+            "full_rescan_incremental",
+            None,
+            Some(1),
+            &lines,
+        );
+
+        let snapshot = persist::load_scan_snapshot(&db_path, &task_id)
+            .expect("load snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.status, "done");
+        assert_eq!(snapshot.configured_max_depth, Some(1));
+        assert_eq!(snapshot.max_scanned_depth, 1);
+        assert!(snapshot.scanned_count >= 4);
+
+        let root_children =
+            persist::load_scan_children(&db_path, &task_id, &snapshot.root_node_id, false)
+                .expect("load root children");
+        assert!(root_children.iter().any(|node| node.name == "A"));
+        assert!(root_children.iter().any(|node| node.name == "B"));
+
+        let boundaries =
+            persist::list_boundary_scan_nodes(&db_path, &task_id, 1).expect("list boundaries");
+        assert!(boundaries.iter().any(|node| node.name == "A"));
+        assert!(boundaries.iter().any(|node| node.name == "B"));
+
+        let latest = persist::find_latest_visible_scan_task_id_for_path(&db_path, &root_string)
+            .expect("find latest")
+            .expect("latest task");
+        assert_eq!(latest, task_id);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn deepen_incremental_scan_preserves_baseline_and_adds_deeper_nodes() {
+        let root = temp_path("deepen-root");
+        let db_path = temp_path("deepen-db.sqlite");
+        fs::create_dir_all(&root).expect("create root");
+        create_scan_fixture(&root);
+        persist::init_db(&db_path).expect("init db");
+
+        let baseline_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let root_string = root.to_string_lossy().to_string();
+        persist::init_scan_task(
+            &db_path,
+            &baseline_task_id,
+            &root_string,
+            0,
+            Some(1),
+            false,
+            None,
+            "full_rescan_incremental",
+        )
+        .expect("init baseline task");
+        let baseline_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            baseline_task_id.clone(),
+            "--root".to_string(),
+            root_string.clone(),
+            "--max-depth".to_string(),
+            "1".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &baseline_task_id,
+            &root,
+            "full_rescan_incremental",
+            None,
+            Some(1),
+            &baseline_lines,
+        );
+
+        let boundary_nodes =
+            persist::list_boundary_scan_nodes(&db_path, &baseline_task_id, 1).expect("boundaries");
+        assert!(
+            !boundary_nodes.is_empty(),
+            "baseline boundary nodes missing"
+        );
+
+        let deepen_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        persist::init_scan_task(
+            &db_path,
+            &deepen_task_id,
+            &root_string,
+            0,
+            Some(2),
+            false,
+            Some(&baseline_task_id),
+            "deepen_incremental",
+        )
+        .expect("init deepen task");
+        persist::clone_scan_task_data(&db_path, &baseline_task_id, &deepen_task_id)
+            .expect("clone baseline task");
+        persist::delete_scan_data_for_paths(
+            &db_path,
+            &deepen_task_id,
+            &boundary_nodes
+                .iter()
+                .map(|node| node.path.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("delete boundary nodes");
+
+        let roots_json = temp_path("deepen-roots.json");
+        let roots_payload = boundary_nodes
+            .iter()
+            .map(|node| {
+                json!({
+                    "path": node.path,
+                    "parent_id": node.parent_id,
+                    "depth": node.depth,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &roots_json,
+            serde_json::to_vec(&roots_payload).expect("serialize roots"),
+        )
+        .expect("write roots payload");
+
+        let deepen_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            deepen_task_id.clone(),
+            "--roots-json".to_string(),
+            roots_json.to_string_lossy().to_string(),
+            "--max-depth".to_string(),
+            "2".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &deepen_task_id,
+            &root,
+            "deepen_incremental",
+            Some(baseline_task_id.clone()),
+            Some(2),
+            &deepen_lines,
+        );
+
+        let deepen_snapshot = persist::load_scan_snapshot(&db_path, &deepen_task_id)
+            .expect("load deepen snapshot")
+            .expect("deepen snapshot exists");
+        assert_eq!(deepen_snapshot.status, "done");
+        assert_eq!(deepen_snapshot.configured_max_depth, Some(2));
+        assert_eq!(deepen_snapshot.max_scanned_depth, 2);
+
+        let node_map =
+            persist::load_scan_node_map(&db_path, &deepen_task_id).expect("load node map");
+        assert!(node_map.contains_key(&root.join("A").to_string_lossy().to_lowercase()));
+        assert!(node_map.contains_key(
+            &root
+                .join("A")
+                .join("nested")
+                .to_string_lossy()
+                .to_lowercase()
+        ));
+        assert!(!node_map.contains_key(
+            &root
+                .join("A")
+                .join("nested")
+                .join("deep.txt")
+                .to_string_lossy()
+                .to_lowercase()
+        ));
+
+        let dir_a_id = persist::create_node_id(&root.join("A").to_string_lossy());
+        let dir_a_children =
+            persist::load_scan_children(&db_path, &deepen_task_id, &dir_a_id, false)
+                .expect("load A children");
+        assert!(dir_a_children.iter().any(|node| node.name == "nested"));
+        assert!(dir_a_children.iter().any(|node| node.name == "a.txt"));
+
+        let latest = persist::find_latest_visible_scan_task_id_for_path(&db_path, &root_string)
+            .expect("find latest task")
+            .expect("latest task exists");
+        assert_eq!(latest, deepen_task_id);
+
+        let _ = fs::remove_file(&roots_json);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&db_path);
+    }
 }

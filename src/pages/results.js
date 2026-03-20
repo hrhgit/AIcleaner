@@ -9,11 +9,11 @@ import {
   openFileLocation,
   requestElevation,
   saveSettings,
-  startScan,
 } from '../utils/api.js';
 import { handleElevationTransition } from '../utils/elevation.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
+import { scanTaskController } from '../utils/scan-task-controller.js';
 
 let sortField = 'size';
 let sortDir = 'desc';
@@ -24,11 +24,14 @@ let historyTasks = [];
 let ignoredPaths = [];
 let renderVersion = 0;
 let continueModalEscapeBound = false;
+let elevationModalEscapeBound = false;
+let elevationModalResolver = null;
 const CONTINUE_SCAN_DRAFT_KEY = 'wipeout.results.global.continue.v1';
 const CONTINUE_SCAN_DRAFT_VERSION = 1;
 const CONTINUE_DEPTH_MAX = 16;
 const CONTINUE_TARGET_MIN_GB = 0.1;
-const CONTINUE_TARGET_MAX_GB = 1000;
+const CONTINUE_TARGET_DEFAULT_MAX_GB = 20;
+const CONTINUE_RECOVERY_WINDOW_MS = 15000;
 
 function getCachedLastSnapshot() {
   return storage.get('lastScan', null);
@@ -42,6 +45,61 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = String(str ?? '');
   return div.innerHTML;
+}
+
+function getErrorMessage(err) {
+  if (typeof err === 'string' && err.trim()) {
+    return err.trim();
+  }
+  if (err && typeof err === 'object') {
+    if (typeof err.message === 'string' && err.message.trim()) {
+      return err.message.trim();
+    }
+    if (typeof err.error === 'string' && err.error.trim()) {
+      return err.error.trim();
+    }
+  }
+  const text = String(err ?? '').trim();
+  return text && text !== '[object Object]' ? text : t('toast.error');
+}
+
+function normalizeComparablePath(value) {
+  return String(value || '').trim().replace(/\//g, '\\').toLowerCase();
+}
+
+function isRecentIsoTime(value, windowMs = CONTINUE_RECOVERY_WINDOW_MS) {
+  const timestamp = Date.parse(String(value || ''));
+  return Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp) <= windowMs;
+}
+
+async function recoverRecentContinueTask({ baselineTaskId, targetPath, depth, unlimited }) {
+  const baselineId = String(baselineTaskId || '').trim();
+  const normalizedTargetPath = normalizeComparablePath(targetPath);
+  if (!baselineId || !normalizedTargetPath) return null;
+
+  try {
+    const history = await listScanHistory(12);
+    return history.find((task) => {
+      const taskId = String(task?.taskId || '').trim();
+      const taskPath = normalizeComparablePath(task?.rootPath);
+      const taskBaselineId = String(task?.baselineTaskId || '').trim();
+      const taskStatus = String(task?.status || '').trim();
+      const taskDepth = task?.maxDepth == null ? null : Number(task.maxDepth);
+      const statusMatches = ['scanning', 'analyzing'].includes(taskStatus);
+      const depthMatches = unlimited ? taskDepth == null : taskDepth === Number(depth);
+
+      return !!taskId
+        && task?.scanMode === 'deepen_incremental'
+        && taskBaselineId === baselineId
+        && taskPath === normalizedTargetPath
+        && depthMatches
+        && statusMatches
+        && isRecentIsoTime(task?.updatedAt);
+    })?.taskId || null;
+  } catch (recoveryErr) {
+    console.warn('Failed to recover recent deepen scan task:', recoveryErr);
+    return null;
+  }
 }
 
 function renderActionIcon(type) {
@@ -92,6 +150,12 @@ function clampNumber(value, min, max, fallback) {
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function roundUpToTenth(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return CONTINUE_TARGET_MIN_GB;
+  return Math.ceil(n * 10) / 10;
 }
 
 function riskBadge(risk) {
@@ -187,7 +251,7 @@ function updateSummary(snapshot = currentSnapshot) {
   if (highEl) highEl.textContent = String(visibleData.filter((item) => item.risk !== 'low').length);
   if (summaryEl) {
     if (snapshot?.id) {
-      const depthLabel = snapshot.configuredMaxDepth == null
+      const depthLabel = usesUnlimitedContinueDepth(snapshot)
         ? t('settings.max_depth_unlimited')
         : `${getContinueDepthBase(snapshot)} ${t('settings.depth_unit')}`;
       const targetSizeGb = Number(snapshot?.targetSize || 0) / 1024 / 1024 / 1024;
@@ -206,9 +270,24 @@ function updateSummary(snapshot = currentSnapshot) {
   }
 }
 
-function getContinueDepthBase(snapshot = currentSnapshot) {
+function getConfiguredContinueDepth(snapshot = currentSnapshot) {
   const configuredDepth = Number(snapshot?.configuredMaxDepth);
   if (Number.isFinite(configuredDepth) && configuredDepth > 0) {
+    return configuredDepth;
+  }
+
+  return null;
+}
+
+function usesUnlimitedContinueDepth(snapshot = currentSnapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  return Object.prototype.hasOwnProperty.call(snapshot, 'configuredMaxDepth')
+    && snapshot.configuredMaxDepth == null;
+}
+
+function getContinueDepthBase(snapshot = currentSnapshot) {
+  const configuredDepth = getConfiguredContinueDepth(snapshot);
+  if (configuredDepth != null) {
     return configuredDepth;
   }
   const scannedDepth = Number(snapshot?.maxScannedDepth);
@@ -225,10 +304,12 @@ function getContinueDepthMin(snapshot = currentSnapshot) {
 function getContinueBaseDraft(snapshot = currentSnapshot) {
   const currentTargetGb = Number(snapshot?.targetSize || 0) / 1024 / 1024 / 1024;
   const currentFoundGb = Number(snapshot?.totalCleanable || 0) / 1024 / 1024 / 1024;
+  const minTargetGb = getContinueTargetMin(snapshot);
+  const maxTargetGb = getContinueTargetMax(snapshot);
   const suggestedTarget = clampNumber(
     Math.max(currentFoundGb, currentTargetGb || currentFoundGb || 1),
-    CONTINUE_TARGET_MIN_GB,
-    CONTINUE_TARGET_MAX_GB,
+    minTargetGb,
+    maxTargetGb,
     1
   );
 
@@ -239,14 +320,25 @@ function getContinueBaseDraft(snapshot = currentSnapshot) {
   };
 }
 
+function getContinueTargetMin(snapshot = currentSnapshot) {
+  const currentFoundGb = Number(snapshot?.totalCleanable || 0) / 1024 / 1024 / 1024;
+  return Math.max(CONTINUE_TARGET_MIN_GB, roundUpToTenth(currentFoundGb));
+}
+
+function getContinueTargetMax(snapshot = currentSnapshot) {
+  return Math.max(CONTINUE_TARGET_DEFAULT_MAX_GB, getContinueTargetMin(snapshot));
+}
+
 function normalizeContinueDraft(raw = {}, snapshot = currentSnapshot) {
   const baseDraft = getContinueBaseDraft(snapshot);
+  const targetMinGb = getContinueTargetMin(snapshot);
+  const targetMaxGb = getContinueTargetMax(snapshot);
   return {
     depth: Math.floor(clampNumber(raw?.depth, getContinueDepthMin(snapshot), CONTINUE_DEPTH_MAX, baseDraft.depth)),
     targetSizeGb: Number(clampNumber(
       raw?.targetSizeGb,
-      CONTINUE_TARGET_MIN_GB,
-      CONTINUE_TARGET_MAX_GB,
+      targetMinGb,
+      targetMaxGb,
       baseDraft.targetSizeGb
     ).toFixed(1)),
     unlimited: !!raw?.unlimited,
@@ -269,23 +361,41 @@ function writeContinueDraft(draft, snapshot = currentSnapshot) {
   });
 }
 
-function readContinueDraftFromDom(snapshot = currentSnapshot) {
+function pickDraftControlValue(primary, secondary, fallback) {
+  const primaryText = String(primary ?? '').trim();
+  if (primaryText) return primaryText;
+
+  const secondaryText = String(secondary ?? '').trim();
+  if (secondaryText) return secondaryText;
+
+  return fallback;
+}
+
+function readContinueDraftFromDom(snapshot = currentSnapshot, { source = null } = {}) {
   const depthRange = document.getElementById('continue-depth-range');
   const depthInput = document.getElementById('continue-depth-input');
   const sizeRange = document.getElementById('continue-target-size-range');
   const sizeInput = document.getElementById('continue-target-size-input');
   const unlimitedToggle = document.getElementById('continue-unlimited-toggle');
   const baseDraft = getContinueBaseDraft(snapshot);
+  const depthValue = source === 'depth-range'
+    ? pickDraftControlValue(depthRange?.value, depthInput?.value, baseDraft.depth)
+    : pickDraftControlValue(depthInput?.value, depthRange?.value, baseDraft.depth);
+  const targetSizeValue = source === 'size-range'
+    ? pickDraftControlValue(sizeRange?.value, sizeInput?.value, baseDraft.targetSizeGb)
+    : pickDraftControlValue(sizeInput?.value, sizeRange?.value, baseDraft.targetSizeGb);
 
   return normalizeContinueDraft({
-    depth: depthInput?.value ?? depthRange?.value ?? baseDraft.depth,
-    targetSizeGb: sizeInput?.value ?? sizeRange?.value ?? baseDraft.targetSizeGb,
+    depth: depthValue,
+    targetSizeGb: targetSizeValue,
     unlimited: !!unlimitedToggle?.checked,
   }, snapshot);
 }
 
 function syncContinueDraftInputs(draft, snapshot = currentSnapshot) {
   const depthMin = getContinueDepthMin(snapshot);
+  const targetMinGb = getContinueTargetMin(snapshot);
+  const targetMaxGb = getContinueTargetMax(snapshot);
   const depthRange = document.getElementById('continue-depth-range');
   const depthInput = document.getElementById('continue-depth-input');
   const sizeRange = document.getElementById('continue-target-size-range');
@@ -302,13 +412,13 @@ function syncContinueDraftInputs(draft, snapshot = currentSnapshot) {
     depthInput.value = String(draft.depth);
   }
   if (sizeRange) {
-    sizeRange.min = String(CONTINUE_TARGET_MIN_GB);
-    sizeRange.max = String(CONTINUE_TARGET_MAX_GB);
+    sizeRange.min = String(targetMinGb);
+    sizeRange.max = String(targetMaxGb);
     sizeRange.value = String(draft.targetSizeGb);
   }
   if (sizeInput) {
-    sizeInput.min = String(CONTINUE_TARGET_MIN_GB);
-    sizeInput.max = String(CONTINUE_TARGET_MAX_GB);
+    sizeInput.min = String(targetMinGb);
+    sizeInput.max = String(targetMaxGb);
     sizeInput.value = draft.targetSizeGb.toFixed(1);
   }
 }
@@ -337,7 +447,7 @@ function updateContinueModalState(snapshot = currentSnapshot) {
     return;
   }
 
-  const taskUsesUnlimitedDepth = snapshot.configuredMaxDepth == null;
+  const taskUsesUnlimitedDepth = usesUnlimitedContinueDepth(snapshot);
   const draft = readContinueDraft(snapshot);
   syncContinueDraftInputs(draft, snapshot);
   writeContinueDraft(draft, snapshot);
@@ -371,6 +481,43 @@ function closeContinueScanModal() {
   if (!modal) return;
   modal.classList.remove('open');
   modal.setAttribute('aria-hidden', 'true');
+}
+
+function closeElevationRequestModal(confirmed = false) {
+  const modal = document.getElementById('results-elevation-modal');
+  if (modal) {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+
+  const resolver = elevationModalResolver;
+  elevationModalResolver = null;
+  resolver?.(confirmed);
+}
+
+function openElevationRequestModal(count) {
+  const modal = document.getElementById('results-elevation-modal');
+  const summaryEl = document.getElementById('results-elevation-modal-summary');
+  const messageEl = document.getElementById('results-elevation-modal-message');
+  const cancelBtn = document.getElementById('results-elevation-modal-cancel');
+  if (!modal || !summaryEl || !messageEl || !cancelBtn) {
+    return Promise.resolve(false);
+  }
+
+  if (typeof elevationModalResolver === 'function') {
+    elevationModalResolver(false);
+    elevationModalResolver = null;
+  }
+
+  summaryEl.textContent = t('scanner.permission_denied_summary', { count });
+  messageEl.textContent = t('results.elevation_needed_confirm', { count });
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  window.setTimeout(() => cancelBtn.focus(), 0);
+
+  return new Promise((resolve) => {
+    elevationModalResolver = resolve;
+  });
 }
 
 function renderAiInsight(item) {
@@ -646,7 +793,7 @@ async function handleContinueScan() {
       submitBtn.disabled = true;
       submitBtn.innerHTML = `<span class="spinner"></span> ${t('scanner.prepare')}`;
     }
-    const result = await startScan({
+    await scanTaskController.startTask({
       targetPath: currentSnapshot.targetPath,
       targetSizeGB: draft.targetSizeGb,
       maxDepth: draft.unlimited ? null : draft.depth,
@@ -655,12 +802,29 @@ async function handleContinueScan() {
       autoAnalyze: true,
       responseLanguage: getLang(),
     });
-    storage.set('lastScanTaskId', result.taskId);
     closeContinueScanModal();
     showToast(t('results.continue_started'), 'success');
     window.location.hash = '#/scanner';
   } catch (err) {
-    showToast(t('results.continue_failed') + err.message, 'error');
+    const recoveredTaskId = await recoverRecentContinueTask({
+      baselineTaskId: currentSnapshot.id,
+      targetPath: currentSnapshot.targetPath,
+      depth: draft.depth,
+      unlimited: draft.unlimited,
+    });
+
+    if (recoveredTaskId) {
+      const restored = await scanTaskController.restoreTaskById(recoveredTaskId);
+      if (!restored) {
+        throw new Error(t('scanner.history_load_failed'));
+      }
+      closeContinueScanModal();
+      showToast(t('results.continue_started'), 'success');
+      window.location.hash = '#/scanner';
+      return;
+    }
+
+    showToast(t('results.continue_failed') + getErrorMessage(err), 'error');
   } finally {
     if (submitBtn) {
       submitBtn.disabled = false;
@@ -780,15 +944,18 @@ async function handleBatchClean() {
       showToast(t('results.cleaned_none', { count: failedItems.length || selectedPaths.length }), 'error');
     }
 
-    if (elevationRequiredItems.length > 0 && confirm(t('results.elevation_needed_confirm', { count: elevationRequiredItems.length }))) {
-      try {
-        const result = await requestElevation();
-        showToast(t('settings.elevation_uac_prompt'), 'info');
-        if (result?.restarting) {
-          handleElevationTransition({ showToast, t });
+    if (elevationRequiredItems.length > 0) {
+      const shouldRequestElevation = await openElevationRequestModal(elevationRequiredItems.length);
+      if (shouldRequestElevation) {
+        try {
+          const result = await requestElevation();
+          showToast(t('settings.elevation_uac_prompt'), 'info');
+          if (result?.restarting) {
+            handleElevationTransition({ showToast, t });
+          }
+        } catch (err) {
+          showToast(t('settings.elevation_failed') + err.message, 'error');
         }
-      } catch (err) {
-        showToast(t('settings.elevation_failed') + err.message, 'error');
       }
     }
   } catch (err) {
@@ -803,6 +970,11 @@ async function handleBatchClean() {
 }
 
 export async function renderResults(container) {
+  if (typeof elevationModalResolver === 'function') {
+    elevationModalResolver(false);
+    elevationModalResolver = null;
+  }
+
   const expectedRenderVersion = ++renderVersion;
   const cachedSnapshot = getCachedLastSnapshot();
   currentTaskId = storage.get('lastScanTaskId', null) || cachedSnapshot?.id || null;
@@ -890,9 +1062,9 @@ export async function renderResults(container) {
             <div class="form-group">
               <label class="form-label">${t('settings.target_size')}</label>
               <div class="range-container">
-                <input id="continue-target-size-range" type="range" class="range-slider" min="0.1" max="1000" step="0.1" value="1" />
+                <input id="continue-target-size-range" type="range" class="range-slider" min="0.1" max="20" step="0.1" value="1" />
                 <div class="results-range-inline">
-                  <input id="continue-target-size-input" class="form-input no-spin" type="number" min="0.1" max="1000" step="0.1" value="1" />
+                  <input id="continue-target-size-input" class="form-input no-spin" type="number" min="0.1" max="20" step="0.1" value="1" />
                   <span class="range-value" style="min-width: unset;">GB</span>
                 </div>
               </div>
@@ -919,6 +1091,29 @@ export async function renderResults(container) {
         <div class="app-modal-actions">
           <button id="continue-scan-modal-cancel" class="btn btn-ghost" type="button">${t('provider_modal.cancel')}</button>
           <button id="continue-scan-submit-btn" class="btn btn-primary" type="button">${t('results.continue_action')}</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="results-elevation-modal" class="app-modal" aria-hidden="true">
+      <div class="app-modal-overlay" data-modal-close="true"></div>
+      <div class="app-modal-panel card results-continue-modal">
+        <div class="app-modal-header">
+          <div>
+            <h2 class="card-title">${t('settings.request_elevation')}</h2>
+            <div class="modal-subtitle">${t('settings.privilege_required')}</div>
+          </div>
+          <button id="results-elevation-modal-close" class="btn btn-ghost" type="button">${t('provider_modal.cancel')}</button>
+        </div>
+        <div class="results-continue-modal-body">
+          <div class="results-continue-overview">
+            <div id="results-elevation-modal-summary" class="results-continue-overview-title"></div>
+            <div id="results-elevation-modal-message" class="form-hint" style="margin-top: 10px;"></div>
+          </div>
+          <div class="app-modal-actions">
+            <button id="results-elevation-modal-cancel" class="btn btn-ghost" type="button">${t('provider_modal.cancel')}</button>
+            <button id="results-elevation-modal-confirm" class="btn btn-secondary" type="button">${t('settings.request_elevation')}</button>
+          </div>
         </div>
       </div>
     </div>
@@ -988,7 +1183,7 @@ export async function renderResults(container) {
     const sizeRange = document.getElementById('continue-target-size-range');
     const sizeInput = document.getElementById('continue-target-size-input');
     const unlimitedToggle = document.getElementById('continue-unlimited-toggle');
-    const draft = readContinueDraftFromDom(snapshot);
+    const draft = readContinueDraftFromDom(snapshot, { source });
 
     if (source === 'depth-range' && depthInput) depthInput.value = String(draft.depth);
     if (source === 'depth-input' && depthRange) depthRange.value = String(draft.depth);
@@ -1005,6 +1200,9 @@ export async function renderResults(container) {
   document.getElementById('continue-scan-modal-close')?.addEventListener('click', closeContinueScanModal);
   document.getElementById('continue-scan-modal-cancel')?.addEventListener('click', closeContinueScanModal);
   document.getElementById('continue-scan-submit-btn')?.addEventListener('click', handleContinueScan);
+  document.getElementById('results-elevation-modal-close')?.addEventListener('click', () => closeElevationRequestModal(false));
+  document.getElementById('results-elevation-modal-cancel')?.addEventListener('click', () => closeElevationRequestModal(false));
+  document.getElementById('results-elevation-modal-confirm')?.addEventListener('click', () => closeElevationRequestModal(true));
   document.getElementById('results-refresh-btn')?.addEventListener('click', () => refreshSnapshot());
   document.getElementById('results-history-refresh-btn')?.addEventListener('click', () => refreshHistoryList());
   document.getElementById('continue-depth-range')?.addEventListener('input', () => syncContinueModalFromControls({ source: 'depth-range' }));
@@ -1017,11 +1215,24 @@ export async function renderResults(container) {
       closeContinueScanModal();
     }
   });
+  document.getElementById('results-elevation-modal')?.addEventListener('click', (event) => {
+    if (event.target?.getAttribute('data-modal-close') === 'true') {
+      closeElevationRequestModal(false);
+    }
+  });
   if (!continueModalEscapeBound) {
     continueModalEscapeBound = true;
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         closeContinueScanModal();
+      }
+    });
+  }
+  if (!elevationModalEscapeBound) {
+    elevationModalEscapeBound = true;
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeElevationRequestModal(false);
       }
     });
   }

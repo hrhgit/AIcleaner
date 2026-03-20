@@ -146,12 +146,11 @@ function normalizeProviders(settings) {
   for (const preset of PROVIDER_PRESETS) {
     presetSet.add(preset.endpoint);
     const config = byEndpoint[preset.endpoint] || {};
-    const isActive = settings?.defaultProviderEndpoint === preset.endpoint || settings?.apiEndpoint === preset.endpoint;
     merged.push({
       name: String(config?.name || preset.name),
       endpoint: preset.endpoint,
       apiKey: '',
-      model: String(config?.model || (isActive ? settings?.model || '' : '') || defaultModelByEndpoint(preset.endpoint)),
+      model: String(config?.model || defaultModelByEndpoint(preset.endpoint)),
     });
   }
 
@@ -171,11 +170,11 @@ function normalizeProviders(settings) {
       name: 'OpenAI',
       endpoint: 'https://api.openai.com/v1',
       apiKey: '',
-      model: String(settings?.model || 'gpt-4o-mini'),
+      model: 'gpt-4o-mini',
     });
   }
 
-  let defaultProviderEndpoint = String(settings?.defaultProviderEndpoint || settings?.apiEndpoint || '').trim();
+  let defaultProviderEndpoint = String(settings?.defaultProviderEndpoint || '').trim();
   if (!merged.some((item) => item.endpoint === defaultProviderEndpoint)) {
     defaultProviderEndpoint = merged[0].endpoint;
   }
@@ -191,33 +190,14 @@ function normalizeSearchApi(settings) {
     ? source.scopes
     : {};
 
-  const scanEnabled = typeof scopesSource.scan === 'boolean'
-    ? scopesSource.scan
-    : !!settings?.enableWebSearch;
-  const classifyEnabled = typeof scopesSource.classify === 'boolean'
-    ? scopesSource.classify
-    : (typeof scopesSource.organizer === 'boolean'
-      ? scopesSource.organizer
-      : (settings?.enableWebSearchClassify != null
-        ? !!settings.enableWebSearchClassify
-        : (settings?.enableWebSearchOrganizer != null
-          ? !!settings.enableWebSearchOrganizer
-          : scanEnabled)));
-  const organizerEnabled = typeof scopesSource.organizer === 'boolean'
-    ? scopesSource.organizer
-    : classifyEnabled;
-  const enabled = source?.enabled != null
-    ? !!source.enabled
-    : (scanEnabled || classifyEnabled || organizerEnabled);
-
   return {
     provider: 'tavily',
-    enabled,
+    enabled: !!source?.enabled,
     apiKey: '',
     scopes: {
-      scan: !!scanEnabled,
-      classify: !!classifyEnabled,
-      organizer: !!organizerEnabled,
+      scan: !!scopesSource.scan,
+      classify: !!scopesSource.classify,
+      organizer: !!scopesSource.organizer,
     },
   };
 }
@@ -557,11 +537,6 @@ function buildModalSnapshot() {
       }]),
     ),
     defaultProviderEndpoint: state.defaultProviderEndpoint,
-    apiEndpoint: state.defaultProviderEndpoint,
-    model: String(
-      state.providers.find((provider) => provider.endpoint === state.defaultProviderEndpoint)?.model
-      || defaultModelByEndpoint(state.defaultProviderEndpoint),
-    ),
     searchApi: {
       provider: 'tavily',
       enabled: !!(
@@ -576,9 +551,6 @@ function buildModalSnapshot() {
         organizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
       },
     },
-    enableWebSearch: !!state.searchApi?.scopes?.scan,
-    enableWebSearchClassify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
-    enableWebSearchOrganizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
   };
   const credentials = listEl ? collectEditableCredentialsFromDOM() : {
     providerSecrets: { ...(state.editableCredentials?.providerSecrets || {}) },
@@ -656,12 +628,7 @@ function collectPayloadFromDOM() {
   return {
     providerConfigs,
     defaultProviderEndpoint,
-    apiEndpoint: defaultProviderEndpoint,
-    model: String(activeConfig.model || defaultModelByEndpoint(defaultProviderEndpoint)),
     searchApi,
-    enableWebSearch: searchApi.enabled && searchApi.scopes.scan,
-    enableWebSearchClassify: searchApi.enabled && searchApi.scopes.classify,
-    enableWebSearchOrganizer: searchApi.enabled && searchApi.scopes.organizer,
   };
 }
 

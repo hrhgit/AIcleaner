@@ -1,0 +1,2 @@
+import{o as e}from"./lib-mmyalE6B.js";var t=`editorDiffViewMode`,n=`wrapCodeDiff.2`,r=`wordDiffsEnabled.2`,i=`diffRichPreview`;const a=e(t,`unified`),o=e(n,!1),s=e(r,!1),c=e(i,!1);export{o as i,c as n,s as r,a as t};
+//# sourceMappingURL=diff-view-mode-Cqw5JYI3.js.map

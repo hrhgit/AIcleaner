@@ -20,6 +20,21 @@ pub struct ScanNode {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScanNodeUpsert {
+    pub node_id: String,
+    pub parent_id: Option<String>,
+    pub path: String,
+    pub name: String,
+    pub node_type: String,
+    pub depth: u32,
+    pub self_size: u64,
+    pub size: u64,
+    pub child_count: u64,
+    pub mtime_ms: Option<i64>,
+    pub ext: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ScanFindingRecord {
     pub item: ScanResultItem,
     pub should_expand: bool,
@@ -147,6 +162,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             error TEXT,
             root_path TEXT NOT NULL,
             recursive INTEGER NOT NULL DEFAULT 1,
+            reference_original_structure INTEGER NOT NULL DEFAULT 0,
             mode TEXT NOT NULL,
             categories_json TEXT NOT NULL,
             allow_new_categories INTEGER NOT NULL DEFAULT 1,
@@ -154,7 +170,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             parallelism INTEGER NOT NULL DEFAULT 5,
             use_web_search INTEGER NOT NULL DEFAULT 0,
             web_search_enabled INTEGER NOT NULL DEFAULT 0,
-            selected_model TEXT NOT NULL,
+            selected_model TEXT NOT NULL DEFAULT '',
             selected_models_json TEXT NOT NULL,
             selected_providers_json TEXT NOT NULL,
             supports_multimodal INTEGER NOT NULL DEFAULT 0,
@@ -232,7 +248,10 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
-    if !scan_task_columns.iter().any(|col| col == "baseline_task_id") {
+    if !scan_task_columns
+        .iter()
+        .any(|col| col == "baseline_task_id")
+    {
         conn.execute(
             "ALTER TABLE scan_tasks ADD COLUMN baseline_task_id TEXT",
             [],
@@ -258,7 +277,10 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
                 .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .map_err(|e| e.to_string())?;
-    if !scan_finding_columns.iter().any(|col| col == "should_expand") {
+    if !scan_finding_columns
+        .iter()
+        .any(|col| col == "should_expand")
+    {
         conn.execute(
             "ALTER TABLE scan_findings ADD COLUMN should_expand INTEGER NOT NULL DEFAULT 0",
             [],
@@ -277,9 +299,39 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
                 .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .map_err(|e| e.to_string())?;
-    if !organize_results_columns.iter().any(|col| col == "item_type") {
+    if !organize_results_columns
+        .iter()
+        .any(|col| col == "item_type")
+    {
         conn.execute(
             "ALTER TABLE organize_results ADD COLUMN item_type TEXT NOT NULL DEFAULT 'file'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let organize_task_columns = conn
+        .prepare("PRAGMA table_info(organize_tasks)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !organize_task_columns
+        .iter()
+        .any(|col| col == "reference_original_structure")
+    {
+        conn.execute(
+            "ALTER TABLE organize_tasks ADD COLUMN reference_original_structure INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !organize_task_columns
+        .iter()
+        .any(|col| col == "selected_model")
+    {
+        conn.execute(
+            "ALTER TABLE organize_tasks ADD COLUMN selected_model TEXT NOT NULL DEFAULT ''",
             [],
         )
         .map_err(|e| e.to_string())?;
@@ -489,6 +541,56 @@ pub fn refresh_scan_stats(db_path: &Path, task_id: &str) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn upsert_scan_nodes(
+    db_path: &Path,
+    task_id: &str,
+    nodes: &[ScanNodeUpsert],
+) -> Result<(), String> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO scan_nodes (
+                task_id, node_id, parent_id, path, name, type, depth,
+                self_size, total_size, child_count, mtime_ms, ext
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(task_id, node_id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                path = excluded.path,
+                name = excluded.name,
+                type = excluded.type,
+                depth = excluded.depth,
+                self_size = excluded.self_size,
+                total_size = excluded.total_size,
+                child_count = excluded.child_count,
+                mtime_ms = excluded.mtime_ms,
+                ext = excluded.ext",
+        )
+        .map_err(|e| e.to_string())?;
+    for node in nodes {
+        stmt.execute(params![
+            task_id,
+            node.node_id,
+            node.parent_id,
+            node.path,
+            node.name,
+            node.node_type,
+            node.depth as i64,
+            node.self_size as i64,
+            node.size as i64,
+            node.child_count as i64,
+            node.mtime_ms,
+            node.ext,
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    drop(stmt);
+    tx.commit().map_err(|e| e.to_string())
 }
 
 fn load_scan_findings(conn: &Connection, task_id: &str) -> Result<Vec<ScanResultItem>, String> {
@@ -811,7 +913,11 @@ pub fn load_scan_node_map(
         .collect())
 }
 
-pub fn clone_scan_task_data(db_path: &Path, from_task_id: &str, to_task_id: &str) -> Result<(), String> {
+pub fn clone_scan_task_data(
+    db_path: &Path,
+    from_task_id: &str,
+    to_task_id: &str,
+) -> Result<(), String> {
     let conn = open_db(db_path)?;
     conn.execute(
         "INSERT INTO scan_nodes (task_id, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext)
@@ -872,7 +978,11 @@ pub fn find_latest_visible_scan_task_id_for_path(
     .map_err(|e| e.to_string())
 }
 
-pub fn list_boundary_scan_nodes(db_path: &Path, task_id: &str, depth: u32) -> Result<Vec<ScanNode>, String> {
+pub fn list_boundary_scan_nodes(
+    db_path: &Path,
+    task_id: &str,
+    depth: u32,
+) -> Result<Vec<ScanNode>, String> {
     let conn = open_db(db_path)?;
     let mut stmt = conn
         .prepare(
@@ -916,19 +1026,20 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
     .map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT OR REPLACE INTO organize_tasks (
-            task_id, status, error, root_path, recursive, mode, categories_json, allow_new_categories,
+            task_id, status, error, root_path, recursive, reference_original_structure, mode, categories_json, allow_new_categories,
             excluded_patterns_json, parallelism, use_web_search, web_search_enabled, selected_model,
             selected_models_json, selected_providers_json, supports_multimodal, total_files,
             processed_files, token_prompt, token_completion, token_total, preview_json, created_at,
             completed_at, job_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                  ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                  ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             snapshot.id,
             snapshot.status,
             snapshot.error,
             snapshot.root_path,
             bool_to_i64(snapshot.recursive),
+            bool_to_i64(snapshot.reference_original_structure),
             snapshot.mode,
             serde_json::to_string(&snapshot.categories).map_err(|e| e.to_string())?,
             bool_to_i64(snapshot.allow_new_categories),
@@ -1035,7 +1146,9 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             row.get("size").and_then(Value::as_u64).unwrap_or(0) as i64,
-            row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+            row.get("itemType")
+                .and_then(Value::as_str)
+                .unwrap_or("file"),
             row.get("category")
                 .and_then(Value::as_str)
                 .unwrap_or("其他待定"),
@@ -1070,8 +1183,8 @@ pub fn load_organize_snapshot(
     let row = conn
         .query_row(
             "SELECT status, error, root_path, recursive, mode, categories_json, allow_new_categories,
-                    excluded_patterns_json, parallelism, use_web_search, web_search_enabled,
-                    selected_model, selected_models_json, selected_providers_json, supports_multimodal,
+                    reference_original_structure, excluded_patterns_json, parallelism, use_web_search,
+                    web_search_enabled, selected_model, selected_models_json, selected_providers_json, supports_multimodal,
                     total_files, processed_files, token_prompt, token_completion, token_total,
                     preview_json, created_at, completed_at, job_id
              FROM organize_tasks WHERE task_id = ?1",
@@ -1085,23 +1198,24 @@ pub fn load_organize_snapshot(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
+                    row.get::<_, String>(14)?,
                     row.get::<_, i64>(15)?,
                     row.get::<_, i64>(16)?,
                     row.get::<_, i64>(17)?,
                     row.get::<_, i64>(18)?,
                     row.get::<_, i64>(19)?,
-                    row.get::<_, String>(20)?,
+                    row.get::<_, i64>(20)?,
                     row.get::<_, String>(21)?,
-                    row.get::<_, Option<String>>(22)?,
+                    row.get::<_, String>(22)?,
                     row.get::<_, Option<String>>(23)?,
+                    row.get::<_, Option<String>>(24)?,
                 ))
             },
         )
@@ -1148,29 +1262,30 @@ pub fn load_organize_snapshot(
         error: row.1,
         root_path: row.2,
         recursive: row.3 != 0,
+        reference_original_structure: row.7 != 0,
         mode: row.4,
         categories: parse_json_or_default(Some(row.5)),
         allow_new_categories: row.6 != 0,
-        excluded_patterns: parse_json_or_default(Some(row.7)),
-        parallelism: row.8 as u32,
-        use_web_search: row.9 != 0,
-        web_search_enabled: row.10 != 0,
-        selected_model: row.11,
-        selected_models: parse_json_or_default(Some(row.12)),
-        selected_providers: parse_json_or_default(Some(row.13)),
-        supports_multimodal: row.14 != 0,
-        total_files: row.15 as u64,
-        processed_files: row.16 as u64,
+        excluded_patterns: parse_json_or_default(Some(row.8)),
+        parallelism: row.9 as u32,
+        use_web_search: row.10 != 0,
+        web_search_enabled: row.11 != 0,
+        selected_model: row.12,
+        selected_models: parse_json_or_default(Some(row.13)),
+        selected_providers: parse_json_or_default(Some(row.14)),
+        supports_multimodal: row.15 != 0,
+        total_files: row.16 as u64,
+        processed_files: row.17 as u64,
         token_usage: TokenUsage {
-            prompt: row.17 as u64,
-            completion: row.18 as u64,
-            total: row.19 as u64,
+            prompt: row.18 as u64,
+            completion: row.19 as u64,
+            total: row.20 as u64,
         },
         results,
-        preview: parse_json_or_default(Some(row.20)),
-        created_at: row.21,
-        completed_at: row.22,
-        job_id: row.23,
+        preview: parse_json_or_default(Some(row.21)),
+        created_at: row.22,
+        completed_at: row.23,
+        job_id: row.24,
     }))
 }
 

@@ -32,6 +32,8 @@
     transition: all var(--transition-normal);
     position: relative;
     overflow: hidden;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .card::before {
@@ -425,6 +427,7 @@
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 16px;
     margin-bottom: 24px;
+    min-width: 0;
 }
 
 .stat-card {
@@ -437,6 +440,7 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+    min-width: 0;
 }
 
 .stat-label {
@@ -651,15 +655,22 @@
     margin-bottom: 16px;
     min-width: 0;
     max-width: 100%;
+    width: 100%;
 }
 
 .scan-breadcrumb .crumb {
+    display: block;
     color: var(--accent-primary);
     min-width: 0;
-    flex: 1 1 auto;
+    flex: 1 1 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.scan-breadcrumb .log-icon,
+.scan-breadcrumb #breadcrumb-depth {
+    flex-shrink: 0;
 }
 
 .scan-breadcrumb .separator {
@@ -1019,6 +1030,76 @@
     word-break: break-word;
 }
 
+.scanner-whitelist-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.scanner-whitelist-panel[hidden] {
+    display: none !important;
+}
+
+.scanner-whitelist-panel {
+    margin-top: 8px;
+}
+
+.results-whitelist-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.results-whitelist-empty {
+    padding-top: 12px;
+}
+
+.results-whitelist-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 14px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.results-whitelist-path-wrap {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.results-whitelist-path-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.results-whitelist-path {
+    margin-top: 6px;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.results-whitelist-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.results-whitelist-actions .btn {
+    min-width: 84px;
+    padding: 8px 12px;
+}
+
 .results-ai-cell {
     display: flex;
     flex-direction: column;
@@ -1270,6 +1351,25 @@
         justify-content: stretch;
     }
 
+    .scanner-whitelist-toolbar {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .results-whitelist-item {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .results-whitelist-actions {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+
+    .results-whitelist-actions .btn {
+        flex: 1 1 100%;
+    }
+
     .results-toolbar-actions .btn {
         flex: 1 1 100%;
     }
@@ -1355,6 +1455,7 @@
 
 .flex {
     display: flex;
+    min-width: 0;
 }
 
 .items-center {

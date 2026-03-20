@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use clap::{Parser, Subcommand};
-use rusqlite::{params, Connection, Transaction};
+use serde::Serialize;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::env;
@@ -48,9 +48,8 @@ struct ScanRootInput {
     depth: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 struct NodeRecord {
-    task_id: String,
     node_id: String,
     parent_id: Option<String>,
     path: String,
@@ -65,7 +64,6 @@ struct NodeRecord {
 }
 
 struct ScanContext {
-    conn: Connection,
     task_id: String,
     max_depth: Option<usize>,
     ignored_paths: Vec<String>,
@@ -76,13 +74,11 @@ struct ScanContext {
 
 impl ScanContext {
     fn new(
-        conn: Connection,
         task_id: String,
         max_depth: Option<usize>,
         ignored_paths: Vec<String>,
     ) -> Self {
         Self {
-            conn,
             task_id,
             max_depth,
             ignored_paths,
@@ -97,7 +93,7 @@ impl ScanContext {
         record: NodeRecord,
         current_path: &str,
         current_depth: usize,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.scanned_count += 1;
         self.buffered.push(record);
 
@@ -108,41 +104,36 @@ impl ScanContext {
         if self.scanned_count == 1 || self.scanned_count - self.last_progress_mark >= PROGRESS_EVERY
         {
             self.last_progress_mark = self.scanned_count;
-            self.update_scan_progress(current_path, current_depth)?;
-            emit_event(json!({
-                "type": "scan_progress",
-                "current_path": current_path,
-                "current_depth": current_depth,
-                "scanned_count": self.scanned_count,
-                "total_entries": self.scanned_count,
-            }));
+            self.update_scan_progress(current_path, current_depth);
         }
 
         Ok(())
     }
 
-    fn flush_nodes(&mut self) -> rusqlite::Result<()> {
+    fn flush_nodes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.buffered.is_empty() {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
-        insert_nodes(&tx, &self.buffered)?;
-        tx.commit()?;
+        emit_event(json!({
+            "type": "node_batch",
+            "taskId": self.task_id,
+            "nodes": self.buffered,
+        }));
         self.buffered.clear();
         Ok(())
     }
 
-    fn update_scan_progress(
-        &self,
-        current_path: &str,
-        current_depth: usize,
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE scan_tasks SET status = 'scanning', current_path = ?, current_depth = ?, scanned_count = ?, total_entries = ?, updated_at = ? WHERE task_id = ?",
-            params![current_path, current_depth as i64, self.scanned_count as i64, self.scanned_count as i64, now_iso(), self.task_id],
-        )?;
-        Ok(())
+    fn update_scan_progress(&self, current_path: &str, current_depth: usize) {
+        emit_event(json!({
+            "type": "scan_progress",
+            "taskId": self.task_id,
+            "current_path": current_path,
+            "current_depth": current_depth,
+            "scanned_count": self.scanned_count,
+            "total_entries": self.scanned_count,
+            "updated_at": now_iso(),
+        }));
     }
 
     fn is_ignored(&self, path: &Path) -> bool {
@@ -215,26 +206,17 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let ignored_paths = load_ignored_paths(args.ignore_json.as_deref())?;
 
-    let conn = Connection::open(&args.db)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    ensure_schema(&conn)?;
-
-    conn.execute(
-        "UPDATE scan_tasks SET status = 'scanning', current_path = ?, current_depth = 0, scanned_count = 0, total_entries = 0, updated_at = ?, error_message = NULL, finished_at = NULL WHERE task_id = ?",
-        params![root_string, now_iso(), args.task_id],
-    )?;
-
     emit_event(json!({
         "type": "task_started",
+        "taskId": args.task_id,
         "current_path": root_string,
         "current_depth": 0,
         "scanned_count": 0,
         "total_entries": 0,
+        "updated_at": now_iso(),
     }));
 
-    let mut ctx = ScanContext::new(conn, args.task_id.clone(), args.max_depth, ignored_paths);
+    let mut ctx = ScanContext::new(args.task_id.clone(), args.max_depth, ignored_paths);
     for root in &roots {
         let abs = absolutize_path(Path::new(&root.path))?;
         if ctx.is_ignored(&abs) {
@@ -243,18 +225,16 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         let _ = scan_dir(&mut ctx, &abs, root.parent_id.clone(), root.depth)?;
     }
     ctx.flush_nodes()?;
-    ctx.update_scan_progress(&root_string, 0)?;
-    ctx.conn.execute(
-        "UPDATE scan_tasks SET status = 'scanning', current_path = ?, current_depth = 0, scanned_count = ?, total_entries = ?, updated_at = ? WHERE task_id = ?",
-        params![root_string, ctx.scanned_count as i64, ctx.scanned_count as i64, now_iso(), ctx.task_id],
-    )?;
+    ctx.update_scan_progress(&root_string, 0);
 
     emit_event(json!({
         "type": "scan_completed",
+        "taskId": ctx.task_id,
         "current_path": root_string,
         "current_depth": 0,
         "scanned_count": ctx.scanned_count,
         "total_entries": ctx.scanned_count,
+        "updated_at": now_iso(),
     }));
 
     Ok(())
@@ -295,7 +275,6 @@ fn scan_dir(
             Err(err) if is_permission_denied(&err) => {
                 emit_permission_denied(&dir_abs, &err);
                 let record = NodeRecord {
-                    task_id: ctx.task_id.clone(),
                     node_id: dir_id,
                     parent_id,
                     path: dir_string.clone(),
@@ -351,7 +330,6 @@ fn scan_dir(
                 total_size += file_size;
 
                 let record = NodeRecord {
-                    task_id: ctx.task_id.clone(),
                     node_id: node_id_for(&child_string),
                     parent_id: Some(dir_id.clone()),
                     path: child_string.clone(),
@@ -373,7 +351,6 @@ fn scan_dir(
     }
 
     let record = NodeRecord {
-        task_id: ctx.task_id.clone(),
         node_id: dir_id,
         parent_id,
         path: dir_string.clone(),
@@ -467,122 +444,6 @@ fn load_ignored_paths(path: Option<&str>) -> Result<Vec<String>, Box<dyn std::er
         out.push(normalized);
     }
     Ok(out)
-}
-
-fn insert_nodes(tx: &Transaction<'_>, nodes: &[NodeRecord]) -> rusqlite::Result<()> {
-    let mut stmt = tx.prepare_cached(
-        "INSERT INTO scan_nodes (task_id, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, node_id) DO UPDATE SET
-            parent_id = excluded.parent_id,
-            path = excluded.path,
-            name = excluded.name,
-            type = excluded.type,
-            depth = excluded.depth,
-            self_size = excluded.self_size,
-            total_size = excluded.total_size,
-            child_count = excluded.child_count,
-            mtime_ms = excluded.mtime_ms,
-            ext = excluded.ext"
-    )?;
-
-    for node in nodes {
-        stmt.execute(params![
-            node.task_id,
-            node.node_id,
-            node.parent_id,
-            node.path,
-            node.name,
-            node.node_type,
-            node.depth as i64,
-            node.self_size,
-            node.total_size,
-            node.child_count,
-            node.mtime_ms,
-            node.ext,
-        ])?;
-    }
-
-    Ok(())
-}
-
-fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS scan_tasks (
-            task_id TEXT PRIMARY KEY,
-            root_path TEXT NOT NULL,
-            root_path_key TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL,
-            scan_mode TEXT NOT NULL DEFAULT 'full_rescan_incremental',
-            baseline_task_id TEXT,
-            visible_latest INTEGER NOT NULL DEFAULT 1,
-            target_size INTEGER,
-            max_depth INTEGER,
-            auto_analyze INTEGER NOT NULL DEFAULT 1,
-            current_path TEXT,
-            current_depth INTEGER NOT NULL DEFAULT 0,
-            scanned_count INTEGER NOT NULL DEFAULT 0,
-            total_entries INTEGER NOT NULL DEFAULT 0,
-            processed_entries INTEGER NOT NULL DEFAULT 0,
-            deletable_count INTEGER NOT NULL DEFAULT 0,
-            total_cleanable INTEGER NOT NULL DEFAULT 0,
-            token_prompt INTEGER NOT NULL DEFAULT 0,
-            token_completion INTEGER NOT NULL DEFAULT 0,
-            token_total INTEGER NOT NULL DEFAULT 0,
-            permission_denied_count INTEGER NOT NULL DEFAULT 0,
-            permission_denied_paths TEXT NOT NULL DEFAULT '[]',
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            finished_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS scan_nodes (
-            task_id TEXT NOT NULL,
-            node_id TEXT NOT NULL,
-            parent_id TEXT,
-            path TEXT NOT NULL,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            depth INTEGER NOT NULL,
-            self_size INTEGER NOT NULL DEFAULT 0,
-            total_size INTEGER NOT NULL DEFAULT 0,
-            child_count INTEGER NOT NULL DEFAULT 0,
-            mtime_ms INTEGER,
-            ext TEXT,
-            PRIMARY KEY (task_id, node_id),
-            UNIQUE (task_id, path)
-        );
-
-        CREATE TABLE IF NOT EXISTS scan_findings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            path TEXT NOT NULL,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            size INTEGER NOT NULL DEFAULT 0,
-            classification TEXT NOT NULL,
-            should_expand INTEGER NOT NULL DEFAULT 0,
-            purpose TEXT,
-            reason TEXT,
-            risk TEXT,
-            source TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE (task_id, path)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_scan_nodes_parent
-        ON scan_nodes(task_id, parent_id, total_size DESC);
-
-        CREATE INDEX IF NOT EXISTS idx_scan_nodes_path
-        ON scan_nodes(task_id, path);
-
-        CREATE INDEX IF NOT EXISTS idx_scan_findings_classification
-        ON scan_findings(task_id, classification, size DESC);
-        "#,
-    )?;
-    Ok(())
 }
 
 fn absolutize_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {

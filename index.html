@@ -105,8 +105,13 @@
     }
 
     @keyframes boot-slide {
-      0% { transform: translateX(-120%); }
-      100% { transform: translateX(340%); }
+      0% {
+        transform: translateX(-120%);
+      }
+
+      100% {
+        transform: translateX(340%);
+      }
     }
   </style>
   <link rel="stylesheet" href="/src/styles/global.css" />
@@ -134,7 +139,7 @@
         </div>
       </div>
       <div class="boot-bar"></div>
-      <div class="boot-hint">开发模式下首次连接前端资源时会略慢，但不应再出现纯白空窗。</div>
+      <div class="boot-hint">开发模式下首次连接前端资源时会稍慢，但不应再出现纯白空窗。</div>
     </div>
   </div>
 
@@ -182,6 +187,10 @@
           </a></li>
       </ul>
 
+      <div class="sidebar-provider-action">
+        <button id="provider-manager-btn" class="btn btn-provider-manager" data-i18n="topbar.manage_api">服务商 API</button>
+      </div>
+
       <div class="sidebar-footer">
         <span class="version">v1.0.0</span>
         <div class="lang-switch-container">
@@ -193,13 +202,6 @@
     </nav>
 
     <main id="content">
-      <header id="topbar" class="topbar">
-        <div class="topbar-title-wrap">
-          <h1 class="topbar-title" data-i18n="topbar.title">工作台</h1>
-          <p class="topbar-subtitle" data-i18n="topbar.subtitle">文件清理与归类</p>
-        </div>
-        <button id="provider-manager-btn" class="btn btn-provider-manager" data-i18n="topbar.manage_api">服务商 API</button>
-      </header>
       <div id="page-container"></div>
     </main>
   </div>
@@ -212,7 +214,7 @@
           <h2 id="provider-modal-title" class="card-title" data-i18n="provider_modal.title">服务商 API 管理</h2>
           <p class="form-hint modal-subtitle" data-i18n="provider_modal.subtitle">集中配置各服务商 API Key 与默认模型</p>
         </div>
-        <button id="provider-modal-close" class="btn btn-ghost" type="button">✕</button>
+        <button id="provider-modal-close" class="btn btn-ghost" type="button">×</button>
       </div>
       <div id="provider-list" class="provider-list"></div>
       <div class="app-modal-actions">
@@ -221,12 +223,15 @@
       </div>
       <div id="provider-close-confirm" class="provider-close-confirm" hidden>
         <div class="provider-close-confirm-backdrop"></div>
-        <section class="provider-close-confirm-card card secret-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="provider-close-confirm-title">
+        <section class="provider-close-confirm-card card secret-dialog-panel" role="dialog" aria-modal="true"
+          aria-labelledby="provider-close-confirm-title">
           <h3 id="provider-close-confirm-title" class="card-title" data-i18n="provider_modal.unsaved_title">未保存变更</h3>
-          <p class="secret-dialog-message" data-i18n="provider_modal.unsaved_message">检测到未保存的 API 配置，关闭前请先保存。</p>
+          <p class="secret-dialog-message" data-i18n="provider_modal.unsaved_message">检测到未保存的 API 配置。关闭将丢失所有未保存的修改。</p>
           <div class="app-modal-actions provider-close-confirm-actions">
-            <button id="provider-close-confirm-cancel" class="btn btn-ghost" type="button" data-i18n="provider_modal.unsaved_continue">继续编辑</button>
-            <button id="provider-close-confirm-discard" class="btn btn-danger" type="button" data-i18n="provider_modal.unsaved_discard_close">不保存关闭</button>
+            <button id="provider-close-confirm-cancel" class="btn btn-ghost" type="button"
+              data-i18n="provider_modal.unsaved_continue">继续编辑</button>
+            <button id="provider-close-confirm-discard" class="btn btn-danger" type="button"
+              data-i18n="provider_modal.unsaved_discard_close">不保存关闭</button>
           </div>
         </section>
       </div>

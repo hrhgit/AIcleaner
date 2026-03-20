@@ -1,0 +1,1 @@
+import{t as e}from"./html-derivative-8PNiyhio.js";export{e as default};

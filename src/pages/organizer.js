@@ -22,19 +22,23 @@ import {
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.organizer.global.root_path.v1',
-  recursive: 'wipeout.organizer.global.recursive.v1',
   mode: 'wipeout.organizer.global.mode.v1',
+  referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v1',
   allowNewCategories: 'wipeout.organizer.global.allow_new_categories.v1',
   categories: 'wipeout.organizer.global.categories.v1',
   exclusions: 'wipeout.organizer.global.exclusions.v1',
   parallelism: 'wipeout.organizer.global.parallelism.v1',
   useWebSearch: 'wipeout.organizer.global.use_web_search.v1',
   modelRouting: 'wipeout.organizer.global.model_routing.v1',
-  modelSelection: 'wipeout.organizer.global.model_selection.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
   lastTaskId: 'wipeout.organizer.global.last_task_id.v1',
   lastSnapshot: 'wipeout.organizer.global.last_snapshot.v1',
 };
+
+const LEGACY_PERSIST_KEYS = [
+  'wipeout.organizer.global.recursive.v1',
+  'wipeout.organizer.global.model_selection.v1',
+];
 
 const DEFAULT_CATEGORIES = [
   '工作学习',
@@ -141,6 +145,36 @@ function setPersisted(key, value) {
   }
 }
 
+function removePersisted(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function cleanupLegacyPersistedState() {
+  for (const key of LEGACY_PERSIST_KEYS) {
+    removePersisted(key);
+  }
+}
+
+function getErrorMessage(err) {
+  if (typeof err === 'string' && err.trim()) {
+    return err.trim();
+  }
+  if (err && typeof err === 'object') {
+    if (typeof err.message === 'string' && err.message.trim()) {
+      return err.message.trim();
+    }
+    if (typeof err.error === 'string' && err.error.trim()) {
+      return err.error.trim();
+    }
+  }
+  const text = String(err ?? '').trim();
+  return text && text !== '[object Object]' ? text : 'unknown error';
+}
+
 function parseListInput(text) {
   return String(text || '')
     .split(/[\n,]/)
@@ -180,9 +214,6 @@ function syncProviderApiKeys(settings = {}) {
     for (const [endpoint] of Object.entries(settings.providerConfigs)) {
       providerApiKeyMap[String(endpoint).trim()] = getProviderCredentialPresence(settings, endpoint);
     }
-  }
-  if (settings?.apiEndpoint && !providerApiKeyMap[settings.apiEndpoint]) {
-    providerApiKeyMap[settings.apiEndpoint] = getProviderCredentialPresence(settings, settings.apiEndpoint);
   }
 }
 
@@ -226,8 +257,10 @@ function readModelRoutingFromDOM() {
 
 function collectForm() {
   const rootPath = document.getElementById('org-root-path')?.value?.trim() || '';
-  const recursive = !!document.getElementById('org-recursive')?.checked;
+  const recursive = true;
   const mode = document.getElementById('org-mode')?.value || 'fast';
+  const referenceOriginalStructure =
+    !!document.getElementById('org-reference-original-structure')?.checked;
   const allowNewCategories = !!document.getElementById('org-allow-new-categories')?.checked;
   const categories = parseListInput(document.getElementById('org-categories')?.value || '');
   const excludedPatterns = parseListInput(document.getElementById('org-exclusions')?.value || '');
@@ -239,6 +272,7 @@ function collectForm() {
     rootPath,
     recursive,
     mode,
+    referenceOriginalStructure,
     allowNewCategories,
     categories: categories.length ? categories : [...DEFAULT_CATEGORIES],
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
@@ -251,8 +285,8 @@ function collectForm() {
 
 function persistForm(data) {
   setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
-  setPersisted(PERSIST_KEYS.recursive, data.recursive);
   setPersisted(PERSIST_KEYS.mode, data.mode);
+  setPersisted(PERSIST_KEYS.referenceOriginalStructure, data.referenceOriginalStructure);
   setPersisted(PERSIST_KEYS.allowNewCategories, data.allowNewCategories);
   setPersisted(PERSIST_KEYS.categories, data.categories);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
@@ -262,26 +296,17 @@ function persistForm(data) {
 }
 
 function restoreDefaults() {
-  const legacyModelSelection = getPersisted(PERSIST_KEYS.modelSelection, {});
   const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
-
-  const fallbackRouting = {
-    text: { endpoint: '', model: legacyModelSelection?.text || '' },
-    image: { endpoint: '', model: legacyModelSelection?.image || '' },
-    video: { endpoint: '', model: legacyModelSelection?.video || '' },
-    audio: { endpoint: '', model: legacyModelSelection?.audio || '' },
-  };
-
   return {
     rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
-    recursive: getPersisted(PERSIST_KEYS.recursive, true),
     mode: getPersisted(PERSIST_KEYS.mode, 'fast'),
+    referenceOriginalStructure: getPersisted(PERSIST_KEYS.referenceOriginalStructure, false),
     allowNewCategories: getPersisted(PERSIST_KEYS.allowNewCategories, true),
     categories: getPersisted(PERSIST_KEYS.categories, DEFAULT_CATEGORIES),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
     parallelism: getPersisted(PERSIST_KEYS.parallelism, 5),
     useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
-    modelRouting: modelRouting || fallbackRouting,
+    modelRouting: modelRouting || {},
   };
 }
 
@@ -293,34 +318,14 @@ function resolveSearchApi(settings) {
     ? source.scopes
     : {};
 
-  const scanEnabled = typeof scopes.scan === 'boolean'
-    ? scopes.scan
-    : !!settings?.enableWebSearch;
-  const classifyEnabled = typeof scopes.classify === 'boolean'
-    ? scopes.classify
-    : (typeof scopes.organizer === 'boolean'
-      ? scopes.organizer
-      : (settings?.enableWebSearchClassify != null
-        ? !!settings.enableWebSearchClassify
-        : (settings?.enableWebSearchOrganizer != null
-          ? !!settings.enableWebSearchOrganizer
-          : scanEnabled)));
-  const organizerEnabled = typeof scopes.organizer === 'boolean'
-    ? scopes.organizer
-    : classifyEnabled;
-  const enabled = typeof source.enabled === 'boolean'
-    ? source.enabled
-    : (scanEnabled || classifyEnabled || organizerEnabled);
-  const apiKey = String(source.apiKey || settings?.tavilyApiKey || '').trim();
-
   return {
     provider: 'tavily',
-    enabled: !!enabled,
-    apiKey,
+    enabled: !!source.enabled,
+    apiKey: String(source.apiKey || '').trim(),
     scopes: {
-      scan: !!scanEnabled,
-      classify: !!classifyEnabled,
-      organizer: !!organizerEnabled,
+      scan: !!scopes.scan,
+      classify: !!scopes.classify,
+      organizer: !!scopes.organizer,
     },
   };
 }
@@ -340,9 +345,6 @@ async function syncClassifyWebSearchToSettings(isEnabled) {
 
   await saveSettings({
     searchApi: nextSearchApi,
-    enableWebSearch: nextSearchApi.enabled && nextSearchApi.scopes.scan,
-    enableWebSearchClassify: nextSearchApi.enabled && nextSearchApi.scopes.classify,
-    enableWebSearchOrganizer: nextSearchApi.enabled && nextSearchApi.scopes.organizer,
   });
 }
 
@@ -411,9 +413,7 @@ function renderCapability(snapshot) {
     || (useDomSelections ? domSelections.selectedModels : latestCapability?.selectedModels);
   const selectedProviders = snapshot?.selectedProviders
     || (useDomSelections ? domSelections.selectedProviders : latestCapability?.selectedProviders);
-  const fallbackModel = snapshot?.selectedModel
-    || (useDomSelections ? domSelections.selectedModels?.text : latestCapability?.selectedModel)
-    || '-';
+  const fallbackModel = selectedModels?.text || '-';
   const labelByEndpoint = new Map(PROVIDER_OPTIONS.map((item) => [item.value, item.label]));
   const renderCell = (modality) => {
     const endpoint = selectedProviders?.[modality] || '';
@@ -518,8 +518,12 @@ async function initModelRoutingFields(defaultRouting = {}) {
 
   syncProviderApiKeys(settings);
 
-  const baseEndpoint = String(settings?.apiEndpoint || 'https://api.deepseek.com').trim();
-  const baseModel = String(settings?.model || 'deepseek-chat').trim();
+  const baseEndpoint = String(settings?.defaultProviderEndpoint || 'https://api.deepseek.com').trim();
+  const baseModel = String(
+    settings?.providerConfigs?.[baseEndpoint]?.model
+    || PROVIDER_MODELS[baseEndpoint]?.[0]?.value
+    || 'deepseek-chat'
+  ).trim();
 
   for (const option of PROVIDER_OPTIONS) {
     for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
@@ -745,6 +749,14 @@ function syncAllowNewCategoriesInput(snapshot) {
   checkbox.checked = snapshot.allowNewCategories;
 }
 
+function syncReferenceOriginalStructureInput(snapshot) {
+  if (!snapshot || typeof snapshot.referenceOriginalStructure !== 'boolean') return;
+  const checkbox = document.getElementById('org-reference-original-structure');
+  if (!checkbox) return;
+  if (checkbox.checked === snapshot.referenceOriginalStructure) return;
+  checkbox.checked = snapshot.referenceOriginalStructure;
+}
+
 function refreshView(snapshot) {
   latestSnapshot = snapshot || null;
   if (snapshot?.id) {
@@ -758,6 +770,7 @@ function refreshView(snapshot) {
     setPersisted(PERSIST_KEYS.lastJobId, snapshot.jobId);
   }
   syncAllowNewCategoriesInput(snapshot);
+  syncReferenceOriginalStructureInput(snapshot);
   syncCategoryInput(snapshot);
   setStatusText(snapshot);
   renderCapability(snapshot);
@@ -791,7 +804,7 @@ function connectTaskStream(taskId) {
       refreshView(snap);
     },
     onError: (err) => {
-      showToast(`${t('organizer.toast_failed')}${err?.message || ''}`, 'error');
+      showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
     },
   });
 }
@@ -811,7 +824,7 @@ async function handleBrowse() {
       persistForm(data);
     }
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = t('settings.browse');
@@ -850,7 +863,7 @@ async function handleSuggest() {
     persistForm({ ...form, categories });
     showToast(t('organizer.toast_suggest_done'), 'success');
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -889,7 +902,7 @@ async function handleStart() {
       syncProviderApiKeys(settingsSnapshot);
       refreshOrganizerApiConfigHint();
     } catch (err) {
-      showToast(err.message, 'error');
+      showToast(getErrorMessage(err), 'error');
       return;
     }
     const stillMissingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
@@ -910,7 +923,6 @@ async function handleStart() {
     const result = await startOrganize(form);
     activeTaskId = result.taskId;
     latestCapability = {
-      selectedModel: result.selectedModel,
       selectedModels: result.selectedModels,
       selectedProviders: result.selectedProviders,
       supportsMultimodal: result.supportsMultimodal,
@@ -920,7 +932,7 @@ async function handleStart() {
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -965,7 +977,7 @@ async function handleApply() {
     const snapshot = await getOrganizeResult(activeTaskId);
     refreshView(snapshot);
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -991,7 +1003,7 @@ async function handleStop() {
     await stopOrganize(activeTaskId);
     showToast(t('organizer.toast_stopped'), 'info');
   } catch (err) {
-    showToast(`${t('organizer.toast_stop_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_stop_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.textContent = t('organizer.stop');
@@ -1038,7 +1050,7 @@ async function handleRollback() {
       showToast(t('organizer.toast_rollback_done'), 'success');
     }
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -1057,7 +1069,7 @@ async function handleCopyTextRoute() {
     await applyTextRouteToOtherModalities();
     showToast(t('organizer.toast_route_copied'), 'success');
   } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${err.message}`, 'error');
+    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -1068,8 +1080,8 @@ async function handleCopyTextRoute() {
 function bindPersistenceListeners() {
   [
     'org-root-path',
-    'org-recursive',
     'org-mode',
+    'org-reference-original-structure',
     'org-allow-new-categories',
     'org-enable-web-search',
     'org-categories',
@@ -1087,7 +1099,7 @@ function bindPersistenceListeners() {
     const el = document.getElementById(id);
     if (!el) return;
     const eventName = [
-      'org-recursive',
+      'org-reference-original-structure',
       'org-allow-new-categories',
       'org-enable-web-search',
       'org-mode',
@@ -1135,6 +1147,7 @@ function bindModelRoutingListeners() {
 export async function renderOrganizer(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
+  cleanupLegacyPersistedState();
   const defaults = restoreDefaults();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
 
@@ -1160,19 +1173,20 @@ export async function renderOrganizer(container) {
 
       <div class="grid-2">
         <div class="form-group">
-          <label class="form-label">${t('organizer.scope')}</label>
-          <label style="display:flex;align-items:center;gap:8px;">
-            <input id="org-recursive" type="checkbox" ${defaults.recursive ? 'checked' : ''} />
-            <span>${t('organizer.scope_recursive')}</span>
-          </label>
-        </div>
-        <div class="form-group">
           <label class="form-label">${t('organizer.mode')}</label>
           <select id="org-mode" class="form-input">
             <option value="fast" ${defaults.mode === 'fast' ? 'selected' : ''}>${t('organizer.mode_fast')}</option>
             <option value="balanced" ${defaults.mode === 'balanced' ? 'selected' : ''}>${t('organizer.mode_balanced')}</option>
             <option value="deep" ${defaults.mode === 'deep' ? 'selected' : ''}>${t('organizer.mode_deep')}</option>
           </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">${t('organizer.reference_original_structure')}</label>
+          <label style="display:flex;align-items:center;gap:8px;">
+            <input id="org-reference-original-structure" type="checkbox" ${defaults.referenceOriginalStructure ? 'checked' : ''} />
+            <span>${t('organizer.reference_original_structure')}</span>
+          </label>
+          <div class="form-hint">${t('organizer.reference_original_structure_hint')}</div>
         </div>
       </div>
 
