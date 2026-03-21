@@ -10,7 +10,6 @@
   rollbackOrganize,
   startOrganize,
   stopOrganize,
-  suggestOrganizeCategories,
 } from '../utils/api.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
@@ -22,32 +21,25 @@ import {
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.organizer.global.root_path.v1',
-  mode: 'wipeout.organizer.global.mode.v1',
   referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v1',
-  allowNewCategories: 'wipeout.organizer.global.allow_new_categories.v1',
-  categories: 'wipeout.organizer.global.categories.v1',
   exclusions: 'wipeout.organizer.global.exclusions.v1',
-  parallelism: 'wipeout.organizer.global.parallelism.v1',
+  batchSize: 'wipeout.organizer.global.batch_size.v1',
+  maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v1',
   useWebSearch: 'wipeout.organizer.global.use_web_search.v1',
   modelRouting: 'wipeout.organizer.global.model_routing.v1',
   lastJobId: 'wipeout.organizer.global.last_job_id.v1',
   lastTaskId: 'wipeout.organizer.global.last_task_id.v1',
   lastSnapshot: 'wipeout.organizer.global.last_snapshot.v1',
+  lastApplyManifest: 'wipeout.organizer.global.last_apply_manifest.v1',
 };
 
 const LEGACY_PERSIST_KEYS = [
   'wipeout.organizer.global.recursive.v1',
   'wipeout.organizer.global.model_selection.v1',
-];
-
-const DEFAULT_CATEGORIES = [
-  '工作学习',
-  '财务票据',
-  '媒体素材',
-  '开发项目',
-  '安装与压缩',
-  '临时下载',
-  '其他待定',
+  'wipeout.organizer.global.mode.v1',
+  'wipeout.organizer.global.allow_new_categories.v1',
+  'wipeout.organizer.global.categories.v1',
+  'wipeout.organizer.global.parallelism.v1',
 ];
 
 const DEFAULT_EXCLUSIONS = [
@@ -60,6 +52,41 @@ const DEFAULT_EXCLUSIONS = [
   'Program Files',
   'Program Files (x86)',
 ];
+
+const DEFAULT_BATCH_SIZE = 50;
+
+const MOVE_RESULT_TEXT = {
+  zh: {
+    title: '移动结果',
+    moved: '已移动',
+    skipped: '已跳过',
+    failed: '失败',
+    total: '总数',
+    status: '状态',
+    reason: '原因',
+    empty: '暂无最近一次移动结果',
+    clean: '本次移动没有失败或跳过项',
+    reasonSkipped: '源路径与目标路径相同，无需重复移动',
+    statusMoved: '已移动',
+    statusSkipped: '已跳过',
+    statusFailed: '失败',
+  },
+  en: {
+    title: 'Move Results',
+    moved: 'Moved',
+    skipped: 'Skipped',
+    failed: 'Failed',
+    total: 'Total',
+    status: 'Status',
+    reason: 'Reason',
+    empty: 'No recent move result yet',
+    clean: 'This move had no failed or skipped items',
+    reasonSkipped: 'Source and target are identical, so the move was skipped',
+    statusMoved: 'Moved',
+    statusSkipped: 'Skipped',
+    statusFailed: 'Failed',
+  },
+};
 
 const MODEL_SELECT_IDS = {
   text: 'org-model-text',
@@ -175,6 +202,24 @@ function getErrorMessage(err) {
   return text && text !== '[object Object]' ? text : 'unknown error';
 }
 
+function getMoveResultText(key) {
+  const lang = getLang() === 'en' ? 'en' : 'zh';
+  return MOVE_RESULT_TEXT[lang]?.[key] || MOVE_RESULT_TEXT.zh[key] || key;
+}
+
+function setPersistedApplyManifest(manifest) {
+  if (manifest && typeof manifest === 'object') {
+    setPersisted(PERSIST_KEYS.lastApplyManifest, manifest);
+    return;
+  }
+  removePersisted(PERSIST_KEYS.lastApplyManifest);
+}
+
+function getPersistedApplyManifest() {
+  const manifest = getPersisted(PERSIST_KEYS.lastApplyManifest, null);
+  return manifest && typeof manifest === 'object' ? manifest : null;
+}
+
 function parseListInput(text) {
   return String(text || '')
     .split(/[\n,]/)
@@ -258,25 +303,28 @@ function readModelRoutingFromDOM() {
 function collectForm() {
   const rootPath = document.getElementById('org-root-path')?.value?.trim() || '';
   const recursive = true;
-  const mode = document.getElementById('org-mode')?.value || 'fast';
   const referenceOriginalStructure =
     !!document.getElementById('org-reference-original-structure')?.checked;
-  const allowNewCategories = !!document.getElementById('org-allow-new-categories')?.checked;
-  const categories = parseListInput(document.getElementById('org-categories')?.value || '');
   const excludedPatterns = parseListInput(document.getElementById('org-exclusions')?.value || '');
-  const parallelism = Number(document.getElementById('org-parallelism')?.value || 5);
+  const batchSizeRaw = Number(document.getElementById('org-batch-size')?.value || DEFAULT_BATCH_SIZE);
+  const maxClusterDepthInput = String(document.getElementById('org-max-cluster-depth')?.value || '').trim();
+  const parsedMaxClusterDepth = maxClusterDepthInput ? Number(maxClusterDepthInput) : null;
   const useWebSearch = !!document.getElementById('org-enable-web-search')?.checked;
   const modelRouting = readModelRoutingFromDOM();
+  const batchSize = Number.isFinite(batchSizeRaw)
+    ? Math.max(1, Math.min(200, Math.floor(batchSizeRaw)))
+    : DEFAULT_BATCH_SIZE;
+  const maxClusterDepth = Number.isFinite(parsedMaxClusterDepth) && parsedMaxClusterDepth > 0
+    ? Math.floor(parsedMaxClusterDepth)
+    : null;
 
   return {
     rootPath,
     recursive,
-    mode,
     referenceOriginalStructure,
-    allowNewCategories,
-    categories: categories.length ? categories : [...DEFAULT_CATEGORIES],
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
-    parallelism: Number.isFinite(parallelism) ? Math.max(1, Math.min(20, Math.floor(parallelism))) : 5,
+    batchSize,
+    maxClusterDepth,
     useWebSearch,
     modelRouting,
     responseLanguage: getLang(),
@@ -285,12 +333,10 @@ function collectForm() {
 
 function persistForm(data) {
   setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
-  setPersisted(PERSIST_KEYS.mode, data.mode);
   setPersisted(PERSIST_KEYS.referenceOriginalStructure, data.referenceOriginalStructure);
-  setPersisted(PERSIST_KEYS.allowNewCategories, data.allowNewCategories);
-  setPersisted(PERSIST_KEYS.categories, data.categories);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
-  setPersisted(PERSIST_KEYS.parallelism, data.parallelism);
+  setPersisted(PERSIST_KEYS.batchSize, data.batchSize);
+  setPersisted(PERSIST_KEYS.maxClusterDepth, data.maxClusterDepth);
   setPersisted(PERSIST_KEYS.useWebSearch, data.useWebSearch);
   setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
 }
@@ -299,12 +345,10 @@ function restoreDefaults() {
   const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
   return {
     rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
-    mode: getPersisted(PERSIST_KEYS.mode, 'fast'),
     referenceOriginalStructure: getPersisted(PERSIST_KEYS.referenceOriginalStructure, false),
-    allowNewCategories: getPersisted(PERSIST_KEYS.allowNewCategories, true),
-    categories: getPersisted(PERSIST_KEYS.categories, DEFAULT_CATEGORIES),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
-    parallelism: getPersisted(PERSIST_KEYS.parallelism, 5),
+    batchSize: getPersisted(PERSIST_KEYS.batchSize, DEFAULT_BATCH_SIZE),
+    maxClusterDepth: getPersisted(PERSIST_KEYS.maxClusterDepth, null),
     useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
     modelRouting: modelRouting || {},
   };
@@ -592,15 +636,20 @@ function renderPreview(snapshot) {
 
   const groups = new Map();
   for (const item of preview) {
-    const category = String(item.category || '其他待定').trim() || '其他待定';
-    if (!groups.has(category)) {
-      groups.set(category, []);
+    const categoryPath = Array.isArray(item.categoryPath)
+      ? item.categoryPath.map((segment) => String(segment || '').trim()).filter(Boolean)
+      : [];
+    const key = categoryPath.length
+      ? categoryPath.join(' / ')
+      : String(item.category || t('organizer.uncategorized')).trim() || t('organizer.uncategorized');
+    if (!groups.has(key)) {
+      groups.set(key, []);
     }
-    groups.get(category).push(item);
+    groups.get(key).push(item);
   }
 
   const sortedGroups = Array.from(groups.entries()).sort(([a], [b]) => String(a).localeCompare(String(b), 'zh-Hans-CN'));
-  groupsEl.innerHTML = sortedGroups.map(([category, items], groupIdx) => {
+  groupsEl.innerHTML = sortedGroups.map(([categoryPathLabel, items], groupIdx) => {
     const rows = items.map((item, rowIdx) => {
       const row = resultsMap.get(item.sourcePath);
       const degraded = row?.degraded
@@ -622,7 +671,7 @@ function renderPreview(snapshot) {
     return `
       <section class="preview-group" style="animation: slideUp 0.2s var(--ease-out) ${Math.min(groupIdx * 0.03, 0.4)}s both;">
         <div class="preview-group-header">
-          <span class="badge badge-info">${escapeHtml(category)}</span>
+          <span class="badge badge-info">${escapeHtml(categoryPathLabel)}</span>
           <span class="preview-group-count">${items.length}</span>
         </div>
         <div class="preview-group-table-wrap">
@@ -667,6 +716,97 @@ function renderDegradedPanel(snapshot) {
         <td>
           <div class="file-name" title="${escapeHtml(row.name || '')}">${escapeHtml(row.name || '')}</div>
           <div class="file-path" title="${escapeHtml(row.path || '')}">${escapeHtml(row.path || '')}</div>
+        </td>
+        <td><div class="file-purpose">${escapeHtml(reason)}</div></td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function getMoveStatusLabel(status) {
+  if (status === 'failed') return getMoveResultText('statusFailed');
+  if (status === 'skipped') return getMoveResultText('statusSkipped');
+  return getMoveResultText('statusMoved');
+}
+
+function getMoveStatusBadge(status) {
+  if (status === 'failed') return 'badge-danger';
+  if (status === 'skipped') return 'badge-warning';
+  return 'badge-success';
+}
+
+function getActiveApplyManifest(snapshot = latestSnapshot) {
+  const manifest = getPersistedApplyManifest();
+  if (!manifest) return null;
+
+  const manifestTaskId = String(manifest.taskId || '').trim();
+  const manifestJobId = String(manifest.jobId || '').trim();
+  const snapshotTaskId = String(snapshot?.id || activeTaskId || '').trim();
+  const snapshotJobId = String(snapshot?.jobId || getPersisted(PERSIST_KEYS.lastJobId, null) || '').trim();
+
+  if (snapshotTaskId && manifestTaskId && snapshotTaskId !== manifestTaskId) {
+    return null;
+  }
+  if (snapshotJobId && manifestJobId && snapshotJobId !== manifestJobId) {
+    return null;
+  }
+  return manifest;
+}
+
+function renderApplyResultPanel(snapshot = latestSnapshot) {
+  const card = document.getElementById('org-move-result-card');
+  const movedEl = document.getElementById('org-move-moved');
+  const skippedEl = document.getElementById('org-move-skipped');
+  const failedEl = document.getElementById('org-move-failed');
+  const totalEl = document.getElementById('org-move-total');
+  const tbody = document.getElementById('org-move-result-body');
+  const empty = document.getElementById('org-move-result-empty');
+  if (!card || !movedEl || !skippedEl || !failedEl || !totalEl || !tbody || !empty) return;
+
+  const manifest = getActiveApplyManifest(snapshot);
+  if (!manifest) {
+    card.hidden = true;
+    tbody.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+
+  card.hidden = false;
+  const summary = manifest.summary && typeof manifest.summary === 'object' ? manifest.summary : {};
+  const moved = Number(summary.moved || 0);
+  const skipped = Number(summary.skipped || 0);
+  const failed = Number(summary.failed || 0);
+  const total = Number(summary.total || 0);
+  const issueEntries = (Array.isArray(manifest.entries) ? manifest.entries : [])
+    .filter((entry) => String(entry?.status || '').trim() !== 'moved');
+
+  movedEl.textContent = String(moved);
+  skippedEl.textContent = String(skipped);
+  failedEl.textContent = String(failed);
+  totalEl.textContent = String(total);
+
+  if (!issueEntries.length) {
+    tbody.innerHTML = '';
+    empty.querySelector('.empty-state-text').textContent = getMoveResultText('clean');
+    empty.style.display = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  tbody.innerHTML = issueEntries.map((entry, idx) => {
+    const status = String(entry?.status || '').trim() || 'failed';
+    const reason = status === 'skipped'
+      ? getMoveResultText('reasonSkipped')
+      : (String(entry?.error || '').trim() || t('organizer.degraded_reason_unknown'));
+
+    return `
+      <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(idx * 0.01, 0.3)}s both;">
+        <td><span class="badge ${getMoveStatusBadge(status)}">${escapeHtml(getMoveStatusLabel(status))}</span></td>
+        <td>
+          <div class="file-path" title="${escapeHtml(entry?.sourcePath || '')}">${escapeHtml(entry?.sourcePath || '')}</div>
+        </td>
+        <td>
+          <div class="file-path" title="${escapeHtml(entry?.targetPath || '')}">${escapeHtml(entry?.targetPath || '')}</div>
         </td>
         <td><div class="file-purpose">${escapeHtml(reason)}</div></td>
       </tr>
@@ -722,39 +862,32 @@ function updateButtons(snapshot) {
   }
 }
 
-function syncCategoryInput(snapshot) {
-  const next = Array.isArray(snapshot?.categories) ? snapshot.categories : [];
-  if (!next.length) return;
-
-  const textArea = document.getElementById('org-categories');
-  if (!textArea) return;
-
-  const current = parseListInput(textArea.value || '');
-  const unchanged =
-    current.length === next.length &&
-    current.every((value, index) => value === next[index]);
-
-  if (unchanged) return;
-
-  textArea.value = next.join('\n');
-  const form = collectForm();
-  persistForm({ ...form, categories: next });
-}
-
-function syncAllowNewCategoriesInput(snapshot) {
-  if (!snapshot || typeof snapshot.allowNewCategories !== 'boolean') return;
-  const checkbox = document.getElementById('org-allow-new-categories');
-  if (!checkbox) return;
-  if (checkbox.checked === snapshot.allowNewCategories) return;
-  checkbox.checked = snapshot.allowNewCategories;
-}
-
 function syncReferenceOriginalStructureInput(snapshot) {
   if (!snapshot || typeof snapshot.referenceOriginalStructure !== 'boolean') return;
   const checkbox = document.getElementById('org-reference-original-structure');
   if (!checkbox) return;
   if (checkbox.checked === snapshot.referenceOriginalStructure) return;
   checkbox.checked = snapshot.referenceOriginalStructure;
+}
+
+function syncBatchConfigInputs(snapshot) {
+  if (!snapshot) return;
+
+  const batchSizeInput = document.getElementById('org-batch-size');
+  if (batchSizeInput && Number(snapshot.batchSize || 0) > 0) {
+    const nextValue = String(snapshot.batchSize);
+    if (String(batchSizeInput.value || '') !== nextValue) {
+      batchSizeInput.value = nextValue;
+    }
+  }
+
+  const depthInput = document.getElementById('org-max-cluster-depth');
+  if (depthInput) {
+    const nextValue = snapshot.maxClusterDepth == null ? '' : String(snapshot.maxClusterDepth);
+    if (String(depthInput.value || '') !== nextValue) {
+      depthInput.value = nextValue;
+    }
+  }
 }
 
 function refreshView(snapshot) {
@@ -768,14 +901,16 @@ function refreshView(snapshot) {
   }
   if (snapshot?.jobId) {
     setPersisted(PERSIST_KEYS.lastJobId, snapshot.jobId);
+  } else {
+    removePersisted(PERSIST_KEYS.lastJobId);
   }
-  syncAllowNewCategoriesInput(snapshot);
   syncReferenceOriginalStructureInput(snapshot);
-  syncCategoryInput(snapshot);
+  syncBatchConfigInputs(snapshot);
   setStatusText(snapshot);
   renderCapability(snapshot);
   updateStats(snapshot);
   renderPreview(snapshot);
+  renderApplyResultPanel(snapshot);
   renderDegradedPanel(snapshot);
   updateButtons(snapshot);
 }
@@ -831,56 +966,11 @@ async function handleBrowse() {
   }
 }
 
-async function handleSuggest() {
-  const form = collectForm();
-  if (!form.rootPath) {
-    showToast(t('organizer.path_required'), 'error');
-    return;
-  }
-
-  const btn = document.getElementById('org-suggest-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = `<span class="spinner"></span> ${t('organizer.suggesting')}`;
-  }
-
-  try {
-    const resp = await suggestOrganizeCategories({
-      rootPath: form.rootPath,
-      recursive: form.recursive,
-      excludedPatterns: form.excludedPatterns,
-      manualCategories: form.categories,
-      useWebSearch: form.useWebSearch,
-      modelRouting: form.modelRouting,
-    });
-
-    const categories = resp?.suggestedCategories || form.categories;
-    const textArea = document.getElementById('org-categories');
-    if (textArea) {
-      textArea.value = categories.join('\n');
-    }
-
-    persistForm({ ...form, categories });
-    showToast(t('organizer.toast_suggest_done'), 'success');
-  } catch (err) {
-    showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = t('organizer.suggest_categories');
-    }
-  }
-}
-
 async function handleStart() {
   const form = collectForm();
   if (!form.rootPath) {
     showToast(t('organizer.path_required'), 'error');
     return;
-  }
-
-  if (form.mode === 'deep') {
-    showToast(t('organizer.deep_warning'), 'info');
   }
 
   persistForm(form);
@@ -922,12 +1012,14 @@ async function handleStart() {
   try {
     const result = await startOrganize(form);
     activeTaskId = result.taskId;
+    setPersistedApplyManifest(null);
     latestCapability = {
       selectedModels: result.selectedModels,
       selectedProviders: result.selectedProviders,
       supportsMultimodal: result.supportsMultimodal,
     };
     renderCapability();
+    renderApplyResultPanel(null);
     setPersisted(PERSIST_KEYS.lastTaskId, activeTaskId);
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
@@ -963,12 +1055,17 @@ async function handleApply() {
     if (jobId) {
       setPersisted(PERSIST_KEYS.lastJobId, jobId);
     }
+    setPersistedApplyManifest(result?.manifest || null);
 
     const summary = result?.manifest?.summary;
     if (summary) {
+      const moved = Number(summary.moved || 0);
+      const skipped = Number(summary.skipped || 0);
+      const failed = Number(summary.failed || 0);
+      const total = Number(summary.total || 0);
       showToast(
-        t('organizer.toast_apply_done') + ` (${summary.moved}/${summary.total})`,
-        summary.failed > 0 ? 'info' : 'success'
+        `${t('organizer.toast_apply_done')} (${getMoveResultText('moved')}: ${moved}，${getMoveResultText('skipped')}: ${skipped}，${getMoveResultText('failed')}: ${failed}，${getMoveResultText('total')}: ${total})`,
+        failed > 0 ? 'error' : (skipped > 0 ? 'info' : 'success')
       );
     } else {
       showToast(t('organizer.toast_apply_done'), 'success');
@@ -1033,6 +1130,11 @@ async function handleRollback() {
     const result = await rollbackOrganize(jobId);
     const summary = result?.rollback?.summary;
     const persistedTaskId = activeTaskId || getPersisted(PERSIST_KEYS.lastTaskId, null);
+    if (summary && Number(summary.failed || 0) === 0) {
+      setPersistedApplyManifest(null);
+      removePersisted(PERSIST_KEYS.lastJobId);
+      renderApplyResultPanel(latestSnapshot);
+    }
     if (persistedTaskId) {
       try {
         const snapshot = await getOrganizeResult(persistedTaskId);
@@ -1056,6 +1158,7 @@ async function handleRollback() {
       btn.disabled = false;
       btn.textContent = t('organizer.rollback');
     }
+    updateButtons(latestSnapshot);
   }
 }
 
@@ -1080,13 +1183,11 @@ async function handleCopyTextRoute() {
 function bindPersistenceListeners() {
   [
     'org-root-path',
-    'org-mode',
     'org-reference-original-structure',
-    'org-allow-new-categories',
     'org-enable-web-search',
-    'org-categories',
     'org-exclusions',
-    'org-parallelism',
+    'org-batch-size',
+    'org-max-cluster-depth',
     PROVIDER_SELECT_IDS.text,
     PROVIDER_SELECT_IDS.image,
     PROVIDER_SELECT_IDS.video,
@@ -1100,9 +1201,7 @@ function bindPersistenceListeners() {
     if (!el) return;
     const eventName = [
       'org-reference-original-structure',
-      'org-allow-new-categories',
       'org-enable-web-search',
-      'org-mode',
       PROVIDER_SELECT_IDS.text,
       PROVIDER_SELECT_IDS.image,
       PROVIDER_SELECT_IDS.video,
@@ -1173,12 +1272,9 @@ export async function renderOrganizer(container) {
 
       <div class="grid-2">
         <div class="form-group">
-          <label class="form-label">${t('organizer.mode')}</label>
-          <select id="org-mode" class="form-input">
-            <option value="fast" ${defaults.mode === 'fast' ? 'selected' : ''}>${t('organizer.mode_fast')}</option>
-            <option value="balanced" ${defaults.mode === 'balanced' ? 'selected' : ''}>${t('organizer.mode_balanced')}</option>
-            <option value="deep" ${defaults.mode === 'deep' ? 'selected' : ''}>${t('organizer.mode_deep')}</option>
-          </select>
+          <label class="form-label">${t('organizer.batch_size')}</label>
+          <input id="org-batch-size" type="number" min="1" max="200" class="form-input no-spin" value="${Number(defaults.batchSize) || DEFAULT_BATCH_SIZE}" />
+          <div class="form-hint">${t('organizer.batch_size_hint')}</div>
         </div>
         <div class="form-group">
           <label class="form-label">${t('organizer.reference_original_structure')}</label>
@@ -1192,12 +1288,13 @@ export async function renderOrganizer(container) {
 
       <div class="grid-2">
         <div class="form-group">
-          <label class="form-label">${t('organizer.parallelism')}</label>
-          <input id="org-parallelism" type="number" min="1" max="20" class="form-input no-spin" value="${Number(defaults.parallelism) || 5}" />
+          <label class="form-label">${t('organizer.max_cluster_depth')}</label>
+          <input id="org-max-cluster-depth" type="number" min="1" class="form-input no-spin" value="${defaults.maxClusterDepth == null ? '' : Number(defaults.maxClusterDepth)}" placeholder="${t('organizer.max_cluster_depth_unlimited')}" />
+          <div class="form-hint">${t('organizer.max_cluster_depth_hint')}</div>
         </div>
         <div class="form-group">
           <label class="form-label">${t('organizer.cost_notice')}</label>
-          <div class="form-hint" id="org-deep-warning">${t('organizer.deep_hint')}</div>
+          <div class="form-hint">${t('organizer.batch_cluster_hint')}</div>
         </div>
       </div>
 
@@ -1265,24 +1362,13 @@ export async function renderOrganizer(container) {
 
       <div class="grid-2">
         <div class="form-group">
-          <label class="form-label">${t('organizer.categories')}</label>
-          <textarea id="org-categories" class="form-input" rows="8">${escapeHtml((defaults.categories || []).join('\n'))}</textarea>
-          <div class="form-hint">${t('organizer.categories_hint')}</div>
-          <label style="display:flex;align-items:center;gap:8px;margin-top:8px;">
-            <input id="org-allow-new-categories" type="checkbox" ${defaults.allowNewCategories ? 'checked' : ''} />
-            <span>${t('organizer.allow_new_categories')}</span>
-          </label>
-          <div class="form-hint">${t('organizer.allow_new_categories_hint')}</div>
-        </div>
-        <div class="form-group">
           <label class="form-label">${t('organizer.exclusions')}</label>
-          <textarea id="org-exclusions" class="form-input" rows="8">${escapeHtml((defaults.excludedPatterns || []).join('\n'))}</textarea>
+          <textarea id="org-exclusions" class="form-input" rows="8" style="grid-column: 1 / span 2;">${escapeHtml((defaults.excludedPatterns || []).join('\n'))}</textarea>
           <div class="form-hint">${t('organizer.exclusions_hint')}</div>
         </div>
       </div>
 
       <div class="flex items-center gap-16">
-        <button id="org-suggest-btn" class="btn btn-ghost" type="button">${t('organizer.suggest_categories')}</button>
         <button id="org-start-btn" class="btn btn-primary" type="button">${t('organizer.start')}</button>
         <button id="org-stop-btn" class="btn btn-danger" type="button" disabled>${t('organizer.stop')}</button>
         <button id="org-apply-btn" class="btn btn-success" type="button" disabled>${t('organizer.apply_move')}</button>
@@ -1331,6 +1417,46 @@ export async function renderOrganizer(container) {
       </div>
     </div>
 
+    <div id="org-move-result-card" class="card animate-in mt-24" style="animation-delay: 0.17s; padding: 0; overflow: hidden;" hidden>
+      <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
+        <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
+      </div>
+      <div class="stats-grid" style="padding: 20px 20px 0;">
+        <div class="stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
+          <span id="org-move-moved" class="stat-value success">0</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
+          <span id="org-move-skipped" class="stat-value warning">0</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
+          <span id="org-move-failed" class="stat-value danger">0</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
+          <span id="org-move-total" class="stat-value">0</span>
+        </div>
+      </div>
+      <div style="overflow-x:auto; padding: 20px 20px 0;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
+              <th style="width: 32%;">${t('organizer.source')}</th>
+              <th style="width: 32%;">${t('organizer.target')}</th>
+              <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
+            </tr>
+          </thead>
+          <tbody id="org-move-result-body"></tbody>
+        </table>
+      </div>
+      <div id="org-move-result-empty" class="empty-state" style="padding: 24px;">
+        <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
+      </div>
+    </div>
+
     <div class="card animate-in mt-24" style="animation-delay: 0.18s; padding: 0; overflow: hidden;">
       <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
         <h2 class="card-title">${t('organizer.degraded_panel_title')}</h2>
@@ -1354,7 +1480,6 @@ export async function renderOrganizer(container) {
   `;
 
   document.getElementById('org-browse-btn')?.addEventListener('click', handleBrowse);
-  document.getElementById('org-suggest-btn')?.addEventListener('click', handleSuggest);
   document.getElementById('org-start-btn')?.addEventListener('click', handleStart);
   document.getElementById('org-stop-btn')?.addEventListener('click', handleStop);
   document.getElementById('org-apply-btn')?.addEventListener('click', handleApply);

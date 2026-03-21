@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use sha1::Digest;
 use std::path::Path;
 
+const ORGANIZER_SCHEMA_VERSION: &str = "tree_v1";
+
 #[derive(Clone, Debug)]
 pub struct ScanNode {
     pub id: String,
@@ -68,6 +70,96 @@ fn bool_to_i64(value: bool) -> i64 {
     } else {
         0
     }
+}
+
+fn organizer_tables_exist(conn: &Connection) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+                'organize_tasks',
+                'organize_results',
+                'organize_jobs',
+                'organize_job_entries',
+                'organize_latest_trees'
+            )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+fn drop_organizer_tables(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS organize_job_entries;
+        DROP TABLE IF EXISTS organize_jobs;
+        DROP TABLE IF EXISTS organize_results;
+        DROP TABLE IF EXISTS organize_tasks;
+        DROP TABLE IF EXISTS organize_latest_trees;
+        "#,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn create_organizer_tables(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS organize_tasks (
+            task_id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            root_path_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            snapshot_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_organize_tasks_root
+        ON organize_tasks(root_path_key, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS organize_results (
+            task_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            leaf_node_id TEXT NOT NULL,
+            category_path_json TEXT NOT NULL DEFAULT '[]',
+            row_json TEXT NOT NULL,
+            PRIMARY KEY (task_id, idx),
+            UNIQUE (task_id, path)
+        );
+
+        CREATE TABLE IF NOT EXISTS organize_jobs (
+            job_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            rollback_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS organize_job_entries (
+            job_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            entry_type TEXT NOT NULL DEFAULT 'file',
+            category TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            PRIMARY KEY (job_id, idx)
+        );
+
+        CREATE TABLE IF NOT EXISTS organize_latest_trees (
+            root_path_key TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL,
+            tree_version INTEGER NOT NULL DEFAULT 0,
+            tree_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn create_node_id(path_value: &str) -> String {
@@ -155,76 +247,15 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         ON scan_findings(task_id, classification, size DESC);
         CREATE INDEX IF NOT EXISTS idx_scan_tasks_root_visible
         ON scan_tasks(root_path_key, visible_latest, updated_at DESC);
-
-        CREATE TABLE IF NOT EXISTS organize_tasks (
-            task_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            error TEXT,
-            root_path TEXT NOT NULL,
-            recursive INTEGER NOT NULL DEFAULT 1,
-            reference_original_structure INTEGER NOT NULL DEFAULT 0,
-            mode TEXT NOT NULL,
-            categories_json TEXT NOT NULL,
-            allow_new_categories INTEGER NOT NULL DEFAULT 1,
-            excluded_patterns_json TEXT NOT NULL,
-            parallelism INTEGER NOT NULL DEFAULT 5,
-            use_web_search INTEGER NOT NULL DEFAULT 0,
-            web_search_enabled INTEGER NOT NULL DEFAULT 0,
-            selected_model TEXT NOT NULL DEFAULT '',
-            selected_models_json TEXT NOT NULL,
-            selected_providers_json TEXT NOT NULL,
-            supports_multimodal INTEGER NOT NULL DEFAULT 0,
-            total_files INTEGER NOT NULL DEFAULT 0,
-            processed_files INTEGER NOT NULL DEFAULT 0,
-            token_prompt INTEGER NOT NULL DEFAULT 0,
-            token_completion INTEGER NOT NULL DEFAULT 0,
-            token_total INTEGER NOT NULL DEFAULT 0,
-            preview_json TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
-            job_id TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS organize_results (
-            task_id TEXT NOT NULL,
-            idx INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            path TEXT NOT NULL,
-            relative_path TEXT NOT NULL,
-            size INTEGER NOT NULL DEFAULT 0,
-            item_type TEXT NOT NULL DEFAULT 'file',
-            category TEXT NOT NULL,
-            created_category INTEGER NOT NULL DEFAULT 0,
-            degraded INTEGER NOT NULL DEFAULT 0,
-            warnings_json TEXT NOT NULL DEFAULT '[]',
-            modality TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
-            PRIMARY KEY (task_id, idx),
-            UNIQUE (task_id, path)
-        );
-
-        CREATE TABLE IF NOT EXISTS organize_jobs (
-            job_id TEXT PRIMARY KEY,
-            task_id TEXT NOT NULL,
-            root_path TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            manifest_json TEXT NOT NULL,
-            rollback_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS organize_job_entries (
-            job_id TEXT NOT NULL,
-            idx INTEGER NOT NULL,
-            source_path TEXT NOT NULL,
-            target_path TEXT NOT NULL,
-            entry_type TEXT NOT NULL DEFAULT 'file',
-            category TEXT NOT NULL,
-            status TEXT NOT NULL,
-            error TEXT,
-            PRIMARY KEY (job_id, idx)
-        );
         "#,
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
     )
     .map_err(|e| e.to_string())?;
     let scan_task_columns = conn
@@ -292,67 +323,29 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-    let organize_results_columns = conn
-        .prepare("PRAGMA table_info(organize_results)")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .map_err(|e| e.to_string())?;
-    if !organize_results_columns
-        .iter()
-        .any(|col| col == "item_type")
-    {
-        conn.execute(
-            "ALTER TABLE organize_results ADD COLUMN item_type TEXT NOT NULL DEFAULT 'file'",
+
+    let current_organizer_schema = conn
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'organizer_schema_version'",
             [],
+            |row| row.get::<_, String>(0),
         )
+        .optional()
         .map_err(|e| e.to_string())?;
+    let needs_reset = current_organizer_schema
+        .as_deref()
+        .map(|value| value != ORGANIZER_SCHEMA_VERSION)
+        .unwrap_or_else(|| organizer_tables_exist(&conn).unwrap_or(false));
+    if needs_reset {
+        drop_organizer_tables(&conn)?;
     }
-    let organize_task_columns = conn
-        .prepare("PRAGMA table_info(organize_tasks)")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .map_err(|e| e.to_string())?;
-    if !organize_task_columns
-        .iter()
-        .any(|col| col == "reference_original_structure")
-    {
-        conn.execute(
-            "ALTER TABLE organize_tasks ADD COLUMN reference_original_structure INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if !organize_task_columns
-        .iter()
-        .any(|col| col == "selected_model")
-    {
-        conn.execute(
-            "ALTER TABLE organize_tasks ADD COLUMN selected_model TEXT NOT NULL DEFAULT ''",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    let organize_job_entry_columns = conn
-        .prepare("PRAGMA table_info(organize_job_entries)")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .map_err(|e| e.to_string())?;
-    if !organize_job_entry_columns
-        .iter()
-        .any(|col| col == "entry_type")
-    {
-        conn.execute(
-            "ALTER TABLE organize_job_entries ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'file'",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    create_organizer_tables(&conn)?;
+    conn.execute(
+        "INSERT INTO app_meta(key, value) VALUES('organizer_schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![ORGANIZER_SCHEMA_VERSION],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -367,13 +360,41 @@ pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let now = now_iso();
-    conn.execute(
-        "UPDATE organize_tasks
-         SET status='stopped', completed_at=COALESCE(completed_at, ?1)
-         WHERE status IN ('idle', 'scanning', 'classifying', 'moving')",
-        params![now],
-    )
-    .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT task_id, snapshot_json
+             FROM organize_tasks
+             WHERE status IN ('idle', 'scanning', 'classifying', 'moving')",
+        )
+        .map_err(|e| e.to_string())?;
+    let stale_rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    for (task_id, snapshot_json) in stale_rows {
+        let mut snapshot =
+            serde_json::from_str::<OrganizeSnapshot>(&snapshot_json).map_err(|e| e.to_string())?;
+        snapshot.status = "stopped".to_string();
+        if snapshot.completed_at.is_none() {
+            snapshot.completed_at = Some(now.clone());
+        }
+        conn.execute(
+            "UPDATE organize_tasks
+             SET status = ?2, completed_at = ?3, snapshot_json = ?4
+             WHERE task_id = ?1",
+            params![
+                task_id,
+                snapshot.status,
+                snapshot.completed_at,
+                serde_json::to_string(&snapshot).map_err(|e| e.to_string())?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1026,40 +1047,16 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
     .map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT OR REPLACE INTO organize_tasks (
-            task_id, status, error, root_path, recursive, reference_original_structure, mode, categories_json, allow_new_categories,
-            excluded_patterns_json, parallelism, use_web_search, web_search_enabled, selected_model,
-            selected_models_json, selected_providers_json, supports_multimodal, total_files,
-            processed_files, token_prompt, token_completion, token_total, preview_json, created_at,
-            completed_at, job_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                  ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            task_id, root_path, root_path_key, status, created_at, completed_at, snapshot_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             snapshot.id,
-            snapshot.status,
-            snapshot.error,
             snapshot.root_path,
-            bool_to_i64(snapshot.recursive),
-            bool_to_i64(snapshot.reference_original_structure),
-            snapshot.mode,
-            serde_json::to_string(&snapshot.categories).map_err(|e| e.to_string())?,
-            bool_to_i64(snapshot.allow_new_categories),
-            serde_json::to_string(&snapshot.excluded_patterns).map_err(|e| e.to_string())?,
-            snapshot.parallelism as i64,
-            bool_to_i64(snapshot.use_web_search),
-            bool_to_i64(snapshot.web_search_enabled),
-            snapshot.selected_model,
-            serde_json::to_string(&snapshot.selected_models).map_err(|e| e.to_string())?,
-            serde_json::to_string(&snapshot.selected_providers).map_err(|e| e.to_string())?,
-            bool_to_i64(snapshot.supports_multimodal),
-            snapshot.total_files as i64,
-            snapshot.processed_files as i64,
-            snapshot.token_usage.prompt as i64,
-            snapshot.token_usage.completion as i64,
-            snapshot.token_usage.total as i64,
-            serde_json::to_string(&snapshot.preview).map_err(|e| e.to_string())?,
+            create_root_path_key(&snapshot.root_path),
+            snapshot.status,
             snapshot.created_at,
             snapshot.completed_at,
-            snapshot.job_id,
+            serde_json::to_string(snapshot).map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1070,54 +1067,30 @@ pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Re
     let conn = open_db(db_path)?;
     conn.execute(
         "UPDATE organize_tasks SET
-            status = ?2,
-            error = ?3,
-            categories_json = ?4,
-            excluded_patterns_json = ?5,
-            parallelism = ?6,
-            use_web_search = ?7,
-            web_search_enabled = ?8,
-            selected_model = ?9,
-            selected_models_json = ?10,
-            selected_providers_json = ?11,
-            supports_multimodal = ?12,
-            total_files = ?13,
-            processed_files = ?14,
-            token_prompt = ?15,
-            token_completion = ?16,
-            token_total = ?17,
-            preview_json = ?18,
-            completed_at = ?19,
-            job_id = ?20
+            root_path = ?2,
+            root_path_key = ?3,
+            status = ?4,
+            completed_at = ?5,
+            snapshot_json = ?6
          WHERE task_id = ?1",
         params![
             snapshot.id,
+            snapshot.root_path,
+            create_root_path_key(&snapshot.root_path),
             snapshot.status,
-            snapshot.error,
-            serde_json::to_string(&snapshot.categories).map_err(|e| e.to_string())?,
-            serde_json::to_string(&snapshot.excluded_patterns).map_err(|e| e.to_string())?,
-            snapshot.parallelism as i64,
-            bool_to_i64(snapshot.use_web_search),
-            bool_to_i64(snapshot.web_search_enabled),
-            snapshot.selected_model,
-            serde_json::to_string(&snapshot.selected_models).map_err(|e| e.to_string())?,
-            serde_json::to_string(&snapshot.selected_providers).map_err(|e| e.to_string())?,
-            bool_to_i64(snapshot.supports_multimodal),
-            snapshot.total_files as i64,
-            snapshot.processed_files as i64,
-            snapshot.token_usage.prompt as i64,
-            snapshot.token_usage.completion as i64,
-            snapshot.token_usage.total as i64,
-            serde_json::to_string(&snapshot.preview).map_err(|e| e.to_string())?,
             snapshot.completed_at,
-            snapshot.job_id,
+            serde_json::to_string(snapshot).map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Result<(), String> {
+fn upsert_organize_result_legacy_unused(
+    db_path: &Path,
+    task_id: &str,
+    row: &Value,
+) -> Result<(), String> {
     let conn = open_db(db_path)?;
     conn.execute(
         "INSERT INTO organize_results (
@@ -1175,7 +1148,7 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
     Ok(())
 }
 
-pub fn load_organize_snapshot(
+fn load_organize_snapshot_legacy_unused(
     db_path: &Path,
     task_id: &str,
 ) -> Result<Option<OrganizeSnapshot>, String> {
@@ -1263,19 +1236,21 @@ pub fn load_organize_snapshot(
         root_path: row.2,
         recursive: row.3 != 0,
         reference_original_structure: row.7 != 0,
-        mode: row.4,
-        categories: parse_json_or_default(Some(row.5)),
-        allow_new_categories: row.6 != 0,
-        excluded_patterns: parse_json_or_default(Some(row.8)),
-        parallelism: row.9 as u32,
+        excluded_patterns: Vec::new(),
+        batch_size: 50,
+        max_cluster_depth: None,
         use_web_search: row.10 != 0,
         web_search_enabled: row.11 != 0,
         selected_model: row.12,
         selected_models: parse_json_or_default(Some(row.13)),
         selected_providers: parse_json_or_default(Some(row.14)),
         supports_multimodal: row.15 != 0,
+        tree: json!({}),
+        tree_version: 0,
         total_files: row.16 as u64,
         processed_files: row.17 as u64,
+        total_batches: 0,
+        processed_batches: 0,
         token_usage: TokenUsage {
             prompt: row.18 as u64,
             completion: row.19 as u64,
@@ -1287,6 +1262,120 @@ pub fn load_organize_snapshot(
         completed_at: row.23,
         job_id: row.24,
     }))
+}
+
+pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Result<(), String> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        "INSERT INTO organize_results (
+            task_id, idx, path, leaf_node_id, category_path_json, row_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(task_id, idx) DO UPDATE SET
+            path = excluded.path,
+            leaf_node_id = excluded.leaf_node_id,
+            category_path_json = excluded.category_path_json,
+            row_json = excluded.row_json",
+        params![
+            task_id,
+            row.get("index").and_then(Value::as_u64).unwrap_or(0) as i64,
+            row.get("path").and_then(Value::as_str).unwrap_or(""),
+            row.get("leafNodeId").and_then(Value::as_str).unwrap_or(""),
+            serde_json::to_string(row.get("categoryPath").unwrap_or(&json!([])))
+                .map_err(|e| e.to_string())?,
+            serde_json::to_string(row).map_err(|e| e.to_string())?,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn load_organize_snapshot(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<Option<OrganizeSnapshot>, String> {
+    let conn = open_db(db_path)?;
+    let snapshot_json = conn
+        .query_row(
+            "SELECT snapshot_json FROM organize_tasks WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(snapshot_json) = snapshot_json else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT row_json
+             FROM organize_results
+             WHERE task_id = ?1
+             ORDER BY idx ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let results = stmt
+        .query_map(params![task_id], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|row| row.ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+        .collect::<Vec<_>>();
+
+    let mut snapshot =
+        serde_json::from_str::<OrganizeSnapshot>(&snapshot_json).map_err(|e| e.to_string())?;
+    snapshot.results = results;
+    Ok(Some(snapshot))
+}
+
+pub fn save_latest_organize_tree(
+    db_path: &Path,
+    root_path: &str,
+    tree: &Value,
+    tree_version: u64,
+) -> Result<(), String> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        "INSERT INTO organize_latest_trees (
+            root_path_key, root_path, tree_version, tree_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(root_path_key) DO UPDATE SET
+            root_path = excluded.root_path,
+            tree_version = excluded.tree_version,
+            tree_json = excluded.tree_json,
+            updated_at = excluded.updated_at",
+        params![
+            create_root_path_key(root_path),
+            root_path,
+            tree_version as i64,
+            serde_json::to_string(tree).map_err(|e| e.to_string())?,
+            now_iso(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn load_latest_organize_tree(
+    db_path: &Path,
+    root_path: &str,
+) -> Result<Option<(Value, u64)>, String> {
+    let conn = open_db(db_path)?;
+    let row = conn
+        .query_row(
+            "SELECT tree_json, tree_version
+             FROM organize_latest_trees
+             WHERE root_path_key = ?1",
+            params![create_root_path_key(root_path)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((tree_json, tree_version)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        serde_json::from_str::<Value>(&tree_json).map_err(|e| e.to_string())?,
+        tree_version as u64,
+    )))
 }
 
 pub fn save_organize_manifest(db_path: &Path, manifest: &Value) -> Result<(), String> {

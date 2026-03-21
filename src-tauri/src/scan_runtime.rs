@@ -152,8 +152,14 @@ fn is_zh_language(value: &str) -> bool {
     normalized == "zh" || normalized.starts_with("zh-") || normalized.starts_with("zh_")
 }
 
-fn prompt_language_name(value: &str) -> &'static str {
-    if is_zh_language(value) {
+fn localized_language_name(prompt_language: &str, output_language: &str) -> &'static str {
+    if is_zh_language(prompt_language) {
+        if is_zh_language(output_language) {
+            "简体中文"
+        } else {
+            "英文"
+        }
+    } else if is_zh_language(output_language) {
         "Simplified Chinese"
     } else {
         "English"
@@ -308,34 +314,61 @@ async fn analyze_scan_node(
     node: &persist::ScanNode,
     child_dirs: &[persist::ScanNode],
 ) -> ScanReview {
-    let response_language = prompt_language_name(&ai.response_language);
+    let prompt_in_zh = is_zh_language(&ai.response_language);
+    let response_language = localized_language_name(&ai.response_language, &ai.response_language);
     let system_prompt = if node.node_type == "directory" {
-        [
-            "You are a disk cleanup safety assistant.",
-            "Return JSON only.",
-            "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
-            "Be conservative. If unsure, use suspicious.",
-            &format!(
-                "The \"reason\" field must be written in {} only.",
-                response_language
-            ),
-        ]
-        .join("\n")
+        if prompt_in_zh {
+            [
+                "你是一个磁盘清理安全分析助手。",
+                "只能返回 JSON。",
+                "输出结构：{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
+                "保持保守判断；如果不确定，使用 suspicious。",
+                &format!("`reason` 字段只能使用{}。", response_language),
+            ]
+            .join("\n")
+        } else {
+            [
+                "You are a disk cleanup safety assistant.",
+                "Return JSON only.",
+                "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
+                "Be conservative. If unsure, use suspicious.",
+                &format!(
+                    "The \"reason\" field must be written in {} only.",
+                    response_language
+                ),
+            ]
+            .join("\n")
+        }
     } else {
-        [
-            "You are a disk cleanup safety assistant.",
-            "Return JSON only.",
-            "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
-            "Be conservative. If unsure, use suspicious.",
-            &format!(
-                "The \"reason\" field must be written in {} only.",
-                response_language
-            ),
-        ]
-        .join("\n")
+        if prompt_in_zh {
+            [
+                "你是一个磁盘清理安全分析助手。",
+                "只能返回 JSON。",
+                "输出结构：{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
+                "保持保守判断；如果不确定，使用 suspicious。",
+                &format!("`reason` 字段只能使用{}。", response_language),
+            ]
+            .join("\n")
+        } else {
+            [
+                "You are a disk cleanup safety assistant.",
+                "Return JSON only.",
+                "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
+                "Be conservative. If unsure, use suspicious.",
+                &format!(
+                    "The \"reason\" field must be written in {} only.",
+                    response_language
+                ),
+            ]
+            .join("\n")
+        }
     };
     let child_summary = if child_dirs.is_empty() {
-        "(none)".to_string()
+        if prompt_in_zh {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
         child_dirs
             .iter()
@@ -345,20 +378,39 @@ async fn analyze_scan_node(
             .join("\n")
     };
     let user_prompt = if node.node_type == "directory" {
-        format!(
-            "Type: directory\nPath: {}\nName: {}\nSize: {}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.",
-            node.path,
-            node.name,
-            format_size(node.size),
-            child_summary
-        )
+        if prompt_in_zh {
+            format!(
+                "类型：目录\n路径：{}\n名称：{}\n大小：{}\n直接子目录：\n{}\n请判断整个目录是否可以安全删除，以及它是否可能包含可删除的子目录。",
+                node.path,
+                node.name,
+                format_size(node.size),
+                child_summary
+            )
+        } else {
+            format!(
+                "Type: directory\nPath: {}\nName: {}\nSize: {}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.",
+                node.path,
+                node.name,
+                format_size(node.size),
+                child_summary
+            )
+        }
     } else {
-        format!(
-            "Type: file\nPath: {}\nName: {}\nSize: {}\nJudge whether the file can be deleted safely.",
-            node.path,
-            node.name,
-            format_size(node.size)
-        )
+        if prompt_in_zh {
+            format!(
+                "类型：文件\n路径：{}\n名称：{}\n大小：{}\n请判断该文件是否可以安全删除。",
+                node.path,
+                node.name,
+                format_size(node.size)
+            )
+        } else {
+            format!(
+                "Type: file\nPath: {}\nName: {}\nSize: {}\nJudge whether the file can be deleted safely.",
+                node.path,
+                node.name,
+                format_size(node.size)
+            )
+        }
     };
     match chat_completion(ai, &system_prompt, &user_prompt).await {
         Ok(resp) => {

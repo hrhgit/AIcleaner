@@ -36,7 +36,6 @@ pub fn run() {
             backend::scan_stop,
             backend::scan_get_result,
             backend::organize_get_capability,
-            backend::organize_suggest_categories,
             backend::organize_start,
             backend::organize_stop,
             backend::organize_get_result,

@@ -225,19 +225,21 @@ pub struct OrganizeSnapshot {
     pub root_path: String,
     pub recursive: bool,
     pub reference_original_structure: bool,
-    pub mode: String,
-    pub categories: Vec<String>,
-    pub allow_new_categories: bool,
     pub excluded_patterns: Vec<String>,
-    pub parallelism: u32,
+    pub batch_size: u32,
+    pub max_cluster_depth: Option<u32>,
     pub use_web_search: bool,
     pub web_search_enabled: bool,
     pub selected_model: String,
     pub selected_models: Value,
     pub selected_providers: Value,
     pub supports_multimodal: bool,
+    pub tree: Value,
+    pub tree_version: u64,
     pub total_files: u64,
     pub processed_files: u64,
+    pub total_batches: u64,
+    pub processed_batches: u64,
     pub token_usage: TokenUsage,
     pub results: Vec<Value>,
     pub preview: Vec<Value>,
@@ -1218,26 +1220,13 @@ pub struct ScanStartInput {
 pub struct OrganizeStartInput {
     pub root_path: String,
     pub reference_original_structure: Option<bool>,
-    pub mode: Option<String>,
-    pub categories: Option<Vec<String>>,
-    pub allow_new_categories: Option<bool>,
     pub excluded_patterns: Option<Vec<String>>,
-    pub parallelism: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub max_cluster_depth: Option<u32>,
     pub use_web_search: Option<bool>,
     pub model_routing: Option<Value>,
     pub search_api_key: Option<String>,
     pub response_language: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct OrganizeSuggestInput {
-    pub root_path: String,
-    pub excluded_patterns: Option<Vec<String>>,
-    pub manual_categories: Option<Vec<String>>,
-    pub model_routing: Option<Value>,
-    pub use_web_search: Option<bool>,
-    pub search_api_key: Option<String>,
 }
 
 fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -> Option<Value> {
@@ -1336,18 +1325,6 @@ pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Res
 #[tauri::command]
 pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
     crate::organizer_runtime::organize_get_capability(state).await
-}
-
-#[tauri::command]
-pub async fn organize_suggest_categories(
-    state: State<'_, AppState>,
-    mut input: OrganizeSuggestInput,
-) -> Result<Value, String> {
-    input.model_routing = hydrate_model_routing_with_secrets(state.inner(), &input.model_routing);
-    if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
-        input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
-    }
-    crate::organizer_runtime::organize_suggest_categories(input).await
 }
 
 #[tauri::command]

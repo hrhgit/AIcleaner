@@ -93,7 +93,7 @@ export async function findLatestScanForPath(path) {
 }
 
 export async function deleteScanHistory(taskId) {
-  return call('scan_delete_history', { task_id: taskId });
+  return call('scan_delete_history', { taskId });
 }
 
 export async function startScan(params) {
@@ -101,11 +101,11 @@ export async function startScan(params) {
 }
 
 export async function stopScan(taskId) {
-  return call('scan_stop', { task_id: taskId });
+  return call('scan_stop', { taskId });
 }
 
 export async function getScanResult(taskId) {
-  return call('scan_get_result', { task_id: taskId });
+  return call('scan_get_result', { taskId });
 }
 
 export function connectScanStream(taskId, handlers) {
@@ -132,10 +132,6 @@ export async function cleanFiles(paths, scanTaskId = null) {
   return call('files_clean', { data: body });
 }
 
-export async function suggestOrganizeCategories(params) {
-  return call('organize_suggest_categories', { input: params });
-}
-
 export async function getOrganizeCapability() {
   return call('organize_get_capability');
 }
@@ -145,19 +141,19 @@ export async function startOrganize(params) {
 }
 
 export async function stopOrganize(taskId) {
-  return call('organize_stop', { task_id: taskId });
+  return call('organize_stop', { taskId });
 }
 
 export async function getOrganizeResult(taskId) {
-  return call('organize_get_result', { task_id: taskId });
+  return call('organize_get_result', { taskId });
 }
 
 export async function applyOrganize(taskId) {
-  return call('organize_apply', { task_id: taskId });
+  return call('organize_apply', { taskId });
 }
 
 export async function rollbackOrganize(jobId) {
-  return call('organize_rollback', { job_id: jobId });
+  return call('organize_rollback', { jobId });
 }
 
 export function connectOrganizeStream(taskId, handlers) {
