@@ -10,13 +10,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 const UNCATEGORIZED_NODE_NAME: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
-const DEFAULT_BATCH_SIZE: u32 = 50;
+const DEFAULT_BATCH_SIZE: u32 = 20;
 const CATEGORY_OTHER_PENDING: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
 
 const DEFAULT_EXCLUDED_PATTERNS: [&str; 11] = [
@@ -972,10 +973,11 @@ async fn chat_completion(
     route: &RouteConfig,
     system_prompt: &str,
     user_prompt: &str,
+    stop: &AtomicBool,
 ) -> Result<(String, TokenUsage), String> {
     let url = format!("{}/chat/completions", route.endpoint.trim_end_matches('/'));
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client
@@ -996,36 +998,49 @@ async fn chat_completion(
             .header("x-api-key", route.api_key.clone())
             .header("api-key", route.api_key.clone());
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(body
-            .pointer("/error/message")
+    let request_future = async move {
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(body
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("classification request failed")
+                .to_string());
+        }
+        let content = body
+            .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .unwrap_or("classification request failed")
-            .to_string());
-    }
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let usage = TokenUsage {
-        prompt: body
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        completion: body
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        total: body
-            .pointer("/usage/total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or("")
+            .to_string();
+        let usage = TokenUsage {
+            prompt: body
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            completion: body
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            total: body
+                .pointer("/usage/total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        };
+        Ok((content, usage))
     };
-    Ok((content, usage))
+    tokio::pin!(request_future);
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("stop_requested".to_string());
+        }
+        tokio::select! {
+            result = &mut request_future => return result,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
 }
 
 fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
@@ -1261,6 +1276,9 @@ async fn run_organize_task<R: Runtime>(
     emit_snapshot(app, state, task).await?;
 
     let units = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
+    if task.stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let reference_structure = if reference_original_structure {
         Some(build_reference_structure_context(
             Path::new(&root_path),
@@ -1271,6 +1289,9 @@ async fn run_organize_task<R: Runtime>(
     } else {
         None
     };
+    if task.stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let total_batches = if units.is_empty() {
         0
     } else {
@@ -1366,7 +1387,7 @@ async fn run_organize_task<R: Runtime>(
             if let Some(structure) = reference_structure.as_ref() {
                 payload["referenceStructure"] = Value::String(structure.clone());
             }
-            match chat_completion(&text_route, &system_prompt, &payload.to_string()).await {
+            match chat_completion(&text_route, &system_prompt, &payload.to_string(), &task.stop).await {
                 Ok((content, usage)) => {
                     cluster_usage = usage;
                     if let Ok(parsed) = serde_json::from_str::<Value>(&sanitize_json_block(&content)) {
@@ -1420,8 +1441,14 @@ async fn run_organize_task<R: Runtime>(
         } else {
             cluster_failed = true;
         }
+        if task.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
         for row in batch_rows {
+            if task.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
             let (leaf_node_id, category_path, reason) = assignment_map
                 .get(item_id)

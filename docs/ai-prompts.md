@@ -5,6 +5,7 @@
 中文：
 - 这个文档整理了当前项目里仍在使用的 AI 提示词与摘要模板。
 - 扫描和 organizer 都已经支持中英双模板。
+- organizer 默认每批 20 个条目。
 - 实际发送给 AI 的提示词语言由 `response_language` 决定：
   - 中文回复语言：发送中文提示词
   - 其他回复语言：发送英文提示词
@@ -13,6 +14,7 @@
 English:
 - This document lists the AI prompts and summary templates that are still in active use.
 - Both scan and organizer now support bilingual prompt templates.
+- Organizer now uses a default batch size of 20 items.
 - The language sent to the model is selected by `response_language`:
   - Chinese response language: send Chinese prompts
   - Other response languages: send English prompts

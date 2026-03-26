@@ -20,20 +20,31 @@ import {
 } from '../utils/secret-ui.js';
 
 const PERSIST_KEYS = {
-  rootPath: 'wipeout.organizer.global.root_path.v1',
-  referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v1',
-  exclusions: 'wipeout.organizer.global.exclusions.v1',
-  batchSize: 'wipeout.organizer.global.batch_size.v1',
-  maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v1',
-  useWebSearch: 'wipeout.organizer.global.use_web_search.v1',
-  modelRouting: 'wipeout.organizer.global.model_routing.v1',
-  lastJobId: 'wipeout.organizer.global.last_job_id.v1',
-  lastTaskId: 'wipeout.organizer.global.last_task_id.v1',
-  lastSnapshot: 'wipeout.organizer.global.last_snapshot.v1',
-  lastApplyManifest: 'wipeout.organizer.global.last_apply_manifest.v1',
+  rootPath: 'wipeout.organizer.global.root_path.v2',
+  referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v2',
+  exclusions: 'wipeout.organizer.global.exclusions.v2',
+  batchSize: 'wipeout.organizer.global.batch_size.v2',
+  maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v2',
+  useWebSearch: 'wipeout.organizer.global.use_web_search.v2',
+  modelRouting: 'wipeout.organizer.global.model_routing.v2',
+  lastJobId: 'wipeout.organizer.global.last_job_id.v2',
+  lastTaskId: 'wipeout.organizer.global.last_task_id.v2',
+  lastSnapshot: 'wipeout.organizer.global.last_snapshot.v2',
+  lastApplyManifest: 'wipeout.organizer.global.last_apply_manifest.v2',
 };
 
 const LEGACY_PERSIST_KEYS = [
+  'wipeout.organizer.global.root_path.v1',
+  'wipeout.organizer.global.reference_original_structure.v1',
+  'wipeout.organizer.global.exclusions.v1',
+  'wipeout.organizer.global.batch_size.v1',
+  'wipeout.organizer.global.max_cluster_depth.v1',
+  'wipeout.organizer.global.use_web_search.v1',
+  'wipeout.organizer.global.model_routing.v1',
+  'wipeout.organizer.global.last_job_id.v1',
+  'wipeout.organizer.global.last_task_id.v1',
+  'wipeout.organizer.global.last_snapshot.v1',
+  'wipeout.organizer.global.last_apply_manifest.v1',
   'wipeout.organizer.global.recursive.v1',
   'wipeout.organizer.global.model_selection.v1',
   'wipeout.organizer.global.mode.v1',
@@ -53,7 +64,7 @@ const DEFAULT_EXCLUSIONS = [
   'Program Files (x86)',
 ];
 
-const DEFAULT_BATCH_SIZE = 50;
+const DEFAULT_BATCH_SIZE = 20;
 
 const MOVE_RESULT_TEXT = {
   zh: {
@@ -403,6 +414,7 @@ function setStatusText(snapshot) {
   if (!el) return;
   if (!snapshot) {
     el.textContent = t('organizer.status_idle');
+    updateStatusDecor(null);
     return;
   }
 
@@ -418,6 +430,7 @@ function setStatusText(snapshot) {
   };
 
   el.textContent = statusMap[snapshot.status] || snapshot.status;
+  updateStatusDecor(snapshot);
 }
 
 function getSelectionsFromDOM() {
@@ -650,6 +663,10 @@ function renderPreview(snapshot) {
 
   const sortedGroups = Array.from(groups.entries()).sort(([a], [b]) => String(a).localeCompare(String(b), 'zh-Hans-CN'));
   groupsEl.innerHTML = sortedGroups.map(([categoryPathLabel, items], groupIdx) => {
+    const categoryTrail = categoryPathLabel
+      .split(' / ')
+      .map((segment) => `<span class="organizer-category-node">${escapeHtml(segment)}</span>`)
+      .join('<span class="organizer-category-separator"></span>');
     const rows = items.map((item, rowIdx) => {
       const row = resultsMap.get(item.sourcePath);
       const degraded = row?.degraded
@@ -671,7 +688,7 @@ function renderPreview(snapshot) {
     return `
       <section class="preview-group" style="animation: slideUp 0.2s var(--ease-out) ${Math.min(groupIdx * 0.03, 0.4)}s both;">
         <div class="preview-group-header">
-          <span class="badge badge-info">${escapeHtml(categoryPathLabel)}</span>
+          <div class="organizer-category-path">${categoryTrail}</div>
           <span class="preview-group-count">${items.length}</span>
         </div>
         <div class="preview-group-table-wrap">
@@ -907,6 +924,7 @@ function refreshView(snapshot) {
   syncReferenceOriginalStructureInput(snapshot);
   syncBatchConfigInputs(snapshot);
   setStatusText(snapshot);
+  updatePipeline(snapshot);
   renderCapability(snapshot);
   updateStats(snapshot);
   renderPreview(snapshot);
@@ -942,6 +960,42 @@ function connectTaskStream(taskId) {
       showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
     },
   });
+}
+
+function buildOptimisticRunningSnapshot(taskId, form, capability) {
+  const selectedModels = capability?.selectedModels || latestCapability?.selectedModels || {};
+  const selectedProviders = capability?.selectedProviders || latestCapability?.selectedProviders || {};
+  return {
+    id: taskId,
+    status: 'scanning',
+    error: null,
+    rootPath: form.rootPath,
+    recursive: true,
+    referenceOriginalStructure: !!form.referenceOriginalStructure,
+    excludedPatterns: Array.isArray(form.excludedPatterns) ? form.excludedPatterns : [],
+    batchSize: Number(form.batchSize) || DEFAULT_BATCH_SIZE,
+    maxClusterDepth: form.maxClusterDepth ?? null,
+    useWebSearch: !!form.useWebSearch,
+    webSearchEnabled: !!form.useWebSearch,
+    selectedModel: selectedModels.text || '',
+    selectedModels,
+    selectedProviders,
+    supportsMultimodal: typeof capability?.supportsMultimodal === 'boolean'
+      ? capability.supportsMultimodal
+      : latestCapability?.supportsMultimodal,
+    tree: latestSnapshot?.tree || null,
+    treeVersion: Number(latestSnapshot?.treeVersion || 0),
+    totalFiles: 0,
+    processedFiles: 0,
+    totalBatches: 0,
+    processedBatches: 0,
+    tokenUsage: { prompt: 0, completion: 0, total: 0 },
+    results: [],
+    preview: [],
+    createdAt: new Date().toISOString(),
+    completedAt: null,
+    jobId: null,
+  };
 }
 
 async function handleBrowse() {
@@ -1021,6 +1075,7 @@ async function handleStart() {
     renderCapability();
     renderApplyResultPanel(null);
     setPersisted(PERSIST_KEYS.lastTaskId, activeTaskId);
+    refreshView(buildOptimisticRunningSnapshot(activeTaskId, form, result));
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
   } catch (err) {
@@ -1243,6 +1298,113 @@ function bindModelRoutingListeners() {
   }
 }
 
+function stripDecorativePrefix(text) {
+  return String(text || '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+}
+
+function renderPipelineStage(stepId, order, label) {
+  return `
+    <div class="organizer-stage" id="org-stage-${stepId}" data-state="pending">
+      <span class="organizer-stage-index">${order}</span>
+      <div class="organizer-stage-copy">
+        <span class="organizer-stage-title">${escapeHtml(label)}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderRoutingCard(modality) {
+  const label = t(`organizer.model_${modality}`);
+  return `
+    <div class="organizer-route-card">
+      <div class="organizer-route-card-header">
+        <span class="organizer-route-chip">${escapeHtml(label)}</span>
+      </div>
+      <div class="provider-model-inline organizer-route-inputs">
+        <select id="${PROVIDER_SELECT_IDS[modality]}" class="form-input"></select>
+        <select id="${MODEL_SELECT_IDS[modality]}" class="form-input"></select>
+      </div>
+    </div>
+  `;
+}
+
+function updateStatusDecor(snapshot) {
+  const el = document.getElementById('org-status');
+  if (!el) return;
+
+  const status = String(snapshot?.status || 'idle').trim() || 'idle';
+  el.dataset.status = status;
+  el.classList.remove('badge-info', 'badge-warning', 'badge-success', 'badge-danger');
+
+  const tone = {
+    idle: 'badge-info',
+    scanning: 'badge-warning',
+    classifying: 'badge-warning',
+    stopped: 'badge-info',
+    completed: 'badge-success',
+    moving: 'badge-warning',
+    done: 'badge-success',
+    error: 'badge-danger',
+  }[status] || 'badge-info';
+
+  el.classList.add(tone);
+}
+
+function updatePipeline(snapshot) {
+  const stages = {
+    scanning: document.getElementById('org-stage-scanning'),
+    classifying: document.getElementById('org-stage-classifying'),
+    preview: document.getElementById('org-stage-preview'),
+    apply: document.getElementById('org-stage-apply'),
+  };
+  if (Object.values(stages).some((node) => !node)) return;
+
+  const status = String(snapshot?.status || 'idle').trim() || 'idle';
+  const hasPreview = Array.isArray(snapshot?.preview) && snapshot.preview.length > 0;
+  const states = {
+    scanning: 'pending',
+    classifying: 'pending',
+    preview: 'pending',
+    apply: 'pending',
+  };
+
+  if (status === 'scanning') {
+    states.scanning = 'active';
+  } else if (status === 'classifying') {
+    states.scanning = 'done';
+    states.classifying = 'active';
+  } else if (status === 'completed') {
+    states.scanning = 'done';
+    states.classifying = 'done';
+    states.preview = 'active';
+  } else if (status === 'moving') {
+    states.scanning = 'done';
+    states.classifying = 'done';
+    states.preview = 'done';
+    states.apply = 'active';
+  } else if (status === 'done') {
+    states.scanning = 'done';
+    states.classifying = 'done';
+    states.preview = 'done';
+    states.apply = 'done';
+  } else if (status === 'stopped' || status === 'error') {
+    if (hasPreview) {
+      states.scanning = 'done';
+      states.classifying = 'done';
+      states.preview = 'active';
+    } else if (Number(snapshot?.processedFiles || 0) > 0 || Number(snapshot?.totalFiles || 0) > 0) {
+      states.scanning = 'done';
+      states.classifying = 'active';
+    } else {
+      states.scanning = 'active';
+    }
+  }
+
+  for (const [name, node] of Object.entries(stages)) {
+    node.dataset.state = states[name];
+  }
+}
+
 export async function renderOrganizer(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
@@ -1251,230 +1413,245 @@ export async function renderOrganizer(container) {
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
 
   container.innerHTML = `
-    <div class="page-header animate-in">
-      <h1 class="page-title">${t('organizer.title')}</h1>
-      <p class="page-subtitle">${t('organizer.subtitle')}</p>
-    </div>
-
-    <div class="card animate-in mb-24" style="animation-delay: 0.05s">
-      <div class="card-header">
-        <h2 class="card-title">${t('organizer.config')}</h2>
-        <span class="badge badge-info" id="org-status">${t('organizer.status_idle')}</span>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">${t('organizer.root_path')}</label>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <input id="org-root-path" class="form-input" style="flex:1;" value="${escapeHtml(defaults.rootPath)}" placeholder="C:\\Users\\..." />
-          <button id="org-browse-btn" class="btn btn-secondary" type="button">${t('settings.browse')}</button>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="form-group">
-          <label class="form-label">${t('organizer.batch_size')}</label>
-          <input id="org-batch-size" type="number" min="1" max="200" class="form-input no-spin" value="${Number(defaults.batchSize) || DEFAULT_BATCH_SIZE}" />
-          <div class="form-hint">${t('organizer.batch_size_hint')}</div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">${t('organizer.reference_original_structure')}</label>
-          <label style="display:flex;align-items:center;gap:8px;">
-            <input id="org-reference-original-structure" type="checkbox" ${defaults.referenceOriginalStructure ? 'checked' : ''} />
-            <span>${t('organizer.reference_original_structure')}</span>
-          </label>
-          <div class="form-hint">${t('organizer.reference_original_structure_hint')}</div>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="form-group">
-          <label class="form-label">${t('organizer.max_cluster_depth')}</label>
-          <input id="org-max-cluster-depth" type="number" min="1" class="form-input no-spin" value="${defaults.maxClusterDepth == null ? '' : Number(defaults.maxClusterDepth)}" placeholder="${t('organizer.max_cluster_depth_unlimited')}" />
-          <div class="form-hint">${t('organizer.max_cluster_depth_hint')}</div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">${t('organizer.cost_notice')}</label>
-          <div class="form-hint">${t('organizer.batch_cluster_hint')}</div>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label class="form-label">${t('organizer.model_routing')}</label>
-        <div class="grid-2">
-          <div class="form-group">
-            <label class="form-label">${t('organizer.model_text')}</label>
-            <div class="provider-model-inline">
-              <select id="${PROVIDER_SELECT_IDS.text}" class="form-input"></select>
-              <select id="${MODEL_SELECT_IDS.text}" class="form-input"></select>
+    <div class="organizer-shell">
+      <section class="card organizer-hero animate-in" style="animation-delay: 0.03s;">
+        <div class="organizer-hero-grid">
+          <div class="organizer-hero-copy">
+            <div class="page-header organizer-page-header">
+              <div class="organizer-kicker">${t('organizer.config')}</div>
+              <h1 class="page-title">${escapeHtml(stripDecorativePrefix(t('organizer.title')) || t('organizer.title'))}</h1>
+              <p class="page-subtitle">${t('organizer.subtitle')}</p>
             </div>
-            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
+            <div class="organizer-feature-pills">
+              <span class="organizer-feature-pill">${t('organizer.preview_title')}</span>
+              <span class="organizer-feature-pill">${t('organizer.rollback')}</span>
+              <span class="organizer-feature-pill">${t('organizer.multimodal')}</span>
+            </div>
+            <div class="organizer-pipeline">
+              ${renderPipelineStage('scanning', '01', t('organizer.status_scanning'))}
+              ${renderPipelineStage('classifying', '02', t('organizer.status_classifying'))}
+              ${renderPipelineStage('preview', '03', t('organizer.preview_title'))}
+              ${renderPipelineStage('apply', '04', t('organizer.apply_move'))}
+            </div>
           </div>
-          <div class="form-group">
-            <label class="form-label">${t('organizer.model_image')}</label>
-            <div class="provider-model-inline">
-              <select id="${PROVIDER_SELECT_IDS.image}" class="form-input"></select>
-              <select id="${MODEL_SELECT_IDS.image}" class="form-input"></select>
+
+          <div class="organizer-hero-side">
+            <div class="organizer-status-card">
+              <div class="organizer-status-row">
+                <div class="organizer-status-stack">
+                  <span id="org-status" class="badge badge-info">${t('organizer.status_idle')}</span>
+                  <div class="organizer-status-caption">${t('organizer.progress')}</div>
+                </div>
+                <span id="org-progress-pct" class="organizer-progress-pct">0.0%</span>
+              </div>
+              <div class="progress-bar organizer-progress-bar">
+                <div id="org-progress-fill" class="progress-fill" style="width:0%;"></div>
+              </div>
+              <div class="organizer-status-meta">
+                <div>
+                  <div class="form-label">${t('organizer.current_model')}</div>
+                  <div id="org-model-name" class="form-hint mono organizer-model-summary">-</div>
+                </div>
+                <div>
+                  <div class="form-label">${t('organizer.multimodal')}</div>
+                  <span id="org-mm-badge" class="badge badge-danger">${t('organizer.multimodal_unknown')}</span>
+                </div>
+              </div>
+              <div class="organizer-action-grid">
+                <button id="org-start-btn" class="btn btn-primary" type="button">${t('organizer.start')}</button>
+                <button id="org-stop-btn" class="btn btn-danger" type="button" disabled>${t('organizer.stop')}</button>
+                <button id="org-apply-btn" class="btn btn-success" type="button" disabled>${t('organizer.apply_move')}</button>
+                <button id="org-rollback-btn" class="btn btn-secondary" type="button">${t('organizer.rollback')}</button>
+              </div>
             </div>
-            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
-          </div>
-          <div class="form-group">
-            <label class="form-label">${t('organizer.model_video')}</label>
-            <div class="provider-model-inline">
-              <select id="${PROVIDER_SELECT_IDS.video}" class="form-input"></select>
-              <select id="${MODEL_SELECT_IDS.video}" class="form-input"></select>
-            </div>
-            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
-          </div>
-          <div class="form-group">
-            <label class="form-label">${t('organizer.model_audio')}</label>
-            <div class="provider-model-inline">
-              <select id="${PROVIDER_SELECT_IDS.audio}" class="form-input"></select>
-              <select id="${MODEL_SELECT_IDS.audio}" class="form-input"></select>
-            </div>
-            <div class="form-hint">${t('settings.provider')} + ${t('settings.model')}</div>
           </div>
         </div>
-        <div class="form-hint">${t('organizer.model_routing_hint')}</div>
-        <div id="org-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
-        <div class="flex items-center gap-8" style="margin-top:8px;">
-          <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
+      </section>
+
+      <div class="organizer-main-grid">
+        <div class="organizer-config-stack">
+          <section class="card organizer-panel animate-in" style="animation-delay: 0.07s;">
+            <div class="card-header organizer-section-header">
+              <div>
+                <h2 class="card-title">${t('organizer.config')}</h2>
+                <div class="form-hint">${t('organizer.batch_cluster_hint')}</div>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">${t('organizer.root_path')}</label>
+              <div class="organizer-path-row">
+                <input id="org-root-path" class="form-input organizer-path-input" value="${escapeHtml(defaults.rootPath)}" placeholder="C:\\Users\\..." />
+                <button id="org-browse-btn" class="btn btn-secondary organizer-browse-btn" type="button">${t('settings.browse')}</button>
+              </div>
+            </div>
+
+            <div class="grid-2 organizer-metrics-grid">
+              <div class="form-group organizer-metric-field">
+                <label class="form-label">${t('organizer.batch_size')}</label>
+                <input id="org-batch-size" type="number" min="1" max="200" class="form-input no-spin" value="${Number(defaults.batchSize) || DEFAULT_BATCH_SIZE}" />
+                <div class="form-hint">${t('organizer.batch_size_hint')}</div>
+              </div>
+              <div class="form-group organizer-metric-field">
+                <label class="form-label">${t('organizer.max_cluster_depth')}</label>
+                <input id="org-max-cluster-depth" type="number" min="1" class="form-input no-spin" value="${defaults.maxClusterDepth == null ? '' : Number(defaults.maxClusterDepth)}" placeholder="${t('organizer.max_cluster_depth_unlimited')}" />
+                <div class="form-hint">${t('organizer.max_cluster_depth_hint')}</div>
+              </div>
+            </div>
+
+            <div class="organizer-toggle-grid">
+              <label class="organizer-toggle-card">
+                <input id="org-reference-original-structure" type="checkbox" ${defaults.referenceOriginalStructure ? 'checked' : ''} />
+                <span class="organizer-toggle-copy">
+                  <span class="organizer-toggle-title">${t('organizer.reference_original_structure')}</span>
+                  <span class="organizer-toggle-hint">${t('organizer.reference_original_structure_hint')}</span>
+                </span>
+              </label>
+              <label class="organizer-toggle-card">
+                <input id="org-enable-web-search" type="checkbox" ${defaults.useWebSearch === true ? 'checked' : ''} />
+                <span class="organizer-toggle-copy">
+                  <span class="organizer-toggle-title">${t('organizer.use_web_search')}</span>
+                  <span class="organizer-toggle-hint">${t('organizer.use_web_search_hint')}</span>
+                </span>
+              </label>
+            </div>
+          </section>
+
+          <section class="card organizer-panel animate-in" style="animation-delay: 0.11s;">
+            <div class="card-header organizer-section-header">
+              <div>
+                <h2 class="card-title">${t('organizer.model_routing')}</h2>
+                <div class="form-hint">${t('organizer.model_routing_hint')}</div>
+              </div>
+            </div>
+
+            <div class="organizer-routing-grid">
+              ${renderRoutingCard('text')}
+              ${renderRoutingCard('image')}
+              ${renderRoutingCard('video')}
+              ${renderRoutingCard('audio')}
+            </div>
+
+            <div id="org-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
+
+            <div class="organizer-routing-footer">
+              <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
+            </div>
+          </section>
+
+          <section class="card organizer-panel animate-in" style="animation-delay: 0.15s;">
+            <div class="card-header organizer-section-header">
+              <div>
+                <h2 class="card-title">${t('organizer.exclusions')}</h2>
+                <div class="form-hint">${t('organizer.exclusions_hint')}</div>
+              </div>
+            </div>
+
+            <textarea id="org-exclusions" class="form-input organizer-exclusion-input" rows="8">${escapeHtml((defaults.excludedPatterns || []).join('\n'))}</textarea>
+          </section>
         </div>
-      </div>
 
-      <div class="form-group">
-        <label style="display:flex;align-items:center;gap:8px;">
-          <input id="org-enable-web-search" type="checkbox" ${defaults.useWebSearch === true ? 'checked' : ''} />
-          <span>${t('organizer.use_web_search')}</span>
-        </label>
-        <div class="form-hint">${t('organizer.use_web_search_hint')}</div>
-      </div>
+        <div class="organizer-results-stack">
+          <div class="stats-grid organizer-stats-grid animate-in" style="animation-delay: 0.09s;">
+            <div class="stat-card organizer-stat-card">
+              <span class="stat-label">${t('organizer.total_files')}</span>
+              <span class="stat-value" id="org-total">0</span>
+            </div>
+            <div class="stat-card organizer-stat-card">
+              <span class="stat-label">${t('organizer.done_files')}</span>
+              <span class="stat-value success" id="org-done">0</span>
+            </div>
+            <div class="stat-card organizer-stat-card">
+              <span class="stat-label">Token</span>
+              <span class="stat-value warning" id="org-token">0</span>
+            </div>
+            <div class="stat-card organizer-stat-card">
+              <span class="stat-label">${t('organizer.degraded')}</span>
+              <span class="stat-value danger" id="org-degraded">0</span>
+            </div>
+          </div>
 
-      <div class="grid-2">
-        <div class="form-group">
-          <label class="form-label">${t('organizer.current_model')}</label>
-          <div id="org-model-name" class="form-hint mono">-</div>
+          <section class="card organizer-panel organizer-preview-panel animate-in" style="animation-delay: 0.13s; padding: 0; overflow: hidden;">
+            <div class="card-header organizer-panel-header">
+              <div>
+                <h2 class="card-title">${t('organizer.preview_title')}</h2>
+                <div class="form-hint">${t('organizer.subtitle')}</div>
+              </div>
+            </div>
+            <div id="org-preview-groups" class="preview-groups organizer-preview-groups"></div>
+            <div id="org-preview-empty" class="empty-state organizer-empty-state" style="padding: 32px;">
+              <div class="organizer-empty-glyph" aria-hidden="true"></div>
+              <div class="empty-state-text">${t('organizer.preview_empty')}</div>
+            </div>
+          </section>
+
+          <section id="org-move-result-card" class="card organizer-panel animate-in mt-24" style="animation-delay: 0.17s; padding: 0; overflow: hidden;" hidden>
+            <div class="card-header organizer-panel-header">
+              <div>
+                <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
+                <div class="form-hint">${t('organizer.apply_move')}</div>
+              </div>
+            </div>
+            <div class="stats-grid organizer-stats-grid organizer-stats-grid-compact" style="padding: 20px 20px 0;">
+              <div class="stat-card organizer-stat-card">
+                <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
+                <span id="org-move-moved" class="stat-value success">0</span>
+              </div>
+              <div class="stat-card organizer-stat-card">
+                <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
+                <span id="org-move-skipped" class="stat-value warning">0</span>
+              </div>
+              <div class="stat-card organizer-stat-card">
+                <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
+                <span id="org-move-failed" class="stat-value danger">0</span>
+              </div>
+              <div class="stat-card organizer-stat-card">
+                <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
+                <span id="org-move-total" class="stat-value">0</span>
+              </div>
+            </div>
+            <div class="organizer-table-wrap" style="padding: 20px 20px 0;">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
+                    <th style="width: 32%;">${t('organizer.source')}</th>
+                    <th style="width: 32%;">${t('organizer.target')}</th>
+                    <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
+                  </tr>
+                </thead>
+                <tbody id="org-move-result-body"></tbody>
+              </table>
+            </div>
+            <div id="org-move-result-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
+              <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
+            </div>
+          </section>
+
+          <section class="card organizer-panel animate-in mt-24" style="animation-delay: 0.19s; padding: 0; overflow: hidden;">
+            <div class="card-header organizer-panel-header">
+              <div>
+                <h2 class="card-title">${t('organizer.degraded_panel_title')}</h2>
+                <div class="form-hint">${t('organizer.degraded_reason')}</div>
+              </div>
+              <span class="badge badge-warning">${t('organizer.degraded')}: <span id="org-degraded-count">0</span></span>
+            </div>
+            <div class="organizer-table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>${t('organizer.source')}</th>
+                    <th>${t('organizer.degraded_reason')}</th>
+                  </tr>
+                </thead>
+                <tbody id="org-degraded-body"></tbody>
+              </table>
+            </div>
+            <div id="org-degraded-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
+              <div class="empty-state-text">${t('organizer.degraded_empty')}</div>
+            </div>
+          </section>
         </div>
-        <div class="form-group">
-          <label class="form-label">${t('organizer.multimodal')}</label>
-          <span id="org-mm-badge" class="badge badge-danger">${t('organizer.multimodal_unknown')}</span>
-        </div>
-      </div>
-
-      <div class="grid-2">
-        <div class="form-group">
-          <label class="form-label">${t('organizer.exclusions')}</label>
-          <textarea id="org-exclusions" class="form-input" rows="8" style="grid-column: 1 / span 2;">${escapeHtml((defaults.excludedPatterns || []).join('\n'))}</textarea>
-          <div class="form-hint">${t('organizer.exclusions_hint')}</div>
-        </div>
-      </div>
-
-      <div class="flex items-center gap-16">
-        <button id="org-start-btn" class="btn btn-primary" type="button">${t('organizer.start')}</button>
-        <button id="org-stop-btn" class="btn btn-danger" type="button" disabled>${t('organizer.stop')}</button>
-        <button id="org-apply-btn" class="btn btn-success" type="button" disabled>${t('organizer.apply_move')}</button>
-        <button id="org-rollback-btn" class="btn btn-secondary" type="button">${t('organizer.rollback')}</button>
-      </div>
-    </div>
-
-    <div class="stats-grid animate-in" style="animation-delay: 0.1s">
-      <div class="stat-card">
-        <span class="stat-label">${t('organizer.total_files')}</span>
-        <span class="stat-value" id="org-total">0</span>
-      </div>
-      <div class="stat-card">
-        <span class="stat-label">${t('organizer.done_files')}</span>
-        <span class="stat-value success" id="org-done">0</span>
-      </div>
-      <div class="stat-card">
-        <span class="stat-label">Token</span>
-        <span class="stat-value warning" id="org-token">0</span>
-      </div>
-      <div class="stat-card">
-        <span class="stat-label">${t('organizer.degraded')}</span>
-        <span class="stat-value danger" id="org-degraded">0</span>
-      </div>
-    </div>
-
-    <div class="card animate-in mb-24" style="animation-delay:0.12s;">
-      <div class="card-header">
-        <h2 class="card-title">${t('organizer.progress')}</h2>
-        <span id="org-progress-pct" class="badge badge-info">0.0%</span>
-      </div>
-      <div class="progress-bar">
-        <div id="org-progress-fill" class="progress-fill" style="width:0%;"></div>
-      </div>
-    </div>
-
-    <div class="card animate-in" style="animation-delay: 0.15s; padding: 0; overflow: hidden;">
-      <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
-        <h2 class="card-title">${t('organizer.preview_title')}</h2>
-      </div>
-      <div id="org-preview-groups" class="preview-groups">
-      </div>
-      <div id="org-preview-empty" class="empty-state" style="padding: 32px;">
-        <div class="empty-state-icon">📁</div>
-        <div class="empty-state-text">${t('organizer.preview_empty')}</div>
-      </div>
-    </div>
-
-    <div id="org-move-result-card" class="card animate-in mt-24" style="animation-delay: 0.17s; padding: 0; overflow: hidden;" hidden>
-      <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
-        <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
-      </div>
-      <div class="stats-grid" style="padding: 20px 20px 0;">
-        <div class="stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
-          <span id="org-move-moved" class="stat-value success">0</span>
-        </div>
-        <div class="stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
-          <span id="org-move-skipped" class="stat-value warning">0</span>
-        </div>
-        <div class="stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
-          <span id="org-move-failed" class="stat-value danger">0</span>
-        </div>
-        <div class="stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
-          <span id="org-move-total" class="stat-value">0</span>
-        </div>
-      </div>
-      <div style="overflow-x:auto; padding: 20px 20px 0;">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
-              <th style="width: 32%;">${t('organizer.source')}</th>
-              <th style="width: 32%;">${t('organizer.target')}</th>
-              <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
-            </tr>
-          </thead>
-          <tbody id="org-move-result-body"></tbody>
-        </table>
-      </div>
-      <div id="org-move-result-empty" class="empty-state" style="padding: 24px;">
-        <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
-      </div>
-    </div>
-
-    <div class="card animate-in mt-24" style="animation-delay: 0.18s; padding: 0; overflow: hidden;">
-      <div class="card-header" style="padding: 16px 20px; margin-bottom: 0; border-bottom: 1px solid var(--bg-glass-border);">
-        <h2 class="card-title">${t('organizer.degraded_panel_title')}</h2>
-        <span class="badge badge-warning">${t('organizer.degraded')}: <span id="org-degraded-count">0</span></span>
-      </div>
-      <div style="overflow-x:auto;">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th>${t('organizer.source')}</th>
-              <th>${t('organizer.degraded_reason')}</th>
-            </tr>
-          </thead>
-          <tbody id="org-degraded-body"></tbody>
-        </table>
-      </div>
-      <div id="org-degraded-empty" class="empty-state" style="padding: 24px;">
-        <div class="empty-state-text">${t('organizer.degraded_empty')}</div>
       </div>
     </div>
   `;

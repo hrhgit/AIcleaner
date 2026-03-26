@@ -1237,7 +1237,7 @@ fn load_organize_snapshot_legacy_unused(
         recursive: row.3 != 0,
         reference_original_structure: row.7 != 0,
         excluded_patterns: Vec::new(),
-        batch_size: 50,
+        batch_size: 20,
         max_cluster_depth: None,
         use_web_search: row.10 != 0,
         web_search_enabled: row.11 != 0,
