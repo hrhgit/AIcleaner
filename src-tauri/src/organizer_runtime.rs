@@ -42,15 +42,46 @@ struct RouteConfig {
     model: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryResultKind {
+    Whole,
+    WholeWrapperPassthrough,
+    MixedSplit,
+    StagingJunk,
+}
+
+impl DirectoryResultKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::WholeWrapperPassthrough => "whole_wrapper_passthrough",
+            Self::MixedSplit => "mixed_split",
+            Self::StagingJunk => "staging_junk",
+        }
+    }
+}
+
 #[derive(Clone)]
-struct DirectoryHint {
+struct DirectoryAssessment {
+    result_kind: DirectoryResultKind,
+    integrity_score: u8,
+    integrity_kind: String,
+    evidence: Vec<String>,
     marker_files: Vec<String>,
     app_signals: Vec<String>,
+    wrapper_target_path: Option<String>,
     top_level_entries: Vec<String>,
     dominant_extensions: Vec<String>,
+    name_families: Vec<String>,
+    paired_sidecars: Vec<String>,
+    fragmentation_warnings: Vec<String>,
+    naming_cohesion: String,
     total_size: u64,
     file_count: u64,
     dir_count: u64,
+    direct_file_count: u64,
+    direct_dir_count: u64,
+    max_depth: u32,
 }
 
 #[derive(Clone)]
@@ -63,7 +94,7 @@ struct OrganizeUnit {
     modified_at: Option<String>,
     item_type: String,
     modality: String,
-    directory_hint: Option<DirectoryHint>,
+    directory_assessment: Option<DirectoryAssessment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -94,6 +125,19 @@ const PROJECT_MARKER_NAMES: [&str; 17] = [
     "docker-compose.yaml",
     ".sln",
 ];
+
+const DOWNLOAD_ROOT_TOKENS: [&str; 4] = ["download", "downloads", "下载", "dwnldata"];
+const JUNK_DIR_NAMES: [&str; 8] = [
+    "log",
+    "logs",
+    "cache",
+    "caches",
+    "temp",
+    "tmp",
+    "updates",
+    "update",
+];
+const WRAPPER_FILE_EXTS: [&str; 7] = [".txt", ".md", ".json", ".nfo", ".url", ".sfv", ".crc"];
 
 pub struct OrganizeTaskRuntime {
     pub stop: AtomicBool,
@@ -253,7 +297,18 @@ fn should_exclude(name: &str, patterns: &[String]) -> bool {
     if lower.starts_with('.') {
         return true;
     }
-    patterns.iter().any(|p| lower == *p || lower.contains(p))
+    patterns.iter().any(|pattern| {
+        let normalized = pattern.trim().to_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        if normalized.contains('*') {
+            let needle = normalized.replace('*', "");
+            !needle.is_empty() && lower.contains(&needle)
+        } else {
+            lower == normalized
+        }
+    })
 }
 
 fn extension_key(path: &Path) -> String {
@@ -263,14 +318,228 @@ fn extension_key(path: &Path) -> String {
         .unwrap_or_else(|| "(no_ext)".to_string())
 }
 
+fn relative_path_string(scan_root: &Path, path: &Path) -> String {
+    path.strip_prefix(scan_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn classify_extension_family(ext: &str) -> &'static str {
+    match ext {
+        ".exe" | ".msi" | ".app" | ".apk" | ".dll" | ".bin" | ".pak" | ".pck" | ".3dsx"
+        | ".firm" => "app",
+        ".json" | ".yaml" | ".yml" | ".toml" | ".ini" | ".cfg" | ".conf" | ".config"
+        | ".xml" => "config",
+        ".md" | ".txt" | ".pdf" | ".doc" | ".docx" | ".rtf" | ".epub" | ".csv" | ".xlsx"
+        | ".xls" | ".bib" => "document",
+        ".png" | ".jpg" | ".jpeg" | ".webp" | ".gif" | ".bmp" | ".ani" | ".ico" => "image",
+        ".mp4" | ".mov" | ".mkv" | ".avi" | ".wmv" | ".webm" => "video",
+        ".mp3" | ".wav" | ".m4a" | ".aac" | ".flac" | ".ogg" => "audio",
+        ".zip" | ".rar" | ".7z" | ".tar" | ".gz" | ".bz2" | ".xz" => "archive",
+        ".ttf" | ".otf" | ".woff" | ".woff2" => "font",
+        ".log" | ".tmp" | ".cache" | ".dat" | ".db" => "runtime",
+        ".ps1" | ".bat" | ".cmd" | ".sh" => "script",
+        _ => "other",
+    }
+}
+
+fn normalize_name_family(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let mut value = stem.trim().to_string();
+    loop {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            return "(empty)".to_string();
+        }
+        if let Some(inner) = trimmed.strip_suffix(')') {
+            if let Some(pos) = inner.rfind(" (") {
+                let suffix = &inner[pos + 2..];
+                if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                    value = inner[..pos].to_string();
+                    continue;
+                }
+            }
+        }
+        let bytes = trimmed.as_bytes();
+        let mut idx = bytes.len();
+        while idx > 0 && bytes[idx - 1].is_ascii_digit() {
+            idx -= 1;
+        }
+        if idx < bytes.len() && idx > 0 {
+            let separator = bytes[idx - 1] as char;
+            if matches!(separator, '-' | '_' | ' ') {
+                value = trimmed[..idx - 1].to_string();
+                continue;
+            }
+        }
+        return trimmed
+            .trim_matches(|ch: char| matches!(ch, '-' | '_' | ' ' | '.'))
+            .to_string();
+    }
+}
+
+fn strip_bundle_suffix_tokens(mut value: String) -> String {
+    const SUFFIXES: [&str; 11] = [
+        "x64",
+        "x86",
+        "arm64",
+        "arm32",
+        "amd64",
+        "win64",
+        "win32",
+        "64bit",
+        "32bit",
+        "setup",
+        "installer",
+    ];
+    loop {
+        let trimmed = value
+            .trim_end_matches(|ch: char| matches!(ch, '-' | '_' | ' ' | '.'))
+            .to_string();
+        let mut changed = false;
+        for suffix in SUFFIXES {
+            if let Some(stripped) = trimmed.strip_suffix(suffix) {
+                let candidate = stripped
+                    .trim_end_matches(|ch: char| matches!(ch, '-' | '_' | ' ' | '.'))
+                    .to_string();
+                if !candidate.is_empty() {
+                    value = candidate;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            return trimmed;
+        }
+    }
+}
+
+fn canonical_bundle_key(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let stripped = strip_bundle_suffix_tokens(stem);
+    let cutoff = stripped
+        .char_indices()
+        .find_map(|(idx, ch)| (idx >= 3 && ch.is_ascii_digit()).then_some(idx))
+        .unwrap_or(stripped.len());
+    let base = stripped[..cutoff]
+        .trim_end_matches(|ch: char| matches!(ch, '-' | '_' | ' ' | '.'))
+        .to_string();
+    let cleaned = base
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    if cleaned.is_empty() {
+        stripped
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect::<String>()
+    } else {
+        cleaned
+    }
+}
+
+fn matches_bundle_root(root_key: &str, entry_name: &str) -> bool {
+    if root_key.len() < 3 {
+        return false;
+    }
+    let entry_key = canonical_bundle_key(entry_name);
+    !entry_key.is_empty() && (entry_key.starts_with(root_key) || root_key.starts_with(&entry_key))
+}
+
+fn is_package_doc_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let ext = extension_key(Path::new(name));
+    let is_doc_ext = matches!(
+        ext.as_str(),
+        ".txt" | ".md" | ".pdf" | ".doc" | ".docx" | ".rtf"
+    );
+    is_doc_ext
+        && [
+            "readme", "guide", "manual", "install", "setup", "usage", "license", "说明", "安装",
+            "使用", "教程", "运行", "版权",
+        ]
+        .iter()
+        .any(|token| lower.contains(token))
+}
+
+fn format_ranked_entries(map: HashMap<String, u64>, limit: usize) -> Vec<String> {
+    let mut rows = map.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter()
+        .take(limit)
+        .map(|(key, count)| format!("{key}:{count}"))
+        .collect()
+}
+
+fn summarize_name_families(file_names: &[String], limit: usize) -> (Vec<String>, usize) {
+    let mut families = HashMap::<String, u64>::new();
+    for name in file_names {
+        let family = normalize_name_family(name);
+        if family.is_empty() || family == "(empty)" {
+            continue;
+        }
+        *families.entry(family).or_insert(0) += 1;
+    }
+    let max_family_count = families.values().copied().max().unwrap_or(0) as usize;
+    let formatted = format_ranked_entries(
+        families
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .collect::<HashMap<_, _>>(),
+        limit,
+    );
+    (formatted, max_family_count)
+}
+
+fn summarize_sidecars(file_names: &[String], limit: usize) -> Vec<String> {
+    let mut families = HashMap::<String, HashSet<String>>::new();
+    for name in file_names {
+        let family = normalize_name_family(name);
+        if family.is_empty() || family == "(empty)" {
+            continue;
+        }
+        families
+            .entry(family)
+            .or_default()
+            .insert(extension_key(Path::new(name)));
+    }
+    let mut rows = families
+        .into_iter()
+        .filter_map(|(family, exts)| {
+            if exts.len() < 2 {
+                return None;
+            }
+            let mut ext_list = exts.into_iter().collect::<Vec<_>>();
+            ext_list.sort();
+            Some((family, ext_list))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter()
+        .take(limit)
+        .map(|(family, exts)| format!("{family}=>{}", exts.join("+")))
+        .collect()
+}
+
 fn summarize_directory_tree(
     path: &Path,
     stop: &AtomicBool,
-) -> (u64, u64, u64, HashMap<String, u64>) {
+) -> (u64, u64, u64, HashMap<String, u64>, u32) {
     let mut total_size = 0_u64;
     let mut file_count = 0_u64;
     let mut dir_count = 0_u64;
     let mut ext_counts = HashMap::new();
+    let mut max_depth = 0_u32;
     for entry in WalkDir::new(path)
         .min_depth(1)
         .into_iter()
@@ -280,6 +549,7 @@ fn summarize_directory_tree(
             break;
         }
         let entry_path = entry.path();
+        max_depth = max_depth.max(entry.depth() as u32);
         if entry.file_type().is_dir() {
             dir_count = dir_count.saturating_add(1);
             continue;
@@ -294,21 +564,96 @@ fn summarize_directory_tree(
         let key = extension_key(entry_path);
         *ext_counts.entry(key).or_insert(0) += 1;
     }
-    (total_size, file_count, dir_count, ext_counts)
+    (total_size, file_count, dir_count, ext_counts, max_depth)
 }
 
-fn inspect_directory_hint(path: &Path, stop: &AtomicBool) -> Option<DirectoryHint> {
+fn is_collection_root(path: &Path, excluded: &[String], stop: &AtomicBool) -> bool {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    let root_name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let has_download_name = DOWNLOAD_ROOT_TOKENS
+        .iter()
+        .any(|token| root_name.contains(token));
+    let mut direct_file_count = 0_u64;
+    let mut direct_dir_count = 0_u64;
+    let mut file_families = HashSet::<String>::new();
+
+    for entry in entries.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if should_exclude(&name, excluded) {
+            continue;
+        }
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            direct_dir_count = direct_dir_count.saturating_add(1);
+            continue;
+        }
+        if entry_path.is_file() {
+            direct_file_count = direct_file_count.saturating_add(1);
+            file_families.insert(classify_extension_family(&extension_key(&entry_path)).to_string());
+        }
+    }
+
+    (has_download_name && direct_dir_count >= 4)
+        || (direct_dir_count >= 8 && direct_file_count >= 6 && file_families.len() >= 4)
+        || (direct_dir_count >= 12 && file_families.len() >= 3)
+}
+
+fn evaluate_directory_assessment(
+    path: &Path,
+    stop: &AtomicBool,
+    prefer_whole: bool,
+) -> Option<DirectoryAssessment> {
     let mut marker_files = Vec::new();
+    let mut evidence = Vec::new();
     let mut app_signals = Vec::new();
+    let mut fragmentation_warnings = Vec::new();
     let mut top_level_entries = Vec::new();
-    let mut direct_ext_counts = HashMap::new();
+    let mut direct_family_counts = HashMap::<String, u64>::new();
+    let mut direct_file_names = Vec::new();
+    let mut direct_dir_names = Vec::new();
+    let mut direct_child_dirs = Vec::<PathBuf>::new();
     let mut has_readme = false;
     let mut has_src = false;
     let mut has_bin = false;
     let mut has_lib = false;
     let mut has_resources = false;
+    let mut has_docs = false;
+    let mut has_images = false;
+    let mut has_labels = false;
+    let mut has_annotations = false;
+    let mut has_train = false;
+    let mut has_val = false;
+    let mut has_test = false;
+    let mut has_mods = false;
+    let mut junk_named_dirs = 0_u64;
     let mut direct_exe_count = 0_u32;
     let mut direct_dll_count = 0_u32;
+    let mut direct_archive_count = 0_u32;
+    let mut direct_font_count = 0_u32;
+    let mut direct_text_count = 0_u32;
+    let mut direct_image_count = 0_u32;
+    let mut direct_video_count = 0_u32;
+    let mut direct_audio_count = 0_u32;
+    let mut direct_runtime_count = 0_u32;
+    let mut direct_config_count = 0_u32;
+    let mut direct_script_count = 0_u32;
+    let mut direct_json_count = 0_u32;
+    let mut direct_pck_count = 0_u32;
+    let mut direct_pak_count = 0_u32;
+    let mut direct_bin_payload_count = 0_u32;
+    let mut direct_cursor_count = 0_u32;
+    let mut direct_inf_count = 0_u32;
+    let mut metadata_marker_count = 0_u32;
 
     let entries = fs::read_dir(path).ok()?;
     for entry in entries.filter_map(Result::ok) {
@@ -320,23 +665,36 @@ fn inspect_directory_hint(path: &Path, stop: &AtomicBool) -> Option<DirectoryHin
         if top_level_entries.len() < 18 {
             top_level_entries.push(name.clone());
         }
-
         if PROJECT_MARKER_NAMES.iter().any(|marker| lower == *marker) {
             marker_files.push(name.clone());
         }
 
         let entry_path = entry.path();
         if entry_path.is_dir() {
+            direct_dir_names.push(name.clone());
+            direct_child_dirs.push(entry_path.clone());
             match lower.as_str() {
                 "src" | "app" => has_src = true,
                 "bin" => has_bin = true,
                 "lib" => has_lib = true,
                 "resources" | "resource" => has_resources = true,
+                "docs" | "doc" => has_docs = true,
+                "images" | "image" | "img" | "imgs" => has_images = true,
+                "labels" => has_labels = true,
+                "annotations" | "annotation" => has_annotations = true,
+                "train" => has_train = true,
+                "val" | "valid" | "validation" => has_val = true,
+                "test" | "tests" => has_test = true,
+                "mods" | "plugins" | "plugin" => has_mods = true,
                 _ => {}
+            }
+            if JUNK_DIR_NAMES.iter().any(|value| lower == *value) {
+                junk_named_dirs = junk_named_dirs.saturating_add(1);
             }
             continue;
         }
 
+        direct_file_names.push(name.clone());
         if lower == "readme.md" || lower == "readme.txt" || lower == "readme" {
             has_readme = true;
         }
@@ -346,51 +704,549 @@ fn inspect_directory_hint(path: &Path, stop: &AtomicBool) -> Option<DirectoryHin
         if lower.ends_with(".dll") {
             direct_dll_count += 1;
         }
-        let key = extension_key(&entry_path);
-        *direct_ext_counts.entry(key).or_insert(0) += 1;
+        if lower.ends_with(".json") {
+            direct_json_count += 1;
+        }
+        if lower.ends_with(".pck") {
+            direct_pck_count += 1;
+        }
+        if lower.ends_with(".pak") {
+            direct_pak_count += 1;
+        }
+        if lower.ends_with(".bin") {
+            direct_bin_payload_count += 1;
+        }
+        if lower.ends_with(".ani") || lower.ends_with(".cur") {
+            direct_cursor_count += 1;
+        }
+        if lower.ends_with(".inf") {
+            direct_inf_count += 1;
+        }
+        if lower.contains("manifest")
+            || lower.contains("metadata")
+            || lower.contains("catalog")
+            || lower.contains("index")
+        {
+            metadata_marker_count += 1;
+        }
+
+        let family = classify_extension_family(&extension_key(&entry_path)).to_string();
+        *direct_family_counts.entry(family.clone()).or_insert(0) += 1;
+        match family.as_str() {
+            "archive" => direct_archive_count += 1,
+            "font" => direct_font_count += 1,
+            "document" => direct_text_count += 1,
+            "image" => direct_image_count += 1,
+            "video" => direct_video_count += 1,
+            "audio" => direct_audio_count += 1,
+            "runtime" => direct_runtime_count += 1,
+            "config" => direct_config_count += 1,
+            "script" => direct_script_count += 1,
+            _ => {}
+        }
     }
 
+    let (total_size, file_count, dir_count, ext_counts, max_depth) =
+        summarize_directory_tree(path, stop);
+    let dominant_extensions = format_ranked_entries(ext_counts.clone(), 8);
+    let (name_families, max_family_count) = summarize_name_families(&direct_file_names, 5);
+    let paired_sidecars = summarize_sidecars(&direct_file_names, 5);
+    let root_bundle_key = canonical_bundle_key(
+        path.file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default(),
+    );
+    let root_named_file_count = direct_file_names
+        .iter()
+        .filter(|name| matches_bundle_root(&root_bundle_key, name))
+        .count() as u64;
+    let root_named_binary_count = direct_file_names
+        .iter()
+        .filter(|name| {
+            matches_bundle_root(&root_bundle_key, name)
+                && matches!(
+                    classify_extension_family(&extension_key(Path::new(name))),
+                    "app" | "config"
+                )
+        })
+        .count() as u64;
+    let package_doc_count = direct_file_names
+        .iter()
+        .filter(|name| is_package_doc_name(name))
+        .count() as u64;
+    let multi_variant_app_bundle = root_named_binary_count >= 2 && direct_exe_count >= 2;
+    let direct_file_count = direct_file_names.len() as u64;
+    let direct_dir_count = direct_dir_names.len() as u64;
+    let document_collection_share =
+        (direct_text_count + direct_archive_count) as u64 * 100 / direct_file_count.max(1);
+    let document_collection_layout = direct_text_count >= 8
+        && document_collection_share >= 85
+        && direct_exe_count == 0
+        && direct_dll_count == 0
+        && direct_image_count <= 3
+        && direct_video_count == 0
+        && direct_audio_count == 0
+        && direct_runtime_count == 0
+        && direct_script_count == 0;
+    let dominant_extension_count = ext_counts.values().copied().max().unwrap_or(0);
+    let dominant_share = if file_count == 0 {
+        0.0
+    } else {
+        dominant_extension_count as f64 / file_count as f64
+    };
+    let naming_cohesion = if max_family_count >= 3 {
+        "high".to_string()
+    } else if max_family_count == 2 || dominant_share >= 0.55 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    };
+
+    let wrapper_target_path = if direct_dir_count == 1
+        && ((direct_file_count == 0)
+            || (direct_file_count <= 2
+                && direct_file_names.iter().all(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    WRAPPER_FILE_EXTS.iter().any(|ext| lower.ends_with(ext))
+                })))
+        && marker_files.is_empty()
+        && direct_exe_count == 0
+        && direct_dll_count == 0
+        && direct_archive_count == 0
+        && direct_font_count == 0
+        && direct_script_count == 0
+    {
+        direct_child_dirs
+            .first()
+            .map(|child| child.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    let runtime_like_only = direct_file_count > 0
+        && (direct_runtime_count + direct_config_count) as u64 * 100 / direct_file_count >= 70
+        && direct_exe_count == 0
+        && direct_dll_count == 0
+        && direct_text_count <= 1
+        && direct_image_count == 0
+        && direct_video_count == 0
+        && direct_audio_count == 0
+        && direct_font_count == 0
+        && direct_script_count <= 1
+        && marker_files.is_empty();
+    let staging_junk = if runtime_like_only {
+        junk_named_dirs == direct_dir_count || direct_dir_count == 0
+    } else {
+        false
+    };
+
+    let mut integrity_kind = "mixed".to_string();
+    let mut score = 0_i32;
+    let mut strong_anchor = false;
+
+    if !marker_files.is_empty() {
+        score += 38;
+        strong_anchor = true;
+        integrity_kind = "project".to_string();
+        evidence.push(format!("markerFiles={}", marker_files.join(",")));
+        app_signals.push("project_markers".to_string());
+    }
+    if has_readme {
+        score += 8;
+        evidence.push("readme_present".to_string());
+        app_signals.push("readme_present".to_string());
+    }
+    if package_doc_count > 0 {
+        score += (package_doc_count.min(3) as i32) * 3;
+        evidence.push(format!("packageDocs={package_doc_count}"));
+        app_signals.push(format!("package_docs:{package_doc_count}"));
+    }
     if has_readme && has_src {
+        score += 30;
+        strong_anchor = true;
+        integrity_kind = "project".to_string();
+        evidence.push("readme+src".to_string());
         app_signals.push("readme+src".to_string());
     }
-    if has_bin && has_lib {
-        app_signals.push("bin+lib".to_string());
+    if ((has_train && has_val) || (has_train && has_test) || (has_val && has_test))
+        || ((has_images || has_docs) && (has_labels || has_annotations))
+    {
+        score += 32;
+        strong_anchor = true;
+        integrity_kind = "dataset_bundle".to_string();
+        evidence.push("dataset_skeleton".to_string());
+        app_signals.push("dataset_skeleton".to_string());
     }
-    if has_resources {
-        app_signals.push("resources".to_string());
-    }
-    if direct_exe_count > 0 {
+    if direct_exe_count > 0
+        && (direct_dll_count > 0
+            || has_resources
+            || has_bin
+            || has_lib
+            || direct_pak_count > 0
+            || direct_bin_payload_count > 0)
+    {
+        score += 36;
+        strong_anchor = true;
+        integrity_kind = "app_bundle".to_string();
+        evidence.push("exe+companions".to_string());
         app_signals.push(format!("exe:{direct_exe_count}"));
-    }
-    if direct_dll_count > 0 {
+    } else if direct_dll_count > 0
+        && (direct_json_count > 0
+            || direct_pck_count > 0
+            || direct_config_count > 0
+            || has_resources
+            || has_bin
+            || has_lib
+            || has_mods)
+    {
+        score += 30;
+        strong_anchor = true;
+        integrity_kind = "app_bundle".to_string();
+        evidence.push("dll+config_bundle".to_string());
+        app_signals.push(format!("dll:{direct_dll_count}"));
+    } else if direct_dll_count > 0 {
+        score += 4;
+        evidence.push("dll_weak_signal".to_string());
         app_signals.push(format!("dll:{direct_dll_count}"));
     }
-
-    let project_like = !marker_files.is_empty()
-        || (has_readme && has_src)
-        || (direct_exe_count > 0 && (direct_dll_count > 0 || has_resources || has_bin || has_lib))
-        || (has_bin && has_lib);
-    if !project_like {
-        return None;
+    if direct_font_count >= 2 && direct_file_count <= 6 && direct_dir_count == 0 {
+        score += 45;
+        strong_anchor = true;
+        integrity_kind = "doc_bundle".to_string();
+        evidence.push("font_pack".to_string());
+        app_signals.push("font_pack".to_string());
+    }
+    if direct_text_count >= 6
+        && document_collection_share >= 75
+    {
+        score += 30;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "doc_bundle".to_string();
+        }
+        evidence.push("document_bundle".to_string());
+        app_signals.push("document_bundle".to_string());
+    } else if direct_archive_count > 0 && direct_text_count >= 3 {
+        score += 18;
+        if integrity_kind == "mixed" {
+            integrity_kind = "doc_bundle".to_string();
+        }
+        evidence.push("archive+documents".to_string());
+        app_signals.push("archive+documents".to_string());
+    }
+    if (direct_image_count + direct_video_count + direct_audio_count) >= 3
+        && !paired_sidecars.is_empty()
+    {
+        score += 22;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "media_bundle".to_string();
+        }
+        evidence.push("media_sidecars".to_string());
+        app_signals.push("media_sidecars".to_string());
+    }
+    if metadata_marker_count > 0 && (direct_dir_count > 0 || direct_file_count >= 3) {
+        score += 22;
+        if integrity_kind == "mixed" {
+            integrity_kind = "export_backup_bundle".to_string();
+        }
+        evidence.push("metadata_markers".to_string());
+        app_signals.push("metadata_markers".to_string());
+    }
+    if direct_exe_count >= 1
+        && package_doc_count > 0
+        && direct_file_count <= 6
+        && direct_dir_count == 0
+        && direct_dll_count == 0
+        && direct_archive_count == 0
+    {
+        score += 30;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "app_bundle".to_string();
+        }
+        evidence.push("installer_with_docs".to_string());
+        app_signals.push(format!("installer_docs:{package_doc_count}"));
+    }
+    if document_collection_layout {
+        score += 14;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "doc_bundle".to_string();
+        }
+        evidence.push("document_collection_layout".to_string());
+        app_signals.push(format!("document_files:{}", direct_text_count));
+    }
+    if direct_cursor_count >= 8
+        && (direct_image_count > 0 || direct_text_count > 0 || direct_inf_count > 0)
+    {
+        score += 34;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "theme_pack".to_string();
+        }
+        evidence.push("cursor_theme_pack".to_string());
+        app_signals.push(format!("cursor_files:{direct_cursor_count}"));
+        if direct_inf_count > 0 {
+            evidence.push("install_manifest_present".to_string());
+        }
+    }
+    if multi_variant_app_bundle {
+        score += 42;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = "app_bundle".to_string();
+        }
+        evidence.push("multi_variant_app_bundle".to_string());
+        app_signals.push(format!("root_named_binaries:{root_named_binary_count}"));
+        if package_doc_count > 0 {
+            evidence.push("package_docs_present".to_string());
+        }
+    } else if package_doc_count > 0
+        && root_named_file_count >= 1
+        && (direct_exe_count > 0 || direct_dll_count > 0 || direct_archive_count > 0)
+        && direct_file_count <= 12
+    {
+        score += 20;
+        strong_anchor = true;
+        if integrity_kind == "mixed" {
+            integrity_kind = if direct_exe_count > 0 || direct_dll_count > 0 {
+                "app_bundle".to_string()
+            } else {
+                "doc_bundle".to_string()
+            };
+        }
+        evidence.push("package_docs_bundle".to_string());
+        app_signals.push(format!("package_docs:{package_doc_count}"));
+    }
+    if max_family_count >= 2 {
+        score += ((max_family_count as i32 - 1) * 4).clamp(4, 16);
+        evidence.push(format!("nameFamilyCount={max_family_count}"));
+    }
+    if dominant_share >= 0.75 {
+        score += 14;
+        evidence.push("dominantExtensionHigh".to_string());
+    } else if dominant_share >= 0.6 {
+        score += 10;
+        evidence.push("dominantExtension".to_string());
+    }
+    if direct_file_count >= 2
+        && direct_file_count <= 5
+        && ((direct_exe_count == 1 && (direct_bin_payload_count > 0 || direct_dll_count > 0))
+            || (direct_dll_count > 0
+                && (direct_json_count > 0 || direct_pck_count > 0 || direct_config_count > 0))
+            || (direct_font_count >= 2 && direct_dir_count == 0))
+    {
+        score += 15;
+        evidence.push("small_strong_bundle".to_string());
+    }
+    if prefer_whole && score > 0 {
+        score += 6;
+        evidence.push("collection_root_bonus".to_string());
     }
 
-    let (total_size, file_count, dir_count, ext_counts) = summarize_directory_tree(path, stop);
-    let mut dominant_extensions = ext_counts.into_iter().collect::<Vec<_>>();
-    dominant_extensions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let app_bundle_layout = strong_anchor
+        && integrity_kind == "app_bundle"
+        && direct_exe_count > 0
+        && (direct_dll_count > 0
+            || has_resources
+            || has_bin
+            || has_lib
+            || direct_pak_count > 0
+            || direct_bin_payload_count > 0);
+    if app_bundle_layout {
+        score += 8;
+        evidence.push("app_layout_bundle".to_string());
+    }
 
-    Some(DirectoryHint {
+    if direct_dir_count >= 3
+        && direct_file_count >= 6
+        && direct_family_counts.len() >= 4
+        && !strong_anchor
+    {
+        score -= 25;
+        fragmentation_warnings.push("heterogeneous_top_level".to_string());
+    }
+    if file_count >= 6
+        && dominant_share < 0.45
+        && ext_counts.len() >= 5
+        && !app_bundle_layout
+        && !multi_variant_app_bundle
+    {
+        score -= 18;
+        fragmentation_warnings.push("low_content_cohesion".to_string());
+    }
+    if max_family_count <= 1
+        && direct_file_count >= 8
+        && !app_bundle_layout
+        && !document_collection_layout
+    {
+        score -= 12;
+        fragmentation_warnings.push("weak_name_families".to_string());
+    }
+
+    if wrapper_target_path.is_some() {
+        evidence.push("single_child_wrapper".to_string());
+    }
+    if staging_junk {
+        fragmentation_warnings.push("runtime_cache_shell".to_string());
+    }
+
+    let integrity_score = score.clamp(0, 100) as u8;
+    let explicit_split = (!strong_anchor
+        && direct_dir_count >= 3
+        && direct_file_count >= 6
+        && direct_family_counts.len() >= 4)
+        || (!strong_anchor
+            && file_count >= 6
+            && dominant_share < 0.45
+            && ext_counts.len() >= 5
+            && direct_family_counts.len() >= 4)
+        || (integrity_kind == "mixed"
+            && direct_dir_count >= 2
+            && direct_file_count >= 6
+            && direct_family_counts.len() >= 4);
+    let result_kind = if wrapper_target_path.is_some() {
+        DirectoryResultKind::WholeWrapperPassthrough
+    } else if staging_junk {
+        DirectoryResultKind::StagingJunk
+    } else if explicit_split {
+        DirectoryResultKind::MixedSplit
+    } else {
+        DirectoryResultKind::Whole
+    };
+
+    Some(DirectoryAssessment {
+        result_kind,
+        integrity_score,
+        integrity_kind,
+        evidence,
         marker_files,
         app_signals,
+        wrapper_target_path,
         top_level_entries,
-        dominant_extensions: dominant_extensions
-            .into_iter()
-            .take(8)
-            .map(|(ext, count)| format!("{ext}:{count}"))
-            .collect(),
+        dominant_extensions,
+        name_families,
+        paired_sidecars,
+        fragmentation_warnings,
+        naming_cohesion,
         total_size,
         file_count,
         dir_count,
+        direct_file_count,
+        direct_dir_count,
+        max_depth,
     })
+}
+
+fn create_directory_unit(
+    scan_root: &Path,
+    path: &Path,
+    metadata: &fs::Metadata,
+    assessment: DirectoryAssessment,
+) -> OrganizeUnit {
+    OrganizeUnit {
+        name: path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        path: path.to_string_lossy().to_string(),
+        relative_path: relative_path_string(scan_root, path),
+        size: assessment.total_size,
+        created_at: metadata.created().ok().map(system_time_to_iso),
+        modified_at: metadata.modified().ok().map(system_time_to_iso),
+        item_type: "directory".to_string(),
+        modality: "directory".to_string(),
+        directory_assessment: Some(assessment),
+    }
+}
+
+fn create_file_unit(scan_root: &Path, path: &Path, metadata: &fs::Metadata) -> OrganizeUnit {
+    OrganizeUnit {
+        name: path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        path: path.to_string_lossy().to_string(),
+        relative_path: relative_path_string(scan_root, path),
+        size: metadata.len(),
+        created_at: metadata.created().ok().map(system_time_to_iso),
+        modified_at: metadata.modified().ok().map(system_time_to_iso),
+        item_type: "file".to_string(),
+        modality: pick_modality(&path.to_string_lossy()).to_string(),
+        directory_assessment: None,
+    }
+}
+
+fn collect_directory_candidate(
+    scan_root: &Path,
+    path: &Path,
+    recursive: bool,
+    excluded: &[String],
+    stop: &AtomicBool,
+    parent_is_collection_root: bool,
+    staging_passthrough_budget: u8,
+    out: &mut Vec<OrganizeUnit>,
+) {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    let assessment = match evaluate_directory_assessment(path, stop, parent_is_collection_root) {
+        Some(assessment) => assessment,
+        None => return,
+    };
+
+    match assessment.result_kind {
+        DirectoryResultKind::Whole => {
+            out.push(create_directory_unit(scan_root, path, &metadata, assessment));
+        }
+        DirectoryResultKind::WholeWrapperPassthrough => {
+            if let Some(target) = assessment.wrapper_target_path.as_ref() {
+                collect_directory_candidate(
+                    scan_root,
+                    Path::new(target),
+                    recursive,
+                    excluded,
+                    stop,
+                    parent_is_collection_root,
+                    staging_passthrough_budget,
+                    out,
+                );
+            }
+        }
+        DirectoryResultKind::MixedSplit => {
+            if recursive {
+                let current_is_collection_root = is_collection_root(path, excluded, stop);
+                collect_units_inner(
+                    scan_root,
+                    path,
+                    true,
+                    excluded,
+                    stop,
+                    current_is_collection_root,
+                    staging_passthrough_budget,
+                    out,
+                );
+            }
+        }
+        DirectoryResultKind::StagingJunk => {
+            if recursive && staging_passthrough_budget > 0 {
+                collect_units_inner(
+                    scan_root,
+                    path,
+                    true,
+                    excluded,
+                    stop,
+                    false,
+                    staging_passthrough_budget.saturating_sub(1),
+                    out,
+                );
+            }
+        }
+    }
 }
 
 fn collect_units_inner(
@@ -399,6 +1255,8 @@ fn collect_units_inner(
     recursive: bool,
     excluded: &[String],
     stop: &AtomicBool,
+    current_is_collection_root: bool,
+    staging_passthrough_budget: u8,
     out: &mut Vec<OrganizeUnit>,
 ) {
     let entries = match fs::read_dir(current_dir) {
@@ -416,56 +1274,23 @@ fn collect_units_inner(
             continue;
         }
         if path.is_dir() {
-            if let Some(hint) = inspect_directory_hint(&path, stop) {
-                out.push(OrganizeUnit {
-                    name: name.clone(),
-                    path: path.to_string_lossy().to_string(),
-                    relative_path: path
-                        .strip_prefix(scan_root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string(),
-                    size: hint.total_size,
-                    created_at: entry
-                        .metadata()
-                        .ok()
-                        .and_then(|meta| meta.created().ok())
-                        .map(system_time_to_iso),
-                    modified_at: entry
-                        .metadata()
-                        .ok()
-                        .and_then(|meta| meta.modified().ok())
-                        .map(system_time_to_iso),
-                    item_type: "directory".to_string(),
-                    modality: "directory".to_string(),
-                    directory_hint: Some(hint),
-                });
-                continue;
-            }
-            if recursive {
-                collect_units_inner(scan_root, &path, true, excluded, stop, out);
-            }
+            collect_directory_candidate(
+                scan_root,
+                &path,
+                recursive,
+                excluded,
+                stop,
+                current_is_collection_root,
+                staging_passthrough_budget,
+                out,
+            );
             continue;
         }
         if !path.is_file() {
             continue;
         }
         if let Ok(meta) = entry.metadata() {
-            out.push(OrganizeUnit {
-                name: name.clone(),
-                path: path.to_string_lossy().to_string(),
-                relative_path: path
-                    .strip_prefix(scan_root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string(),
-                size: meta.len(),
-                created_at: meta.created().ok().map(system_time_to_iso),
-                modified_at: meta.modified().ok().map(system_time_to_iso),
-                item_type: "file".to_string(),
-                modality: pick_modality(&path.to_string_lossy()).to_string(),
-                directory_hint: None,
-            });
+            out.push(create_file_unit(scan_root, &path, &meta));
         }
     }
 }
@@ -477,7 +1302,17 @@ fn collect_units(
     stop: &AtomicBool,
 ) -> Vec<OrganizeUnit> {
     let mut out = Vec::new();
-    collect_units_inner(root, root, recursive, excluded, stop, &mut out);
+    let root_is_collection_root = is_collection_root(root, excluded, stop);
+    collect_units_inner(
+        root,
+        root,
+        recursive,
+        excluded,
+        stop,
+        root_is_collection_root,
+        1,
+        &mut out,
+    );
     out.sort_by(|a, b| {
         a.relative_path
             .to_lowercase()
@@ -487,14 +1322,103 @@ fn collect_units(
     out
 }
 
+#[allow(unreachable_code, unused_variables)]
 fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) -> String {
-    let Some(hint) = unit.directory_hint.as_ref() else {
+    let Some(assessment) = unit.directory_assessment.as_ref() else {
         return if is_zh_language(response_language) {
             "暂无目录摘要。".to_string()
         } else {
             "No directory summary available.".to_string()
         };
     };
+    let hint = assessment;
+    let mut lines = vec![
+        format!("resultKind={}", assessment.result_kind.as_str()),
+        format!("integrityKind={}", assessment.integrity_kind),
+        format!("integrityScore={}", assessment.integrity_score),
+        format!("relativePath={}", unit.relative_path),
+        format!("totalSize={}", unit.size),
+        format!(
+            "createdAt={}",
+            unit.created_at
+                .clone()
+                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
+        ),
+        format!(
+            "modifiedAt={}",
+            unit.modified_at
+                .clone()
+                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
+        ),
+        format!(
+            "directoryShape=directFiles:{}|directDirs:{}|totalFiles:{}|totalDirectories:{}|maxDepth:{}",
+            assessment.direct_file_count,
+            assessment.direct_dir_count,
+            assessment.file_count,
+            assessment.dir_count,
+            assessment.max_depth
+        ),
+        format!(
+            "evidence={}",
+            if assessment.evidence.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.evidence.join(", ")
+            }
+        ),
+        format!("namingCohesion={}", assessment.naming_cohesion),
+        format!(
+            "topLevelEntries={}",
+            if assessment.top_level_entries.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.top_level_entries.join(", ")
+            }
+        ),
+        format!(
+            "dominantExtensions={}",
+            if assessment.dominant_extensions.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.dominant_extensions.join(", ")
+            }
+        ),
+        format!(
+            "nameFamilies={}",
+            if assessment.name_families.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.name_families.join(", ")
+            }
+        ),
+        format!(
+            "pairedSidecars={}",
+            if assessment.paired_sidecars.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.paired_sidecars.join(", ")
+            }
+        ),
+        format!(
+            "fragmentationWarnings={}",
+            if assessment.fragmentation_warnings.is_empty() {
+                organizer_none_label(response_language).to_string()
+            } else {
+                assessment.fragmentation_warnings.join(", ")
+            }
+        ),
+    ];
+    if is_zh_language(response_language) {
+        lines.push(
+            "该目录已是整体候选，默认按整体归类，除非摘要明确显示多主题混杂。".to_string(),
+        );
+    } else {
+        lines.push(
+            "This directory is already a bundle candidate. Default to classifying it as a whole unit unless the summary clearly indicates multiple unrelated themes."
+                .to_string(),
+        );
+    }
+    return lines.join("\n");
     if is_zh_language(response_language) {
         [
             format!("相对路径={}", unit.relative_path),
@@ -883,11 +1807,18 @@ fn summarize_unit_for_batch(
     response_language: &str,
 ) -> (String, bool, Vec<String>) {
     match unit.item_type.as_str() {
-        "directory" => (
-            summarize_directory_for_prompt(unit, response_language),
-            false,
-            Vec::new(),
-        ),
+        "directory" => {
+            let warnings = unit
+                .directory_assessment
+                .as_ref()
+                .map(|assessment| assessment.fragmentation_warnings.clone())
+                .unwrap_or_default();
+            (
+                summarize_directory_for_prompt(unit, response_language),
+                false,
+                warnings,
+            )
+        }
         _ if unit.modality == "text" => {
             let snippet = fs::read_to_string(&unit.path)
                 .ok()
@@ -1078,6 +2009,7 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
         "Return JSON only.".to_string(),
         "Final schema: {\"tree\":{...},\"assignments\":[{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}]}".to_string(),
         "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
+        "When an item summary includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the summary clearly shows unrelated mixed content.".to_string(),
         format!("Use {output_language} names and keep labels short."),
         format!("The assignment \"reason\" field must be written in {output_language} only."),
     ];
@@ -2167,6 +3099,21 @@ pub async fn organize_rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+    use uuid::Uuid;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wipeout-organizer-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn write_file(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, b"test").expect("write file");
+    }
 
     #[test]
     fn ensure_path_creates_nested_tree() {
@@ -2192,5 +3139,317 @@ mod tests {
             preview[0].get("targetPath").and_then(Value::as_str),
             Some(r"C:\root\group\leaf\foo.txt")
         );
+    }
+
+    #[test]
+    fn collection_root_detects_download_like_root() {
+        let root = temp_dir("download-root").join("Download");
+        fs::create_dir_all(root.join("Buzz-1.4.2-Windows-X64")).expect("create buzz dir");
+        fs::create_dir_all(root.join("QuickRestart")).expect("create quick dir");
+        fs::create_dir_all(root.join("Fonts")).expect("create fonts dir");
+        fs::create_dir_all(root.join("Docs")).expect("create docs dir");
+        write_file(&root.join("setup.exe"));
+        write_file(&root.join("paper.pdf"));
+        write_file(&root.join("archive.zip"));
+        write_file(&root.join("image.png"));
+
+        let stop = AtomicBool::new(false);
+        assert!(is_collection_root(&root, &normalize_excluded(None), &stop));
+
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn evaluates_whole_for_app_bundle_directory() {
+        let root = temp_dir("app-bundle");
+        fs::create_dir_all(&root).expect("create root");
+        write_file(&root.join("Buzz-1.4.2-windows.exe"));
+        write_file(&root.join("Buzz-1.4.2-windows-1.bin"));
+        write_file(&root.join("Buzz-1.4.2-windows-2.bin"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_whole_for_plugin_bundle_directory() {
+        let root = temp_dir("plugin-bundle");
+        fs::create_dir_all(&root).expect("create root");
+        write_file(&root.join("QuickRestart.dll"));
+        write_file(&root.join("QuickRestart.json"));
+        write_file(&root.join("QuickRestart.pck"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_whole_for_font_pack_directory() {
+        let root = temp_dir("font-pack");
+        fs::create_dir_all(&root).expect("create root");
+        write_file(&root.join("generica.otf"));
+        write_file(&root.join("generica bold.otf"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_whole_for_document_bundle_directory() {
+        let root = temp_dir("doc-bundle");
+        fs::create_dir_all(root.join("我的女友孟飘渺（待续）")).expect("create child dir");
+        for idx in 0..8 {
+            write_file(&root.join(format!("chapter-{idx}.txt")));
+        }
+        write_file(&root.join("collection.zip"));
+        write_file(&root.join("extras.zip"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_wrapper_passthrough_for_single_child_shell() {
+        let root = temp_dir("wrapper");
+        let shell = root.join("DwnlData");
+        let target = shell.join("32858");
+        fs::create_dir_all(&target).expect("create target");
+        write_file(&target.join("app.exe"));
+        write_file(&target.join("payload.bin"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&shell, &stop, true).expect("assessment exists");
+        assert_eq!(
+            assessment.result_kind,
+            DirectoryResultKind::WholeWrapperPassthrough
+        );
+        assert_eq!(
+            assessment.wrapper_target_path.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+
+        let units = collect_units(&root, true, &normalize_excluded(None), &stop);
+        assert!(
+            units.iter()
+                .any(|unit| unit.item_type == "directory" && unit.relative_path.ends_with("DwnlData\\32858"))
+        );
+        assert!(
+            !units.iter()
+                .any(|unit| unit.item_type == "directory" && unit.relative_path == "DwnlData")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_mixed_split_for_mixed_directory() {
+        let root = temp_dir("mixed");
+        fs::create_dir_all(root.join("photos")).expect("create photos dir");
+        fs::create_dir_all(root.join("docs")).expect("create docs dir");
+        fs::create_dir_all(root.join("tools")).expect("create tools dir");
+        write_file(&root.join("setup.exe"));
+        write_file(&root.join("paper.pdf"));
+        write_file(&root.join("cover.png"));
+        write_file(&root.join("song.mp3"));
+        write_file(&root.join("font.ttf"));
+        write_file(&root.join("notes.txt"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::MixedSplit);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_staging_junk_for_runtime_cache_shell() {
+        let root = temp_dir("junk");
+        fs::create_dir_all(root.join("logs")).expect("create logs dir");
+        fs::create_dir_all(root.join("cache")).expect("create cache dir");
+        write_file(&root.join("telemetry_cache.json"));
+        write_file(&root.join("update_cache.json"));
+        write_file(&root.join("session.dat"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::StagingJunk);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_whole_for_complex_windows_app_directory() {
+        let root = temp_dir("windows-app");
+        fs::create_dir_all(root.join("Config")).expect("create config dir");
+        fs::create_dir_all(root.join("Images")).expect("create images dir");
+        write_file(&root.join("App.exe"));
+        for idx in 0..10 {
+            write_file(&root.join(format!("runtime-{idx}.dll")));
+        }
+        for idx in 0..6 {
+            write_file(&root.join(format!("asset-{idx}.png")));
+        }
+        for idx in 0..6 {
+            write_file(&root.join(format!("strings-{idx}.res")));
+        }
+        write_file(&root.join("App.exe.config"));
+        write_file(&root.join("readme.txt"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+        assert_eq!(assessment.integrity_kind, "app_bundle");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evaluates_whole_for_multi_variant_package_with_docs() {
+        let root = temp_dir("dism-bundle").join("Dism++10.1.1002.1B");
+        fs::create_dir_all(root.join("Config")).expect("create config dir");
+        write_file(&root.join("Dism++ARM64.exe"));
+        write_file(&root.join("Dism++x64.exe"));
+        write_file(&root.join("Dism++x86.exe"));
+        write_file(&root.join("ReadMe for NCleaner.txt"));
+        write_file(&root.join("双击 Dism++x86 即可运行.txt"));
+        write_file(&root.join("请先解压，然后再运行！！！.txt"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+        assert_eq!(assessment.integrity_kind, "app_bundle");
+
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn evaluates_whole_for_cursor_theme_pack_directory() {
+        let root = temp_dir("cursor-pack").join("Nagasaki Soyo-长崎素世");
+        fs::create_dir_all(root.join("可替换（需手动）")).expect("create alt dir");
+        for name in [
+            "Alternate.ani",
+            "Busy.ani",
+            "Diagonal Resize 1.ani",
+            "Diagonal Resize 2.ani",
+            "Help Select.ani",
+            "Horizontal Resize.ani",
+            "Link.ani",
+            "Location Select.ani",
+            "Move.ani",
+            "Normal Select.ani",
+            "Person Select.ani",
+            "Precision Select.ani",
+            "Text Select.ani",
+            "Unavailable.ani",
+            "Vertical Resize.ani",
+            "Work.ani",
+            "Arrow.cur",
+            "Hand.cur",
+        ] {
+            write_file(&root.join(name));
+        }
+        write_file(&root.join("1.如何手动替换单个指针步骤.jpg"));
+        write_file(&root.join("【作者xe08 仅供学习禁止商用】.txt"));
+        write_file(&root.join("右键点击安装.inf"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+        assert_eq!(assessment.integrity_kind, "theme_pack");
+
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn evaluates_whole_for_document_collection_with_weak_name_families() {
+        let root = temp_dir("doc-collection").join("MC王大锤文章合集 (1)");
+        fs::create_dir_all(root.join("我的女友孟飘渺（待续）")).expect("create child dir");
+        for name in [
+            "世间调制模式（坑）.txt",
+            "为了拯救被戒色宝典洗脑的固执男友.txt",
+            "主系统系列（坑）.txt",
+            "他还只是个孩子（待续）.txt",
+            "催眠剧本之荒岛求生（坑）.txt",
+            "催眠带湿（完）.txt",
+            "催眠手环番外之恐怖屋大冒险（坑）.txt",
+            "催眠死对头美女班长（完）.txt",
+            "关于我的借口被所有人相信这件事（坑）.txt",
+            "意外用俗语攻略了女友妹妹（完）.txt",
+            "我的姐姐是大演员之亵玩病人肉棒的痴女护士.txt",
+            "我的校花女神女友与巨乳萝莉小姨子.txt",
+        ] {
+            write_file(&root.join(name));
+        }
+        for name in [
+            "MC王大锤文章合集 (1).zip",
+            "世界调制模式同人（待续）.zip",
+            "催眠考核（待续）.zip",
+            "我的女友孟飘渺（待续）.zip",
+            "外传合集.7z",
+        ] {
+            write_file(&root.join(name));
+        }
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+        assert_eq!(assessment.integrity_kind, "doc_bundle");
+
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn evaluates_whole_for_single_installer_with_readme() {
+        let root = temp_dir("installer-docs").join("IDM-main");
+        fs::create_dir_all(&root).expect("create root");
+        write_file(&root.join("IDM_v6.41.2_Setup_by-System3206.exe"));
+        write_file(&root.join("README.md"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
+        assert_eq!(assessment.integrity_kind, "app_bundle");
+
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn dll_only_directory_does_not_become_whole() {
+        let root = temp_dir("dll-only");
+        fs::create_dir_all(&root).expect("create root");
+        write_file(&root.join("a.dll"));
+        write_file(&root.join("b.dll"));
+        write_file(&root.join("c.dll"));
+
+        let stop = AtomicBool::new(false);
+        let assessment =
+            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+        assert_ne!(assessment.result_kind, DirectoryResultKind::Whole);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
