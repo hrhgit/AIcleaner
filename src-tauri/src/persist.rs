@@ -1317,7 +1317,10 @@ pub fn load_organize_snapshot(
     let results = stmt
         .query_map(params![task_id], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?
-        .filter_map(|row| row.ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()))
+        .filter_map(|row| {
+            row.ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        })
         .collect::<Vec<_>>();
 
     let mut snapshot =

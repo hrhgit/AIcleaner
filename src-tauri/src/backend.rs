@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1113,6 +1114,23 @@ pub async fn system_request_elevation() -> Result<Value, String> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpenExternalUrlInput {
+    url: String,
+}
+
+#[tauri::command]
+pub async fn system_open_external_url(data: OpenExternalUrlInput) -> Result<Value, String> {
+    let parsed = Url::parse(data.url.trim()).map_err(|e| e.to_string())?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("Only http(s) URLs are allowed.".to_string()),
+    }
+    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|e| e.to_string())?;
+    Ok(json!({ "success": true, "url": parsed.as_str() }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenLocationInput {
     path: String,
 }
@@ -1212,6 +1230,8 @@ pub struct ScanStartInput {
     pub api_endpoint: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub use_web_search: Option<bool>,
+    pub search_api_key: Option<String>,
     pub response_language: Option<String>,
 }
 
@@ -1279,6 +1299,21 @@ pub async fn scan_start<R: Runtime>(
         input.api_key = Some(resolve_provider_api_key(state.inner(), &endpoint)?);
     } else if input.api_key.is_none() {
         input.api_key = Some(String::new());
+    }
+    if input.use_web_search.is_none() {
+        let settings = read_settings(&state.settings_path);
+        let scan_enabled = settings
+            .pointer("/searchApi/scopes/scan")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let classify_enabled = settings
+            .pointer("/searchApi/scopes/classify")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        input.use_web_search = Some(scan_enabled || classify_enabled);
+    }
+    if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
+        input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
     }
     crate::scan_runtime::scan_start(app, state, input).await
 }

@@ -1,7 +1,8 @@
-use crate::backend::{
-    AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage,
-};
+use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
 use crate::persist;
+use crate::web_search::{
+    format_web_search_context, parse_web_search_request, tavily_search, web_search_trace_to_value,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -98,6 +99,7 @@ pub struct OrganizeTaskRuntime {
     pub stop: AtomicBool,
     pub snapshot: Mutex<OrganizeSnapshot>,
     routes: HashMap<String, RouteConfig>,
+    search_api_key: String,
     response_language: String,
     pub job: Mutex<Option<JoinHandle<()>>>,
 }
@@ -726,13 +728,21 @@ fn category_tree_to_value(node: &CategoryTreeNode) -> Value {
 
 fn tree_from_value(value: &Value) -> CategoryTreeNode {
     fn parse_node(value: &Value) -> Option<CategoryTreeNode> {
-        let node_id = value.get("nodeId").and_then(Value::as_str)?.trim().to_string();
+        let node_id = value
+            .get("nodeId")
+            .and_then(Value::as_str)?
+            .trim()
+            .to_string();
         if node_id.is_empty() {
             return None;
         }
         Some(CategoryTreeNode {
             node_id,
-            name: value.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             children: value
                 .get("children")
                 .and_then(Value::as_array)
@@ -798,7 +808,8 @@ fn normalize_ai_tree(value: &Value, current: &CategoryTreeNode) -> CategoryTreeN
 
     let mut existing_ids = HashSet::new();
     collect_existing_node_ids(current, &mut existing_ids);
-    value.get("tree")
+    value
+        .get("tree")
         .and_then(|tree| parse_node(tree, &existing_ids, true))
         .unwrap_or_else(|| current.clone())
 }
@@ -854,9 +865,11 @@ fn category_path_for_id(node: &CategoryTreeNode, target_id: &str) -> Option<Vec<
 }
 
 fn category_path_from_value(value: Option<&Value>) -> Vec<String> {
-    value.and_then(Value::as_array)
+    value
+        .and_then(Value::as_array)
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(Value::as_str)
                 .map(sanitize_node_name)
                 .filter(|name| !name.is_empty())
@@ -865,7 +878,10 @@ fn category_path_from_value(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn summarize_unit_for_batch(unit: &OrganizeUnit, response_language: &str) -> (String, bool, Vec<String>) {
+fn summarize_unit_for_batch(
+    unit: &OrganizeUnit,
+    response_language: &str,
+) -> (String, bool, Vec<String>) {
     match unit.item_type.as_str() {
         "directory" => (
             summarize_directory_for_prompt(unit, response_language),
@@ -887,10 +903,14 @@ fn summarize_unit_for_batch(unit: &OrganizeUnit, response_language: &str) -> (St
                             unit.size,
                             unit.created_at
                                 .clone()
-                                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string()),
+                                .unwrap_or_else(
+                                    || organizer_unknown_label(response_language).to_string()
+                                ),
                             unit.modified_at
                                 .clone()
-                                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
+                                .unwrap_or_else(
+                                    || organizer_unknown_label(response_language).to_string()
+                                )
                         ),
                         true,
                         vec!["text_summary_fallback".to_string()],
@@ -904,10 +924,14 @@ fn summarize_unit_for_batch(unit: &OrganizeUnit, response_language: &str) -> (St
                             unit.size,
                             unit.created_at
                                 .clone()
-                                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string()),
+                                .unwrap_or_else(
+                                    || organizer_unknown_label(response_language).to_string()
+                                ),
                             unit.modified_at
                                 .clone()
-                                .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
+                                .unwrap_or_else(
+                                    || organizer_unknown_label(response_language).to_string()
+                                )
                         ),
                         true,
                         vec!["text_summary_fallback".to_string()],
@@ -928,10 +952,14 @@ fn summarize_unit_for_batch(unit: &OrganizeUnit, response_language: &str) -> (St
                         unit.size,
                         unit.created_at
                             .clone()
-                            .unwrap_or_else(|| organizer_unknown_label(response_language).to_string()),
+                            .unwrap_or_else(
+                                || organizer_unknown_label(response_language).to_string()
+                            ),
                         unit.modified_at
                             .clone()
-                            .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
+                            .unwrap_or_else(
+                                || organizer_unknown_label(response_language).to_string()
+                            )
                     ),
                     true,
                     vec!["metadata_only_summary".to_string()],
@@ -1043,6 +1071,89 @@ async fn chat_completion(
     }
 }
 
+fn build_organize_system_prompt(response_language: &str, allow_web_search: bool) -> String {
+    let output_language = localized_language_name(response_language, response_language);
+    let mut lines = vec![
+        "You cluster file summaries into a hierarchical category tree.".to_string(),
+        "Return JSON only.".to_string(),
+        "Final schema: {\"tree\":{...},\"assignments\":[{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}]}".to_string(),
+        "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
+        format!("Use {output_language} names and keep labels short."),
+        format!("The assignment \"reason\" field must be written in {output_language} only."),
+    ];
+    if allow_web_search {
+        lines.push(
+            "If local metadata is insufficient and external context is necessary, you may return {\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"} instead of the final schema. Use one concise query only."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+async fn classify_organize_batch(
+    text_route: &RouteConfig,
+    response_language: &str,
+    stop: &AtomicBool,
+    existing_tree: &CategoryTreeNode,
+    batch_rows: &[Value],
+    max_cluster_depth: Option<u32>,
+    reference_structure: Option<&String>,
+    use_web_search: bool,
+    search_api_key: &str,
+) -> Result<(Value, TokenUsage, Value), String> {
+    let search_allowed = use_web_search && !search_api_key.trim().is_empty();
+    let mut total_usage = TokenUsage::default();
+    let mut search_context = None::<String>;
+    let mut search_trace = Value::Null;
+    let max_rounds = if search_allowed { 2 } else { 1 };
+
+    for _round in 0..max_rounds {
+        let system_prompt = build_organize_system_prompt(
+            response_language,
+            search_allowed && search_context.is_none(),
+        );
+        let mut payload = json!({
+            "maxClusterDepth": max_cluster_depth,
+            "existingTree": category_tree_to_value(existing_tree),
+            "items": batch_rows,
+            "useWebSearch": use_web_search,
+        });
+        if let Some(structure) = reference_structure {
+            payload["referenceStructure"] = Value::String(structure.clone());
+        }
+        if let Some(context) = search_context.as_ref() {
+            payload["webSearchContext"] = Value::String(context.clone());
+            payload["webSearchFollowup"] =
+                Value::String("Return the final tree and assignments JSON only.".to_string());
+        }
+
+        let (content, usage) =
+            chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await?;
+        total_usage.prompt = total_usage.prompt.saturating_add(usage.prompt);
+        total_usage.completion = total_usage.completion.saturating_add(usage.completion);
+        total_usage.total = total_usage.total.saturating_add(usage.total);
+
+        let parsed = serde_json::from_str::<Value>(&sanitize_json_block(&content))
+            .unwrap_or_else(|_| json!({}));
+        if search_allowed && search_context.is_none() {
+            if let Some(request) = parse_web_search_request(&parsed) {
+                let trace = tavily_search(search_api_key, &request).await?;
+                search_context = Some(format_web_search_context(&trace, response_language));
+                search_trace = web_search_trace_to_value(&trace);
+                continue;
+            }
+        }
+
+        if parsed.get("tree").is_some() || parsed.get("assignments").is_some() {
+            return Ok((parsed, total_usage, search_trace));
+        }
+
+        return Err("classification response is not valid JSON schema".to_string());
+    }
+
+    Err("model requested web search but did not return final batch assignments".to_string())
+}
+
 fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
     let mut used = HashSet::new();
     let mut out = Vec::new();
@@ -1059,7 +1170,10 @@ fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
         let mut target = target_dir.join(row.get("name").and_then(Value::as_str).unwrap_or(""));
         let mut suffix = 1_u32;
         while used.contains(&target.to_string_lossy().to_lowercase()) {
-            let name = target.file_stem().and_then(|x| x.to_str()).unwrap_or("file");
+            let name = target
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .unwrap_or("file");
             let ext = target.extension().and_then(|x| x.to_str()).unwrap_or("");
             let next_name = if ext.is_empty() {
                 format!("{name} ({suffix})")
@@ -1257,7 +1371,15 @@ async fn run_organize_task<R: Runtime>(
     state: &AppState,
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
-    let (root_path, recursive, excluded, batch_size, max_cluster_depth, use_web_search, reference_original_structure) = {
+    let (
+        root_path,
+        recursive,
+        excluded,
+        batch_size,
+        max_cluster_depth,
+        use_web_search,
+        reference_original_structure,
+    ) = {
         let snap = task.snapshot.lock();
         (
             snap.root_path.clone(),
@@ -1314,15 +1436,11 @@ async fn run_organize_task<R: Runtime>(
         tree_from_value(&snap.tree)
     };
     ensure_uncategorized_leaf(&mut tree);
-    let text_route = task
-        .routes
-        .get("text")
-        .cloned()
-        .unwrap_or(RouteConfig {
-            endpoint: "https://api.openai.com/v1".to_string(),
-            api_key: String::new(),
-            model: "gpt-4o-mini".to_string(),
-        });
+    let text_route = task.routes.get("text").cloned().unwrap_or(RouteConfig {
+        endpoint: "https://api.openai.com/v1".to_string(),
+        api_key: String::new(),
+        model: "gpt-4o-mini".to_string(),
+    });
 
     for (batch_idx, batch) in units.chunks(batch_size as usize).enumerate() {
         if task.stop.load(Ordering::Relaxed) {
@@ -1331,7 +1449,11 @@ async fn run_organize_task<R: Runtime>(
 
         let mut batch_rows = Vec::new();
         for (offset, unit) in batch.iter().enumerate() {
-            let route_key = if unit.item_type == "directory" { "text" } else { unit.modality.as_str() };
+            let route_key = if unit.item_type == "directory" {
+                "text"
+            } else {
+                unit.modality.as_str()
+            };
             let route = task
                 .routes
                 .get(route_key)
@@ -1367,6 +1489,80 @@ async fn run_organize_task<R: Runtime>(
         let mut assignment_map: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
 
         if !text_route.api_key.trim().is_empty() {
+            match classify_organize_batch(
+                &text_route,
+                &task.response_language,
+                &task.stop,
+                &tree,
+                &batch_rows,
+                max_cluster_depth,
+                reference_structure.as_ref(),
+                use_web_search,
+                &task.search_api_key,
+            )
+            .await
+            {
+                Ok((parsed, usage, _search_trace)) => {
+                    cluster_usage = usage;
+                    tree = normalize_ai_tree(&parsed, &tree);
+                    ensure_uncategorized_leaf(&mut tree);
+                    for assignment in parsed
+                        .get("assignments")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let Some(item_id) = assignment.get("itemId").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let mut category_path = category_path_from_value(
+                            assignment
+                                .get("categoryPath")
+                                .or_else(|| assignment.get("leafPath")),
+                        );
+                        let leaf_node_id = if let Some(node_id) =
+                            assignment.get("leafNodeId").and_then(Value::as_str)
+                        {
+                            if let Some(path) = category_path_for_id(&tree, node_id) {
+                                category_path = path;
+                                node_id.to_string()
+                            } else if !category_path.is_empty() {
+                                ensure_path(&mut tree, &category_path)
+                            } else {
+                                ensure_uncategorized_leaf(&mut tree)
+                            }
+                        } else if !category_path.is_empty() {
+                            ensure_path(&mut tree, &category_path)
+                        } else {
+                            ensure_uncategorized_leaf(&mut tree)
+                        };
+                        if category_path.is_empty() {
+                            category_path = category_path_for_id(&tree, &leaf_node_id)
+                                .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
+                        }
+                        assignment_map.insert(
+                            item_id.to_string(),
+                            (
+                                leaf_node_id,
+                                category_path,
+                                assignment
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                Err(_) => {
+                    cluster_failed = true;
+                }
+            }
+        } else if false {
+            cluster_failed = true;
+        }
+
+        if false && !text_route.api_key.trim().is_empty() {
             let system_prompt = if is_zh_language(&task.response_language) {
                 format!(
                     "你需要把一批文件摘要聚成一个分层分类树。只能返回 JSON，输出结构为 {{\"tree\":{{...}},\"assignments\":[{{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}}]}}。现有节点已经有稳定的 nodeId；当你复用、重命名或移动已有节点时，必须保留原 nodeId。分类名称请使用{}，并保持简短。",
@@ -1387,10 +1583,19 @@ async fn run_organize_task<R: Runtime>(
             if let Some(structure) = reference_structure.as_ref() {
                 payload["referenceStructure"] = Value::String(structure.clone());
             }
-            match chat_completion(&text_route, &system_prompt, &payload.to_string(), &task.stop).await {
+            match chat_completion(
+                &text_route,
+                &system_prompt,
+                &payload.to_string(),
+                &task.stop,
+            )
+            .await
+            {
                 Ok((content, usage)) => {
                     cluster_usage = usage;
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&sanitize_json_block(&content)) {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<Value>(&sanitize_json_block(&content))
+                    {
                         tree = normalize_ai_tree(&parsed, &tree);
                         ensure_uncategorized_leaf(&mut tree);
                         for assignment in parsed
@@ -1399,11 +1604,18 @@ async fn run_organize_task<R: Runtime>(
                             .cloned()
                             .unwrap_or_default()
                         {
-                            let Some(item_id) = assignment.get("itemId").and_then(Value::as_str) else { continue; };
+                            let Some(item_id) = assignment.get("itemId").and_then(Value::as_str)
+                            else {
+                                continue;
+                            };
                             let mut category_path = category_path_from_value(
-                                assignment.get("categoryPath").or_else(|| assignment.get("leafPath")),
+                                assignment
+                                    .get("categoryPath")
+                                    .or_else(|| assignment.get("leafPath")),
                             );
-                            let leaf_node_id = if let Some(node_id) = assignment.get("leafNodeId").and_then(Value::as_str) {
+                            let leaf_node_id = if let Some(node_id) =
+                                assignment.get("leafNodeId").and_then(Value::as_str)
+                            {
                                 if let Some(path) = category_path_for_id(&tree, node_id) {
                                     category_path = path;
                                     node_id.to_string()
@@ -1426,7 +1638,11 @@ async fn run_organize_task<R: Runtime>(
                                 (
                                     leaf_node_id,
                                     category_path,
-                                    assignment.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
+                                    assignment
+                                        .get("reason")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
                                 ),
                             );
                         }
@@ -1450,10 +1666,8 @@ async fn run_organize_task<R: Runtime>(
                 return Ok(());
             }
             let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
-            let (leaf_node_id, category_path, reason) = assignment_map
-                .get(item_id)
-                .cloned()
-                .unwrap_or_else(|| {
+            let (leaf_node_id, category_path, reason) =
+                assignment_map.get(item_id).cloned().unwrap_or_else(|| {
                     let leaf = ensure_uncategorized_leaf(&mut tree);
                     let path = category_path_for_id(&tree, &leaf)
                         .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
@@ -1503,7 +1717,10 @@ async fn run_organize_task<R: Runtime>(
             snap.tree_version = snap.tree_version.saturating_add(1);
             snap.processed_batches = (batch_idx + 1) as u64;
             snap.token_usage.prompt = snap.token_usage.prompt.saturating_add(cluster_usage.prompt);
-            snap.token_usage.completion = snap.token_usage.completion.saturating_add(cluster_usage.completion);
+            snap.token_usage.completion = snap
+                .token_usage
+                .completion
+                .saturating_add(cluster_usage.completion);
             snap.token_usage.total = snap.token_usage.total.saturating_add(cluster_usage.total);
         }
         emit_snapshot(app, state, task).await?;
@@ -1511,7 +1728,8 @@ async fn run_organize_task<R: Runtime>(
 
     let final_snapshot = {
         let mut snap = task.snapshot.lock();
-        snap.results.sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
+        snap.results
+            .sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
         snap.preview = build_preview(&snap.root_path, &snap.results);
         snap.tree = category_tree_to_value(&tree);
         snap.status = "completed".to_string();
@@ -1532,7 +1750,6 @@ async fn run_organize_task<R: Runtime>(
     .map_err(|e| e.to_string())?;
     Ok(())
 }
-
 
 pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
     let settings = crate::backend::read_settings(&state.settings_path);
@@ -1563,8 +1780,9 @@ pub async fn organize_start<R: Runtime>(
         api_key: String::new(),
         model: "gpt-4o-mini".to_string(),
     });
-    let (tree, tree_version) = persist::load_latest_organize_tree(&state.db_path, &input.root_path)?
-        .unwrap_or_else(|| (category_tree_to_value(&default_tree()), 0));
+    let (tree, tree_version) =
+        persist::load_latest_organize_tree(&state.db_path, &input.root_path)?
+            .unwrap_or_else(|| (category_tree_to_value(&default_tree()), 0));
     let snapshot = OrganizeSnapshot {
         id: task_id.clone(),
         status: "idle".to_string(),
@@ -1610,10 +1828,14 @@ pub async fn organize_start<R: Runtime>(
         stop: AtomicBool::new(false),
         snapshot: Mutex::new(snapshot.clone()),
         routes,
+        search_api_key: input.search_api_key.unwrap_or_default(),
         response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
         job: Mutex::new(None),
     });
-    state.organize_tasks.lock().insert(task_id.clone(), task.clone());
+    state
+        .organize_tasks
+        .lock()
+        .insert(task_id.clone(), task.clone());
     let state_clone = state.inner().clone();
     let task_id_clone = task_id.clone();
     let app_clone = app.clone();
@@ -1649,7 +1871,6 @@ pub async fn organize_start<R: Runtime>(
         "supportsMultimodal": snapshot.supports_multimodal
     }))
 }
-
 
 pub async fn organize_stop(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
     let task = state

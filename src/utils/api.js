@@ -80,6 +80,10 @@ export async function requestElevation() {
   return call('system_request_elevation');
 }
 
+export async function openExternalUrl(url) {
+  return call('system_open_external_url', { data: { url } });
+}
+
 export async function getActiveScan() {
   return call('scan_get_active');
 }

@@ -404,6 +404,28 @@ class ScanTaskController {
       </div>`;
     }
 
+    const search = data.search && typeof data.search === 'object' ? data.search : null;
+    const searchQuery = String(search?.request?.query || '').trim();
+    if (searchQuery) {
+      const searchReason = String(search?.request?.reason || '').trim();
+      const searchResults = Array.isArray(search?.results) ? search.results : [];
+      const formattedResults = searchResults
+        .slice(0, 5)
+        .map((item, index) => {
+          const title = String(item?.title || '').trim() || `Result ${index + 1}`;
+          const url = String(item?.url || '').trim();
+          const content = String(item?.content || '').trim();
+          return [title, url, content].filter(Boolean).join('\n');
+        })
+        .filter(Boolean)
+        .join('\n\n');
+
+      detailSections += `<div style="margin-bottom: 10px;">
+        <strong>Web Search:</strong>
+        <div style="margin-top: 4px; padding: 8px; background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.15); border-radius: 4px; max-height: 400px; overflow-y: auto;">${this.escHtml(`Query: ${searchQuery}${searchReason ? `\nReason: ${searchReason}` : ''}${formattedResults ? `\n\n${formattedResults}` : ''}`)}</div>
+      </div>`;
+    }
+
     if (data.rawContent) {
       const raw = String(data.rawContent);
       const truncated = raw.length > 2000 ? `${raw.slice(0, 2000)}\n...` : raw;

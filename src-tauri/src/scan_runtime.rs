@@ -1,5 +1,8 @@
 use crate::backend::{AppState, ScanResultItem, ScanSnapshot, ScanStartInput, TokenUsage};
 use crate::persist;
+use crate::web_search::{
+    format_web_search_context, parse_web_search_request, tavily_search, web_search_trace_to_value,
+};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -66,6 +69,8 @@ struct ScanAiConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    use_web_search: bool,
+    search_api_key: String,
     response_language: String,
 }
 
@@ -309,7 +314,8 @@ async fn chat_completion(
     })
 }
 
-async fn analyze_scan_node(
+#[allow(dead_code)]
+async fn analyze_scan_node_legacy(
     ai: &ScanAiConfig,
     node: &persist::ScanNode,
     child_dirs: &[persist::ScanNode],
@@ -460,6 +466,230 @@ async fn analyze_scan_node(
                 "error": err,
             }),
         },
+    }
+}
+
+fn build_scan_system_prompt(
+    response_language: &str,
+    is_directory: bool,
+    allow_web_search: bool,
+) -> String {
+    let response_language_name = localized_language_name(response_language, response_language);
+    let final_schema = if is_directory {
+        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}"
+    } else {
+        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}"
+    };
+
+    let mut lines = vec![
+        "You are a disk cleanup safety assistant.".to_string(),
+        "Return JSON only.".to_string(),
+        format!("Final schema: {final_schema}"),
+        "Be conservative. If unsure, use suspicious.".to_string(),
+        format!("The \"reason\" field must be written in {response_language_name} only."),
+    ];
+    if allow_web_search {
+        lines.push(
+            "If local metadata is insufficient and external context is necessary, you may return {\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"} instead of the final schema. Use one concise query only."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
+
+async fn analyze_scan_node(
+    ai: &ScanAiConfig,
+    node: &persist::ScanNode,
+    child_dirs: &[persist::ScanNode],
+) -> ScanReview {
+    let prompt_in_zh = is_zh_language(&ai.response_language);
+    let child_summary = if child_dirs.is_empty() {
+        if prompt_in_zh {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
+    } else {
+        child_dirs
+            .iter()
+            .take(24)
+            .map(|child| format!("- {} ({})", child.name, format_size(child.size)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let user_prompt = if node.node_type == "directory" {
+        if prompt_in_zh {
+            format!(
+                "类型：目录\n路径：{}\n名称：{}\n大小：{}\n直接子目录：\n{}\n请判断整个目录是否可以安全删除，以及它是否可能包含可删除的子目录。",
+                node.path,
+                node.name,
+                format_size(node.size),
+                child_summary
+            )
+        } else {
+            format!(
+                "Type: directory\nPath: {}\nName: {}\nSize: {}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.",
+                node.path,
+                node.name,
+                format_size(node.size),
+                child_summary
+            )
+        }
+    } else if prompt_in_zh {
+        format!(
+            "类型：文件\n路径：{}\n名称：{}\n大小：{}\n请判断该文件是否可以安全删除。",
+            node.path,
+            node.name,
+            format_size(node.size)
+        )
+    } else {
+        format!(
+            "Type: file\nPath: {}\nName: {}\nSize: {}\nJudge whether the file can be deleted safely.",
+            node.path,
+            node.name,
+            format_size(node.size)
+        )
+    };
+
+    let search_allowed = ai.use_web_search && !ai.search_api_key.trim().is_empty();
+    let mut total_usage = TokenUsage::default();
+    let mut search_context = None::<String>;
+    let mut search_trace = Value::Null;
+    let max_rounds = if search_allowed { 2 } else { 1 };
+
+    for round in 0..max_rounds {
+        let system_prompt = build_scan_system_prompt(
+            &ai.response_language,
+            node.node_type == "directory",
+            search_allowed && search_context.is_none(),
+        );
+        let current_user_prompt = if let Some(context) = search_context.as_ref() {
+            format!(
+                "{user_prompt}\n\nWeb search context:\n{context}\n\nReturn the final classification JSON only."
+            )
+        } else {
+            user_prompt.clone()
+        };
+
+        match chat_completion(ai, &system_prompt, &current_user_prompt).await {
+            Ok(resp) => {
+                total_usage.prompt = total_usage.prompt.saturating_add(resp.token_usage.prompt);
+                total_usage.completion = total_usage
+                    .completion
+                    .saturating_add(resp.token_usage.completion);
+                total_usage.total = total_usage.total.saturating_add(resp.token_usage.total);
+
+                let parsed: Value = serde_json::from_str(&extract_json_text(&resp.content))
+                    .unwrap_or_else(|_| json!({}));
+                if search_allowed && search_context.is_none() {
+                    if let Some(request) = parse_web_search_request(&parsed) {
+                        match tavily_search(&ai.search_api_key, &request).await {
+                            Ok(trace) => {
+                                search_context =
+                                    Some(format_web_search_context(&trace, &ai.response_language));
+                                search_trace = web_search_trace_to_value(&trace);
+                                continue;
+                            }
+                            Err(err) => {
+                                return ScanReview {
+                                    classification: "suspicious".to_string(),
+                                    reason: default_analysis_failed_reason(
+                                        &ai.response_language,
+                                        &format!("web search failed: {err}"),
+                                    ),
+                                    risk: "high".to_string(),
+                                    has_potential_deletable_subfolders: node.node_type
+                                        == "directory",
+                                    token_usage: total_usage,
+                                    trace: json!({
+                                        "model": ai.model,
+                                        "responseLanguage": ai.response_language,
+                                        "systemPrompt": system_prompt,
+                                        "userPrompt": current_user_prompt,
+                                        "rawContent": resp.content,
+                                        "search": {
+                                            "request": {
+                                                "query": request.query,
+                                                "reason": request.reason,
+                                            },
+                                            "error": err,
+                                        },
+                                    }),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                return ScanReview {
+                    classification: parsed
+                        .get("classification")
+                        .and_then(Value::as_str)
+                        .unwrap_or("suspicious")
+                        .to_string(),
+                    reason: parsed
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or(default_unclear_reason(&ai.response_language))
+                        .to_string(),
+                    risk: parsed
+                        .get("risk")
+                        .and_then(Value::as_str)
+                        .unwrap_or("medium")
+                        .to_string(),
+                    has_potential_deletable_subfolders: parsed
+                        .get("hasPotentialDeletableSubfolders")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(node.node_type == "directory"),
+                    token_usage: total_usage,
+                    trace: json!({
+                        "model": ai.model,
+                        "responseLanguage": ai.response_language,
+                        "systemPrompt": system_prompt,
+                        "userPrompt": current_user_prompt,
+                        "rawContent": resp.content,
+                        "search": search_trace,
+                        "round": round + 1,
+                    }),
+                };
+            }
+            Err(err) => {
+                return ScanReview {
+                    classification: "suspicious".to_string(),
+                    reason: default_analysis_failed_reason(&ai.response_language, &err),
+                    risk: "high".to_string(),
+                    has_potential_deletable_subfolders: node.node_type == "directory",
+                    token_usage: total_usage,
+                    trace: json!({
+                        "model": ai.model,
+                        "responseLanguage": ai.response_language,
+                        "systemPrompt": system_prompt,
+                        "userPrompt": current_user_prompt,
+                        "error": err,
+                        "search": search_trace,
+                    }),
+                };
+            }
+        }
+    }
+
+    ScanReview {
+        classification: "suspicious".to_string(),
+        reason: default_analysis_failed_reason(
+            &ai.response_language,
+            "model requested web search but did not return a final classification",
+        ),
+        risk: "high".to_string(),
+        has_potential_deletable_subfolders: node.node_type == "directory",
+        token_usage: total_usage,
+        trace: json!({
+            "model": ai.model,
+            "responseLanguage": ai.response_language,
+            "userPrompt": user_prompt,
+            "search": search_trace,
+            "error": "missing_final_classification",
+        }),
     }
 }
 
@@ -793,6 +1023,7 @@ async fn run_auto_analyze<R: Runtime>(
                 "tokenUsage": review.token_usage,
                 "rawContent": review.trace.get("rawContent").cloned().unwrap_or(Value::Null),
                 "userPrompt": review.trace.get("userPrompt").cloned().unwrap_or(Value::Null),
+                "search": review.trace.get("search").cloned().unwrap_or(Value::Null),
                 "error": review.trace.get("error").cloned().unwrap_or(Value::Null),
             }),
         )
@@ -1270,6 +1501,8 @@ pub async fn scan_start<R: Runtime>(
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             api_key: input.api_key.unwrap_or_default(),
             model: input.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            use_web_search: input.use_web_search.unwrap_or(false),
+            search_api_key: input.search_api_key.unwrap_or_default(),
             response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
         },
         job: Mutex::new(None),

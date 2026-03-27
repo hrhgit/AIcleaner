@@ -31,6 +31,10 @@ const PERSIST_KEYS = {
   lastTaskId: 'wipeout.organizer.global.last_task_id.v2',
   lastSnapshot: 'wipeout.organizer.global.last_snapshot.v2',
   lastApplyManifest: 'wipeout.organizer.global.last_apply_manifest.v2',
+  logEntries: 'wipeout.organizer.global.log_entries.v1',
+  logCollapsed: 'wipeout.organizer.global.log_collapsed.v1',
+  logRecordGroupCollapsed: 'wipeout.organizer.global.log_record_group_collapsed.v1',
+  logTaskId: 'wipeout.organizer.global.log_task_id.v1',
 };
 
 const LEGACY_PERSIST_KEYS = [
@@ -164,6 +168,10 @@ const remoteModelsCache = new Map();
 const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
 let organizerProviderSettingsUpdatedHandler = null;
 let renderVersion = 0;
+let organizerLogEntries = [];
+const expandedOrganizerDetailLogIds = new Set();
+let organizerLogTaskId = null;
+let organizerLogProgressBaseline = null;
 
 function getPersisted(key, fallback) {
   try {
@@ -407,6 +415,498 @@ function escapeHtml(value) {
   const div = document.createElement('div');
   div.textContent = String(value ?? '');
   return div.innerHTML;
+}
+
+function organizerText(zh, en) {
+  return getLang() === 'en' ? en : zh;
+}
+
+function getProviderLabel(endpoint) {
+  return PROVIDER_OPTIONS.find((item) => item.value === endpoint)?.label || String(endpoint || '').trim() || 'N/A';
+}
+
+function getOrganizerCategoryLabel(data = {}) {
+  if (Array.isArray(data.categoryPath) && data.categoryPath.length > 0) {
+    return data.categoryPath.map((segment) => String(segment || '').trim()).filter(Boolean).join(' / ');
+  }
+  return String(data.category || '').trim() || t('organizer.uncategorized');
+}
+
+function getOrganizerLogTime() {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+
+function buildOrganizerLogEntry({
+  type = 'scanning',
+  kind = 'simple',
+  summary = '',
+  text = '',
+  detail = '',
+  taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null,
+} = {}) {
+  const detailText = String(detail || '').trim();
+  return {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+    type,
+    kind,
+    time: getOrganizerLogTime(),
+    taskId: taskId ? String(taskId) : null,
+    summary: String(summary || text || '').trim(),
+    text: String(text || summary || '').trim(),
+    detailHtml: detailText ? escapeHtml(detailText).replace(/\n/g, '<br>') : '',
+  };
+}
+
+function isGroupedOrganizerLogType(type) {
+  return ['scanning', 'analyzing', 'found'].includes(type);
+}
+
+function getOrganizerLogIcon(type) {
+  if (type === 'found') return '+';
+  if (type === 'analyzing') return '*';
+  if (type === 'agent_call') return '>';
+  if (type === 'agent_response') return '<';
+  if (type === 'error') return '!';
+  return '-';
+}
+
+function setOrganizerDetailLogExpanded(entryId, expanded) {
+  if (entryId == null) return;
+  if (expanded) {
+    expandedOrganizerDetailLogIds.add(entryId);
+  } else {
+    expandedOrganizerDetailLogIds.delete(entryId);
+  }
+}
+
+function isOrganizerLogPinnedToBottom(log) {
+  if (!log) return true;
+  return (log.scrollHeight - log.scrollTop - log.clientHeight) <= 24;
+}
+
+function isOrganizerLogCollapsed() {
+  return !!getPersisted(PERSIST_KEYS.logCollapsed, true);
+}
+
+function setOrganizerLogCollapsed(collapsed) {
+  setPersisted(PERSIST_KEYS.logCollapsed, !!collapsed);
+}
+
+function isOrganizerRecordGroupCollapsed() {
+  return !!getPersisted(PERSIST_KEYS.logRecordGroupCollapsed, true);
+}
+
+function setOrganizerRecordGroupCollapsed(collapsed) {
+  setPersisted(PERSIST_KEYS.logRecordGroupCollapsed, !!collapsed);
+}
+
+function refreshOrganizerLogPanel() {
+  const collapsed = isOrganizerLogCollapsed();
+  const panel = document.getElementById('org-log-panel');
+  const toggleBtn = document.getElementById('org-toggle-log-btn');
+  const hint = document.getElementById('org-log-collapsed-hint');
+  const hasPreview = organizerLogEntries.length > 0;
+  if (panel) {
+    panel.classList.toggle('is-collapsed', collapsed);
+    panel.classList.toggle('is-clickable-preview', collapsed && hasPreview);
+    panel.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    if (collapsed && hasPreview) {
+      panel.setAttribute('role', 'button');
+      panel.setAttribute('tabindex', '0');
+      panel.setAttribute('aria-label', t('organizer.log_preview_hint'));
+    } else {
+      panel.removeAttribute('role');
+      panel.removeAttribute('tabindex');
+      panel.removeAttribute('aria-label');
+    }
+  }
+  if (toggleBtn) {
+    toggleBtn.textContent = collapsed ? t('organizer.log_expand') : t('organizer.log_collapse');
+    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  if (hint) {
+    hint.style.display = collapsed && hasPreview ? '' : 'none';
+  }
+}
+
+function createOrganizerSimpleLogEntryElement(entry) {
+  const el = document.createElement('div');
+  el.className = `scan-log-entry ${entry.type}`;
+  el.innerHTML = `
+    <span class="log-icon">${getOrganizerLogIcon(entry.type)}</span>
+    <span class="log-time" style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
+    <span class="log-text">${entry.text}</span>
+  `;
+  return el;
+}
+
+function createOrganizerDetailLogEntryElement(entry) {
+  const expanded = expandedOrganizerDetailLogIds.has(entry.id);
+  const wrapper = document.createElement('div');
+  wrapper.className = `scan-log-entry ${entry.type}`;
+  wrapper.innerHTML = `
+    <span class="log-icon">${getOrganizerLogIcon(entry.type)}</span>
+    <div class="log-content">
+      <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
+        <span class="log-time" style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
+        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">></span>
+        <span class="log-summary">${entry.summary}</span>
+      </div>
+      <div class="log-detail-body" style="display: ${expanded ? 'block' : 'none'}; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
+        ${entry.detailHtml}
+      </div>
+    </div>
+  `;
+
+  const header = wrapper.querySelector('.log-detail-header');
+  const body = wrapper.querySelector('.log-detail-body');
+  const arrow = wrapper.querySelector('.log-detail-arrow');
+  header?.addEventListener('click', () => {
+    if (!body || !arrow) return;
+    const nextOpen = body.style.display === 'none';
+    setOrganizerDetailLogExpanded(entry.id, nextOpen);
+    body.style.display = nextOpen ? 'block' : 'none';
+    arrow.style.transform = nextOpen ? 'rotate(90deg)' : 'rotate(0deg)';
+  });
+
+  return wrapper;
+}
+
+function createOrganizerRecordGroupElement(entries) {
+  const wrapper = document.createElement('div');
+  wrapper.className = `scan-log-group${isOrganizerRecordGroupCollapsed() ? ' is-collapsed' : ''}`;
+
+  const header = document.createElement('div');
+  header.className = 'scan-log-group-header';
+  header.innerHTML = `
+    <div class="scan-log-group-title">
+      <span class="scan-log-group-arrow">></span>
+      <span>${t('organizer.log_records')} (${entries.length})</span>
+    </div>
+  `;
+
+  const body = document.createElement('div');
+  body.className = 'scan-log-group-body';
+  for (const entry of entries) {
+    body.appendChild(createOrganizerSimpleLogEntryElement(entry));
+  }
+
+  header.addEventListener('click', () => {
+    const nextCollapsed = !wrapper.classList.contains('is-collapsed');
+    setOrganizerRecordGroupCollapsed(nextCollapsed);
+    wrapper.classList.toggle('is-collapsed', nextCollapsed);
+  });
+
+  wrapper.appendChild(header);
+  wrapper.appendChild(body);
+  return wrapper;
+}
+
+function applyOrganizerLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight }) {
+  if (shouldStickToBottom) {
+    log.scrollTop = log.scrollHeight;
+    return;
+  }
+
+  if (insertMode === 'top') {
+    const heightDelta = Math.max(0, log.scrollHeight - previousScrollHeight);
+    log.scrollTop = previousScrollTop + heightDelta;
+    return;
+  }
+
+  const maxScrollTop = Math.max(0, log.scrollHeight - log.clientHeight);
+  log.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+}
+
+function updateOrganizerRecordGroupHeader(wrapper, count) {
+  if (!wrapper) return;
+  const titleText = wrapper.querySelector('.scan-log-group-title span:last-child');
+  if (titleText) {
+    titleText.textContent = `${t('organizer.log_records')} (${count})`;
+  }
+}
+
+function ensureOrganizerRecordGroup(log) {
+  if (!log) return null;
+  let group = log.querySelector('.scan-log-group');
+  if (group) return group;
+
+  group = createOrganizerRecordGroupElement([]);
+  log.prepend(group);
+  return group;
+}
+
+function renderOrganizerLogEntries(insertMode = 'reset') {
+  const log = document.getElementById('org-log');
+  if (!log) return;
+  const shouldStickToBottom = isOrganizerLogPinnedToBottom(log);
+  const previousScrollTop = log.scrollTop;
+  const previousScrollHeight = log.scrollHeight;
+
+  log.innerHTML = '';
+  const groupedEntries = organizerLogEntries.filter((entry) => isGroupedOrganizerLogType(entry.type));
+  const detailEntries = organizerLogEntries.filter((entry) => !isGroupedOrganizerLogType(entry.type));
+
+  if (groupedEntries.length > 0) {
+    log.appendChild(createOrganizerRecordGroupElement(groupedEntries));
+  }
+
+  for (const entry of detailEntries) {
+    if (entry.kind === 'detail') {
+      log.appendChild(createOrganizerDetailLogEntryElement(entry));
+    } else {
+      log.appendChild(createOrganizerSimpleLogEntryElement(entry));
+    }
+  }
+
+  applyOrganizerLogScrollPosition(log, {
+    shouldStickToBottom,
+    insertMode,
+    previousScrollTop,
+    previousScrollHeight,
+  });
+}
+
+function replaceOrganizerLogEntries(nextEntries = [], { persist = true, taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null } = {}) {
+  organizerLogEntries = Array.isArray(nextEntries) ? nextEntries : [];
+  organizerLogTaskId = taskId ? String(taskId) : null;
+  expandedOrganizerDetailLogIds.clear();
+  if (persist) {
+    setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
+    if (organizerLogTaskId) {
+      setPersisted(PERSIST_KEYS.logTaskId, organizerLogTaskId);
+    } else {
+      removePersisted(PERSIST_KEYS.logTaskId);
+    }
+  }
+
+  const logEl = document.getElementById('org-log');
+  if (logEl) {
+    if (organizerLogEntries.length > 0) {
+      renderOrganizerLogEntries();
+    } else {
+      logEl.innerHTML = '';
+    }
+  }
+  refreshOrganizerLogPanel();
+}
+
+function appendOrganizerLogEntry(entry, { persist = true } = {}) {
+  if (!entry) return;
+  organizerLogEntries = [...organizerLogEntries, entry];
+  organizerLogTaskId = entry.taskId ? String(entry.taskId) : (organizerLogTaskId || null);
+  if (persist) {
+    setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
+    if (organizerLogTaskId) {
+      setPersisted(PERSIST_KEYS.logTaskId, organizerLogTaskId);
+    }
+  }
+
+  const log = document.getElementById('org-log');
+  if (!log) {
+    refreshOrganizerLogPanel();
+    return;
+  }
+
+  const shouldStickToBottom = isOrganizerLogPinnedToBottom(log);
+  const previousScrollTop = log.scrollTop;
+  const previousScrollHeight = log.scrollHeight;
+  const insertMode = isGroupedOrganizerLogType(entry.type) ? 'top' : 'bottom';
+
+  if (isGroupedOrganizerLogType(entry.type)) {
+    const group = ensureOrganizerRecordGroup(log);
+    const body = group?.querySelector('.scan-log-group-body');
+    if (body) {
+      body.appendChild(createOrganizerSimpleLogEntryElement(entry));
+    }
+    updateOrganizerRecordGroupHeader(group, organizerLogEntries.filter((item) => isGroupedOrganizerLogType(item.type)).length);
+  } else if (entry.kind === 'detail') {
+    log.appendChild(createOrganizerDetailLogEntryElement(entry));
+  } else {
+    log.appendChild(createOrganizerSimpleLogEntryElement(entry));
+  }
+
+  applyOrganizerLogScrollPosition(log, {
+    shouldStickToBottom,
+    insertMode,
+    previousScrollTop,
+    previousScrollHeight,
+  });
+  refreshOrganizerLogPanel();
+}
+
+function bindOrganizerLogPanelEvents() {
+  document.getElementById('org-toggle-log-btn')?.addEventListener('click', () => {
+    setOrganizerLogCollapsed(!isOrganizerLogCollapsed());
+    refreshOrganizerLogPanel();
+  });
+  document.getElementById('org-log-panel')?.addEventListener('click', (event) => {
+    if (!isOrganizerLogCollapsed() || !organizerLogEntries.length) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest('button, a, input, textarea, select, label')) {
+      return;
+    }
+    setOrganizerLogCollapsed(false);
+    refreshOrganizerLogPanel();
+  });
+  document.getElementById('org-log-panel')?.addEventListener('keydown', (event) => {
+    if (!isOrganizerLogCollapsed() || !organizerLogEntries.length) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    setOrganizerLogCollapsed(false);
+    refreshOrganizerLogPanel();
+  });
+  document.getElementById('org-clear-log-btn')?.addEventListener('click', () => {
+    replaceOrganizerLogEntries([], { persist: true, taskId: organizerLogTaskId });
+  });
+}
+
+function syncOrganizerLogProgressBaseline(snapshot) {
+  if (!snapshot?.id) {
+    organizerLogProgressBaseline = null;
+    return;
+  }
+  organizerLogProgressBaseline = {
+    taskId: String(snapshot.id),
+    status: String(snapshot.status || 'idle'),
+    processedFiles: Number(snapshot.processedFiles || 0),
+    processedBatches: Number(snapshot.processedBatches || 0),
+    totalBatches: Number(snapshot.totalBatches || 0),
+    tokenTotal: Number(snapshot.tokenUsage?.total || 0),
+  };
+}
+
+function restoreOrganizerLogState(snapshot = null) {
+  const rawEntries = getPersisted(PERSIST_KEYS.logEntries, []);
+  organizerLogEntries = Array.isArray(rawEntries) ? rawEntries : [];
+  organizerLogTaskId = String(getPersisted(PERSIST_KEYS.logTaskId, '') || '').trim() || null;
+  expandedOrganizerDetailLogIds.clear();
+  syncOrganizerLogProgressBaseline(snapshot);
+}
+
+function ensureOrganizerLogsForSnapshot(snapshot) {
+  const snapshotTaskId = String(snapshot?.id || '').trim();
+  if (!snapshotTaskId) return;
+  if (organizerLogEntries.length > 0 && organizerLogTaskId === snapshotTaskId) return;
+
+  const summary = organizerText('已恢复最近一次归类任务', 'Restored the most recent organize task');
+  const detail = [
+    `${organizerText('状态', 'Status')}: ${String(snapshot.status || 'idle')}`,
+    `${organizerText('目录', 'Root')}: ${snapshot.rootPath || '-'}`,
+    `${organizerText('文件', 'Files')}: ${Number(snapshot.processedFiles || 0)}/${Number(snapshot.totalFiles || 0)}`,
+    `${organizerText('批次', 'Batches')}: ${Number(snapshot.processedBatches || 0)}/${Number(snapshot.totalBatches || 0)}`,
+    `${organizerText('Token', 'Token')}: ${Number(snapshot.tokenUsage?.total || 0).toLocaleString()}`,
+  ].join('\n');
+  replaceOrganizerLogEntries([
+    buildOrganizerLogEntry({
+      type: 'agent_response',
+      kind: 'detail',
+      summary,
+      detail,
+      taskId: snapshotTaskId,
+    }),
+  ], { persist: true, taskId: snapshotTaskId });
+}
+
+function formatOrganizerRouteLabel(endpoint, model) {
+  const providerLabel = getProviderLabel(endpoint);
+  return `${providerLabel}/${String(model || '').trim() || '-'}`;
+}
+
+function recordOrganizerStartLog(form, taskId, capability) {
+  const textRoute = form?.modelRouting?.text || {};
+  const selectedProviders = capability?.selectedProviders || latestCapability?.selectedProviders || {};
+  const selectedModels = capability?.selectedModels || latestCapability?.selectedModels || {};
+  const detail = [
+    `${organizerText('目录', 'Root')}: ${form.rootPath || '-'}`,
+    `${organizerText('批大小', 'Batch Size')}: ${Number(form.batchSize || DEFAULT_BATCH_SIZE)}`,
+    `${organizerText('聚类深度', 'Cluster Depth')}: ${form.maxClusterDepth == null ? organizerText('不限', 'Unlimited') : Number(form.maxClusterDepth)}`,
+    `${organizerText('参考原结构', 'Reference Structure')}: ${form.referenceOriginalStructure ? organizerText('是', 'Yes') : organizerText('否', 'No')}`,
+    `${organizerText('联网搜索', 'Web Search')}: ${form.useWebSearch ? organizerText('开启', 'Enabled') : organizerText('关闭', 'Disabled')}`,
+    `${organizerText('文本路由', 'Text Route')}: ${formatOrganizerRouteLabel(textRoute.endpoint || selectedProviders.text, textRoute.model || selectedModels.text)}`,
+  ].join('\n');
+
+  replaceOrganizerLogEntries([], { persist: true, taskId });
+  appendOrganizerLogEntry(buildOrganizerLogEntry({
+    type: 'agent_call',
+    kind: 'detail',
+    summary: organizerText('开始归类任务', 'Organize task started'),
+    detail,
+    taskId,
+  }));
+}
+
+function recordOrganizerProgressLog(snapshot) {
+  if (!snapshot?.id) return;
+  const previous = organizerLogProgressBaseline;
+  const current = {
+    taskId: String(snapshot.id),
+    status: String(snapshot.status || 'idle'),
+    processedFiles: Number(snapshot.processedFiles || 0),
+    processedBatches: Number(snapshot.processedBatches || 0),
+    totalBatches: Number(snapshot.totalBatches || 0),
+    tokenTotal: Number(snapshot.tokenUsage?.total || 0),
+  };
+
+  if (!previous || previous.taskId !== current.taskId) {
+    appendOrganizerLogEntry(buildOrganizerLogEntry({
+      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
+      text: organizerText(
+        `任务状态: ${current.status} | 文件 ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | 批次 ${current.processedBatches}/${current.totalBatches} | Token ${current.tokenTotal.toLocaleString()}`,
+        `Task status: ${current.status} | Files ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Batches ${current.processedBatches}/${current.totalBatches} | Token ${current.tokenTotal.toLocaleString()}`
+      ),
+      taskId: current.taskId,
+    }));
+    return;
+  }
+
+  if (previous.status !== current.status) {
+    appendOrganizerLogEntry(buildOrganizerLogEntry({
+      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
+      text: organizerText(
+        `阶段切换为 ${current.status}`,
+        `Stage changed to ${current.status}`
+      ),
+      taskId: current.taskId,
+    }));
+  }
+
+  if (previous.processedBatches !== current.processedBatches || previous.tokenTotal !== current.tokenTotal) {
+    appendOrganizerLogEntry(buildOrganizerLogEntry({
+      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
+      text: organizerText(
+        `批次 ${current.processedBatches}/${current.totalBatches} | 已处理 ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Token ${current.tokenTotal.toLocaleString()}`,
+        `Batches ${current.processedBatches}/${current.totalBatches} | Processed ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Token ${current.tokenTotal.toLocaleString()}`
+      ),
+      taskId: current.taskId,
+    }));
+  }
+}
+
+function recordOrganizerFileDoneLog(row) {
+  if (!row) return;
+  const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
+  const category = getOrganizerCategoryLabel(row);
+  const route = formatOrganizerRouteLabel(row.provider, row.model);
+  const degradedText = row.degraded ? ` | ${organizerText('降级', 'Degraded')}` : '';
+  appendOrganizerLogEntry(buildOrganizerLogEntry({
+    type: 'found',
+    text: organizerText(
+      `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`,
+      `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`
+    ),
+    taskId,
+  }));
+}
+
+function recordOrganizerTerminalLog(snapshot, kind, message, detail) {
+  appendOrganizerLogEntry(buildOrganizerLogEntry({
+    type: kind === 'error' ? 'error' : 'agent_response',
+    kind: 'detail',
+    summary: message,
+    detail,
+    taskId: snapshot?.id || organizerLogTaskId || activeTaskId || null,
+  }));
 }
 
 function setStatusText(snapshot) {
@@ -707,39 +1207,6 @@ function renderPreview(snapshot) {
   }).join('');
 }
 
-function renderDegradedPanel(snapshot) {
-  const tbody = document.getElementById('org-degraded-body');
-  const empty = document.getElementById('org-degraded-empty');
-  const count = document.getElementById('org-degraded-count');
-  if (!tbody || !empty || !count) return;
-
-  const rows = (snapshot?.results || []).filter((x) => x.degraded);
-  count.textContent = String(rows.length);
-
-  if (!rows.length) {
-    tbody.innerHTML = '';
-    empty.style.display = '';
-    return;
-  }
-
-  empty.style.display = 'none';
-  tbody.innerHTML = rows.map((row, idx) => {
-    const reason = Array.isArray(row.warnings) && row.warnings.length
-      ? row.warnings.join(' | ')
-      : t('organizer.degraded_reason_unknown');
-
-    return `
-      <tr style="animation: slideUp 0.2s var(--ease-out) ${Math.min(idx * 0.01, 0.3)}s both;">
-        <td>
-          <div class="file-name" title="${escapeHtml(row.name || '')}">${escapeHtml(row.name || '')}</div>
-          <div class="file-path" title="${escapeHtml(row.path || '')}">${escapeHtml(row.path || '')}</div>
-        </td>
-        <td><div class="file-purpose">${escapeHtml(reason)}</div></td>
-      </tr>
-    `;
-  }).join('');
-}
-
 function getMoveStatusLabel(status) {
   if (status === 'failed') return getMoveResultText('statusFailed');
   if (status === 'skipped') return getMoveResultText('statusSkipped');
@@ -830,6 +1297,17 @@ function renderApplyResultPanel(snapshot = latestSnapshot) {
     `;
   }).join('');
 }
+
+function renderOrganizerResultsEmptyState(snapshot = latestSnapshot) {
+  const emptyCard = document.getElementById('org-results-empty-card');
+  const stack = document.getElementById('org-results-stack');
+  if (!emptyCard || !stack) return;
+
+  const hasSnapshot = !!snapshot?.id;
+  emptyCard.hidden = hasSnapshot;
+  stack.hidden = !hasSnapshot;
+}
+
 function updateStats(snapshot) {
   const total = snapshot?.totalFiles || 0;
   const done = snapshot?.processedFiles || 0;
@@ -923,13 +1401,14 @@ function refreshView(snapshot) {
   }
   syncReferenceOriginalStructureInput(snapshot);
   syncBatchConfigInputs(snapshot);
+  syncOrganizerLogProgressBaseline(snapshot);
   setStatusText(snapshot);
   updatePipeline(snapshot);
   renderCapability(snapshot);
   updateStats(snapshot);
+  renderOrganizerResultsEmptyState(snapshot);
   renderPreview(snapshot);
   renderApplyResultPanel(snapshot);
-  renderDegradedPanel(snapshot);
   updateButtons(snapshot);
 }
 
@@ -944,19 +1423,56 @@ function connectTaskStream(taskId) {
   closeActiveSSE();
   activeEventSource = connectOrganizeStream(taskId, {
     onProgress: (snap) => {
+      recordOrganizerProgressLog(snap);
       refreshView(snap);
     },
-    onFileDone: () => {
-      // no-op, progress snapshot already contains latest aggregate
+    onFileDone: (row) => {
+      recordOrganizerFileDoneLog(row);
     },
     onDone: (snap) => {
+      const detail = [
+        `${organizerText('状态', 'Status')}: ${String(snap?.status || 'completed')}`,
+        `${organizerText('文件', 'Files')}: ${Number(snap?.processedFiles || 0)}/${Number(snap?.totalFiles || 0)}`,
+        `${organizerText('批次', 'Batches')}: ${Number(snap?.processedBatches || 0)}/${Number(snap?.totalBatches || 0)}`,
+        `${organizerText('降级', 'Degraded')}: ${Number((snap?.results || []).filter((item) => item?.degraded).length)}`,
+        `${organizerText('Token', 'Token')}: ${Number(snap?.tokenUsage?.total || 0).toLocaleString()}`,
+      ].join('\n');
+      recordOrganizerTerminalLog(
+        snap,
+        'done',
+        organizerText('归类完成，结果已就绪', 'Organize task completed'),
+        detail,
+      );
       refreshView(snap);
       showToast(t('organizer.toast_classify_done'), 'success');
+      window.location.hash = '#/organizer-results';
     },
     onStopped: (snap) => {
+      const detail = [
+        `${organizerText('状态', 'Status')}: ${String(snap?.status || 'stopped')}`,
+        `${organizerText('文件', 'Files')}: ${Number(snap?.processedFiles || 0)}/${Number(snap?.totalFiles || 0)}`,
+        `${organizerText('批次', 'Batches')}: ${Number(snap?.processedBatches || 0)}/${Number(snap?.totalBatches || 0)}`,
+      ].join('\n');
+      recordOrganizerTerminalLog(
+        snap,
+        'stopped',
+        organizerText('归类任务已停止', 'Organize task stopped'),
+        detail,
+      );
       refreshView(snap);
     },
     onError: (err) => {
+      const detail = getErrorMessage(err);
+      const errSnapshot = err?.snapshot && typeof err.snapshot === 'object' ? err.snapshot : latestSnapshot;
+      recordOrganizerTerminalLog(
+        errSnapshot,
+        'error',
+        organizerText('归类任务失败', 'Organize task failed'),
+        detail,
+      );
+      if (errSnapshot) {
+        refreshView(errSnapshot);
+      }
       showToast(`${t('organizer.toast_failed')}${getErrorMessage(err)}`, 'error');
     },
   });
@@ -1075,6 +1591,7 @@ async function handleStart() {
     renderCapability();
     renderApplyResultPanel(null);
     setPersisted(PERSIST_KEYS.lastTaskId, activeTaskId);
+    recordOrganizerStartLog(form, activeTaskId, result);
     refreshView(buildOptimisticRunningSnapshot(activeTaskId, form, result));
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
@@ -1118,11 +1635,28 @@ async function handleApply() {
       const skipped = Number(summary.skipped || 0);
       const failed = Number(summary.failed || 0);
       const total = Number(summary.total || 0);
+      recordOrganizerTerminalLog(
+        latestSnapshot,
+        failed > 0 ? 'error' : 'done',
+        organizerText('移动任务已完成', 'Move operation completed'),
+        [
+          `${getMoveResultText('moved')}: ${moved}`,
+          `${getMoveResultText('skipped')}: ${skipped}`,
+          `${getMoveResultText('failed')}: ${failed}`,
+          `${getMoveResultText('total')}: ${total}`,
+        ].join('\n'),
+      );
       showToast(
         `${t('organizer.toast_apply_done')} (${getMoveResultText('moved')}: ${moved}，${getMoveResultText('skipped')}: ${skipped}，${getMoveResultText('failed')}: ${failed}，${getMoveResultText('total')}: ${total})`,
         failed > 0 ? 'error' : (skipped > 0 ? 'info' : 'success')
       );
     } else {
+      recordOrganizerTerminalLog(
+        latestSnapshot,
+        'done',
+        organizerText('移动任务已完成', 'Move operation completed'),
+        organizerText('移动结果已更新。', 'Move results have been updated.'),
+      );
       showToast(t('organizer.toast_apply_done'), 'success');
     }
 
@@ -1199,11 +1733,27 @@ async function handleRollback() {
       }
     }
     if (summary) {
+      recordOrganizerTerminalLog(
+        latestSnapshot,
+        summary.failed > 0 ? 'error' : 'done',
+        organizerText('回滚任务已完成', 'Rollback completed'),
+        [
+          `${organizerText('已回滚', 'Rolled back')}: ${Number(summary.rolledBack || 0)}`,
+          `${organizerText('总数', 'Total')}: ${Number(summary.total || 0)}`,
+          `${organizerText('失败', 'Failed')}: ${Number(summary.failed || 0)}`,
+        ].join('\n'),
+      );
       showToast(
         `${t('organizer.toast_rollback_done')} (${summary.rolledBack}/${summary.total})`,
         summary.failed > 0 ? 'info' : 'success'
       );
     } else {
+      recordOrganizerTerminalLog(
+        latestSnapshot,
+        'done',
+        organizerText('回滚任务已完成', 'Rollback completed'),
+        organizerText('最近一次移动任务已回滚。', 'The most recent move task has been rolled back.'),
+      );
       showToast(t('organizer.toast_rollback_done'), 'success');
     }
   } catch (err) {
@@ -1405,12 +1955,139 @@ function updatePipeline(snapshot) {
   }
 }
 
+async function restoreOrganizerSnapshot(cachedSnapshot, isStale) {
+  try {
+    latestCapability = await getOrganizeCapability();
+  } catch {
+    latestCapability = null;
+  }
+  if (isStale()) return;
+  renderCapability();
+
+  const lastTaskId = getPersisted(PERSIST_KEYS.lastTaskId, null) || cachedSnapshot?.id || null;
+  if (lastTaskId) {
+    try {
+      const snapshot = await getOrganizeResult(lastTaskId);
+      if (isStale()) return;
+      activeTaskId = lastTaskId;
+      ensureOrganizerLogsForSnapshot(snapshot);
+      refreshView(snapshot);
+
+      if (['scanning', 'classifying', 'moving'].includes(snapshot.status)) {
+        connectTaskStream(lastTaskId);
+      }
+      return;
+    } catch {
+      if (cachedSnapshot?.id === lastTaskId) {
+        ensureOrganizerLogsForSnapshot(cachedSnapshot);
+        refreshView(cachedSnapshot);
+        return;
+      }
+      refreshView(null);
+      return;
+    }
+  }
+
+  if (!cachedSnapshot?.id) {
+    refreshView(null);
+  }
+}
+
+function renderOrganizerStatsGrid(animationDelay = '0.09s') {
+  return `
+    <div class="stats-grid organizer-stats-grid animate-in" style="animation-delay: ${animationDelay};">
+      <div class="stat-card organizer-stat-card">
+        <span class="stat-label">${t('organizer.total_files')}</span>
+        <span class="stat-value" id="org-total">0</span>
+      </div>
+      <div class="stat-card organizer-stat-card">
+        <span class="stat-label">${t('organizer.done_files')}</span>
+        <span class="stat-value success" id="org-done">0</span>
+      </div>
+      <div class="stat-card organizer-stat-card">
+        <span class="stat-label">Token</span>
+        <span class="stat-value warning" id="org-token">0</span>
+      </div>
+      <div class="stat-card organizer-stat-card">
+        <span class="stat-label">${t('organizer.degraded')}</span>
+        <span class="stat-value danger" id="org-degraded">0</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderOrganizerPreviewPanel(animationDelay = '0.13s', subtitle = t('organizer.subtitle')) {
+  return `
+    <section class="card organizer-panel organizer-preview-panel animate-in" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;">
+      <div class="card-header organizer-panel-header">
+        <div>
+          <h2 class="card-title">${t('organizer.preview_title')}</h2>
+          <div class="form-hint">${escapeHtml(subtitle)}</div>
+        </div>
+      </div>
+      <div id="org-preview-groups" class="preview-groups organizer-preview-groups"></div>
+      <div id="org-preview-empty" class="empty-state organizer-empty-state" style="padding: 32px;">
+        <div class="organizer-empty-glyph" aria-hidden="true"></div>
+        <div class="empty-state-text">${t('organizer.preview_empty')}</div>
+      </div>
+    </section>
+  `;
+}
+
+function renderOrganizerMoveResultPanel(animationDelay = '0.17s') {
+  return `
+    <section id="org-move-result-card" class="card organizer-panel animate-in mt-24" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;" hidden>
+      <div class="card-header organizer-panel-header">
+        <div>
+          <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
+          <div class="form-hint">${t('organizer.apply_move')}</div>
+        </div>
+      </div>
+      <div class="stats-grid organizer-stats-grid organizer-stats-grid-compact" style="padding: 20px 20px 0;">
+        <div class="stat-card organizer-stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
+          <span id="org-move-moved" class="stat-value success">0</span>
+        </div>
+        <div class="stat-card organizer-stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
+          <span id="org-move-skipped" class="stat-value warning">0</span>
+        </div>
+        <div class="stat-card organizer-stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
+          <span id="org-move-failed" class="stat-value danger">0</span>
+        </div>
+        <div class="stat-card organizer-stat-card">
+          <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
+          <span id="org-move-total" class="stat-value">0</span>
+        </div>
+      </div>
+      <div class="organizer-table-wrap" style="padding: 20px 20px 0;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
+              <th style="width: 32%;">${t('organizer.source')}</th>
+              <th style="width: 32%;">${t('organizer.target')}</th>
+              <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
+            </tr>
+          </thead>
+          <tbody id="org-move-result-body"></tbody>
+        </table>
+      </div>
+      <div id="org-move-result-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
+        <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
+      </div>
+    </section>
+  `;
+}
+
 export async function renderOrganizer(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
   cleanupLegacyPersistedState();
   const defaults = restoreDefaults();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
+  restoreOrganizerLogState(cachedSnapshot);
 
   container.innerHTML = `
     <div class="organizer-shell">
@@ -1423,8 +2100,8 @@ export async function renderOrganizer(container) {
               <p class="page-subtitle">${t('organizer.subtitle')}</p>
             </div>
             <div class="organizer-feature-pills">
+              <span class="organizer-feature-pill">${t('organizer.activity_log')}</span>
               <span class="organizer-feature-pill">${t('organizer.preview_title')}</span>
-              <span class="organizer-feature-pill">${t('organizer.rollback')}</span>
               <span class="organizer-feature-pill">${t('organizer.multimodal')}</span>
             </div>
             <div class="organizer-pipeline">
@@ -1457,11 +2134,9 @@ export async function renderOrganizer(container) {
                   <span id="org-mm-badge" class="badge badge-danger">${t('organizer.multimodal_unknown')}</span>
                 </div>
               </div>
-              <div class="organizer-action-grid">
+              <div class="organizer-action-grid organizer-action-grid-compact">
                 <button id="org-start-btn" class="btn btn-primary" type="button">${t('organizer.start')}</button>
                 <button id="org-stop-btn" class="btn btn-danger" type="button" disabled>${t('organizer.stop')}</button>
-                <button id="org-apply-btn" class="btn btn-success" type="button" disabled>${t('organizer.apply_move')}</button>
-                <button id="org-rollback-btn" class="btn btn-secondary" type="button">${t('organizer.rollback')}</button>
               </div>
             </div>
           </div>
@@ -1552,103 +2227,21 @@ export async function renderOrganizer(container) {
         </div>
 
         <div class="organizer-results-stack">
-          <div class="stats-grid organizer-stats-grid animate-in" style="animation-delay: 0.09s;">
-            <div class="stat-card organizer-stat-card">
-              <span class="stat-label">${t('organizer.total_files')}</span>
-              <span class="stat-value" id="org-total">0</span>
-            </div>
-            <div class="stat-card organizer-stat-card">
-              <span class="stat-label">${t('organizer.done_files')}</span>
-              <span class="stat-value success" id="org-done">0</span>
-            </div>
-            <div class="stat-card organizer-stat-card">
-              <span class="stat-label">Token</span>
-              <span class="stat-value warning" id="org-token">0</span>
-            </div>
-            <div class="stat-card organizer-stat-card">
-              <span class="stat-label">${t('organizer.degraded')}</span>
-              <span class="stat-value danger" id="org-degraded">0</span>
-            </div>
-          </div>
+          ${renderOrganizerStatsGrid('0.09s')}
 
-          <section class="card organizer-panel organizer-preview-panel animate-in" style="animation-delay: 0.13s; padding: 0; overflow: hidden;">
-            <div class="card-header organizer-panel-header">
-              <div>
-                <h2 class="card-title">${t('organizer.preview_title')}</h2>
-                <div class="form-hint">${t('organizer.subtitle')}</div>
+          <section class="card organizer-panel animate-in mt-24" style="animation-delay: 0.13s;">
+            <div class="card-header">
+              <h2 class="card-title">${t('organizer.activity_log')}</h2>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button id="org-toggle-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('organizer.log_expand')}</button>
+                <button id="org-clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
               </div>
             </div>
-            <div id="org-preview-groups" class="preview-groups organizer-preview-groups"></div>
-            <div id="org-preview-empty" class="empty-state organizer-empty-state" style="padding: 32px;">
-              <div class="organizer-empty-glyph" aria-hidden="true"></div>
-              <div class="empty-state-text">${t('organizer.preview_empty')}</div>
-            </div>
-          </section>
-
-          <section id="org-move-result-card" class="card organizer-panel animate-in mt-24" style="animation-delay: 0.17s; padding: 0; overflow: hidden;" hidden>
-            <div class="card-header organizer-panel-header">
-              <div>
-                <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
-                <div class="form-hint">${t('organizer.apply_move')}</div>
+            <div id="org-log-panel" class="scan-log-panel">
+              <div class="scan-activity">
+                <div class="scan-log" id="org-log"></div>
+                <div id="org-log-collapsed-hint" class="scan-log-collapsed-hint" style="display:none;">${t('organizer.log_preview_hint')}</div>
               </div>
-            </div>
-            <div class="stats-grid organizer-stats-grid organizer-stats-grid-compact" style="padding: 20px 20px 0;">
-              <div class="stat-card organizer-stat-card">
-                <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
-                <span id="org-move-moved" class="stat-value success">0</span>
-              </div>
-              <div class="stat-card organizer-stat-card">
-                <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
-                <span id="org-move-skipped" class="stat-value warning">0</span>
-              </div>
-              <div class="stat-card organizer-stat-card">
-                <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
-                <span id="org-move-failed" class="stat-value danger">0</span>
-              </div>
-              <div class="stat-card organizer-stat-card">
-                <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
-                <span id="org-move-total" class="stat-value">0</span>
-              </div>
-            </div>
-            <div class="organizer-table-wrap" style="padding: 20px 20px 0;">
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
-                    <th style="width: 32%;">${t('organizer.source')}</th>
-                    <th style="width: 32%;">${t('organizer.target')}</th>
-                    <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
-                  </tr>
-                </thead>
-                <tbody id="org-move-result-body"></tbody>
-              </table>
-            </div>
-            <div id="org-move-result-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
-              <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
-            </div>
-          </section>
-
-          <section class="card organizer-panel animate-in mt-24" style="animation-delay: 0.19s; padding: 0; overflow: hidden;">
-            <div class="card-header organizer-panel-header">
-              <div>
-                <h2 class="card-title">${t('organizer.degraded_panel_title')}</h2>
-                <div class="form-hint">${t('organizer.degraded_reason')}</div>
-              </div>
-              <span class="badge badge-warning">${t('organizer.degraded')}: <span id="org-degraded-count">0</span></span>
-            </div>
-            <div class="organizer-table-wrap">
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>${t('organizer.source')}</th>
-                    <th>${t('organizer.degraded_reason')}</th>
-                  </tr>
-                </thead>
-                <tbody id="org-degraded-body"></tbody>
-              </table>
-            </div>
-            <div id="org-degraded-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
-              <div class="empty-state-text">${t('organizer.degraded_empty')}</div>
             </div>
           </section>
         </div>
@@ -1659,9 +2252,12 @@ export async function renderOrganizer(container) {
   document.getElementById('org-browse-btn')?.addEventListener('click', handleBrowse);
   document.getElementById('org-start-btn')?.addEventListener('click', handleStart);
   document.getElementById('org-stop-btn')?.addEventListener('click', handleStop);
-  document.getElementById('org-apply-btn')?.addEventListener('click', handleApply);
-  document.getElementById('org-rollback-btn')?.addEventListener('click', handleRollback);
   document.getElementById(COPY_TEXT_ROUTE_BTN_ID)?.addEventListener('click', handleCopyTextRoute);
+  bindOrganizerLogPanelEvents();
+  if (organizerLogEntries.length > 0) {
+    renderOrganizerLogEntries();
+  }
+  refreshOrganizerLogPanel();
 
   const runtimeSettings = await initModelRoutingFields(defaults.modelRouting);
   if (isStale()) return;
@@ -1679,7 +2275,10 @@ export async function renderOrganizer(container) {
   refreshOrganizerApiConfigHint();
   renderCapability();
   if (cachedSnapshot?.id) {
+    ensureOrganizerLogsForSnapshot(cachedSnapshot);
     refreshView(cachedSnapshot);
+  } else {
+    refreshView(null);
   }
 
   if (organizerProviderSettingsUpdatedHandler) {
@@ -1706,36 +2305,75 @@ export async function renderOrganizer(container) {
   };
   window.addEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
 
-  try {
-    latestCapability = await getOrganizeCapability();
-  } catch {
-    latestCapability = null;
+  await restoreOrganizerSnapshot(cachedSnapshot, isStale);
+}
+
+export async function renderOrganizerResults(container) {
+  const expectedRenderVersion = ++renderVersion;
+  const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
+  const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
+  restoreOrganizerLogState(cachedSnapshot);
+  if (organizerProviderSettingsUpdatedHandler) {
+    window.removeEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
+    organizerProviderSettingsUpdatedHandler = null;
   }
-  if (isStale()) return;
-  renderCapability();
 
-  // Try to reconnect to a running task.
-  const lastTaskId = getPersisted(PERSIST_KEYS.lastTaskId, null) || cachedSnapshot?.id || null;
-  if (lastTaskId) {
-    try {
-      const snapshot = await getOrganizeResult(lastTaskId);
-      if (isStale()) return;
-      activeTaskId = lastTaskId;
-      refreshView(snapshot);
+  container.innerHTML = `
+    <div class="page-header animate-in">
+      <h1 class="page-title">${t('organizer.results_title')}</h1>
+      <p class="page-subtitle">${t('organizer.results_subtitle')}</p>
+    </div>
 
-      if (['scanning', 'classifying', 'moving'].includes(snapshot.status)) {
-        connectTaskStream(lastTaskId);
-      }
-    } catch {
-      if (cachedSnapshot?.id === lastTaskId) {
-        refreshView(cachedSnapshot);
-      } else {
-        refreshView(null);
-      }
-    }
-  } else if (!cachedSnapshot?.id) {
+    <section id="org-results-empty-card" class="card animate-in mb-24" style="animation-delay: 0.05s;">
+      <div class="empty-state organizer-empty-state" style="padding: 36px;">
+        <div class="organizer-empty-glyph" aria-hidden="true"></div>
+        <div class="empty-state-text">${t('organizer.results_empty')}</div>
+        <div class="empty-state-hint">${t('organizer.results_empty_hint')}</div>
+        <button id="org-results-go-btn" class="btn btn-primary" type="button">${t('organizer.go_organize')}</button>
+      </div>
+    </section>
+
+    <div id="org-results-stack" class="organizer-results-page-stack" hidden>
+      <section class="card organizer-panel animate-in mb-24" style="animation-delay: 0.08s;">
+        <div class="card-header organizer-panel-header">
+          <div>
+            <h2 class="card-title">${t('organizer.results_title')}</h2>
+            <div class="form-hint">${t('organizer.results_subtitle')}</div>
+          </div>
+          <div class="organizer-results-toolbar">
+            <span id="org-status" class="badge badge-info">${t('organizer.status_idle')}</span>
+            <button id="org-apply-btn" class="btn btn-success" type="button" disabled>${t('organizer.apply_move')}</button>
+            <button id="org-rollback-btn" class="btn btn-secondary" type="button">${t('organizer.rollback')}</button>
+          </div>
+        </div>
+        <div class="organizer-result-progress">
+          <span id="org-progress-pct" class="organizer-progress-pct organizer-progress-pct-inline">0.0%</span>
+          <div class="progress-bar organizer-progress-bar">
+            <div id="org-progress-fill" class="progress-fill" style="width:0%;"></div>
+          </div>
+        </div>
+      </section>
+
+      ${renderOrganizerStatsGrid('0.1s')}
+      ${renderOrganizerPreviewPanel('0.14s', t('organizer.results_subtitle'))}
+      ${renderOrganizerMoveResultPanel('0.18s')}
+    </div>
+  `;
+
+  document.getElementById('org-results-go-btn')?.addEventListener('click', () => {
+    window.location.hash = '#/organizer';
+  });
+  document.getElementById('org-apply-btn')?.addEventListener('click', handleApply);
+  document.getElementById('org-rollback-btn')?.addEventListener('click', handleRollback);
+
+  if (cachedSnapshot?.id) {
+    ensureOrganizerLogsForSnapshot(cachedSnapshot);
+    refreshView(cachedSnapshot);
+  } else {
     refreshView(null);
   }
+
+  await restoreOrganizerSnapshot(cachedSnapshot, isStale);
 }
 
 

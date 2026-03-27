@@ -17,7 +17,11 @@ import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
-import { ensureRequiredCredentialsConfigured, getProviderCredentialPresence } from '../utils/secret-ui.js';
+import {
+  ensureRequiredCredentialsConfigured,
+  getProviderCredentialPresence,
+  getSearchCredentialPresence,
+} from '../utils/secret-ui.js';
 import { scanTaskController } from '../utils/scan-task-controller.js';
 
 let activeTaskId = null;
@@ -1682,6 +1686,19 @@ async function handleStart() {
       try {
         await ensureRequiredCredentialsConfigured({
           providerEndpoints: [selectedEndpoint],
+          requireSearchApi: !!form.scanWebSearchEnabled,
+          reasonText: t('scanner.api_key_required'),
+        });
+      } catch (err) {
+        showToast(err.message, 'error');
+        return;
+      }
+    }
+    if (form.scanWebSearchEnabled && !getSearchCredentialPresence(currentSettings || {})) {
+      try {
+        await ensureRequiredCredentialsConfigured({
+          providerEndpoints: [selectedEndpoint],
+          requireSearchApi: true,
           reasonText: t('scanner.api_key_required'),
         });
       } catch (err) {
@@ -1702,6 +1719,7 @@ async function handleStart() {
       maxDepth: form.maxDepthUnlimited ? null : form.maxDepth,
       scanMode: 'full_rescan_incremental',
       autoAnalyze: true,
+      useWebSearch: !!form.scanWebSearchEnabled,
       responseLanguage: getLang(),
     });
   } catch (err) {

@@ -2,6 +2,7 @@ mod backend;
 mod organizer_runtime;
 mod persist;
 mod scan_runtime;
+mod web_search;
 
 use backend::AppState;
 use tauri::Manager;
@@ -26,6 +27,7 @@ pub fn run() {
             backend::settings_browse_folder,
             backend::system_get_privilege,
             backend::system_request_elevation,
+            backend::system_open_external_url,
             backend::files_open_location,
             backend::files_clean,
             backend::scan_get_active,

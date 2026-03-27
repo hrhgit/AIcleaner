@@ -4,7 +4,8 @@
  */
 import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
-import { renderOrganizer } from './pages/organizer.js';
+import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
+import { openExternalUrl } from './utils/api.js';
 import { emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
 
@@ -12,6 +13,7 @@ const pages = {
     scanner: renderScanner,
     results: renderResults,
     organizer: renderOrganizer,
+    'organizer-results': renderOrganizerResults,
 };
 
 let currentPage = null;
@@ -62,6 +64,18 @@ function getPageFromHash() {
     return pages[hash] ? hash : 'scanner';
 }
 
+async function handleExternalLinkClick(event) {
+    const link = event.target?.closest?.('a[data-open-external="true"][href]');
+    if (!link) return;
+
+    event.preventDefault();
+    try {
+        await openExternalUrl(link.href);
+    } catch (err) {
+        showToast(`Failed to open link: ${err?.message || err}`, 'error');
+    }
+}
+
 // Event listeners
 window.addEventListener('hashchange', () => {
     navigate(getPageFromHash());
@@ -69,6 +83,7 @@ window.addEventListener('hashchange', () => {
 
 document.addEventListener('DOMContentLoaded', () => {
     initProviderManager();
+    document.addEventListener('click', handleExternalLinkClick);
 
     // Nav link clicks
     document.querySelectorAll('.nav-link').forEach(link => {

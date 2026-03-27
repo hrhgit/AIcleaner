@@ -789,6 +789,7 @@ async function handleContinueScan() {
   writeContinueDraft(draft, currentSnapshot);
 
   try {
+    const settings = await getSettings().catch(() => null);
     if (submitBtn) {
       submitBtn.disabled = true;
       submitBtn.innerHTML = `<span class="spinner"></span> ${t('scanner.prepare')}`;
@@ -800,6 +801,7 @@ async function handleContinueScan() {
       baselineTaskId: currentSnapshot.id,
       scanMode: 'deepen_incremental',
       autoAnalyze: true,
+      useWebSearch: !!(settings?.searchApi?.scopes?.classify || settings?.searchApi?.scopes?.scan),
       responseLanguage: getLang(),
     });
     closeContinueScanModal();

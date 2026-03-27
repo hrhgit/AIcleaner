@@ -296,7 +296,7 @@ function renderProviderRows() {
             />
             ${hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
             <div class="form-hint">
-              <a href="https://tavily.com/" target="_blank" style="color: var(--accent-info); text-decoration: underline;">
+              <a href="https://tavily.com/" data-open-external="true" target="_blank" rel="noopener noreferrer" style="color: var(--accent-info); text-decoration: underline;">
                 ${escapeHtml(t('provider_modal.search_api_hint'))}
               </a>
             </div>
