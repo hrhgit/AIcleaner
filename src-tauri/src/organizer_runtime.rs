@@ -315,6 +315,14 @@ fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfi
     }
 }
 
+fn force_enable_tika_for_summary_mode(config: &mut ExtractionToolConfig) {
+    if config.tika_url.trim().is_empty() {
+        config.tika_url = DEFAULT_TIKA_URL.to_string();
+    }
+    config.tika_enabled = true;
+    config.tika_auto_start = true;
+}
+
 async fn is_tika_server_available(url: &str) -> bool {
     let normalized = url.trim().trim_end_matches('/');
     if normalized.is_empty() {
@@ -1752,6 +1760,7 @@ fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) 
     lines.join("\n")
 }
 
+#[allow(dead_code)]
 fn build_reference_structure_context(
     root: &Path,
     excluded: &[String],
@@ -2804,6 +2813,52 @@ async fn classify_organize_batch(
     })
 }
 
+fn emit_organize_summary_ready<R: Runtime>(
+    app: &AppHandle<R>,
+    task_id: &str,
+    batch_index: u64,
+    row: &Value,
+) {
+    let payload = json!({
+        "taskId": task_id,
+        "batchIndex": batch_index,
+        "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+        "path": row.get("path").and_then(Value::as_str).unwrap_or(""),
+        "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+        "size": row.get("size").and_then(Value::as_u64).unwrap_or(0),
+        "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+        "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+        "summaryMode": row
+            .get("summaryMode")
+            .cloned()
+            .unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
+        "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
+        "summarySource": row
+            .get("summarySource")
+            .and_then(Value::as_str)
+            .unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
+        "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
+        "summaryKeywords": row
+            .get("summaryKeywords")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new())),
+        "summaryWarnings": row
+            .get("summaryWarnings")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new())),
+        "warnings": row
+            .get("summaryWarnings")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new())),
+        "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
+        "provider": row.get("provider").and_then(Value::as_str).unwrap_or(""),
+        "model": row.get("model").and_then(Value::as_str).unwrap_or(""),
+    });
+    if let Err(err) = app.emit("organize_summary_ready", payload) {
+        log::warn!("failed to emit organize_summary_ready for task {task_id}: {err}");
+    }
+}
+
 fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
     let mut used = HashSet::new();
     let mut out = Vec::new();
@@ -3028,7 +3083,6 @@ async fn run_organize_task<R: Runtime>(
         summary_mode,
         max_cluster_depth,
         use_web_search,
-        reference_original_structure,
     ) = {
         let snap = task.snapshot.lock();
         (
@@ -3039,7 +3093,6 @@ async fn run_organize_task<R: Runtime>(
             snap.summary_mode.clone(),
             snap.max_cluster_depth,
             snap.use_web_search,
-            snap.reference_original_structure,
         )
     };
     {
@@ -3052,16 +3105,7 @@ async fn run_organize_task<R: Runtime>(
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let reference_structure = if reference_original_structure {
-        Some(build_reference_structure_context(
-            Path::new(&root_path),
-            &excluded,
-            &task.stop,
-            &task.response_language,
-        ))
-    } else {
-        None
-    };
+    let reference_structure = None;
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -3092,6 +3136,7 @@ async fn run_organize_task<R: Runtime>(
         api_key: String::new(),
         model: "gpt-4o-mini".to_string(),
     });
+    let task_id = task.snapshot.lock().id.clone();
 
     for (batch_idx, batch) in units.chunks(batch_size as usize).enumerate() {
         if task.stop.load(Ordering::Relaxed) {
@@ -3181,6 +3226,11 @@ async fn run_organize_task<R: Runtime>(
                 "provider": route.endpoint,
                 "model": route.model,
             }));
+            if summary_mode == SUMMARY_MODE_LOCAL_SUMMARY {
+                if let Some(row) = batch_rows.last() {
+                    emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
+                }
+            }
             local_results.push(local_result);
         }
 
@@ -3254,6 +3304,9 @@ async fn run_organize_task<R: Runtime>(
                     row["summaryWarnings"] =
                         Value::Array(warnings.into_iter().map(Value::String).collect::<Vec<_>>());
                 }
+            }
+            for row in &batch_rows {
+                emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
             }
         }
 
@@ -3506,6 +3559,7 @@ pub async fn organize_start<R: Runtime>(
     let mut extraction_tool = extraction_tool_config_from_settings(&settings);
     let normalized_summary_mode = normalize_summary_mode(input.summary_mode.as_deref());
     if normalized_summary_mode != SUMMARY_MODE_FILENAME_ONLY {
+        force_enable_tika_for_summary_mode(&mut extraction_tool);
         ensure_tika_server_running(state.inner(), &mut extraction_tool).await;
     }
     let routes = parse_routes(&input.model_routing);
@@ -3523,7 +3577,6 @@ pub async fn organize_start<R: Runtime>(
         error: None,
         root_path: input.root_path.clone(),
         recursive: true,
-        reference_original_structure: input.reference_original_structure.unwrap_or(false),
         excluded_patterns: normalize_excluded(input.excluded_patterns.clone()),
         batch_size: normalize_batch_size(input.batch_size),
         summary_mode: normalized_summary_mode,
@@ -3761,7 +3814,6 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         "batchSize": snapshot.batch_size,
         "maxClusterDepth": snapshot.max_cluster_depth,
         "recursive": snapshot.recursive,
-        "referenceOriginalStructure": snapshot.reference_original_structure,
         "entries": entries,
         "summary": {
             "moved": moved,
@@ -4023,7 +4075,6 @@ mod tests {
             error: None,
             root_path: r"C:\root".to_string(),
             recursive: true,
-            reference_original_structure: false,
             excluded_patterns: Vec::new(),
             batch_size: 20,
             summary_mode: SUMMARY_MODE_FILENAME_ONLY.to_string(),
@@ -4134,6 +4185,23 @@ mod tests {
         assert!(config.tika_enabled);
         assert!(config.tika_auto_start);
         assert!(!config.tika_ready);
+    }
+
+    #[test]
+    fn summary_modes_force_enable_tika_runtime() {
+        let mut config = ExtractionToolConfig {
+            tika_enabled: false,
+            tika_url: String::new(),
+            tika_auto_start: false,
+            tika_jar_path: String::new(),
+            tika_ready: false,
+        };
+
+        force_enable_tika_for_summary_mode(&mut config);
+
+        assert!(config.tika_enabled);
+        assert!(config.tika_auto_start);
+        assert_eq!(config.tika_url, DEFAULT_TIKA_URL.to_string());
     }
 
     #[test]

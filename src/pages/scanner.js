@@ -33,6 +33,7 @@ let scannerWhitelistExpanded = false;
 let renderVersion = 0;
 let scannerTaskUnsubscribe = null;
 const expandedDetailLogIds = new Set();
+let renderedLogKeys = [];
 const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v2';
 const SCANNER_FORM_DRAFT_VERSION = 2;
 const SCAN_LOG_COLLAPSED_KEY = 'wipeout.scanner.log.collapsed.v1';
@@ -90,6 +91,18 @@ function clampNumber(value, min, max, fallback) {
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function normalizePathKey(value) {
+  let normalized = String(value || '').trim().replace(/\//g, '\\').toLowerCase();
+  while (normalized.length > 3 && normalized.endsWith('\\')) {
+    normalized = normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function isSystemPrunedRootPath(path) {
+  return normalizePathKey(path) === 'c:\\';
 }
 
 function escapeHtml(value) {
@@ -332,14 +345,7 @@ function replaceLogEntries(nextEntries = [], { persist = true } = {}) {
   scanTaskController.replaceLogEntries(nextEntries, { persist });
   logEntries = scanTaskController.getState().logEntries;
   expandedDetailLogIds.clear();
-  const logEl = document.getElementById('scan-log');
-  if (logEl) {
-    if (logEntries.length > 0) {
-      renderLogEntries();
-    } else {
-      logEl.innerHTML = '';
-    }
-  }
+  syncRenderedLogEntries({ force: true });
   refreshScanLogPanel();
 }
 
@@ -551,6 +557,55 @@ function appendLogEntry(entry) {
   applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight });
 }
 
+function getLogEntryKey(entry) {
+  return JSON.stringify([
+    entry?.id ?? '',
+    entry?.kind ?? 'simple',
+    entry?.type ?? '',
+    entry?.time ?? '',
+    entry?.text ?? '',
+    entry?.summary ?? '',
+    entry?.detailHtml ?? '',
+  ]);
+}
+
+function areLogKeysEqual(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function syncRenderedLogEntries({ force = false } = {}) {
+  const log = document.getElementById('scan-log');
+  if (!log) return;
+
+  const nextKeys = logEntries.map((entry) => getLogEntryKey(entry));
+  if (!force && areLogKeysEqual(renderedLogKeys, nextKeys)) {
+    return;
+  }
+
+  const canAppendOnly = !force
+    && renderedLogKeys.length > 0
+    && nextKeys.length === renderedLogKeys.length + 1
+    && areLogKeysEqual(renderedLogKeys, nextKeys.slice(0, -1));
+
+  if (canAppendOnly) {
+    appendLogEntry(logEntries[logEntries.length - 1]);
+    renderedLogKeys = nextKeys;
+    return;
+  }
+
+  if (!nextKeys.length) {
+    log.innerHTML = '';
+    renderedLogKeys = [];
+    return;
+  }
+
+  renderLogEntries();
+}
+
 function renderLogEntries(insertMode = 'reset') {
   const log = document.getElementById('scan-log');
   if (!log) return;
@@ -575,6 +630,7 @@ function renderLogEntries(insertMode = 'reset') {
   }
 
   applyLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight });
+  renderedLogKeys = logEntries.map((entry) => getLogEntryKey(entry));
 }
 
 function normalizeRemoteModels(models) {
@@ -834,6 +890,8 @@ function resetScanPreview({ clearLog = true } = {}) {
 
   if (clearLog) {
     replaceLogEntries([], { persist: false });
+  } else {
+    syncRenderedLogEntries({ force: true });
   }
 }
 
@@ -852,26 +910,35 @@ function previewSnapshotForPath(snapshot) {
     replaceLogEntries([], { persist: false });
   } else {
     refreshScanLogPanel();
-    if (logEntries.length > 0) {
-      renderLogEntries();
-    }
+    syncRenderedLogEntries({ force: true });
   }
 }
 
 function refreshScanActionHint() {
   const hintEl = document.getElementById('scan-incremental-hint');
+  const pruneHintEl = document.getElementById('scan-system-prune-hint');
   const startBtn = document.getElementById('start-btn');
   const baseline = latestBaselineSnapshot;
+  const scanPath = String(document.getElementById('scan-path')?.value || '').trim();
   if (hintEl) {
     if (baseline?.id) {
       hintEl.textContent = t('scanner.incremental_hint', {
-        depth: baseline.configuredMaxDepth ?? baseline.maxScannedDepth ?? 0,
+        depth: baseline.maxScannedDepth ?? baseline.configuredMaxDepth ?? 0,
         size: formatSize(baseline.totalCleanable || 0),
       });
       hintEl.style.display = 'block';
     } else {
       hintEl.textContent = '';
       hintEl.style.display = 'none';
+    }
+  }
+  if (pruneHintEl) {
+    if (isSystemPrunedRootPath(scanPath)) {
+      pruneHintEl.textContent = t('scanner.system_prune_hint');
+      pruneHintEl.style.display = 'block';
+    } else {
+      pruneHintEl.textContent = '';
+      pruneHintEl.style.display = 'none';
     }
   }
   if (startBtn && !activeTaskId) {
@@ -1162,8 +1229,6 @@ function bindSettingsEvents() {
   });
 
   document.getElementById('request-elevation-btn')?.addEventListener('click', async () => {
-    if (!confirm(t('settings.elevation_confirm'))) return;
-
     const elevationBtn = document.getElementById('request-elevation-btn');
     const adminStatusEl = document.getElementById('admin-status');
     if (elevationBtn) {
@@ -1246,14 +1311,7 @@ function getErrorMessage(err) {
 function applyTaskControllerState(state = scanTaskController.getState()) {
   syncTaskViewState(state);
   refreshScanLogPanel();
-  const log = document.getElementById('scan-log');
-  if (log) {
-    if (logEntries.length > 0) {
-      renderLogEntries();
-    } else {
-      log.innerHTML = '';
-    }
-  }
+  syncRenderedLogEntries();
 
   if (activeTaskId) {
     restoreActiveState(state?.snapshot || null);
@@ -1321,6 +1379,7 @@ export async function renderScanner(container) {
   const preferredTaskId = String(storage.get('lastScanTaskId', null) || '').trim();
   scannerIgnoredPaths = [];
   scannerWhitelistExpanded = false;
+  renderedLogKeys = [];
   syncTaskViewState(scanTaskController.getState());
 
   container.innerHTML = `
@@ -1362,6 +1421,7 @@ export async function renderScanner(container) {
         </div>
         <div class="form-hint">${t('settings.browse_hint')}</div>
         <div id="scan-incremental-hint" class="form-hint" style="display:none; color: var(--accent-info); margin-top: 6px;"></div>
+        <div id="scan-system-prune-hint" class="form-hint" style="display:none; color: var(--text-secondary); margin-top: 6px;"></div>
       </div>
 
       <div class="form-group">
@@ -1636,11 +1696,6 @@ function restoreActiveState(initialSnapshot = null) {
   if (activityEl) activityEl.style.display = '';
   if (emptyEl) emptyEl.style.display = 'none';
   if (breadcrumb) breadcrumb.style.display = '';
-
-  const log = document.getElementById('scan-log');
-  if (log && logEntries.length > 0) {
-    renderLogEntries();
-  }
 
   const cachedSnapshot = initialSnapshot?.id
     ? initialSnapshot

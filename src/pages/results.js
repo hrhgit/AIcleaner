@@ -195,6 +195,10 @@ function normalizePathKey(value) {
   return normalized;
 }
 
+function isSystemPrunedRootPath(path) {
+  return normalizePathKey(path) === 'c:\\';
+}
+
 function isSameOrDescendantPath(path, parent) {
   return path === parent || path.startsWith(`${parent}\\`);
 }
@@ -286,13 +290,13 @@ function usesUnlimitedContinueDepth(snapshot = currentSnapshot) {
 }
 
 function getContinueDepthBase(snapshot = currentSnapshot) {
-  const configuredDepth = getConfiguredContinueDepth(snapshot);
-  if (configuredDepth != null) {
-    return configuredDepth;
-  }
   const scannedDepth = Number(snapshot?.maxScannedDepth);
   if (Number.isFinite(scannedDepth) && scannedDepth > 0) {
     return scannedDepth;
+  }
+  const configuredDepth = getConfiguredContinueDepth(snapshot);
+  if (configuredDepth != null) {
+    return configuredDepth;
   }
   return 0;
 }
@@ -427,6 +431,7 @@ function updateContinueModalState(snapshot = currentSnapshot) {
   const openBtn = document.getElementById('continue-scan-btn');
   const summaryEl = document.getElementById('continue-scan-summary');
   const hintEl = document.getElementById('continue-scan-hint');
+  const pruneHintEl = document.getElementById('continue-scan-system-prune-hint');
   const rootEl = document.getElementById('continue-scan-root');
   const submitBtn = document.getElementById('continue-scan-submit-btn');
   const unlimitedToggle = document.getElementById('continue-unlimited-toggle');
@@ -437,11 +442,13 @@ function updateContinueModalState(snapshot = currentSnapshot) {
     openBtn.disabled = !hasSnapshot;
   }
 
-  if (!summaryEl || !hintEl || !rootEl || !submitBtn || !unlimitedToggle || !depthRange || !depthInput) return;
+  if (!summaryEl || !hintEl || !rootEl || !submitBtn || !unlimitedToggle || !depthRange || !depthInput || !pruneHintEl) return;
 
   if (!hasSnapshot) {
     summaryEl.textContent = '';
     hintEl.textContent = '';
+    pruneHintEl.textContent = '';
+    pruneHintEl.style.display = 'none';
     rootEl.textContent = '';
     submitBtn.disabled = true;
     return;
@@ -466,6 +473,13 @@ function updateContinueModalState(snapshot = currentSnapshot) {
   hintEl.textContent = taskUsesUnlimitedDepth
     ? t('results.continue_unlimited_hint')
     : (draft.unlimited ? t('settings.max_depth_unlimited_hint') : t('results.continue_hint'));
+  if (isSystemPrunedRootPath(snapshot?.targetPath)) {
+    pruneHintEl.textContent = t('results.continue_system_prune_hint');
+    pruneHintEl.style.display = 'block';
+  } else {
+    pruneHintEl.textContent = '';
+    pruneHintEl.style.display = 'none';
+  }
 }
 
 function openContinueScanModal() {
@@ -789,7 +803,6 @@ async function handleContinueScan() {
   writeContinueDraft(draft, currentSnapshot);
 
   try {
-    const settings = await getSettings().catch(() => null);
     if (submitBtn) {
       submitBtn.disabled = true;
       submitBtn.innerHTML = `<span class="spinner"></span> ${t('scanner.prepare')}`;
@@ -801,7 +814,6 @@ async function handleContinueScan() {
       baselineTaskId: currentSnapshot.id,
       scanMode: 'deepen_incremental',
       autoAnalyze: true,
-      useWebSearch: !!(settings?.searchApi?.scopes?.classify || settings?.searchApi?.scopes?.scan),
       responseLanguage: getLang(),
     });
     closeContinueScanModal();
@@ -1058,6 +1070,7 @@ export async function renderResults(container) {
               <div id="continue-scan-root" class="results-continue-overview-value"></div>
             </div>
             <div id="continue-scan-hint" class="form-hint"></div>
+            <div id="continue-scan-system-prune-hint" class="form-hint" style="display:none; margin-top: 8px;"></div>
           </div>
 
           <div class="results-continue-grid">

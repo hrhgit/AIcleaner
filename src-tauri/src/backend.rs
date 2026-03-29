@@ -234,7 +234,6 @@ pub struct OrganizeSnapshot {
     pub error: Option<String>,
     pub root_path: String,
     pub recursive: bool,
-    pub reference_original_structure: bool,
     pub excluded_patterns: Vec<String>,
     pub batch_size: u32,
     #[serde(default = "default_organize_summary_mode")]
@@ -569,20 +568,34 @@ fn normalize_settings_shape(value: &mut Value) {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let tika_enabled = tika.get("enabled").and_then(Value::as_bool);
+    let tika_auto_start = tika.get("autoStart").and_then(Value::as_bool);
+    let tika_url = tika
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("http://127.0.0.1:9998")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let tika_jar_path = tika
+        .get("jarPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Keep settings UI aligned with organizer runtime's legacy fallback behavior.
+    let legacy_tika_defaults = !tika_enabled.unwrap_or(false)
+        && !tika_auto_start.unwrap_or(false)
+        && tika_url == "http://127.0.0.1:9998"
+        && tika_jar_path.is_empty();
     obj.insert(
         "contentExtraction".to_string(),
         json!({
             "tika": {
-                "enabled": tika.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-                "url": tika
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("http://127.0.0.1:9998"),
-                "autoStart": tika.get("autoStart").and_then(Value::as_bool).unwrap_or(true),
-                "jarPath": tika
-                    .get("jarPath")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
+                "enabled": if legacy_tika_defaults { true } else { tika_enabled.unwrap_or(true) },
+                "url": tika_url,
+                "autoStart": if legacy_tika_defaults { true } else { tika_auto_start.unwrap_or(true) },
+                "jarPath": tika_jar_path
             }
         }),
     );
@@ -1285,7 +1298,6 @@ pub struct ScanStartInput {
 #[serde(rename_all = "camelCase")]
 pub struct OrganizeStartInput {
     pub root_path: String,
-    pub reference_original_structure: Option<bool>,
     pub excluded_patterns: Option<Vec<String>>,
     pub batch_size: Option<u32>,
     pub summary_mode: Option<String>,
@@ -1570,6 +1582,39 @@ mod tests {
     }
 
     #[test]
+    fn read_settings_upgrades_legacy_tika_defaults_for_ui_consistency() {
+        let path = temp_settings_path();
+        let legacy = json!({
+            "contentExtraction": {
+                "tika": {
+                    "enabled": false,
+                    "autoStart": false,
+                    "url": "http://127.0.0.1:9998",
+                    "jarPath": ""
+                }
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&legacy).expect("serialize legacy tika settings"),
+        )
+        .expect("write legacy tika settings");
+
+        let saved = read_settings(&path);
+
+        assert_eq!(
+            saved["contentExtraction"]["tika"]["enabled"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            saved["contentExtraction"]["tika"]["autoStart"],
+            Value::Bool(true)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn organize_snapshot_defaults_summary_mode_when_missing() {
         let snapshot: OrganizeSnapshot = serde_json::from_value(json!({
             "id": "task_legacy",
@@ -1577,7 +1622,6 @@ mod tests {
             "error": null,
             "rootPath": "C:\\root",
             "recursive": true,
-            "referenceOriginalStructure": false,
             "excludedPatterns": [],
             "batchSize": 20,
             "maxClusterDepth": null,

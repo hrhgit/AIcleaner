@@ -681,7 +681,11 @@ pub fn load_scan_findings_map(
         .collect())
 }
 
-pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSnapshot>, String> {
+fn load_scan_snapshot_internal(
+    db_path: &Path,
+    task_id: &str,
+    include_findings: bool,
+) -> Result<Option<ScanSnapshot>, String> {
     let conn = open_db(db_path)?;
     let row = conn
         .query_row(
@@ -724,7 +728,11 @@ pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSn
     let Some(row) = row else {
         return Ok(None);
     };
-    let findings = load_scan_findings(&conn, task_id)?;
+    let findings = if include_findings {
+        load_scan_findings(&conn, task_id)?
+    } else {
+        Vec::new()
+    };
     let root_path = row.0.clone();
     let max_scanned_depth = conn
         .query_row(
@@ -763,6 +771,17 @@ pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSn
         permission_denied_paths: parse_json_or_default(Some(row.20)),
         error_message: row.21.unwrap_or_default(),
     }))
+}
+
+pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSnapshot>, String> {
+    load_scan_snapshot_internal(db_path, task_id, true)
+}
+
+pub fn load_scan_snapshot_summary(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<Option<ScanSnapshot>, String> {
+    load_scan_snapshot_internal(db_path, task_id, false)
 }
 
 pub fn list_scan_history(db_path: &Path, limit: u32) -> Result<Vec<Value>, String> {
@@ -939,22 +958,23 @@ pub fn clone_scan_task_data(
     from_task_id: &str,
     to_task_id: &str,
 ) -> Result<(), String> {
-    let conn = open_db(db_path)?;
-    conn.execute(
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
         "INSERT INTO scan_nodes (task_id, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext)
          SELECT ?2, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext
          FROM scan_nodes WHERE task_id = ?1",
         params![from_task_id, to_task_id],
     )
     .map_err(|e| e.to_string())?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO scan_findings (task_id, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at)
          SELECT ?2, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at
          FROM scan_findings WHERE task_id = ?1",
         params![from_task_id, to_task_id],
     )
     .map_err(|e| e.to_string())?;
-    refresh_scan_stats(db_path, to_task_id)
+    tx.commit().map_err(|e| e.to_string())
 }
 
 pub fn delete_scan_data_for_paths(
@@ -962,21 +982,63 @@ pub fn delete_scan_data_for_paths(
     task_id: &str,
     paths: &[String],
 ) -> Result<(), String> {
+    if paths.is_empty() {
+        return refresh_scan_stats(db_path, task_id);
+    }
+
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    for path in paths {
-        let variants = [path.clone(), format!("{path}\\%"), format!("{path}/%")];
-        tx.execute(
-            "DELETE FROM scan_findings WHERE task_id = ?1 AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
-            params![task_id, variants[0], variants[1], variants[2]],
-        )
+
+    tx.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS temp_prune_paths (
+            path TEXT PRIMARY KEY
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM temp_prune_paths", [])
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM scan_nodes WHERE task_id = ?1 AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
-            params![task_id, variants[0], variants[1], variants[2]],
-        )
-        .map_err(|e| e.to_string())?;
+
+    {
+        let mut stmt = tx
+            .prepare_cached("INSERT OR IGNORE INTO temp_prune_paths(path) VALUES (?1)")
+            .map_err(|e| e.to_string())?;
+        for path in paths {
+            stmt.execute(params![path]).map_err(|e| e.to_string())?;
+        }
     }
+
+    tx.execute(
+        "DELETE FROM scan_findings
+         WHERE task_id = ?1
+           AND EXISTS (
+             SELECT 1
+             FROM temp_prune_paths p
+             WHERE scan_findings.path = p.path
+                OR scan_findings.path LIKE p.path || '\\%'
+                OR scan_findings.path LIKE p.path || '/%'
+           )",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "DELETE FROM scan_nodes
+         WHERE task_id = ?1
+           AND EXISTS (
+             SELECT 1
+             FROM temp_prune_paths p
+             WHERE scan_nodes.path = p.path
+                OR scan_nodes.path LIKE p.path || '\\%'
+                OR scan_nodes.path LIKE p.path || '/%'
+           )",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute("DELETE FROM temp_prune_paths", [])
+        .map_err(|e| e.to_string())?;
+
     tx.commit().map_err(|e| e.to_string())?;
     refresh_scan_stats(db_path, task_id)
 }

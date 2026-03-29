@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::env;
@@ -37,6 +37,8 @@ struct ScanArgs {
     roots_json: Option<String>,
     #[arg(long = "ignore-json")]
     ignore_json: Option<String>,
+    #[arg(long = "prune-rules-json")]
+    prune_rules_json: Option<String>,
     #[arg(long = "max-depth")]
     max_depth: Option<usize>,
 }
@@ -63,10 +65,43 @@ struct NodeRecord {
     ext: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PruneRuleJson {
+    SkipSubtree {
+        path: String,
+    },
+    CapSubtreeDepth {
+        path: String,
+        max_relative_depth: usize,
+    },
+    SkipReparsePoints,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanPruneRule {
+    SkipSubtree {
+        path: String,
+    },
+    CapSubtreeDepth {
+        path: String,
+        max_relative_depth: usize,
+    },
+    SkipReparsePoints,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirTraversalMode {
+    Normal,
+    CapSubtree,
+    SkipSubtree,
+}
+
 struct ScanContext {
     task_id: String,
     max_depth: Option<usize>,
     ignored_paths: Vec<String>,
+    prune_rules: Vec<ScanPruneRule>,
     scanned_count: u64,
     buffered: Vec<NodeRecord>,
     last_progress_mark: u64,
@@ -77,11 +112,13 @@ impl ScanContext {
         task_id: String,
         max_depth: Option<usize>,
         ignored_paths: Vec<String>,
+        prune_rules: Vec<ScanPruneRule>,
     ) -> Self {
         Self {
             task_id,
             max_depth,
             ignored_paths,
+            prune_rules,
             scanned_count: 0,
             buffered: Vec::with_capacity(BATCH_SIZE),
             last_progress_mark: 0,
@@ -142,6 +179,40 @@ impl ScanContext {
             .iter()
             .any(|ignored| is_same_or_descendant_path(&path_key, ignored))
     }
+
+    fn dir_traversal_mode(&self, path: &Path) -> DirTraversalMode {
+        let path_key = normalize_path_key(&path_to_string(path));
+        let mut mode = DirTraversalMode::Normal;
+        for rule in &self.prune_rules {
+            match rule {
+                ScanPruneRule::SkipSubtree { path } => {
+                    if is_same_or_descendant_path(&path_key, path) {
+                        return DirTraversalMode::SkipSubtree;
+                    }
+                }
+                ScanPruneRule::CapSubtreeDepth {
+                    path,
+                    max_relative_depth,
+                } => {
+                    if relative_path_depth(&path_key, path)
+                        .map(|depth| depth >= *max_relative_depth)
+                        .unwrap_or(false)
+                    {
+                        mode = DirTraversalMode::CapSubtree;
+                    }
+                }
+                ScanPruneRule::SkipReparsePoints => {}
+            }
+        }
+        mode
+    }
+
+    fn should_skip_reparse_point(&self, metadata: Option<&fs::Metadata>) -> bool {
+        self.prune_rules
+            .iter()
+            .any(|rule| matches!(rule, ScanPruneRule::SkipReparsePoints))
+            && metadata.map(metadata_is_reparse_point).unwrap_or(false)
+    }
 }
 
 fn main() {
@@ -189,11 +260,10 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         parsed
     } else {
-        let root = absolutize_path(Path::new(
-            args.root
-                .as_deref()
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "--root is required"))?,
-        ))?;
+        let root =
+            absolutize_path(Path::new(args.root.as_deref().ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidInput, "--root is required")
+            })?))?;
         vec![ScanRootInput {
             path: path_to_string(&root),
             parent_id: None,
@@ -205,6 +275,7 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map(|item| item.path.clone())
         .unwrap_or_default();
     let ignored_paths = load_ignored_paths(args.ignore_json.as_deref())?;
+    let prune_rules = load_prune_rules(args.prune_rules_json.as_deref())?;
 
     emit_event(json!({
         "type": "task_started",
@@ -216,7 +287,12 @@ fn run_scan(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         "updated_at": now_iso(),
     }));
 
-    let mut ctx = ScanContext::new(args.task_id.clone(), args.max_depth, ignored_paths);
+    let mut ctx = ScanContext::new(
+        args.task_id.clone(),
+        args.max_depth,
+        ignored_paths,
+        prune_rules,
+    );
     for root in &roots {
         let abs = absolutize_path(Path::new(&root.path))?;
         if ctx.is_ignored(&abs) {
@@ -264,12 +340,54 @@ fn scan_dir(
     }
     let dir_string = path_to_string(&dir_abs);
     let dir_id = node_id_for(&dir_string);
-    let metadata = fs::metadata(&dir_abs).ok();
+    let metadata = fs::symlink_metadata(&dir_abs).ok();
 
     let mut total_size = 0_i64;
     let mut child_count = 0_i64;
 
-    if ctx.max_depth.map(|limit| depth < limit).unwrap_or(true) {
+    if ctx.should_skip_reparse_point(metadata.as_ref()) {
+        let record = NodeRecord {
+            node_id: dir_id,
+            parent_id,
+            path: dir_string.clone(),
+            name: directory_name(&dir_abs),
+            node_type: "directory".to_string(),
+            depth,
+            self_size: 0,
+            total_size: 0,
+            child_count: 0,
+            mtime_ms: metadata_to_mtime_ms(metadata.as_ref()),
+            ext: String::new(),
+        };
+        ctx.queue_node(record, &dir_string, depth)?;
+        return Ok(0);
+    }
+
+    let traversal_mode = ctx.dir_traversal_mode(&dir_abs);
+    if matches!(traversal_mode, DirTraversalMode::SkipSubtree) {
+        let record = NodeRecord {
+            node_id: dir_id,
+            parent_id,
+            path: dir_string.clone(),
+            name: directory_name(&dir_abs),
+            node_type: "directory".to_string(),
+            depth,
+            self_size: 0,
+            total_size: 0,
+            child_count: 0,
+            mtime_ms: metadata_to_mtime_ms(metadata.as_ref()),
+            ext: String::new(),
+        };
+        ctx.queue_node(record, &dir_string, depth)?;
+        return Ok(0);
+    }
+
+    if matches!(traversal_mode, DirTraversalMode::CapSubtree)
+        || !ctx.max_depth.map(|limit| depth < limit).unwrap_or(true)
+    {
+        total_size = compute_hidden_dir_size(ctx, &dir_abs)?;
+        child_count = count_children(ctx, &dir_abs)? as i64;
+    } else {
         let read_dir = match fs::read_dir(&dir_abs) {
             Ok(value) => value,
             Err(err) if is_permission_denied(&err) => {
@@ -345,9 +463,6 @@ fn scan_dir(
                 ctx.queue_node(record, &child_string, depth + 1)?;
             }
         }
-    } else {
-        total_size = compute_hidden_dir_size(ctx, &dir_abs)?;
-        child_count = count_children(ctx, &dir_abs)? as i64;
     }
 
     let record = NodeRecord {
@@ -396,7 +511,16 @@ fn compute_hidden_dir_size(
         };
 
         if file_type.is_dir() {
-            total += compute_hidden_dir_size(ctx, &child_path)?;
+            let child_meta = fs::symlink_metadata(&child_path).ok();
+            if ctx.should_skip_reparse_point(child_meta.as_ref()) {
+                continue;
+            }
+            match ctx.dir_traversal_mode(&child_path) {
+                DirTraversalMode::SkipSubtree => continue,
+                DirTraversalMode::CapSubtree | DirTraversalMode::Normal => {
+                    total += compute_hidden_dir_size(ctx, &child_path)?;
+                }
+            }
         } else if file_type.is_file() {
             if let Ok(meta) = entry.metadata() {
                 total += meta.len() as i64;
@@ -422,6 +546,43 @@ fn count_children(ctx: &ScanContext, path: &Path) -> Result<usize, Box<dyn std::
         }
     }
     Ok(count)
+}
+
+fn load_prune_rules(path: Option<&str>) -> Result<Vec<ScanPruneRule>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let raw = fs::read_to_string(path)?;
+    let values = serde_json::from_str::<Vec<PruneRuleJson>>(&raw)?;
+    let mut out = Vec::new();
+    for value in values {
+        match value {
+            PruneRuleJson::SkipSubtree { path } => {
+                let absolute = absolutize_path(Path::new(path.trim()))?;
+                let normalized = normalize_path_key(&path_to_string(&absolute));
+                if normalized.is_empty() {
+                    continue;
+                }
+                out.push(ScanPruneRule::SkipSubtree { path: normalized });
+            }
+            PruneRuleJson::CapSubtreeDepth {
+                path,
+                max_relative_depth,
+            } => {
+                let absolute = absolutize_path(Path::new(path.trim()))?;
+                let normalized = normalize_path_key(&path_to_string(&absolute));
+                if normalized.is_empty() {
+                    continue;
+                }
+                out.push(ScanPruneRule::CapSubtreeDepth {
+                    path: normalized,
+                    max_relative_depth,
+                });
+            }
+            PruneRuleJson::SkipReparsePoints => out.push(ScanPruneRule::SkipReparsePoints),
+        }
+    }
+    Ok(out)
 }
 
 fn load_ignored_paths(path: Option<&str>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -477,6 +638,17 @@ fn is_same_or_descendant_path(path: &str, parent: &str) -> bool {
     path == parent || path.starts_with(&format!("{parent}\\"))
 }
 
+fn relative_path_depth(path: &str, parent: &str) -> Option<usize> {
+    if !is_same_or_descendant_path(path, parent) {
+        return None;
+    }
+    if path == parent {
+        return Some(0);
+    }
+    let suffix = path.strip_prefix(parent)?.strip_prefix('\\')?;
+    Some(suffix.split('\\').count())
+}
+
 fn directory_name(path: &Path) -> String {
     path.file_name()
         .map(|value| value.to_string_lossy().to_string())
@@ -494,6 +666,25 @@ fn metadata_to_mtime_ms(metadata: Option<&fs::Metadata>) -> Option<i64> {
     let modified = metadata?.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(duration.as_millis() as i64)
+}
+
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn emit_event(value: serde_json::Value) {
@@ -551,8 +742,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_same_or_descendant_path;
-    use super::normalize_path_key;
+    use super::*;
+    use std::fs;
 
     #[test]
     fn normalized_paths_compare_case_insensitively() {
@@ -566,5 +757,103 @@ mod tests {
         let ignored = normalize_path_key("C:\\Temp\\foo");
         let sibling = normalize_path_key("C:\\Temp\\foobar.txt");
         assert!(!is_same_or_descendant_path(&sibling, &ignored));
+    }
+
+    #[test]
+    fn cap_subtree_depth_stops_after_relative_boundary_and_keeps_hidden_size() {
+        let root = std::env::temp_dir().join(format!("scanner-cap-{}", std::process::id()));
+        let target = root.join("Windows");
+        let leaf = target.join("System32").join("drivers").join("etc");
+        fs::create_dir_all(&leaf).expect("create nested fixture");
+        fs::write(leaf.join("hosts"), b"127.0.0.1 localhost").expect("write hosts file");
+
+        let mut ctx = ScanContext::new(
+            "task".to_string(),
+            None,
+            Vec::new(),
+            vec![ScanPruneRule::CapSubtreeDepth {
+                path: normalize_path_key(&path_to_string(&target)),
+                max_relative_depth: 2,
+            }],
+        );
+
+        let total_size = scan_dir(&mut ctx, &target, None, 1).expect("scan target");
+
+        let system32 = ctx
+            .buffered
+            .iter()
+            .find(|node| {
+                node.path
+                    .eq_ignore_ascii_case(&path_to_string(&target.join("System32")))
+            })
+            .expect("system32 node exists");
+        assert!(total_size > 0);
+        assert!(system32.total_size > 0);
+        assert_eq!(system32.child_count, 1);
+        assert!(
+            !ctx.buffered.iter().any(|node| {
+                node.path.eq_ignore_ascii_case(&path_to_string(
+                    &target.join("System32").join("drivers").join("etc"),
+                ))
+            }),
+            "cap boundary should prevent deeper nodes from being emitted"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_subtree_keeps_directory_node_without_descending() {
+        let root = std::env::temp_dir().join(format!("scanner-skip-{}", std::process::id()));
+        let target = root.join("Recovery").join("nested");
+        fs::create_dir_all(&target).expect("create skipped tree");
+        fs::write(target.join("hidden.bin"), b"skip").expect("write skipped file");
+
+        let skip_root = root.join("Recovery");
+        let mut ctx = ScanContext::new(
+            "task".to_string(),
+            None,
+            Vec::new(),
+            vec![ScanPruneRule::SkipSubtree {
+                path: normalize_path_key(&path_to_string(&skip_root)),
+            }],
+        );
+
+        let total_size = scan_dir(&mut ctx, &skip_root, None, 1).expect("scan skipped root");
+
+        assert_eq!(total_size, 0);
+        assert_eq!(ctx.buffered.len(), 1);
+        let record = &ctx.buffered[0];
+        assert_eq!(record.child_count, 0);
+        assert_eq!(record.total_size, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn metadata_reparse_point_detection_checks_windows_attribute_bit() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+
+            let root = std::env::temp_dir().join(format!("scanner-reparse-{}", std::process::id()));
+            fs::create_dir_all(&root).expect("create reparse fixture");
+            let metadata = fs::metadata(&root).expect("read metadata");
+            let attrs = metadata.file_attributes();
+            assert_eq!(
+                metadata_is_reparse_point(&metadata),
+                attrs & 0x400 != 0 || metadata.file_type().is_symlink()
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let root = std::env::temp_dir().join(format!("scanner-reparse-{}", std::process::id()));
+            fs::create_dir_all(&root).expect("create fixture");
+            let metadata = fs::metadata(&root).expect("read metadata");
+            assert!(!metadata_is_reparse_point(&metadata));
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }

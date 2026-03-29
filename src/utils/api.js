@@ -163,6 +163,7 @@ export async function rollbackOrganize(jobId) {
 export function connectOrganizeStream(taskId, handlers) {
   const stream = createStream(taskId, [
     ['organize_progress', (p) => handlers.onProgress?.(p)],
+    ['organize_summary_ready', (p) => handlers.onSummaryReady?.(p)],
     ['organize_file_done', (p) => handlers.onFileDone?.(p)],
     ['organize_done', (p) => { handlers.onDone?.(p); stream.close(); }],
     ['organize_error', (p) => { handlers.onError?.(p); stream.close(); }],

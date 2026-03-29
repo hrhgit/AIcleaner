@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -52,6 +52,168 @@ fn round_up_to_tenth(value: f64) -> f64 {
     (value * 10.0).ceil() / 10.0
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanPruneRule {
+    SkipSubtree {
+        path: String,
+    },
+    CapSubtreeDepth {
+        path: String,
+        max_relative_depth: u32,
+    },
+    SkipReparsePoints,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PruneRuleJson {
+    SkipSubtree {
+        path: String,
+    },
+    CapSubtreeDepth {
+        path: String,
+        max_relative_depth: u32,
+    },
+    SkipReparsePoints,
+}
+
+impl From<&ScanPruneRule> for PruneRuleJson {
+    fn from(value: &ScanPruneRule) -> Self {
+        match value {
+            ScanPruneRule::SkipSubtree { path } => Self::SkipSubtree { path: path.clone() },
+            ScanPruneRule::CapSubtreeDepth {
+                path,
+                max_relative_depth,
+            } => Self::CapSubtreeDepth {
+                path: path.clone(),
+                max_relative_depth: *max_relative_depth,
+            },
+            ScanPruneRule::SkipReparsePoints => Self::SkipReparsePoints,
+        }
+    }
+}
+
+fn normalize_scan_path_key(value: &str) -> String {
+    let mut normalized = value.trim().replace('/', "\\").to_lowercase();
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn is_same_or_descendant_path(path: &str, parent: &str) -> bool {
+    path == parent || path.starts_with(&format!("{parent}\\"))
+}
+
+fn relative_path_depth(path: &str, parent: &str) -> Option<u32> {
+    if !is_same_or_descendant_path(path, parent) {
+        return None;
+    }
+    if path == parent {
+        return Some(0);
+    }
+    let suffix = path.strip_prefix(parent)?.strip_prefix('\\')?;
+    Some(suffix.split('\\').count() as u32)
+}
+
+fn is_c_drive_root(path: &str) -> bool {
+    normalize_scan_path_key(path) == "c:\\"
+}
+
+fn build_scan_prune_rules(target_path: &str) -> Vec<ScanPruneRule> {
+    if !is_c_drive_root(target_path) {
+        return Vec::new();
+    }
+
+    vec![
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\System Volume Information".to_string(),
+        },
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\Recovery".to_string(),
+        },
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\$Recycle.Bin".to_string(),
+        },
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\Documents and Settings".to_string(),
+        },
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\Config.Msi".to_string(),
+        },
+        ScanPruneRule::SkipSubtree {
+            path: "C:\\PerfLogs".to_string(),
+        },
+        ScanPruneRule::CapSubtreeDepth {
+            path: "C:\\Windows".to_string(),
+            max_relative_depth: 2,
+        },
+        ScanPruneRule::CapSubtreeDepth {
+            path: "C:\\Program Files".to_string(),
+            max_relative_depth: 2,
+        },
+        ScanPruneRule::CapSubtreeDepth {
+            path: "C:\\Program Files (x86)".to_string(),
+            max_relative_depth: 2,
+        },
+        ScanPruneRule::CapSubtreeDepth {
+            path: "C:\\ProgramData".to_string(),
+            max_relative_depth: 3,
+        },
+        ScanPruneRule::SkipReparsePoints,
+    ]
+}
+
+fn should_exclude_deepen_boundary_node(
+    node: &persist::ScanNode,
+    prune_rules: &[ScanPruneRule],
+) -> bool {
+    if node.child_count == 0 {
+        return true;
+    }
+
+    let path_key = normalize_scan_path_key(&node.path);
+    prune_rules.iter().any(|rule| match rule {
+        ScanPruneRule::SkipSubtree { path } => {
+            let rule_path = normalize_scan_path_key(path);
+            is_same_or_descendant_path(&path_key, &rule_path)
+        }
+        ScanPruneRule::CapSubtreeDepth {
+            path,
+            max_relative_depth,
+        } => {
+            let rule_path = normalize_scan_path_key(path);
+            relative_path_depth(&path_key, &rule_path)
+                .map(|depth| depth >= *max_relative_depth)
+                .unwrap_or(false)
+        }
+        ScanPruneRule::SkipReparsePoints => false,
+    })
+}
+
+fn resolve_deepen_boundary_nodes(
+    db_path: &Path,
+    baseline: &ScanSnapshot,
+    requested_max_depth: Option<u32>,
+    prune_rules: &[ScanPruneRule],
+) -> Result<(u32, Vec<persist::ScanNode>), String> {
+    let boundary_depth = baseline.max_scanned_depth;
+    if requested_max_depth
+        .map(|value| value <= boundary_depth)
+        .unwrap_or(false)
+    {
+        return Err("New maxDepth must be greater than the current depth".to_string());
+    }
+    let nodes = persist::list_boundary_scan_nodes(db_path, &baseline.id, boundary_depth)?
+        .into_iter()
+        .filter(|node| !should_exclude_deepen_boundary_node(node, prune_rules))
+        .collect::<Vec<_>>();
+    if nodes.is_empty() {
+        return Err("No boundary directories available for deeper scan".to_string());
+    }
+    Ok((boundary_depth, nodes))
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 struct SidecarRoot {
     path: String,
@@ -86,6 +248,7 @@ pub struct ScanTaskRuntime {
     baseline_task_id: Option<String>,
     sidecar_roots: Vec<SidecarRoot>,
     ignored_paths: Vec<String>,
+    prune_rules: Vec<ScanPruneRule>,
     scan_count_offset: u64,
     pending_sidecar_nodes: Mutex<Vec<persist::ScanNodeUpsert>>,
     last_progress_persist_at: Mutex<Option<Instant>>,
@@ -1141,6 +1304,23 @@ async fn run_sidecar_scan<R: Runtime>(
         child.arg("--ignore-json").arg(&file_path);
         Some(file_path)
     };
+    let prune_rule_file = if task.prune_rules.is_empty() {
+        None
+    } else {
+        let file_path = std::env::temp_dir().join(format!("wipeout-scan-prune-{}.json", snap.id));
+        let payload = task
+            .prune_rules
+            .iter()
+            .map(PruneRuleJson::from)
+            .collect::<Vec<_>>();
+        fs::write(
+            &file_path,
+            serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        child.arg("--prune-rules-json").arg(&file_path);
+        Some(file_path)
+    };
     if let Some(max_depth) = task.max_depth {
         child.arg("--max-depth").arg(max_depth.to_string());
     }
@@ -1188,6 +1368,9 @@ async fn run_sidecar_scan<R: Runtime>(
     if let Some(file_path) = ignore_path_file {
         let _ = fs::remove_file(file_path);
     }
+    if let Some(file_path) = prune_rule_file {
+        let _ = fs::remove_file(file_path);
+    }
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1212,6 +1395,7 @@ async fn run_scan_task<R: Runtime>(
         snap.status = "scanning".to_string();
     }
     emit_progress(app, state, task).await?;
+    prepare_runtime_scan_data(app, state, task).await?;
     run_sidecar_scan(app, state, task).await?;
     flush_pending_sidecar_nodes(state, task)?;
     if task.stop.load(Ordering::Relaxed) {
@@ -1228,6 +1412,69 @@ async fn run_scan_task<R: Runtime>(
         drop(snap);
         app.emit("scan_done", payload).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+async fn prepare_runtime_scan_data<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    task: &Arc<ScanTaskRuntime>,
+) -> Result<(), String> {
+    if task.scan_mode != ScanMode::DeepenIncremental {
+        return Ok(());
+    }
+
+    let baseline_task_id = task
+        .baseline_task_id
+        .clone()
+        .ok_or_else(|| "Missing baseline snapshot".to_string())?;
+    let task_id = task.snapshot.lock().id.clone();
+    let affected_paths = task
+        .sidecar_roots
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+
+    emit_cache_event(
+        app,
+        &task_id,
+        "prepare_incremental_clone",
+        None,
+        Some(affected_paths.len() as u64),
+    )
+    .await?;
+
+    persist::clone_scan_task_data(&state.db_path, &baseline_task_id, &task_id)?;
+
+    emit_cache_event(
+        app,
+        &task_id,
+        "prepare_incremental_prune",
+        None,
+        Some(affected_paths.len() as u64),
+    )
+    .await?;
+
+    if !affected_paths.is_empty() {
+        persist::delete_scan_data_for_paths(&state.db_path, &task_id, &affected_paths)?;
+    }
+    if !task.ignored_paths.is_empty() {
+        persist::delete_scan_data_for_paths(&state.db_path, &task_id, &task.ignored_paths)?;
+    }
+
+    if let Some(prepared_snapshot) = persist::load_scan_snapshot(&state.db_path, &task_id)? {
+        let mut snap = task.snapshot.lock();
+        snap.deletable = prepared_snapshot.deletable;
+        snap.deletable_count = prepared_snapshot.deletable_count;
+        snap.total_cleanable = prepared_snapshot.total_cleanable;
+        snap.token_usage = prepared_snapshot.token_usage;
+        snap.permission_denied_count = prepared_snapshot.permission_denied_count;
+        snap.permission_denied_paths = prepared_snapshot.permission_denied_paths;
+        snap.error_message = prepared_snapshot.error_message;
+    }
+
+    emit_cache_event(app, &task_id, "prepare_incremental_ready", None, None).await?;
+
     Ok(())
 }
 
@@ -1262,6 +1509,7 @@ pub async fn scan_start<R: Runtime>(
         .to_string();
     let ignored_paths = crate::backend::read_scan_ignore_paths(&state.settings_path);
     let scan_mode = ScanMode::parse(input.scan_mode.as_deref());
+    let prune_rules = build_scan_prune_rules(&target_path);
     let baseline_task_id = resolve_latest_baseline_task_id(
         state.inner(),
         &target_path,
@@ -1279,22 +1527,12 @@ pub async fn scan_start<R: Runtime>(
         let baseline = baseline_snapshot
             .as_ref()
             .ok_or_else(|| "Missing baseline snapshot".to_string())?;
-        let boundary_depth = baseline.configured_max_depth.ok_or_else(|| {
-            "Current task already uses unlimited depth and cannot deepen".to_string()
-        })?;
-        if input
-            .max_depth
-            .map(|value| value <= boundary_depth)
-            .unwrap_or(false)
-        {
-            return Err("New maxDepth must be greater than the current depth".to_string());
-        }
-        let nodes =
-            persist::list_boundary_scan_nodes(&state.db_path, &baseline.id, boundary_depth)?;
-        if nodes.is_empty() {
-            return Err("No boundary directories available for deeper scan".to_string());
-        }
-        Some((boundary_depth, nodes))
+        Some(resolve_deepen_boundary_nodes(
+            &state.db_path,
+            baseline,
+            input.max_depth,
+            &prune_rules,
+        )?)
     } else {
         None
     };
@@ -1360,27 +1598,9 @@ pub async fn scan_start<R: Runtime>(
         depth: 0,
     }];
     if matches!(scan_mode, ScanMode::DeepenIncremental) {
-        let baseline = baseline_snapshot
-            .clone()
-            .ok_or_else(|| "Missing baseline snapshot".to_string())?;
         let (boundary_depth, boundary_nodes) = deepen_boundary_nodes
             .clone()
             .ok_or_else(|| "No boundary directories available for deeper scan".to_string())?;
-        persist::clone_scan_task_data(&state.db_path, &baseline.id, &task_id)?;
-        let affected_paths = boundary_nodes
-            .iter()
-            .map(|node| node.path.clone())
-            .collect::<Vec<_>>();
-        persist::delete_scan_data_for_paths(&state.db_path, &task_id, &affected_paths)?;
-        if !ignored_paths.is_empty() {
-            persist::delete_scan_data_for_paths(&state.db_path, &task_id, &ignored_paths)?;
-        }
-        if let Some(cloned_snapshot) = persist::load_scan_snapshot(&state.db_path, &task_id)? {
-            snapshot.deletable = cloned_snapshot.deletable;
-            snapshot.deletable_count = cloned_snapshot.deletable_count;
-            snapshot.total_cleanable = cloned_snapshot.total_cleanable;
-            snapshot.max_scanned_depth = cloned_snapshot.max_scanned_depth;
-        }
         snapshot.current_depth = boundary_depth;
         snapshot.current_path = boundary_nodes
             .first()
@@ -1405,6 +1625,7 @@ pub async fn scan_start<R: Runtime>(
         baseline_task_id,
         sidecar_roots,
         ignored_paths,
+        prune_rules,
         scan_count_offset: 0,
         pending_sidecar_nodes: Mutex::new(Vec::new()),
         last_progress_persist_at: Mutex::new(None),
@@ -1523,7 +1744,7 @@ pub async fn scan_find_latest_for_path(
     else {
         return Ok(Value::Null);
     };
-    let snapshot = persist::load_scan_snapshot(&state.db_path, &task_id)?
+    let snapshot = persist::load_scan_snapshot_summary(&state.db_path, &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
     serde_json::to_value(snapshot).map_err(|e| e.to_string())
 }
@@ -1939,6 +2160,80 @@ mod tests {
     }
 
     #[test]
+    fn deepen_incremental_uses_actual_scanned_depth_for_stopped_baseline() {
+        let root = temp_path("deepen-stopped-root");
+        let db_path = temp_path("deepen-stopped-db.sqlite");
+        fs::create_dir_all(&root).expect("create root");
+        create_scan_fixture(&root);
+        persist::init_db(&db_path).expect("init db");
+
+        let baseline_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let root_string = root.to_string_lossy().to_string();
+        persist::init_scan_task(
+            &db_path,
+            &baseline_task_id,
+            &root_string,
+            0,
+            Some(1),
+            false,
+            None,
+            "full_rescan_incremental",
+        )
+        .expect("init baseline task");
+        let baseline_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            baseline_task_id.clone(),
+            "--root".to_string(),
+            root_string.clone(),
+            "--max-depth".to_string(),
+            "1".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &baseline_task_id,
+            &root,
+            "full_rescan_incremental",
+            None,
+            Some(1),
+            &baseline_lines,
+        );
+
+        let stopped_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        persist::init_scan_task(
+            &db_path,
+            &stopped_task_id,
+            &root_string,
+            0,
+            Some(3),
+            false,
+            Some(&baseline_task_id),
+            "deepen_incremental",
+        )
+        .expect("init stopped deepen task");
+        persist::clone_scan_task_data(&db_path, &baseline_task_id, &stopped_task_id)
+            .expect("clone baseline task");
+
+        let stopped_snapshot = persist::load_scan_snapshot(&db_path, &stopped_task_id)
+            .expect("load stopped snapshot")
+            .expect("stopped snapshot exists");
+        assert_eq!(stopped_snapshot.configured_max_depth, Some(3));
+        assert_eq!(stopped_snapshot.max_scanned_depth, 1);
+
+        let (boundary_depth, boundary_nodes) =
+            resolve_deepen_boundary_nodes(&db_path, &stopped_snapshot, Some(4), &[])
+                .expect("resolve deepen boundary nodes");
+        assert_eq!(boundary_depth, 1);
+        assert!(boundary_nodes.iter().any(|node| node.name == "A"));
+        assert!(boundary_nodes.iter().any(|node| node.name == "B"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
     fn parse_chat_completion_http_body_extracts_content_and_usage() {
         let raw_body = r#"{
           "choices": [
@@ -1971,5 +2266,81 @@ mod tests {
         assert!(err.message.contains("error decoding response body"));
         assert!(err.message.contains("upstream gateway error"));
         assert_eq!(err.raw_body, raw_body);
+    }
+
+    #[test]
+    fn build_scan_prune_rules_only_applies_to_c_drive_root() {
+        let c_rules = build_scan_prune_rules("C:\\");
+        assert!(c_rules.iter().any(|rule| matches!(
+            rule,
+            ScanPruneRule::SkipSubtree { path } if path == "C:\\System Volume Information"
+        )));
+        assert!(c_rules.iter().any(|rule| matches!(
+            rule,
+            ScanPruneRule::CapSubtreeDepth {
+                path,
+                max_relative_depth
+            } if path == "C:\\Windows" && *max_relative_depth == 2
+        )));
+        assert!(c_rules
+            .iter()
+            .any(|rule| matches!(rule, ScanPruneRule::SkipReparsePoints)));
+
+        assert!(build_scan_prune_rules("D:\\").is_empty());
+        assert!(build_scan_prune_rules("C:\\Users\\32858\\AppData").is_empty());
+    }
+
+    #[test]
+    fn deepen_boundary_filter_skips_pruned_and_non_expandable_nodes() {
+        let prune_rules = build_scan_prune_rules("C:\\");
+        let windows_cap = persist::ScanNode {
+            id: "1".to_string(),
+            parent_id: Some("root".to_string()),
+            path: "C:\\Windows\\System32\\Config".to_string(),
+            name: "Config".to_string(),
+            node_type: "directory".to_string(),
+            depth: 3,
+            self_size: 0,
+            size: 1024,
+            child_count: 2,
+            mtime_ms: None,
+        };
+        let users_node = persist::ScanNode {
+            id: "2".to_string(),
+            parent_id: Some("root".to_string()),
+            path: "C:\\Users\\32858".to_string(),
+            name: "32858".to_string(),
+            node_type: "directory".to_string(),
+            depth: 2,
+            self_size: 0,
+            size: 2048,
+            child_count: 3,
+            mtime_ms: None,
+        };
+        let empty_leaf = persist::ScanNode {
+            id: "3".to_string(),
+            parent_id: Some("root".to_string()),
+            path: "C:\\Temp\\Empty".to_string(),
+            name: "Empty".to_string(),
+            node_type: "directory".to_string(),
+            depth: 2,
+            self_size: 0,
+            size: 0,
+            child_count: 0,
+            mtime_ms: None,
+        };
+
+        assert!(should_exclude_deepen_boundary_node(
+            &windows_cap,
+            &prune_rules
+        ));
+        assert!(!should_exclude_deepen_boundary_node(
+            &users_node,
+            &prune_rules
+        ));
+        assert!(should_exclude_deepen_boundary_node(
+            &empty_leaf,
+            &prune_rules
+        ));
     }
 }

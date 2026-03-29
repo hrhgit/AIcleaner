@@ -374,7 +374,6 @@ export async function renderSettings(container) {
   }
 
   elevationBtn?.addEventListener('click', async () => {
-    if (!confirm(t('settings.elevation_confirm'))) return;
     elevationBtn.disabled = true;
     elevationBtn.innerHTML = `<span class="spinner"></span> ${t('settings.requesting_elevation')}`;
 

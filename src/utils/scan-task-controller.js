@@ -11,6 +11,7 @@ import { t } from './i18n.js';
 
 const ACTIVE_SCAN_STATUSES = new Set(['idle', 'scanning', 'analyzing']);
 const SCAN_LOG_CACHE_KEY = 'wipeout.scanner.global.log.v1';
+const PROGRESS_LOG_INTERVAL_MS = 250;
 
 function isActiveScanStatus(status) {
   return ACTIVE_SCAN_STATUSES.has(String(status || '').trim());
@@ -47,6 +48,8 @@ class ScanTaskController {
   constructor() {
     const persistedLog = readPersistedScanLog();
     this.listeners = new Set();
+    this.lastProgressLogAt = 0;
+    this.lastProgressLogStatus = '';
     this.state = {
       activeTaskId: null,
       latestTaskId: null,
@@ -100,6 +103,9 @@ class ScanTaskController {
     this.state.logEntries = normalizePersistedLogEntries(nextEntries);
     const maxId = this.state.logEntries.reduce((acc, entry) => Math.max(acc, Number.isFinite(entry.id) ? entry.id : -1), -1);
     this.state.nextLogEntryId = maxId + 1;
+    if (!this.state.logEntries.length) {
+      this.resetProgressLogThrottle();
+    }
     if (persist) {
       this.persistScanLog();
     }
@@ -184,6 +190,7 @@ class ScanTaskController {
     if (!normalizedTaskId) return;
     this.state.activeTaskId = normalizedTaskId;
     this.updateTaskIds(normalizedTaskId);
+    this.resetProgressLogThrottle();
     if (resetLogs) {
       this.replaceLogEntries([], { persist: true });
     }
@@ -207,7 +214,28 @@ class ScanTaskController {
     } else {
       this.state.latestTaskId = latestTaskId;
     }
+    this.resetProgressLogThrottle();
     this.notifyState();
+  }
+
+  resetProgressLogThrottle() {
+    this.lastProgressLogAt = 0;
+    this.lastProgressLogStatus = '';
+  }
+
+  shouldLogProgress(status) {
+    const normalizedStatus = String(status || '').trim();
+    const now = Date.now();
+    if (normalizedStatus !== this.lastProgressLogStatus) {
+      this.lastProgressLogStatus = normalizedStatus;
+      this.lastProgressLogAt = now;
+      return true;
+    }
+    if ((now - this.lastProgressLogAt) < PROGRESS_LOG_INTERVAL_MS) {
+      return false;
+    }
+    this.lastProgressLogAt = now;
+    return true;
   }
 
   async startTask(params) {
@@ -279,6 +307,10 @@ class ScanTaskController {
     }
     this.updateSnapshot(data, { persist: true });
 
+    if (!this.shouldLogProgress(data?.status)) {
+      return;
+    }
+
     if (data?.status === 'analyzing') {
       this.addLog('analyzing', `${t('scanner.analyzing')}: ${data.currentPath}`);
     } else if (data?.status === 'scanning') {
@@ -299,6 +331,18 @@ class ScanTaskController {
   handleCache(info) {
     if (!info || typeof info !== 'object') return;
     const action = String(info.action || '').trim();
+    if (action === 'prepare_incremental_clone') {
+      this.addLog('analyzing', `继续深入：正在复制上一轮扫描结果（${info.count || 0} 个边界目录）`);
+      return;
+    }
+    if (action === 'prepare_incremental_prune') {
+      this.addLog('analyzing', `继续深入：正在裁剪待深入的边界目录（${info.count || 0} 个）`);
+      return;
+    }
+    if (action === 'prepare_incremental_ready') {
+      this.addLog('analyzing', '继续深入：增量基线准备完成，开始读取更深层目录');
+      return;
+    }
     if (action === 'reuse') {
       this.addLog('analyzing', `${t('scanner.cache_reuse')}: ${info.path || info.name || ''}`);
       return;

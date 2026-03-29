@@ -21,7 +21,6 @@ import {
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.organizer.global.root_path.v2',
-  referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v2',
   exclusions: 'wipeout.organizer.global.exclusions.v2',
   batchSize: 'wipeout.organizer.global.batch_size.v2',
   summaryMode: 'wipeout.organizer.global.summary_mode.v1',
@@ -40,7 +39,6 @@ const PERSIST_KEYS = {
 
 const LEGACY_PERSIST_KEYS = [
   'wipeout.organizer.global.root_path.v1',
-  'wipeout.organizer.global.reference_original_structure.v1',
   'wipeout.organizer.global.exclusions.v1',
   'wipeout.organizer.global.batch_size.v1',
   'wipeout.organizer.global.max_cluster_depth.v1',
@@ -174,6 +172,7 @@ let renderVersion = 0;
 let organizerLogEntries = [];
 const expandedOrganizerDetailLogIds = new Set();
 const loggedOrganizerRawBatchKeys = new Set();
+const loggedOrganizerSummaryKeys = new Set();
 let organizerLogTaskId = null;
 let organizerLogProgressBaseline = null;
 
@@ -326,8 +325,6 @@ function readModelRoutingFromDOM() {
 function collectForm() {
   const rootPath = document.getElementById('org-root-path')?.value?.trim() || '';
   const recursive = true;
-  const referenceOriginalStructure =
-    !!document.getElementById('org-reference-original-structure')?.checked;
   const excludedPatterns = parseListInput(document.getElementById('org-exclusions')?.value || '');
   const batchSizeRaw = Number(document.getElementById('org-batch-size')?.value || DEFAULT_BATCH_SIZE);
   const maxClusterDepthInput = String(document.getElementById('org-max-cluster-depth')?.value || '').trim();
@@ -346,7 +343,6 @@ function collectForm() {
   return {
     rootPath,
     recursive,
-    referenceOriginalStructure,
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
     batchSize,
     summaryMode,
@@ -359,7 +355,6 @@ function collectForm() {
 
 function persistForm(data) {
   setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
-  setPersisted(PERSIST_KEYS.referenceOriginalStructure, data.referenceOriginalStructure);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
   setPersisted(PERSIST_KEYS.batchSize, data.batchSize);
   setPersisted(PERSIST_KEYS.summaryMode, data.summaryMode || DEFAULT_SUMMARY_MODE);
@@ -372,7 +367,6 @@ function restoreDefaults() {
   const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
   return {
     rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
-    referenceOriginalStructure: getPersisted(PERSIST_KEYS.referenceOriginalStructure, false),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
     batchSize: getPersisted(PERSIST_KEYS.batchSize, DEFAULT_BATCH_SIZE),
     summaryMode: getPersisted(PERSIST_KEYS.summaryMode, DEFAULT_SUMMARY_MODE),
@@ -418,6 +412,39 @@ async function syncClassifyWebSearchToSettings(isEnabled) {
   await saveSettings({
     searchApi: nextSearchApi,
   });
+}
+
+async function syncSummaryModeTikaToSettings(summaryMode, settings = null) {
+  if (!['local_summary', 'agent_summary'].includes(String(summaryMode || '').trim())) {
+    return settings;
+  }
+
+  const currentSettings = settings || await getSettings();
+  const currentTika = currentSettings?.contentExtraction?.tika && typeof currentSettings.contentExtraction.tika === 'object'
+    ? currentSettings.contentExtraction.tika
+    : {};
+
+  const nextEnabled = true;
+  const nextAutoStart = true;
+  const currentEnabled = !!currentTika.enabled;
+  const currentAutoStart = !!currentTika.autoStart;
+
+  if (currentEnabled === nextEnabled && currentAutoStart === nextAutoStart) {
+    return currentSettings;
+  }
+
+  await saveSettings({
+    contentExtraction: {
+      tika: {
+        enabled: nextEnabled,
+        autoStart: nextAutoStart,
+        url: String(currentTika.url || '').trim() || 'http://127.0.0.1:9998',
+        jarPath: String(currentTika.jarPath || '').trim(),
+      },
+    },
+  });
+
+  return getSettings();
 }
 
 function escapeHtml(value) {
@@ -476,6 +503,7 @@ function buildOrganizerLogEntry({
   text = '',
   detail = '',
   batchKey = '',
+  summaryKey = '',
   taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null,
 } = {}) {
   const detailText = String(detail || '').trim();
@@ -486,6 +514,7 @@ function buildOrganizerLogEntry({
     time: getOrganizerLogTime(),
     taskId: taskId ? String(taskId) : null,
     batchKey: String(batchKey || '').trim() || null,
+    summaryKey: String(summaryKey || '').trim() || null,
     summary: String(summary || text || '').trim(),
     text: String(text || summary || '').trim(),
     detailHtml: detailText ? escapeHtml(detailText).replace(/\n/g, '<br>') : '',
@@ -513,7 +542,7 @@ function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } =
   const extractionWarnings = normalizeOrganizerLogStringList(extraction?.warnings);
   const extractionMetadata = normalizeOrganizerLogStringList(extraction?.metadata);
   const summaryKeywords = normalizeOrganizerLogStringList(row?.summaryKeywords);
-  const summaryWarnings = normalizeOrganizerLogStringList(row?.warnings);
+  const summaryWarnings = normalizeOrganizerLogStringList(row?.warnings ?? row?.summaryWarnings);
   const excerpt = String(extraction?.excerpt || '').trim();
   const summary = String(row?.summary || '').trim();
   const title = String(extraction?.title || '').trim();
@@ -553,10 +582,20 @@ function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } =
 
 function syncOrganizerRawBatchKeys() {
   loggedOrganizerRawBatchKeys.clear();
+  loggedOrganizerSummaryKeys.clear();
   for (const entry of organizerLogEntries) {
     const batchKey = String(entry?.batchKey || '').trim();
     if (batchKey) loggedOrganizerRawBatchKeys.add(batchKey);
+    const summaryKey = String(entry?.summaryKey || '').trim();
+    if (summaryKey) loggedOrganizerSummaryKeys.add(summaryKey);
   }
+}
+
+function buildOrganizerSummaryLogKey(row, taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null) {
+  const resolvedTaskId = String(taskId || row?.taskId || '').trim();
+  const pathKey = String(row?.path || row?.relativePath || row?.name || '').trim();
+  if (!resolvedTaskId || !pathKey) return '';
+  return `${resolvedTaskId}::summary::${pathKey}`;
 }
 
 function isGroupedOrganizerLogType(type) {
@@ -801,6 +840,9 @@ function appendOrganizerLogEntry(entry, { persist = true } = {}) {
   if (entry.batchKey) {
     loggedOrganizerRawBatchKeys.add(String(entry.batchKey));
   }
+  if (entry.summaryKey) {
+    loggedOrganizerSummaryKeys.add(String(entry.summaryKey));
+  }
   if (persist) {
     setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
     if (organizerLogTaskId) {
@@ -976,7 +1018,6 @@ function recordOrganizerStartLog(form, taskId, capability) {
     `${organizerText('批大小', 'Batch Size')}: ${Number(form.batchSize || DEFAULT_BATCH_SIZE)}`,
     `${organizerText('聚类深度', 'Cluster Depth')}: ${form.maxClusterDepth == null ? organizerText('不限', 'Unlimited') : Number(form.maxClusterDepth)}`,
     `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(form.summaryMode)}`,
-    `${organizerText('参考原结构', 'Reference Structure')}: ${form.referenceOriginalStructure ? organizerText('是', 'Yes') : organizerText('否', 'No')}`,
     `${organizerText('联网搜索', 'Web Search')}: ${form.useWebSearch ? organizerText('开启', 'Enabled') : organizerText('关闭', 'Disabled')}`,
     `${organizerText('文本路由', 'Text Route')}: ${formatOrganizerRouteLabel(textRoute.endpoint || selectedProviders.text, textRoute.model || selectedModels.text)}`,
   ].join('\n');
@@ -1043,6 +1084,7 @@ function recordOrganizerFileDoneLog(row) {
   const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
   const batchIndex = Number(row.batchIndex || 0);
   const batchKey = batchIndex ? `${taskId || ''}::${batchIndex}` : '';
+  const summaryKey = buildOrganizerSummaryLogKey(row, taskId);
   const category = getOrganizerCategoryLabel(row);
   const route = formatOrganizerRouteLabel(row.provider, row.model);
   const degradedText = row.degraded ? ` | ${organizerText('降级', 'Degraded')}` : '';
@@ -1074,7 +1116,7 @@ function recordOrganizerFileDoneLog(row) {
     }
   }
   const localSummaryDetail = buildOrganizerLocalSummaryDetail(row, { category, route });
-  if (localSummaryDetail) {
+  if (localSummaryDetail && (!summaryKey || !loggedOrganizerSummaryKeys.has(summaryKey))) {
     appendOrganizerLogEntry(buildOrganizerLogEntry({
       type: 'agent_response',
       kind: 'detail',
@@ -1084,6 +1126,7 @@ function recordOrganizerFileDoneLog(row) {
       ),
       detail: localSummaryDetail,
       taskId,
+      summaryKey,
     }));
   }
   if (isFallbackBatchRow) {
@@ -1106,6 +1149,34 @@ function recordOrganizerTerminalLog(snapshot, kind, message, detail) {
     summary: message,
     detail,
     taskId: snapshot?.id || organizerLogTaskId || activeTaskId || null,
+  }));
+}
+
+function recordOrganizerSummaryReadyLog(row) {
+  if (!row) return;
+  const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
+  const route = formatOrganizerRouteLabel(row.provider, row.model);
+  const summaryKey = buildOrganizerSummaryLogKey(row, taskId);
+  if (summaryKey && loggedOrganizerSummaryKeys.has(summaryKey)) {
+    return;
+  }
+  const detail = buildOrganizerLocalSummaryDetail(row, {
+    category: organizerText('待分类', 'Pending Classification'),
+    route,
+  });
+  if (!detail) {
+    return;
+  }
+  appendOrganizerLogEntry(buildOrganizerLogEntry({
+    type: 'agent_response',
+    kind: 'detail',
+    summary: organizerText(
+      `分类前摘要 | ${row.name || row.path || '-'}`,
+      `Pre-classification summary | ${row.name || row.path || '-'}`,
+    ),
+    detail,
+    taskId,
+    summaryKey,
   }));
 }
 
@@ -1566,14 +1637,6 @@ function updateButtons(snapshot) {
   }
 }
 
-function syncReferenceOriginalStructureInput(snapshot) {
-  if (!snapshot || typeof snapshot.referenceOriginalStructure !== 'boolean') return;
-  const checkbox = document.getElementById('org-reference-original-structure');
-  if (!checkbox) return;
-  if (checkbox.checked === snapshot.referenceOriginalStructure) return;
-  checkbox.checked = snapshot.referenceOriginalStructure;
-}
-
 function syncBatchConfigInputs(snapshot) {
   if (!snapshot) return;
 
@@ -1618,7 +1681,6 @@ function refreshView(snapshot) {
   } else {
     removePersisted(PERSIST_KEYS.lastJobId);
   }
-  syncReferenceOriginalStructureInput(snapshot);
   syncBatchConfigInputs(snapshot);
   syncOrganizerLogProgressBaseline(snapshot);
   setStatusText(snapshot);
@@ -1644,6 +1706,9 @@ function connectTaskStream(taskId) {
     onProgress: (snap) => {
       recordOrganizerProgressLog(snap);
       refreshView(snap);
+    },
+    onSummaryReady: (row) => {
+      recordOrganizerSummaryReadyLog(row);
     },
     onFileDone: (row) => {
       recordOrganizerFileDoneLog(row);
@@ -1706,7 +1771,6 @@ function buildOptimisticRunningSnapshot(taskId, form, capability) {
     error: null,
     rootPath: form.rootPath,
     recursive: true,
-    referenceOriginalStructure: !!form.referenceOriginalStructure,
     excludedPatterns: Array.isArray(form.excludedPatterns) ? form.excludedPatterns : [],
     batchSize: Number(form.batchSize) || DEFAULT_BATCH_SIZE,
     summaryMode: form.summaryMode || DEFAULT_SUMMARY_MODE,
@@ -1770,6 +1834,11 @@ async function handleStart() {
     .filter(Boolean);
   const missingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
   let settingsSnapshot = await getSettings().catch(() => null);
+  try {
+    settingsSnapshot = await syncSummaryModeTikaToSettings(form.summaryMode, settingsSnapshot);
+  } catch (err) {
+    console.warn('[Organizer] Failed to sync Tika setting for summary mode:', err);
+  }
   const needsSearchSecret = !!form.useWebSearch && !getSearchCredentialPresence(settingsSnapshot || {});
   if (missingProviderSecret || needsSearchSecret) {
     try {
@@ -2014,7 +2083,6 @@ async function handleCopyTextRoute() {
 function bindPersistenceListeners() {
   [
     'org-root-path',
-    'org-reference-original-structure',
     'org-enable-web-search',
     'org-exclusions',
     'org-batch-size',
@@ -2032,7 +2100,6 @@ function bindPersistenceListeners() {
     const el = document.getElementById(id);
     if (!el) return;
     const eventName = [
-      'org-reference-original-structure',
       'org-enable-web-search',
       'org-summary-mode',
       PROVIDER_SELECT_IDS.text,
@@ -2421,13 +2488,6 @@ export async function renderOrganizer(container) {
 
             <div class="organizer-toggle-grid">
               <label class="organizer-toggle-card">
-                <input id="org-reference-original-structure" type="checkbox" ${defaults.referenceOriginalStructure ? 'checked' : ''} />
-                <span class="organizer-toggle-copy">
-                  <span class="organizer-toggle-title">${t('organizer.reference_original_structure')}</span>
-                  <span class="organizer-toggle-hint">${t('organizer.reference_original_structure_hint')}</span>
-                </span>
-              </label>
-              <label class="organizer-toggle-card">
                 <input id="org-enable-web-search" type="checkbox" ${defaults.useWebSearch === true ? 'checked' : ''} />
                 <span class="organizer-toggle-copy">
                   <span class="organizer-toggle-title">${t('organizer.use_web_search')}</span>
@@ -2504,6 +2564,9 @@ export async function renderOrganizer(container) {
     if (hint && select) {
       hint.textContent = getOrganizerSummaryModeDescription(select.value);
     }
+    syncSummaryModeTikaToSettings(select?.value).catch((err) => {
+      console.warn('[Organizer] Failed to enable Tika for summary mode:', err);
+    });
   });
   bindOrganizerLogPanelEvents();
   if (organizerLogEntries.length > 0) {
