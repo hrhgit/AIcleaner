@@ -4,6 +4,7 @@ use crate::web_search::{
     format_web_search_context, parse_web_search_request, tavily_search, web_search_trace_to_value,
 };
 use parking_lot::Mutex;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +23,8 @@ const TARGET_SIZE_MIN_GB: f64 = 0.1;
 const TARGET_SIZE_DEFAULT_MAX_GB: f64 = 20.0;
 const SCAN_NODE_FLUSH_THRESHOLD: usize = 1024;
 const SCAN_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
+const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
+const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanMode {
@@ -102,8 +105,15 @@ struct ScanReview {
 
 #[derive(Clone, Debug)]
 struct ChatResponse {
+    raw_body: String,
     content: String,
     token_usage: TokenUsage,
+}
+
+#[derive(Debug)]
+struct ChatCompletionError {
+    message: String,
+    raw_body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +160,91 @@ fn extract_json_text(content: &str) -> String {
         clean.truncate(clean.len().saturating_sub(3));
     }
     clean.trim().to_string()
+}
+
+fn summarize_response_body_for_error(raw_body: &str) -> String {
+    let trimmed = raw_body.trim();
+    if trimmed.is_empty() {
+        return "empty body".to_string();
+    }
+    let snippet: String = trimmed.chars().take(RESPONSE_ERROR_SNIPPET_CHARS).collect();
+    if trimmed.chars().count() > RESPONSE_ERROR_SNIPPET_CHARS {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
+fn extract_message_content(value: Option<&Value>) -> String {
+    value
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else {
+                v.as_array().map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn parse_chat_completion_http_body(
+    status: StatusCode,
+    raw_body: &str,
+) -> Result<ChatResponse, ChatCompletionError> {
+    let body: Value = serde_json::from_str(raw_body).map_err(|e| ChatCompletionError {
+        message: format!(
+            "error decoding response body: {} | body: {}",
+            e,
+            summarize_response_body_for_error(raw_body)
+        ),
+        raw_body: raw_body.to_string(),
+    })?;
+    if !status.is_success() {
+        let api_message = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("chat completion failed");
+        return Err(ChatCompletionError {
+            message: format!("{} (HTTP {})", api_message, status.as_u16()),
+            raw_body: raw_body.to_string(),
+        });
+    }
+    let content = extract_message_content(body.pointer("/choices/0/message/content"));
+    if content.trim().is_empty() {
+        return Err(ChatCompletionError {
+            message: format!(
+                "chat completion response missing choices[0].message.content | body: {}",
+                summarize_response_body_for_error(raw_body)
+            ),
+            raw_body: raw_body.to_string(),
+        });
+    }
+    Ok(ChatResponse {
+        raw_body: raw_body.to_string(),
+        content,
+        token_usage: TokenUsage {
+            prompt: body
+                .pointer("/usage/prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            completion: body
+                .pointer("/usage/completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            total: body
+                .pointer("/usage/total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        },
+    })
 }
 
 fn is_zh_language(value: &str) -> bool {
@@ -245,12 +340,15 @@ async fn chat_completion(
     ai: &ScanAiConfig,
     system_prompt: &str,
     user_prompt: &str,
-) -> Result<ChatResponse, String> {
+) -> Result<ChatResponse, ChatCompletionError> {
     let url = format!("{}/chat/completions", ai.endpoint.trim_end_matches('/'));
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(CHAT_COMPLETION_TIMEOUT_SECS))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ChatCompletionError {
+            message: e.to_string(),
+            raw_body: String::new(),
+        })?;
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -269,204 +367,16 @@ async fn chat_completion(
             .header("x-api-key", ai.api_key.clone())
             .header("api-key", ai.api_key.clone());
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(|e| ChatCompletionError {
+        message: e.to_string(),
+        raw_body: String::new(),
+    })?;
     let status = resp.status();
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("chat completion failed")
-            .to_string());
-    }
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(|v| {
-            if let Some(s) = v.as_str() {
-                Some(s.to_string())
-            } else {
-                v.as_array().map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            }
-        })
-        .unwrap_or_default();
-    Ok(ChatResponse {
-        content,
-        token_usage: TokenUsage {
-            prompt: body
-                .pointer("/usage/prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            completion: body
-                .pointer("/usage/completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            total: body
-                .pointer("/usage/total_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        },
-    })
-}
-
-#[allow(dead_code)]
-async fn analyze_scan_node_legacy(
-    ai: &ScanAiConfig,
-    node: &persist::ScanNode,
-    child_dirs: &[persist::ScanNode],
-) -> ScanReview {
-    let prompt_in_zh = is_zh_language(&ai.response_language);
-    let response_language = localized_language_name(&ai.response_language, &ai.response_language);
-    let system_prompt = if node.node_type == "directory" {
-        if prompt_in_zh {
-            [
-                "你是一个磁盘清理安全分析助手。",
-                "只能返回 JSON。",
-                "输出结构：{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
-                "保持保守判断；如果不确定，使用 suspicious。",
-                &format!("`reason` 字段只能使用{}。", response_language),
-            ]
-            .join("\n")
-        } else {
-            [
-                "You are a disk cleanup safety assistant.",
-                "Return JSON only.",
-                "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}",
-                "Be conservative. If unsure, use suspicious.",
-                &format!(
-                    "The \"reason\" field must be written in {} only.",
-                    response_language
-                ),
-            ]
-            .join("\n")
-        }
-    } else {
-        if prompt_in_zh {
-            [
-                "你是一个磁盘清理安全分析助手。",
-                "只能返回 JSON。",
-                "输出结构：{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
-                "保持保守判断；如果不确定，使用 suspicious。",
-                &format!("`reason` 字段只能使用{}。", response_language),
-            ]
-            .join("\n")
-        } else {
-            [
-                "You are a disk cleanup safety assistant.",
-                "Return JSON only.",
-                "Schema: {\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}",
-                "Be conservative. If unsure, use suspicious.",
-                &format!(
-                    "The \"reason\" field must be written in {} only.",
-                    response_language
-                ),
-            ]
-            .join("\n")
-        }
-    };
-    let child_summary = if child_dirs.is_empty() {
-        if prompt_in_zh {
-            "（无）".to_string()
-        } else {
-            "(none)".to_string()
-        }
-    } else {
-        child_dirs
-            .iter()
-            .take(24)
-            .map(|child| format!("- {} ({})", child.name, format_size(child.size)))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let user_prompt = if node.node_type == "directory" {
-        if prompt_in_zh {
-            format!(
-                "类型：目录\n路径：{}\n名称：{}\n大小：{}\n直接子目录：\n{}\n请判断整个目录是否可以安全删除，以及它是否可能包含可删除的子目录。",
-                node.path,
-                node.name,
-                format_size(node.size),
-                child_summary
-            )
-        } else {
-            format!(
-                "Type: directory\nPath: {}\nName: {}\nSize: {}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.",
-                node.path,
-                node.name,
-                format_size(node.size),
-                child_summary
-            )
-        }
-    } else {
-        if prompt_in_zh {
-            format!(
-                "类型：文件\n路径：{}\n名称：{}\n大小：{}\n请判断该文件是否可以安全删除。",
-                node.path,
-                node.name,
-                format_size(node.size)
-            )
-        } else {
-            format!(
-                "Type: file\nPath: {}\nName: {}\nSize: {}\nJudge whether the file can be deleted safely.",
-                node.path,
-                node.name,
-                format_size(node.size)
-            )
-        }
-    };
-    match chat_completion(ai, &system_prompt, &user_prompt).await {
-        Ok(resp) => {
-            let parsed: Value = serde_json::from_str(&extract_json_text(&resp.content))
-                .unwrap_or_else(|_| json!({}));
-            ScanReview {
-                classification: parsed
-                    .get("classification")
-                    .and_then(Value::as_str)
-                    .unwrap_or("suspicious")
-                    .to_string(),
-                reason: parsed
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or(default_unclear_reason(&ai.response_language))
-                    .to_string(),
-                risk: parsed
-                    .get("risk")
-                    .and_then(Value::as_str)
-                    .unwrap_or("medium")
-                    .to_string(),
-                has_potential_deletable_subfolders: parsed
-                    .get("hasPotentialDeletableSubfolders")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(node.node_type == "directory"),
-                token_usage: resp.token_usage,
-                trace: json!({
-                    "model": ai.model,
-                    "responseLanguage": ai.response_language,
-                    "systemPrompt": system_prompt,
-                    "userPrompt": user_prompt,
-                    "rawContent": resp.content,
-                }),
-            }
-        }
-        Err(err) => ScanReview {
-            classification: "suspicious".to_string(),
-            reason: default_analysis_failed_reason(&ai.response_language, &err),
-            risk: "high".to_string(),
-            has_potential_deletable_subfolders: node.node_type == "directory",
-            token_usage: TokenUsage::default(),
-            trace: json!({
-                "model": ai.model,
-                "responseLanguage": ai.response_language,
-                "systemPrompt": system_prompt,
-                "userPrompt": user_prompt,
-                "error": err,
-            }),
-        },
-    }
+    let raw_body = resp.text().await.map_err(|e| ChatCompletionError {
+        message: format!("error reading response body: {}", e),
+        raw_body: String::new(),
+    })?;
+    parse_chat_completion_http_body(status, &raw_body)
 }
 
 fn build_scan_system_prompt(
@@ -608,6 +518,7 @@ async fn analyze_scan_node(
                                         "systemPrompt": system_prompt,
                                         "userPrompt": current_user_prompt,
                                         "rawContent": resp.content,
+                                        "rawHttpBody": resp.raw_body,
                                         "search": {
                                             "request": {
                                                 "query": request.query,
@@ -649,6 +560,7 @@ async fn analyze_scan_node(
                         "systemPrompt": system_prompt,
                         "userPrompt": current_user_prompt,
                         "rawContent": resp.content,
+                        "rawHttpBody": resp.raw_body,
                         "search": search_trace,
                         "round": round + 1,
                     }),
@@ -657,7 +569,7 @@ async fn analyze_scan_node(
             Err(err) => {
                 return ScanReview {
                     classification: "suspicious".to_string(),
-                    reason: default_analysis_failed_reason(&ai.response_language, &err),
+                    reason: default_analysis_failed_reason(&ai.response_language, &err.message),
                     risk: "high".to_string(),
                     has_potential_deletable_subfolders: node.node_type == "directory",
                     token_usage: total_usage,
@@ -666,7 +578,8 @@ async fn analyze_scan_node(
                         "responseLanguage": ai.response_language,
                         "systemPrompt": system_prompt,
                         "userPrompt": current_user_prompt,
-                        "error": err,
+                        "error": err.message,
+                        "errorRawBody": err.raw_body,
                         "search": search_trace,
                     }),
                 };
@@ -2023,5 +1936,39 @@ mod tests {
         let _ = fs::remove_file(&roots_json);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn parse_chat_completion_http_body_extracts_content_and_usage() {
+        let raw_body = r#"{
+          "choices": [
+            {
+              "message": {
+                "content": "{\"classification\":\"keep\",\"reason\":\"ok\",\"risk\":\"low\"}"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "total_tokens": 46
+          }
+        }"#;
+        let parsed =
+            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect("parse success");
+        assert!(parsed.content.contains("\"classification\":\"keep\""));
+        assert_eq!(parsed.token_usage.prompt, 12);
+        assert_eq!(parsed.token_usage.completion, 34);
+        assert_eq!(parsed.token_usage.total, 46);
+        assert_eq!(parsed.raw_body, raw_body);
+    }
+
+    #[test]
+    fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
+        let raw_body = "<html>upstream gateway error</html>";
+        let err = parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
+        assert!(err.message.contains("error decoding response body"));
+        assert!(err.message.contains("upstream gateway error"));
+        assert_eq!(err.raw_body, raw_body);
     }
 }

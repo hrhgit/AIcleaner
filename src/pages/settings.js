@@ -218,6 +218,34 @@ export async function renderSettings(container) {
       </div>
     </div>
 
+    <div class="card animate-in mb-24" style="animation-delay: 0.125s">
+      <div class="card-header">
+        <h2 class="card-title">${t('settings.extraction_config')}</h2>
+        <span class="badge badge-warning">${t('settings.expert_feature')}</span>
+      </div>
+      <div class="form-group">
+        <label style="display:flex; align-items:center; gap:10px; cursor:pointer; margin-bottom: 8px;">
+          <input type="checkbox" id="enable-tika-extractor" class="toggle-checkbox" style="width: 20px; height: 20px;" />
+          <span class="form-label" style="margin:0;">${t('settings.tika_enabled')}</span>
+        </label>
+        <label style="display:flex; align-items:center; gap:10px; cursor:pointer; margin-bottom: 8px;">
+          <input type="checkbox" id="enable-tika-auto-start" class="toggle-checkbox" style="width: 20px; height: 20px;" />
+          <span class="form-label" style="margin:0;">${t('settings.tika_auto_start')}</span>
+        </label>
+        <div class="form-hint">${t('settings.tika_hint')}</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">${t('settings.tika_url')}</label>
+        <input type="text" id="tika-url" class="form-input" placeholder="http://127.0.0.1:9998" />
+        <div class="form-hint">${t('settings.tika_url_hint')}</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">${t('settings.tika_jar_path')}</label>
+        <input type="text" id="tika-jar-path" class="form-input" placeholder="C:\\tools\\tika-server-standard-3.2.3.jar" />
+        <div class="form-hint">${t('settings.tika_jar_path_hint')}</div>
+      </div>
+    </div>
+
     <div class="card animate-in mb-24" style="animation-delay: 0.15s">
       <div class="card-header">
         <h2 class="card-title">${t('settings.privilege_config')}</h2>
@@ -480,6 +508,10 @@ export async function renderSettings(container) {
     }
     el('max-depth-unlimited').checked = !!s.maxDepthUnlimited;
     updateMaxDepthControls(!!s.maxDepthUnlimited);
+    el('enable-tika-extractor').checked = !!s?.contentExtraction?.tika?.enabled;
+    el('enable-tika-auto-start').checked = !!s?.contentExtraction?.tika?.autoStart;
+    el('tika-url').value = String(s?.contentExtraction?.tika?.url || 'http://127.0.0.1:9998').trim();
+    el('tika-jar-path').value = String(s?.contentExtraction?.tika?.jarPath || '').trim();
     const searchApiEnabled = !!s?.searchApi?.enabled;
     const scanWebSearchEnabled = searchApiEnabled && !!s?.searchApi?.scopes?.scan;
     const organizerWebSearchEnabled = searchApiEnabled && !!s?.searchApi?.scopes?.organizer;
@@ -561,5 +593,13 @@ function collectForm(currentSettings) {
     maxDepth: parseInt(maxDepthVal, 10),
     maxDepthUnlimited,
     searchApi,
+    contentExtraction: {
+      tika: {
+        enabled: !!document.getElementById('enable-tika-extractor')?.checked,
+        autoStart: !!document.getElementById('enable-tika-auto-start')?.checked,
+        url: String(document.getElementById('tika-url')?.value || '').trim() || 'http://127.0.0.1:9998',
+        jarPath: String(document.getElementById('tika-jar-path')?.value || '').trim(),
+      },
+    },
   };
 }

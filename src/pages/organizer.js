@@ -24,6 +24,7 @@ const PERSIST_KEYS = {
   referenceOriginalStructure: 'wipeout.organizer.global.reference_original_structure.v2',
   exclusions: 'wipeout.organizer.global.exclusions.v2',
   batchSize: 'wipeout.organizer.global.batch_size.v2',
+  summaryMode: 'wipeout.organizer.global.summary_mode.v1',
   maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v2',
   useWebSearch: 'wipeout.organizer.global.use_web_search.v2',
   modelRouting: 'wipeout.organizer.global.model_routing.v2',
@@ -69,6 +70,8 @@ const DEFAULT_EXCLUSIONS = [
 ];
 
 const DEFAULT_BATCH_SIZE = 20;
+const DEFAULT_SUMMARY_MODE = 'filename_only';
+const SUMMARY_MODES = ['filename_only', 'local_summary', 'agent_summary'];
 
 const MOVE_RESULT_TEXT = {
   zh: {
@@ -170,6 +173,7 @@ let organizerProviderSettingsUpdatedHandler = null;
 let renderVersion = 0;
 let organizerLogEntries = [];
 const expandedOrganizerDetailLogIds = new Set();
+const loggedOrganizerRawBatchKeys = new Set();
 let organizerLogTaskId = null;
 let organizerLogProgressBaseline = null;
 
@@ -329,6 +333,8 @@ function collectForm() {
   const maxClusterDepthInput = String(document.getElementById('org-max-cluster-depth')?.value || '').trim();
   const parsedMaxClusterDepth = maxClusterDepthInput ? Number(maxClusterDepthInput) : null;
   const useWebSearch = !!document.getElementById('org-enable-web-search')?.checked;
+  const summaryModeRaw = String(document.getElementById('org-summary-mode')?.value || '').trim();
+  const summaryMode = SUMMARY_MODES.includes(summaryModeRaw) ? summaryModeRaw : DEFAULT_SUMMARY_MODE;
   const modelRouting = readModelRoutingFromDOM();
   const batchSize = Number.isFinite(batchSizeRaw)
     ? Math.max(1, Math.min(200, Math.floor(batchSizeRaw)))
@@ -343,6 +349,7 @@ function collectForm() {
     referenceOriginalStructure,
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
     batchSize,
+    summaryMode,
     maxClusterDepth,
     useWebSearch,
     modelRouting,
@@ -355,6 +362,7 @@ function persistForm(data) {
   setPersisted(PERSIST_KEYS.referenceOriginalStructure, data.referenceOriginalStructure);
   setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
   setPersisted(PERSIST_KEYS.batchSize, data.batchSize);
+  setPersisted(PERSIST_KEYS.summaryMode, data.summaryMode || DEFAULT_SUMMARY_MODE);
   setPersisted(PERSIST_KEYS.maxClusterDepth, data.maxClusterDepth);
   setPersisted(PERSIST_KEYS.useWebSearch, data.useWebSearch);
   setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
@@ -367,6 +375,7 @@ function restoreDefaults() {
     referenceOriginalStructure: getPersisted(PERSIST_KEYS.referenceOriginalStructure, false),
     excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
     batchSize: getPersisted(PERSIST_KEYS.batchSize, DEFAULT_BATCH_SIZE),
+    summaryMode: getPersisted(PERSIST_KEYS.summaryMode, DEFAULT_SUMMARY_MODE),
     maxClusterDepth: getPersisted(PERSIST_KEYS.maxClusterDepth, null),
     useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
     modelRouting: modelRouting || {},
@@ -426,6 +435,9 @@ function getProviderLabel(endpoint) {
 }
 
 function getOrganizerCategoryLabel(data = {}) {
+  if (String(data.reason || '').trim() === 'classification_error' || String(data.classificationError || '').trim()) {
+    return organizerText('分类错误', 'Classification Error');
+  }
   if (Array.isArray(data.categoryPath) && data.categoryPath.length > 0) {
     return data.categoryPath.map((segment) => String(segment || '').trim()).filter(Boolean).join(' / ');
   }
@@ -436,12 +448,34 @@ function getOrganizerLogTime() {
   return new Date().toLocaleTimeString([], { hour12: false });
 }
 
+function getOrganizerSummaryModeLabel(mode) {
+  if (mode === 'local_summary') return t('organizer.summary_mode_local_summary');
+  if (mode === 'agent_summary') return t('organizer.summary_mode_agent_summary');
+  return t('organizer.summary_mode_filename_only');
+}
+
+function getOrganizerSummaryModeDescription(mode) {
+  if (mode === 'local_summary') return t('organizer.summary_mode_local_summary_hint');
+  if (mode === 'agent_summary') return t('organizer.summary_mode_agent_summary_hint');
+  return t('organizer.summary_mode_filename_only_hint');
+}
+
+function getOrganizerSummaryText(row = {}) {
+  const summary = String(row.summary || '').trim();
+  if (summary) return summary;
+  const summarySource = String(row.summarySource || '').trim();
+  if (summarySource === 'filename_only') return t('organizer.summary_placeholder_filename_only');
+  if (summarySource === 'agent_fallback_local') return t('organizer.summary_placeholder_agent_fallback');
+  return t('organizer.summary_placeholder_empty');
+}
+
 function buildOrganizerLogEntry({
   type = 'scanning',
   kind = 'simple',
   summary = '',
   text = '',
   detail = '',
+  batchKey = '',
   taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null,
 } = {}) {
   const detailText = String(detail || '').trim();
@@ -451,10 +485,19 @@ function buildOrganizerLogEntry({
     kind,
     time: getOrganizerLogTime(),
     taskId: taskId ? String(taskId) : null,
+    batchKey: String(batchKey || '').trim() || null,
     summary: String(summary || text || '').trim(),
     text: String(text || summary || '').trim(),
     detailHtml: detailText ? escapeHtml(detailText).replace(/\n/g, '<br>') : '',
   };
+}
+
+function syncOrganizerRawBatchKeys() {
+  loggedOrganizerRawBatchKeys.clear();
+  for (const entry of organizerLogEntries) {
+    const batchKey = String(entry?.batchKey || '').trim();
+    if (batchKey) loggedOrganizerRawBatchKeys.add(batchKey);
+  }
 }
 
 function isGroupedOrganizerLogType(type) {
@@ -671,6 +714,7 @@ function replaceOrganizerLogEntries(nextEntries = [], { persist = true, taskId =
   organizerLogEntries = Array.isArray(nextEntries) ? nextEntries : [];
   organizerLogTaskId = taskId ? String(taskId) : null;
   expandedOrganizerDetailLogIds.clear();
+  syncOrganizerRawBatchKeys();
   if (persist) {
     setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
     if (organizerLogTaskId) {
@@ -695,6 +739,9 @@ function appendOrganizerLogEntry(entry, { persist = true } = {}) {
   if (!entry) return;
   organizerLogEntries = [...organizerLogEntries, entry];
   organizerLogTaskId = entry.taskId ? String(entry.taskId) : (organizerLogTaskId || null);
+  if (entry.batchKey) {
+    loggedOrganizerRawBatchKeys.add(String(entry.batchKey));
+  }
   if (persist) {
     setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
     if (organizerLogTaskId) {
@@ -781,7 +828,54 @@ function restoreOrganizerLogState(snapshot = null) {
   organizerLogEntries = Array.isArray(rawEntries) ? rawEntries : [];
   organizerLogTaskId = String(getPersisted(PERSIST_KEYS.logTaskId, '') || '').trim() || null;
   expandedOrganizerDetailLogIds.clear();
+  syncOrganizerRawBatchKeys();
   syncOrganizerLogProgressBaseline(snapshot);
+}
+
+function buildOrganizerBatchRawOutputEntries(results = [], taskId = organizerLogTaskId) {
+  const grouped = new Map();
+  for (const row of Array.isArray(results) ? results : []) {
+    const batchIndex = Number(row?.batchIndex || 0);
+    const rawOutput = String(row?.modelRawOutput || '').trim();
+    const classificationError = String(row?.classificationError || '').trim();
+    if (!batchIndex || (!rawOutput && !classificationError)) continue;
+    if (!grouped.has(batchIndex)) {
+      grouped.set(batchIndex, {
+        batchIndex,
+        taskId: String(row?.taskId || taskId || '').trim() || null,
+        route: formatOrganizerRouteLabel(row?.provider, row?.model),
+        rawOutput,
+        classificationError,
+        names: [],
+      });
+    }
+    const item = grouped.get(batchIndex);
+    const name = String(row?.name || row?.path || '').trim();
+    if (name) item.names.push(name);
+    if (!item.rawOutput && rawOutput) item.rawOutput = rawOutput;
+    if (!item.classificationError && classificationError) item.classificationError = classificationError;
+  }
+
+  return Array.from(grouped.values())
+    .sort((a, b) => a.batchIndex - b.batchIndex)
+    .map((item) => {
+      const detail = [
+        `${organizerText('批次', 'Batch')}: ${item.batchIndex}`,
+        `${organizerText('模型', 'Model')}: ${item.route}`,
+        item.names.length ? `${organizerText('文件', 'Items')}: ${item.names.join(', ')}` : '',
+        item.classificationError ? `${organizerText('分类错误', 'Classification Error')}: ${item.classificationError}` : '',
+        '',
+        item.rawOutput || organizerText('模型没有返回可记录的 HTTP 原始响应。', 'The model did not return any recordable HTTP raw response.'),
+      ].filter(Boolean).join('\n');
+      return buildOrganizerLogEntry({
+        type: item.classificationError ? 'error' : 'agent_response',
+        kind: 'detail',
+        summary: organizerText(`批次 ${item.batchIndex} HTTP 原始响应`, `Batch ${item.batchIndex} HTTP raw response`),
+        detail,
+        batchKey: `${item.taskId || ''}::${item.batchIndex}`,
+        taskId: item.taskId,
+      });
+    });
 }
 
 function ensureOrganizerLogsForSnapshot(snapshot) {
@@ -805,6 +899,7 @@ function ensureOrganizerLogsForSnapshot(snapshot) {
       detail,
       taskId: snapshotTaskId,
     }),
+    ...buildOrganizerBatchRawOutputEntries(snapshot?.results, snapshotTaskId),
   ], { persist: true, taskId: snapshotTaskId });
 }
 
@@ -821,6 +916,7 @@ function recordOrganizerStartLog(form, taskId, capability) {
     `${organizerText('目录', 'Root')}: ${form.rootPath || '-'}`,
     `${organizerText('批大小', 'Batch Size')}: ${Number(form.batchSize || DEFAULT_BATCH_SIZE)}`,
     `${organizerText('聚类深度', 'Cluster Depth')}: ${form.maxClusterDepth == null ? organizerText('不限', 'Unlimited') : Number(form.maxClusterDepth)}`,
+    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(form.summaryMode)}`,
     `${organizerText('参考原结构', 'Reference Structure')}: ${form.referenceOriginalStructure ? organizerText('是', 'Yes') : organizerText('否', 'No')}`,
     `${organizerText('联网搜索', 'Web Search')}: ${form.useWebSearch ? organizerText('开启', 'Enabled') : organizerText('关闭', 'Disabled')}`,
     `${organizerText('文本路由', 'Text Route')}: ${formatOrganizerRouteLabel(textRoute.endpoint || selectedProviders.text, textRoute.model || selectedModels.text)}`,
@@ -886,11 +982,43 @@ function recordOrganizerProgressLog(snapshot) {
 function recordOrganizerFileDoneLog(row) {
   if (!row) return;
   const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
+  const batchIndex = Number(row.batchIndex || 0);
+  const batchKey = batchIndex ? `${taskId || ''}::${batchIndex}` : '';
   const category = getOrganizerCategoryLabel(row);
   const route = formatOrganizerRouteLabel(row.provider, row.model);
   const degradedText = row.degraded ? ` | ${organizerText('降级', 'Degraded')}` : '';
+  const classificationError = String(row.classificationError || '').trim();
+  const isClassificationErrorRow =
+    String(row.reason || '').trim() === 'classification_error' || !!classificationError;
+  const isFallbackBatchRow =
+    String(row.reason || '').trim() === 'fallback_uncategorized'
+    && (!!classificationError || (batchKey && loggedOrganizerRawBatchKeys.has(batchKey)));
+  if (batchKey && !loggedOrganizerRawBatchKeys.has(batchKey)) {
+    const rawOutput = String(row.modelRawOutput || '').trim();
+    if (rawOutput || classificationError) {
+      const detail = [
+        `${organizerText('批次', 'Batch')}: ${batchIndex}`,
+        `${organizerText('模型', 'Model')}: ${route}`,
+        classificationError ? `${organizerText('分类错误', 'Classification Error')}: ${classificationError}` : '',
+        classificationError ? organizerText('该批次未拿到最终分类结果，下面显示的是中间输出或可记录的原始响应。', 'This batch did not produce a final classification result. The content below is intermediate output or the raw response we managed to record.') : '',
+        '',
+        rawOutput || organizerText('模型没有返回可记录的 HTTP 原始响应。', 'The model did not return any recordable HTTP raw response.'),
+      ].filter(Boolean).join('\n');
+      appendOrganizerLogEntry(buildOrganizerLogEntry({
+        type: classificationError ? 'error' : 'agent_response',
+        kind: 'detail',
+        summary: organizerText(`批次 ${batchIndex} HTTP 原始响应`, `Batch ${batchIndex} HTTP raw response`),
+        detail,
+        batchKey,
+        taskId,
+      }));
+    }
+  }
+  if (isFallbackBatchRow) {
+    return;
+  }
   appendOrganizerLogEntry(buildOrganizerLogEntry({
-    type: 'found',
+    type: isClassificationErrorRow ? 'error' : 'found',
     text: organizerText(
       `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`,
       `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`
@@ -922,6 +1050,7 @@ function setStatusText(snapshot) {
     idle: t('organizer.status_idle'),
     scanning: t('organizer.status_scanning'),
     classifying: t('organizer.status_classifying'),
+    stopping: t('organizer.status_stopping'),
     stopped: t('organizer.status_stopped'),
     completed: t('organizer.status_completed'),
     moving: t('organizer.status_moving'),
@@ -1169,8 +1298,13 @@ function renderPreview(snapshot) {
       .join('<span class="organizer-category-separator"></span>');
     const rows = items.map((item, rowIdx) => {
       const row = resultsMap.get(item.sourcePath);
+      const summaryText = getOrganizerSummaryText(row);
+      const summarySource = String(row?.summarySource || '').trim();
       const degraded = row?.degraded
         ? `<div style="margin-top:6px;"><span class="badge badge-warning">${t('organizer.degraded')}</span></div>`
+        : '';
+      const summaryBadge = summarySource
+        ? `<div style="margin-top:6px;"><span class="badge badge-info">${escapeHtml(getOrganizerSummaryModeLabel(row?.summaryMode || DEFAULT_SUMMARY_MODE))}</span></div>`
         : '';
 
       return `
@@ -1178,6 +1312,8 @@ function renderPreview(snapshot) {
           <td>
             <div class="file-name" title="${escapeHtml(row?.name || '')}">${escapeHtml(row?.name || '')}</div>
             <div class="file-path" title="${escapeHtml(item.sourcePath)}">${escapeHtml(item.sourcePath)}</div>
+            <div class="file-purpose" title="${escapeHtml(summaryText)}">${escapeHtml(summaryText)}</div>
+            ${summaryBadge}
             ${degraded}
           </td>
           <td><div class="file-path" title="${escapeHtml(item.targetPath)}">${escapeHtml(item.targetPath)}</div></td>
@@ -1339,7 +1475,7 @@ function updateButtons(snapshot) {
   const rollbackBtn = document.getElementById('org-rollback-btn');
 
   if (startBtn) {
-    const running = status === 'scanning' || status === 'classifying' || status === 'moving';
+    const running = status === 'scanning' || status === 'classifying' || status === 'stopping' || status === 'moving';
     startBtn.disabled = running;
   }
 
@@ -1349,7 +1485,8 @@ function updateButtons(snapshot) {
   }
 
   if (applyBtn) {
-    applyBtn.disabled = !(status === 'completed' || status === 'done');
+    const hasPreview = Array.isArray(snapshot?.preview) && snapshot.preview.length > 0;
+    applyBtn.disabled = !(status === 'completed' || status === 'done') || !hasPreview;
   }
 
   if (rollbackBtn) {
@@ -1381,6 +1518,16 @@ function syncBatchConfigInputs(snapshot) {
     const nextValue = snapshot.maxClusterDepth == null ? '' : String(snapshot.maxClusterDepth);
     if (String(depthInput.value || '') !== nextValue) {
       depthInput.value = nextValue;
+    }
+  }
+
+  const summaryModeSelect = document.getElementById('org-summary-mode');
+  if (summaryModeSelect) {
+    const nextValue = SUMMARY_MODES.includes(String(snapshot.summaryMode || '').trim())
+      ? String(snapshot.summaryMode).trim()
+      : DEFAULT_SUMMARY_MODE;
+    if (String(summaryModeSelect.value || '') !== nextValue) {
+      summaryModeSelect.value = nextValue;
     }
   }
 }
@@ -1490,6 +1637,7 @@ function buildOptimisticRunningSnapshot(taskId, form, capability) {
     referenceOriginalStructure: !!form.referenceOriginalStructure,
     excludedPatterns: Array.isArray(form.excludedPatterns) ? form.excludedPatterns : [],
     batchSize: Number(form.batchSize) || DEFAULT_BATCH_SIZE,
+    summaryMode: form.summaryMode || DEFAULT_SUMMARY_MODE,
     maxClusterDepth: form.maxClusterDepth ?? null,
     useWebSearch: !!form.useWebSearch,
     webSearchEnabled: !!form.useWebSearch,
@@ -1687,6 +1835,12 @@ async function handleStop() {
 
   try {
     await stopOrganize(activeTaskId);
+    if (latestSnapshot?.id === activeTaskId) {
+      refreshView({
+        ...latestSnapshot,
+        status: 'stopping',
+      });
+    }
     showToast(t('organizer.toast_stopped'), 'info');
   } catch (err) {
     showToast(`${t('organizer.toast_stop_failed')}${getErrorMessage(err)}`, 'error');
@@ -1792,6 +1946,7 @@ function bindPersistenceListeners() {
     'org-enable-web-search',
     'org-exclusions',
     'org-batch-size',
+    'org-summary-mode',
     'org-max-cluster-depth',
     PROVIDER_SELECT_IDS.text,
     PROVIDER_SELECT_IDS.image,
@@ -1807,6 +1962,7 @@ function bindPersistenceListeners() {
     const eventName = [
       'org-reference-original-structure',
       'org-enable-web-search',
+      'org-summary-mode',
       PROVIDER_SELECT_IDS.text,
       PROVIDER_SELECT_IDS.image,
       PROVIDER_SELECT_IDS.video,
@@ -1890,6 +2046,7 @@ function updateStatusDecor(snapshot) {
     idle: 'badge-info',
     scanning: 'badge-warning',
     classifying: 'badge-warning',
+    stopping: 'badge-warning',
     stopped: 'badge-info',
     completed: 'badge-success',
     moving: 'badge-warning',
@@ -1923,6 +2080,13 @@ function updatePipeline(snapshot) {
   } else if (status === 'classifying') {
     states.scanning = 'done';
     states.classifying = 'active';
+  } else if (status === 'stopping') {
+    if (Number(snapshot?.processedFiles || 0) > 0 || Number(snapshot?.totalFiles || 0) > 0) {
+      states.scanning = 'done';
+      states.classifying = 'active';
+    } else {
+      states.scanning = 'active';
+    }
   } else if (status === 'completed') {
     states.scanning = 'done';
     states.classifying = 'done';
@@ -2168,6 +2332,15 @@ export async function renderOrganizer(container) {
                 <div class="form-hint">${t('organizer.batch_size_hint')}</div>
               </div>
               <div class="form-group organizer-metric-field">
+                <label class="form-label">${t('organizer.summary_mode')}</label>
+                <select id="org-summary-mode" class="form-input">
+                  <option value="filename_only" ${defaults.summaryMode === 'filename_only' ? 'selected' : ''}>${t('organizer.summary_mode_filename_only')}</option>
+                  <option value="local_summary" ${defaults.summaryMode === 'local_summary' ? 'selected' : ''}>${t('organizer.summary_mode_local_summary')}</option>
+                  <option value="agent_summary" ${defaults.summaryMode === 'agent_summary' ? 'selected' : ''}>${t('organizer.summary_mode_agent_summary')}</option>
+                </select>
+                <div class="form-hint" id="org-summary-mode-hint">${t(`organizer.summary_mode_${defaults.summaryMode || DEFAULT_SUMMARY_MODE}_hint`)}</div>
+              </div>
+              <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.max_cluster_depth')}</label>
                 <input id="org-max-cluster-depth" type="number" min="1" class="form-input no-spin" value="${defaults.maxClusterDepth == null ? '' : Number(defaults.maxClusterDepth)}" placeholder="${t('organizer.max_cluster_depth_unlimited')}" />
                 <div class="form-hint">${t('organizer.max_cluster_depth_hint')}</div>
@@ -2253,6 +2426,13 @@ export async function renderOrganizer(container) {
   document.getElementById('org-start-btn')?.addEventListener('click', handleStart);
   document.getElementById('org-stop-btn')?.addEventListener('click', handleStop);
   document.getElementById(COPY_TEXT_ROUTE_BTN_ID)?.addEventListener('click', handleCopyTextRoute);
+  document.getElementById('org-summary-mode')?.addEventListener('change', () => {
+    const select = document.getElementById('org-summary-mode');
+    const hint = document.getElementById('org-summary-mode-hint');
+    if (hint && select) {
+      hint.textContent = getOrganizerSummaryModeDescription(select.value);
+    }
+  });
   bindOrganizerLogPanelEvents();
   if (organizerLogEntries.length > 0) {
     renderOrganizerLogEntries();

@@ -1,14 +1,16 @@
 use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
 use crate::persist;
 use crate::web_search::{
-    format_web_search_context, parse_web_search_request, tavily_search, web_search_trace_to_value,
+    format_web_search_context, parse_web_search_request, tavily_search,
 };
 use parking_lot::Mutex;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,25 @@ use walkdir::WalkDir;
 const UNCATEGORIZED_NODE_NAME: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
 const DEFAULT_BATCH_SIZE: u32 = 20;
 const CATEGORY_OTHER_PENDING: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
+const CATEGORY_CLASSIFICATION_ERROR: &str = "\u{5206}\u{7C7B}\u{9519}\u{8BEF}";
+const RESULT_REASON_CLASSIFICATION_ERROR: &str = "classification_error";
+const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
+const TIKA_EXTRACT_TIMEOUT_SECS: u64 = 90;
+const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
+const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
+const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
+const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
+const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+const SUMMARY_MODE_FILENAME_ONLY: &str = "filename_only";
+const SUMMARY_MODE_LOCAL_SUMMARY: &str = "local_summary";
+const SUMMARY_MODE_AGENT_SUMMARY: &str = "agent_summary";
+
+const SUMMARY_SOURCE_FILENAME_ONLY: &str = "filename_only";
+const SUMMARY_SOURCE_LOCAL_SUMMARY: &str = "local_summary";
+const SUMMARY_SOURCE_AGENT_SUMMARY: &str = "agent_summary";
+const SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL: &str = "agent_fallback_local";
 
 const DEFAULT_EXCLUDED_PATTERNS: [&str; 11] = [
     ".git",
@@ -40,6 +61,67 @@ struct RouteConfig {
     endpoint: String,
     api_key: String,
     model: String,
+}
+
+#[derive(Debug)]
+struct ChatCompletionOutput {
+    raw_body: String,
+    content: String,
+    usage: TokenUsage,
+}
+
+#[derive(Debug)]
+struct ChatCompletionError {
+    message: String,
+    raw_body: String,
+}
+
+struct ClassifyOrganizeBatchOutput {
+    parsed: Option<Value>,
+    usage: TokenUsage,
+    raw_output: String,
+    error: Option<String>,
+}
+
+struct SummaryAgentBatchOutput {
+    items: HashMap<String, SummaryAgentItem>,
+    usage: TokenUsage,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SummaryAgentItem {
+    summary: String,
+    keywords: Vec<String>,
+    confidence: Option<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SummaryExtraction {
+    parser: String,
+    title: Option<String>,
+    excerpt: String,
+    keywords: Vec<String>,
+    metadata_lines: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SummaryBuildResult {
+    summary: String,
+    source: String,
+    degraded: bool,
+    warnings: Vec<String>,
+    confidence: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExtractionToolConfig {
+    tika_enabled: bool,
+    tika_url: String,
+    tika_auto_start: bool,
+    tika_jar_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +149,6 @@ struct DirectoryAssessment {
     integrity_score: u8,
     integrity_kind: String,
     evidence: Vec<String>,
-    marker_files: Vec<String>,
-    app_signals: Vec<String>,
     wrapper_target_path: Option<String>,
     top_level_entries: Vec<String>,
     dominant_extensions: Vec<String>,
@@ -126,16 +206,9 @@ const PROJECT_MARKER_NAMES: [&str; 17] = [
     ".sln",
 ];
 
-const DOWNLOAD_ROOT_TOKENS: [&str; 4] = ["download", "downloads", "下载", "dwnldata"];
+const DOWNLOAD_ROOT_TOKENS: [&str; 4] = ["download", "downloads", "涓嬭浇", "dwnldata"];
 const JUNK_DIR_NAMES: [&str; 8] = [
-    "log",
-    "logs",
-    "cache",
-    "caches",
-    "temp",
-    "tmp",
-    "updates",
-    "update",
+    "log", "logs", "cache", "caches", "temp", "tmp", "updates", "update",
 ];
 const WRAPPER_FILE_EXTS: [&str; 7] = [".txt", ".md", ".json", ".nfo", ".url", ".sfv", ".crc"];
 
@@ -145,6 +218,7 @@ pub struct OrganizeTaskRuntime {
     routes: HashMap<String, RouteConfig>,
     search_api_key: String,
     response_language: String,
+    extraction_tool: ExtractionToolConfig,
     pub job: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -178,7 +252,7 @@ fn localized_language_name(prompt_language: &str, output_language: &str) -> &'st
 
 fn organizer_unknown_label(value: &str) -> &'static str {
     if is_zh_language(value) {
-        "（未知）"
+        "锛堟湭鐭ワ級"
     } else {
         "(unknown)"
     }
@@ -189,6 +263,144 @@ fn organizer_none_label(value: &str) -> &'static str {
         "（无）"
     } else {
         "(none)"
+    }
+}
+
+fn normalize_summary_mode(value: Option<&str>) -> String {
+    match value.unwrap_or("").trim() {
+        SUMMARY_MODE_LOCAL_SUMMARY => SUMMARY_MODE_LOCAL_SUMMARY.to_string(),
+        SUMMARY_MODE_AGENT_SUMMARY => SUMMARY_MODE_AGENT_SUMMARY.to_string(),
+        _ => SUMMARY_MODE_FILENAME_ONLY.to_string(),
+    }
+}
+
+fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfig {
+    let tika = settings
+        .get("contentExtraction")
+        .and_then(|value| value.get("tika"));
+    let tika_enabled = tika
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tika_auto_start = tika
+        .and_then(|value| value.get("autoStart"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tika_jar_path = tika
+        .and_then(|value| value.get("jarPath"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let tika_url = tika
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+        .unwrap_or("http://127.0.0.1:9998")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    ExtractionToolConfig {
+        tika_enabled: tika_enabled && !tika_url.is_empty(),
+        tika_url,
+        tika_auto_start,
+        tika_jar_path,
+    }
+}
+
+async fn is_tika_server_available(url: &str) -> bool {
+    let normalized = url.trim().trim_end_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    match client
+        .get(format!("{normalized}/version"))
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn managed_tika_process_alive(process: &mut crate::backend::ManagedTikaProcess) -> bool {
+    match process.child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(_)) | Err(_) => false,
+    }
+}
+
+async fn ensure_tika_server_running(
+    state: &AppState,
+    extraction_tool: &ExtractionToolConfig,
+) -> Result<(), String> {
+    if !extraction_tool.tika_enabled || !extraction_tool.tika_auto_start {
+        return Ok(());
+    }
+    if is_tika_server_available(&extraction_tool.tika_url).await {
+        return Ok(());
+    }
+    if extraction_tool.tika_jar_path.trim().is_empty() {
+        return Err("Tika auto-start is enabled but jarPath is empty".to_string());
+    }
+    let waiting_for_existing_process = {
+        let mut guard = state.tika_process.lock();
+        if let Some(process) = guard.as_mut() {
+            if process.url == extraction_tool.tika_url && managed_tika_process_alive(process) {
+                true
+            } else {
+                *guard = None;
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if waiting_for_existing_process {
+        for _ in 0..25 {
+            if is_tika_server_available(&extraction_tool.tika_url).await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        return Err("Tika process started by app did not become ready in time".to_string());
+    }
+
+    let child = Command::new("java")
+        .arg("-jar")
+        .arg(&extraction_tool.tika_jar_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start Tika Server: {e}"))?;
+    {
+        let mut guard = state.tika_process.lock();
+        *guard = Some(crate::backend::ManagedTikaProcess {
+            url: extraction_tool.tika_url.clone(),
+            child,
+        });
+    }
+    for _ in 0..30 {
+        if is_tika_server_available(&extraction_tool.tika_url).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("Tika Server did not become ready in time".to_string())
+}
+
+fn sanitize_summary_confidence(value: Option<&str>) -> Option<String> {
+    match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "high" => Some("high".to_string()),
+        "medium" => Some("medium".to_string()),
+        "low" => Some("low".to_string()),
+        _ => None,
     }
 }
 
@@ -329,8 +541,9 @@ fn classify_extension_family(ext: &str) -> &'static str {
     match ext {
         ".exe" | ".msi" | ".app" | ".apk" | ".dll" | ".bin" | ".pak" | ".pck" | ".3dsx"
         | ".firm" => "app",
-        ".json" | ".yaml" | ".yml" | ".toml" | ".ini" | ".cfg" | ".conf" | ".config"
-        | ".xml" => "config",
+        ".json" | ".yaml" | ".yml" | ".toml" | ".ini" | ".cfg" | ".conf" | ".config" | ".xml" => {
+            "config"
+        }
         ".md" | ".txt" | ".pdf" | ".doc" | ".docx" | ".rtf" | ".epub" | ".csv" | ".xlsx"
         | ".xls" | ".bib" => "document",
         ".png" | ".jpg" | ".jpeg" | ".webp" | ".gif" | ".bmp" | ".ani" | ".ico" => "image",
@@ -465,8 +678,8 @@ fn is_package_doc_name(name: &str) -> bool {
     );
     is_doc_ext
         && [
-            "readme", "guide", "manual", "install", "setup", "usage", "license", "说明", "安装",
-            "使用", "教程", "运行", "版权",
+            "readme", "guide", "manual", "install", "setup", "usage", "license", "璇存槑", "瀹夎",
+            "浣跨敤", "鏁欑▼", "杩愯", "鐗堟潈",
         ]
         .iter()
         .any(|token| lower.contains(token))
@@ -599,7 +812,8 @@ fn is_collection_root(path: &Path, excluded: &[String], stop: &AtomicBool) -> bo
         }
         if entry_path.is_file() {
             direct_file_count = direct_file_count.saturating_add(1);
-            file_families.insert(classify_extension_family(&extension_key(&entry_path)).to_string());
+            file_families
+                .insert(classify_extension_family(&extension_key(&entry_path)).to_string());
         }
     }
 
@@ -839,6 +1053,18 @@ fn evaluate_directory_assessment(
     } else {
         false
     };
+    let dll_only_directory = direct_dll_count >= 2
+        && u64::from(direct_dll_count) == direct_file_count
+        && direct_dir_count == 0
+        && direct_exe_count == 0
+        && direct_json_count == 0
+        && direct_pck_count == 0
+        && direct_config_count == 0
+        && direct_text_count == 0
+        && direct_image_count == 0
+        && direct_video_count == 0
+        && direct_audio_count == 0
+        && direct_script_count == 0;
 
     let mut integrity_kind = "mixed".to_string();
     let mut score = 0_i32;
@@ -916,9 +1142,7 @@ fn evaluate_directory_assessment(
         evidence.push("font_pack".to_string());
         app_signals.push("font_pack".to_string());
     }
-    if direct_text_count >= 6
-        && document_collection_share >= 75
-    {
+    if direct_text_count >= 6 && document_collection_share >= 75 {
         score += 30;
         strong_anchor = true;
         if integrity_kind == "mixed" {
@@ -1084,6 +1308,10 @@ fn evaluate_directory_assessment(
         score -= 12;
         fragmentation_warnings.push("weak_name_families".to_string());
     }
+    if dll_only_directory {
+        score -= 24;
+        fragmentation_warnings.push("dll_only_directory".to_string());
+    }
 
     if wrapper_target_path.is_some() {
         evidence.push("single_child_wrapper".to_string());
@@ -1102,6 +1330,7 @@ fn evaluate_directory_assessment(
             && dominant_share < 0.45
             && ext_counts.len() >= 5
             && direct_family_counts.len() >= 4)
+        || dll_only_directory
         || (integrity_kind == "mixed"
             && direct_dir_count >= 2
             && direct_file_count >= 6
@@ -1121,8 +1350,6 @@ fn evaluate_directory_assessment(
         integrity_score,
         integrity_kind,
         evidence,
-        marker_files,
-        app_signals,
         wrapper_target_path,
         top_level_entries,
         dominant_extensions,
@@ -1201,7 +1428,9 @@ fn collect_directory_candidate(
 
     match assessment.result_kind {
         DirectoryResultKind::Whole => {
-            out.push(create_directory_unit(scan_root, path, &metadata, assessment));
+            out.push(create_directory_unit(
+                scan_root, path, &metadata, assessment,
+            ));
         }
         DirectoryResultKind::WholeWrapperPassthrough => {
             if let Some(target) = assessment.wrapper_target_path.as_ref() {
@@ -1322,7 +1551,6 @@ fn collect_units(
     out
 }
 
-#[allow(unreachable_code, unused_variables)]
 fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) -> String {
     let Some(assessment) = unit.directory_assessment.as_ref() else {
         return if is_zh_language(response_language) {
@@ -1331,7 +1559,6 @@ fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) 
             "No directory summary available.".to_string()
         };
     };
-    let hint = assessment;
     let mut lines = vec![
         format!("resultKind={}", assessment.result_kind.as_str()),
         format!("integrityKind={}", assessment.integrity_kind),
@@ -1409,121 +1636,14 @@ fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) 
         ),
     ];
     if is_zh_language(response_language) {
-        lines.push(
-            "该目录已是整体候选，默认按整体归类，除非摘要明确显示多主题混杂。".to_string(),
-        );
+        lines.push("该目录已是整体候选，默认按整体归类，除非摘要明确显示存在多个无关主题。".to_string());
     } else {
         lines.push(
             "This directory is already a bundle candidate. Default to classifying it as a whole unit unless the summary clearly indicates multiple unrelated themes."
                 .to_string(),
         );
     }
-    return lines.join("\n");
-    if is_zh_language(response_language) {
-        [
-            format!("相对路径={}", unit.relative_path),
-            format!("总大小={}", unit.size),
-            format!(
-                "创建时间={}",
-                unit.created_at
-                    .clone()
-                    .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
-            ),
-            format!(
-                "修改时间={}",
-                unit.modified_at
-                    .clone()
-                    .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
-            ),
-            format!("文件数={}", hint.file_count),
-            format!("目录数={}", hint.dir_count),
-            format!(
-                "标记文件={}",
-                if hint.marker_files.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.marker_files.join(", ")
-                }
-            ),
-            format!(
-                "应用特征={}",
-                if hint.app_signals.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.app_signals.join(", ")
-                }
-            ),
-            format!(
-                "顶层条目={}",
-                if hint.top_level_entries.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.top_level_entries.join(", ")
-                }
-            ),
-            format!(
-                "主要扩展名={}",
-                if hint.dominant_extensions.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.dominant_extensions.join(", ")
-                }
-            ),
-        ]
-        .join("\n")
-    } else {
-        [
-            format!("relativePath={}", unit.relative_path),
-            format!("totalSize={}", unit.size),
-            format!(
-                "createdAt={}",
-                unit.created_at
-                    .clone()
-                    .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
-            ),
-            format!(
-                "modifiedAt={}",
-                unit.modified_at
-                    .clone()
-                    .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
-            ),
-            format!("totalFiles={}", hint.file_count),
-            format!("totalDirectories={}", hint.dir_count),
-            format!(
-                "markerFiles={}",
-                if hint.marker_files.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.marker_files.join(", ")
-                }
-            ),
-            format!(
-                "appSignals={}",
-                if hint.app_signals.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.app_signals.join(", ")
-                }
-            ),
-            format!(
-                "topLevelEntries={}",
-                if hint.top_level_entries.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.top_level_entries.join(", ")
-                }
-            ),
-            format!(
-                "dominantExtensions={}",
-                if hint.dominant_extensions.is_empty() {
-                    organizer_none_label(response_language).to_string()
-                } else {
-                    hint.dominant_extensions.join(", ")
-                }
-            ),
-        ]
-        .join("\n")
-    }
+    lines.join("\n")
 }
 
 fn build_reference_structure_context(
@@ -1574,7 +1694,7 @@ fn build_reference_structure_context(
         if entry.file_type().is_dir() {
             total_dirs = total_dirs.saturating_add(1);
             if is_zh_language(response_language) {
-                lines.push(format!("{indent}[目录] {relative}/"));
+                lines.push(format!("{indent}[鐩綍] {relative}/"));
             } else {
                 lines.push(format!("{indent}[D] {relative}/"));
             }
@@ -1584,7 +1704,7 @@ fn build_reference_structure_context(
             total_files = total_files.saturating_add(1);
             let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
             if is_zh_language(response_language) {
-                lines.push(format!("{indent}[文件] {relative} ({size} bytes)"));
+                lines.push(format!("{indent}[鏂囦欢] {relative} ({size} bytes)"));
             } else {
                 lines.push(format!("{indent}[F] {relative} ({size} bytes)"));
             }
@@ -1593,7 +1713,7 @@ fn build_reference_structure_context(
 
     let mut out = if is_zh_language(response_language) {
         vec![
-            format!("根路径={}", root.to_string_lossy()),
+            format!("鏍硅矾寰?{}", root.to_string_lossy()),
             format!("参考树最大深度={max_depth}"),
             format!("参考树展示行数={}", lines.len()),
             format!("参考树目录数={total_dirs}"),
@@ -1640,6 +1760,23 @@ fn category_path_display(path: &[String]) -> String {
     } else {
         path.join(" / ")
     }
+}
+
+fn row_has_classification_error(row: &Value) -> bool {
+    if row
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some(RESULT_REASON_CLASSIFICATION_ERROR)
+    {
+        return true;
+    }
+    !row
+        .get("classificationError")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .is_empty()
 }
 
 fn category_tree_to_value(node: &CategoryTreeNode) -> Value {
@@ -1802,119 +1939,319 @@ fn category_path_from_value(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn summarize_unit_for_batch(
+fn trim_to_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect::<String>()
+}
+
+fn normalize_multiline_text(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut last_blank = false;
+    for raw_line in value.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let line = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !last_blank && !out.is_empty() {
+                out.push('\n');
+            }
+            last_blank = true;
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        last_blank = false;
+    }
+    trim_to_chars(out.trim(), max_chars)
+}
+
+fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let stem = Path::new(&unit.name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&unit.name);
+    for token in stem
+        .split(|ch: char| !ch.is_alphanumeric() && !('\u{4e00}'..='\u{9fff}').contains(&ch))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = token.to_ascii_lowercase();
+        if seen.insert(normalized) {
+            out.push(token.to_string());
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push(unit.name.clone());
+    }
+    out
+}
+
+
+fn build_empty_extraction(unit: &OrganizeUnit, warning: &str) -> SummaryExtraction {
+    build_empty_extraction_with_warnings(unit, vec![warning.to_string()])
+}
+
+fn build_empty_extraction_with_warnings(
+    unit: &OrganizeUnit,
+    warnings: Vec<String>,
+) -> SummaryExtraction {
+    SummaryExtraction {
+        parser: "unavailable".to_string(),
+        title: None,
+        excerpt: String::new(),
+        keywords: collect_name_keywords(unit, 6),
+        metadata_lines: Vec::new(),
+        warnings,
+    }
+}
+
+fn extract_plain_text_summary(unit: &OrganizeUnit) -> SummaryExtraction {
+    if unit.size > LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES {
+        return build_empty_extraction_with_warnings(
+            unit,
+            vec![format!(
+                "summary_input_too_large:{}>{}",
+                unit.size, LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES
+            )],
+        );
+    }
+    match fs::read(&unit.path) {
+        Ok(bytes) => {
+            let text = normalize_multiline_text(
+                &String::from_utf8_lossy(&bytes),
+                LOCAL_TEXT_EXCERPT_CHARS,
+            );
+            if text.trim().is_empty() {
+                return build_empty_extraction(unit, "text_summary_fallback");
+            }
+            SummaryExtraction {
+                parser: "plain_text".to_string(),
+                title: Some(unit.name.clone()),
+                excerpt: text,
+                keywords: collect_name_keywords(unit, 6),
+                metadata_lines: vec![
+                    format!("name={}", unit.name),
+                    format!("relativePath={}", unit.relative_path),
+                    format!("size={}", unit.size),
+                ],
+                warnings: Vec::new(),
+            }
+        }
+        Err(_) => build_empty_extraction(unit, "text_summary_fallback"),
+    }
+}
+
+fn extract_unit_content_for_summary(
     unit: &OrganizeUnit,
     response_language: &str,
-) -> (String, bool, Vec<String>) {
-    match unit.item_type.as_str() {
-        "directory" => {
-            let warnings = unit
+    stop: &AtomicBool,
+) -> SummaryExtraction {
+    if stop.load(Ordering::Relaxed) {
+        return build_empty_extraction(unit, "stop_requested");
+    }
+    if unit.item_type == "directory" {
+        return SummaryExtraction {
+            parser: "directory_assessment".to_string(),
+            title: Some(unit.name.clone()),
+            excerpt: summarize_directory_for_prompt(unit, response_language),
+            keywords: collect_name_keywords(unit, 6),
+            metadata_lines: vec![
+                format!("name={}", unit.name),
+                format!("relativePath={}", unit.relative_path),
+                "itemType=directory".to_string(),
+            ],
+            warnings: unit
                 .directory_assessment
                 .as_ref()
                 .map(|assessment| assessment.fragmentation_warnings.clone())
-                .unwrap_or_default();
-            (
-                summarize_directory_for_prompt(unit, response_language),
-                false,
-                warnings,
-            )
+                .unwrap_or_default(),
+        };
+    }
+
+    let ext = extension_key(Path::new(&unit.path));
+    match ext.as_str() {
+        ".txt" | ".md" | ".csv" | ".json" | ".yaml" | ".yml" | ".toml" | ".xml" | ".log"
+        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py"
+        | ".java" | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql"
+        | ".sh" | ".bat" | ".ps1" => extract_plain_text_summary(unit),
+        _ if unit.modality == "text" => extract_plain_text_summary(unit),
+        _ => build_empty_extraction(unit, "filename_only_fallback"),
+    }
+}
+
+fn supports_tika_extraction(unit: &OrganizeUnit) -> bool {
+    if unit.item_type != "file" {
+        return false;
+    }
+    let ext = extension_key(Path::new(&unit.path));
+    matches!(
+        ext.as_str(),
+        ".pdf"
+            | ".doc"
+            | ".docx"
+            | ".xls"
+            | ".xlsx"
+            | ".ppt"
+            | ".pptx"
+            | ".rtf"
+            | ".odt"
+            | ".ods"
+            | ".odp"
+            | ".epub"
+    )
+}
+
+async fn tika_extract_text(
+    config: &ExtractionToolConfig,
+    unit: &OrganizeUnit,
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    if !config.tika_enabled || !supports_tika_extraction(unit) {
+        return Err("tika_not_enabled".to_string());
+    }
+    if unit.size > TIKA_MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "tika_input_too_large:{}>{}",
+            unit.size, TIKA_MAX_UPLOAD_BYTES
+        ));
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err("stop_requested".to_string());
+    }
+
+    let body = fs::read(&unit.path).map_err(|e| format!("tika_read_failed:{e}"))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(TIKA_EXTRACT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("tika_client_failed:{e}"))?;
+    let request = client
+        .put(format!("{}/tika", config.tika_url))
+        .header("Accept", "text/plain")
+        .header("Content-Type", "application/octet-stream")
+        .body(body);
+    let request_future = async move {
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("tika_request_failed:{e}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| format!("tika_body_failed:{e}"))?;
+        if !status.is_success() {
+            return Err(format!("tika_http_{}:{}", status.as_u16(), text));
         }
-        _ if unit.modality == "text" => {
-            let snippet = fs::read_to_string(&unit.path)
-                .ok()
-                .map(|content| content.chars().take(1500).collect::<String>())
-                .unwrap_or_default();
-            if snippet.trim().is_empty() {
-                if is_zh_language(response_language) {
-                    (
-                        format!(
-                            "名称={}\n相对路径={}\n大小={}\n创建时间={}\n修改时间={}",
-                            unit.name,
-                            unit.relative_path,
-                            unit.size,
-                            unit.created_at
-                                .clone()
-                                .unwrap_or_else(
-                                    || organizer_unknown_label(response_language).to_string()
-                                ),
-                            unit.modified_at
-                                .clone()
-                                .unwrap_or_else(
-                                    || organizer_unknown_label(response_language).to_string()
-                                )
-                        ),
-                        true,
-                        vec!["text_summary_fallback".to_string()],
-                    )
-                } else {
-                    (
-                        format!(
-                            "name={}\nrelativePath={}\nsize={}\ncreatedAt={}\nmodifiedAt={}",
-                            unit.name,
-                            unit.relative_path,
-                            unit.size,
-                            unit.created_at
-                                .clone()
-                                .unwrap_or_else(
-                                    || organizer_unknown_label(response_language).to_string()
-                                ),
-                            unit.modified_at
-                                .clone()
-                                .unwrap_or_else(
-                                    || organizer_unknown_label(response_language).to_string()
-                                )
-                        ),
-                        true,
-                        vec!["text_summary_fallback".to_string()],
-                    )
+        Ok(text)
+    };
+    tokio::pin!(request_future);
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("stop_requested".to_string());
+        }
+        tokio::select! {
+            result = &mut request_future => return result,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+}
+
+async fn extract_unit_content_for_summary_with_tools(
+    unit: &OrganizeUnit,
+    response_language: &str,
+    stop: &AtomicBool,
+    extraction_tool: &ExtractionToolConfig,
+) -> SummaryExtraction {
+    if extraction_tool.tika_enabled && supports_tika_extraction(unit) {
+        match tika_extract_text(extraction_tool, unit, stop).await {
+            Ok(text) => {
+                let excerpt = normalize_multiline_text(&text, LOCAL_TEXT_EXCERPT_CHARS);
+                if !excerpt.trim().is_empty() {
+                    return SummaryExtraction {
+                        parser: "tika".to_string(),
+                        title: Some(unit.name.clone()),
+                        excerpt,
+                        keywords: collect_name_keywords(unit, 6),
+                        metadata_lines: vec![
+                            format!("name={}", unit.name),
+                            format!("relativePath={}", unit.relative_path),
+                            format!("itemType={}", unit.item_type),
+                            format!("modality={}", unit.modality),
+                            "externalExtractor=tika".to_string(),
+                        ],
+                        warnings: Vec::new(),
+                    };
                 }
-            } else {
-                (snippet, false, Vec::new())
+                return build_empty_extraction_with_warnings(
+                    unit,
+                    vec!["tika_empty_text".to_string(), "filename_only_fallback".to_string()],
+                );
+            }
+            Err(err) if err == "stop_requested" => {
+                return build_empty_extraction(unit, "stop_requested");
+            }
+            Err(err) => {
+                let mut fallback = extract_unit_content_for_summary(unit, response_language, stop);
+                fallback.warnings.push(err);
+                return fallback;
             }
         }
-        _ => {
-            if is_zh_language(response_language) {
-                (
-                    format!(
-                        "名称={}\n相对路径={}\n模态={}\n大小={}\n创建时间={}\n修改时间={}",
-                        unit.name,
-                        unit.relative_path,
-                        unit.modality,
-                        unit.size,
-                        unit.created_at
-                            .clone()
-                            .unwrap_or_else(
-                                || organizer_unknown_label(response_language).to_string()
-                            ),
-                        unit.modified_at
-                            .clone()
-                            .unwrap_or_else(
-                                || organizer_unknown_label(response_language).to_string()
-                            )
-                    ),
-                    true,
-                    vec!["metadata_only_summary".to_string()],
-                )
-            } else {
-                (
-                    format!(
-                        "name={}\nrelativePath={}\nmodality={}\nsize={}\ncreatedAt={}\nmodifiedAt={}",
-                        unit.name,
-                        unit.relative_path,
-                        unit.modality,
-                        unit.size,
-                        unit.created_at
-                            .clone()
-                            .unwrap_or_else(|| organizer_unknown_label(response_language).to_string()),
-                        unit.modified_at
-                            .clone()
-                            .unwrap_or_else(|| organizer_unknown_label(response_language).to_string())
-                    ),
-                    true,
-                    vec!["metadata_only_summary".to_string()],
-                )
-            }
-        }
+    }
+    extract_unit_content_for_summary(unit, response_language, stop)
+}
+
+fn build_local_summary(
+    unit: &OrganizeUnit,
+    extracted: &SummaryExtraction,
+) -> SummaryBuildResult {
+    if unit.item_type != "directory" && extracted.excerpt.trim().is_empty() {
+        return SummaryBuildResult {
+            summary: String::new(),
+            source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
+            degraded: true,
+            warnings: extracted.warnings.clone(),
+            confidence: None,
+        };
+    }
+
+    let mut lines = vec![
+        format!("name={}", unit.name),
+        format!("relativePath={}", unit.relative_path),
+        format!("itemType={}", unit.item_type),
+        format!("modality={}", unit.modality),
+        format!("parser={}", extracted.parser),
+    ];
+    if let Some(title) = extracted.title.as_ref().filter(|value| !value.trim().is_empty()) {
+        lines.push(format!(
+            "title={}",
+            trim_to_chars(title, LOCAL_SUMMARY_EXCERPT_CHARS)
+        ));
+    }
+    if !extracted.keywords.is_empty() {
+        lines.push(format!(
+            "keywords={}",
+            trim_to_chars(&extracted.keywords.join(", "), LOCAL_SUMMARY_EXCERPT_CHARS)
+        ));
+    }
+    lines.extend(extracted.metadata_lines.iter().cloned());
+    if !extracted.excerpt.trim().is_empty() {
+        lines.push(format!(
+            "excerpt={}",
+            trim_to_chars(&normalize_multiline_text(&extracted.excerpt, LOCAL_TEXT_EXCERPT_CHARS), LOCAL_SUMMARY_EXCERPT_CHARS)
+        ));
+    }
+
+    SummaryBuildResult {
+        summary: lines.join("\n"),
+        source: SUMMARY_SOURCE_LOCAL_SUMMARY.to_string(),
+        degraded: false,
+        warnings: extracted.warnings.clone(),
+        confidence: None,
     }
 }
 
@@ -1928,17 +2265,126 @@ fn sanitize_json_block(content: &str) -> String {
         .to_string()
 }
 
+fn append_batch_trace(
+    trace: &mut Vec<String>,
+    round: usize,
+    route: &RouteConfig,
+    outcome: &str,
+    raw_body: &str,
+    message_content: Option<&str>,
+    error_message: Option<&str>,
+) {
+    let mut sections = vec![
+        format!("Round: {}", round),
+        format!("Model: {}/{}", route.endpoint, route.model),
+        format!("Outcome: {}", outcome),
+    ];
+    if let Some(error_message) = error_message.filter(|value| !value.trim().is_empty()) {
+        sections.push(format!("Error: {}", error_message));
+    }
+    if let Some(message_content) = message_content.filter(|value| !value.trim().is_empty()) {
+        sections.push("Message Content:".to_string());
+        sections.push(message_content.to_string());
+    }
+    sections.push("HTTP Raw Response Body:".to_string());
+    sections.push(if raw_body.trim().is_empty() {
+        "(unavailable)".to_string()
+    } else {
+        raw_body.to_string()
+    });
+    trace.push(sections.join("\n"));
+}
+
+fn summarize_response_body_for_error(raw_body: &str) -> String {
+    let trimmed = raw_body.trim();
+    if trimmed.is_empty() {
+        return "empty body".to_string();
+    }
+    let snippet: String = trimmed.chars().take(RESPONSE_ERROR_SNIPPET_CHARS).collect();
+    if trimmed.chars().count() > RESPONSE_ERROR_SNIPPET_CHARS {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
+fn parse_chat_completion_http_body(
+    status: StatusCode,
+    raw_body: &str,
+) -> Result<ChatCompletionOutput, ChatCompletionError> {
+    let body: Value = serde_json::from_str(raw_body).map_err(|e| ChatCompletionError {
+        message: format!(
+            "error decoding response body: {} | body: {}",
+            e,
+            summarize_response_body_for_error(raw_body)
+        ),
+        raw_body: raw_body.to_string(),
+    })?;
+    if !status.is_success() {
+        let api_message = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("classification request failed");
+        return Err(ChatCompletionError {
+            message: format!(
+                "{} (HTTP {})",
+                api_message,
+                status.as_u16()
+            ),
+            raw_body: raw_body.to_string(),
+        });
+    }
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if content.trim().is_empty() {
+        return Err(ChatCompletionError {
+            message: format!(
+                "classification response missing choices[0].message.content | body: {}",
+                summarize_response_body_for_error(raw_body)
+            ),
+            raw_body: raw_body.to_string(),
+        });
+    }
+    let usage = TokenUsage {
+        prompt: body
+            .pointer("/usage/prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        completion: body
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        total: body
+            .pointer("/usage/total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    };
+    Ok(ChatCompletionOutput {
+        raw_body: raw_body.to_string(),
+        content,
+        usage,
+    })
+}
+
 async fn chat_completion(
     route: &RouteConfig,
     system_prompt: &str,
     user_prompt: &str,
     stop: &AtomicBool,
-) -> Result<(String, TokenUsage), String> {
+) -> Result<ChatCompletionOutput, ChatCompletionError> {
     let url = format!("{}/chat/completions", route.endpoint.trim_end_matches('/'));
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(CHAT_COMPLETION_TIMEOUT_SECS))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ChatCompletionError {
+            message: e.to_string(),
+            raw_body: String::new(),
+        })?;
     let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -1958,47 +2404,158 @@ async fn chat_completion(
             .header("api-key", route.api_key.clone());
     }
     let request_future = async move {
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| ChatCompletionError {
+            message: e.to_string(),
+            raw_body: String::new(),
+        })?;
         let status = resp.status();
-        let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("classification request failed")
-                .to_string());
-        }
-        let content = body
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let usage = TokenUsage {
-            prompt: body
-                .pointer("/usage/prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            completion: body
-                .pointer("/usage/completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            total: body
-                .pointer("/usage/total_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        };
-        Ok((content, usage))
+        let raw_body = resp.text().await.map_err(|e| ChatCompletionError {
+            message: format!("error reading response body: {}", e),
+            raw_body: String::new(),
+        })?;
+        parse_chat_completion_http_body(status, &raw_body)
     };
     tokio::pin!(request_future);
 
     loop {
         if stop.load(Ordering::Relaxed) {
-            return Err("stop_requested".to_string());
+            return Err(ChatCompletionError {
+                message: "stop_requested".to_string(),
+                raw_body: String::new(),
+            });
         }
         tokio::select! {
             result = &mut request_future => return result,
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
+    }
+}
+
+fn build_summary_agent_system_prompt(response_language: &str) -> String {
+    let output_language = localized_language_name(response_language, response_language);
+    [
+        "You prepare short standardized summaries for a later file classification step."
+            .to_string(),
+        "Return JSON only.".to_string(),
+        "Schema: {\"items\":[{\"itemId\":\"...\",\"summary\":\"...\",\"keywords\":[\"...\"],\"confidence\":\"high|medium|low\",\"warnings\":[\"...\"]}]}".to_string(),
+        "Cover every input item exactly once and preserve itemId verbatim.".to_string(),
+        "Do not classify, rename, or omit items.".to_string(),
+        format!(
+            "Write summary and warnings in {output_language} only. Keep each summary under about {SUMMARY_AGENT_SUMMARY_CHARS} characters."
+        ),
+        "Use the provided local extraction material first. If content is sparse, say so briefly instead of inventing details.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn parse_summary_agent_output(
+    content: &str,
+) -> Result<HashMap<String, SummaryAgentItem>, String> {
+    let parsed: Value =
+        serde_json::from_str(&sanitize_json_block(content)).map_err(|e| e.to_string())?;
+    let items = parsed
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "summary agent response missing items".to_string())?;
+    let mut out = HashMap::new();
+    for item in items {
+        let Some(item_id) = item.get("itemId").and_then(Value::as_str) else {
+            continue;
+        };
+        let summary = item
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let keywords = item
+            .get("keywords")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+            .filter(|value| !value.is_empty())
+            .take(8)
+            .collect::<Vec<_>>();
+        let warnings = item
+            .get("warnings")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+            .filter(|value| !value.is_empty())
+            .take(8)
+            .collect::<Vec<_>>();
+        out.insert(
+            item_id.to_string(),
+            SummaryAgentItem {
+                summary,
+                keywords,
+                confidence: sanitize_summary_confidence(
+                    item.get("confidence").and_then(Value::as_str),
+                ),
+                warnings,
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn summarize_batch_with_agent(
+    text_route: &RouteConfig,
+    response_language: &str,
+    stop: &AtomicBool,
+    batch_rows: &[Value],
+) -> SummaryAgentBatchOutput {
+    if text_route.api_key.trim().is_empty() {
+        return SummaryAgentBatchOutput {
+            items: HashMap::new(),
+            usage: TokenUsage::default(),
+            error: Some("summary_agent_missing_api_key".to_string()),
+        };
+    }
+
+    let system_prompt = build_summary_agent_system_prompt(response_language);
+    let payload = json!({
+        "mode": SUMMARY_MODE_AGENT_SUMMARY,
+        "outputLanguage": localized_language_name(response_language, response_language),
+        "fileIndex": batch_rows.iter().map(|row| json!({
+            "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+            "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+            "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+            "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+        })).collect::<Vec<_>>(),
+        "items": batch_rows.iter().map(|row| json!({
+            "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+            "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+            "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+            "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+            "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
+        })).collect::<Vec<_>>(),
+    });
+
+    match chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await {
+        Ok(output) => match parse_summary_agent_output(&output.content) {
+            Ok(items) => SummaryAgentBatchOutput {
+                items,
+                usage: output.usage,
+                error: None,
+            },
+            Err(err) => SummaryAgentBatchOutput {
+                items: HashMap::new(),
+                usage: output.usage,
+                error: Some(format!("summary_agent_parse_failed:{err}")),
+            },
+        },
+        Err(err) => SummaryAgentBatchOutput {
+            items: HashMap::new(),
+            usage: TokenUsage::default(),
+            error: Some(err.message),
+        },
     }
 }
 
@@ -2010,6 +2567,8 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
         "Final schema: {\"tree\":{...},\"assignments\":[{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}]}".to_string(),
         "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
         "When an item summary includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the summary clearly shows unrelated mixed content.".to_string(),
+        "Some items may have an empty summary and only provide file name, path, type, or modality. In that case, classify using those fields instead of assuming missing content.".to_string(),
+        "Prefer using summary first when it exists; otherwise fall back to name, relativePath, itemType, and modality.".to_string(),
         format!("Use {output_language} names and keep labels short."),
         format!("The assignment \"reason\" field must be written in {output_language} only."),
     ];
@@ -2032,14 +2591,15 @@ async fn classify_organize_batch(
     reference_structure: Option<&String>,
     use_web_search: bool,
     search_api_key: &str,
-) -> Result<(Value, TokenUsage, Value), String> {
+) -> Result<ClassifyOrganizeBatchOutput, String> {
     let search_allowed = use_web_search && !search_api_key.trim().is_empty();
     let mut total_usage = TokenUsage::default();
     let mut search_context = None::<String>;
-    let mut search_trace = Value::Null;
+    let mut round_trace = Vec::new();
     let max_rounds = if search_allowed { 2 } else { 1 };
 
-    for _round in 0..max_rounds {
+    for round_idx in 0..max_rounds {
+        let round = round_idx + 1;
         let system_prompt = build_organize_system_prompt(
             response_language,
             search_allowed && search_context.is_none(),
@@ -2047,6 +2607,14 @@ async fn classify_organize_batch(
         let mut payload = json!({
             "maxClusterDepth": max_cluster_depth,
             "existingTree": category_tree_to_value(existing_tree),
+            "fileIndex": batch_rows.iter().map(|row| json!({
+                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
+            })).collect::<Vec<_>>(),
             "items": batch_rows,
             "useWebSearch": use_web_search,
         });
@@ -2059,37 +2627,87 @@ async fn classify_organize_batch(
                 Value::String("Return the final tree and assignments JSON only.".to_string());
         }
 
-        let (content, usage) =
-            chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await?;
-        total_usage.prompt = total_usage.prompt.saturating_add(usage.prompt);
-        total_usage.completion = total_usage.completion.saturating_add(usage.completion);
-        total_usage.total = total_usage.total.saturating_add(usage.total);
+        let completion = match chat_completion(text_route, &system_prompt, &payload.to_string(), stop)
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                append_batch_trace(
+                    &mut round_trace,
+                    round,
+                    text_route,
+                    "http_error",
+                    &err.raw_body,
+                    None,
+                    Some(&err.message),
+                );
+                return Ok(ClassifyOrganizeBatchOutput {
+                    parsed: None,
+                    usage: total_usage,
+                    raw_output: round_trace.join("\n\n====================\n\n"),
+                    error: Some(err.message),
+                });
+            }
+        };
+        total_usage.prompt = total_usage.prompt.saturating_add(completion.usage.prompt);
+        total_usage.completion = total_usage
+            .completion
+            .saturating_add(completion.usage.completion);
+        total_usage.total = total_usage.total.saturating_add(completion.usage.total);
+        append_batch_trace(
+            &mut round_trace,
+            round,
+            text_route,
+            "http_ok",
+            &completion.raw_body,
+            Some(&completion.content),
+            None,
+        );
 
-        let parsed = serde_json::from_str::<Value>(&sanitize_json_block(&content))
+        let parsed = serde_json::from_str::<Value>(&sanitize_json_block(&completion.content))
             .unwrap_or_else(|_| json!({}));
         if search_allowed && search_context.is_none() {
             if let Some(request) = parse_web_search_request(&parsed) {
                 let trace = tavily_search(search_api_key, &request).await?;
                 search_context = Some(format_web_search_context(&trace, response_language));
-                search_trace = web_search_trace_to_value(&trace);
                 continue;
             }
         }
 
         if parsed.get("tree").is_some() || parsed.get("assignments").is_some() {
-            return Ok((parsed, total_usage, search_trace));
+            return Ok(ClassifyOrganizeBatchOutput {
+                parsed: Some(parsed),
+                usage: total_usage,
+                raw_output: round_trace.join("\n\n====================\n\n"),
+                error: None,
+            });
         }
 
-        return Err("classification response is not valid JSON schema".to_string());
+        return Ok(ClassifyOrganizeBatchOutput {
+            parsed: None,
+            usage: total_usage,
+            raw_output: round_trace.join("\n\n====================\n\n"),
+            error: Some("classification response is not valid JSON schema".to_string()),
+        });
     }
 
-    Err("model requested web search but did not return final batch assignments".to_string())
+    Ok(ClassifyOrganizeBatchOutput {
+        parsed: None,
+        usage: total_usage,
+        raw_output: round_trace.join("\n\n====================\n\n"),
+        error: Some(
+            "model requested web search but did not return final batch assignments".to_string(),
+        ),
+    })
 }
 
 fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
     let mut used = HashSet::new();
     let mut out = Vec::new();
     for row in results {
+        if row_has_classification_error(row) {
+            continue;
+        }
         let category_path = category_path_from_value(row.get("categoryPath"));
         let mut target_dir = PathBuf::from(root_path);
         for segment in if category_path.is_empty() {
@@ -2207,11 +2825,7 @@ fn prune_empty_dirs_upward(start_dir: &Path, stop_dir: &Path) {
 }
 
 fn build_apply_plan(snapshot: &OrganizeSnapshot) -> Vec<Value> {
-    let preview_rows = if snapshot.preview.is_empty() {
-        build_preview(&snapshot.root_path, &snapshot.results)
-    } else {
-        snapshot.preview.clone()
-    };
+    let preview_rows = build_preview(&snapshot.root_path, &snapshot.results);
 
     let mut plan = preview_rows
         .into_iter()
@@ -2308,6 +2922,7 @@ async fn run_organize_task<R: Runtime>(
         recursive,
         excluded,
         batch_size,
+        summary_mode,
         max_cluster_depth,
         use_web_search,
         reference_original_structure,
@@ -2318,6 +2933,7 @@ async fn run_organize_task<R: Runtime>(
             snap.recursive,
             snap.excluded_patterns.clone(),
             snap.batch_size,
+            snap.summary_mode.clone(),
             snap.max_cluster_depth,
             snap.use_web_search,
             snap.reference_original_structure,
@@ -2380,7 +2996,11 @@ async fn run_organize_task<R: Runtime>(
         }
 
         let mut batch_rows = Vec::new();
+        let mut local_results = Vec::new();
         for (offset, unit) in batch.iter().enumerate() {
+            if task.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let route_key = if unit.item_type == "directory" {
                 "text"
             } else {
@@ -2396,8 +3016,41 @@ async fn run_organize_task<R: Runtime>(
                     api_key: String::new(),
                     model: "gpt-4o-mini".to_string(),
                 });
-            let (summary, degraded, warnings) =
-                summarize_unit_for_batch(unit, &task.response_language);
+            let extracted = match summary_mode.as_str() {
+                SUMMARY_MODE_FILENAME_ONLY => None,
+                _ => Some(
+                    extract_unit_content_for_summary_with_tools(
+                        unit,
+                        &task.response_language,
+                        &task.stop,
+                        &task.extraction_tool,
+                    )
+                    .await,
+                ),
+            };
+            let local_result = match summary_mode.as_str() {
+                SUMMARY_MODE_FILENAME_ONLY => SummaryBuildResult {
+                    summary: String::new(),
+                    source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
+                    degraded: false,
+                    warnings: Vec::new(),
+                    confidence: None,
+                },
+                _ => build_local_summary(
+                    unit,
+                    extracted.as_ref().unwrap_or(&SummaryExtraction::default()),
+                ),
+            };
+            let extraction_json = extracted.as_ref().map(|value| {
+                json!({
+                    "parser": value.parser,
+                    "title": value.title,
+                    "excerpt": value.excerpt,
+                    "keywords": value.keywords,
+                    "metadata": value.metadata_lines,
+                    "warnings": value.warnings,
+                })
+            }).unwrap_or(Value::Null);
             batch_rows.push(json!({
                 "itemId": format!("batch{}_{}", batch_idx + 1, offset + 1),
                 "name": unit.name,
@@ -2408,16 +3061,111 @@ async fn run_organize_task<R: Runtime>(
                 "modifiedAt": unit.modified_at,
                 "itemType": unit.item_type,
                 "modality": unit.modality,
-                "summary": summary,
-                "summaryDegraded": degraded,
-                "summaryWarnings": warnings,
+                "summaryMode": summary_mode.clone(),
+                "summary": local_result.summary,
+                "summarySource": local_result.source,
+                "summaryConfidence": local_result.confidence,
+                "summaryKeywords": extracted
+                    .as_ref()
+                    .map(|value| Value::Array(value.keywords.iter().cloned().map(Value::String).collect::<Vec<_>>()))
+                    .unwrap_or(Value::Array(Vec::new())),
+                "summaryDegraded": local_result.degraded,
+                "summaryWarnings": local_result.warnings,
+                "localExtraction": extraction_json,
                 "provider": route.endpoint,
                 "model": route.model,
             }));
+            local_results.push(local_result);
+        }
+
+        let mut summary_usage = TokenUsage::default();
+        if summary_mode == SUMMARY_MODE_AGENT_SUMMARY {
+            let output = summarize_batch_with_agent(
+                &text_route,
+                &task.response_language,
+                &task.stop,
+                &batch_rows,
+            )
+            .await;
+            summary_usage = output.usage;
+            let batch_failed_warning = output
+                .error
+                .clone()
+                .unwrap_or_else(|| "summary_agent_missing_items".to_string());
+            for (idx, row) in batch_rows.iter_mut().enumerate() {
+                let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
+                let local_result = local_results
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut warnings = row
+                    .get("summaryWarnings")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(|item| item.to_string()))
+                    .collect::<Vec<_>>();
+                let fallback_source = if local_result.source == SUMMARY_SOURCE_FILENAME_ONLY {
+                    SUMMARY_SOURCE_FILENAME_ONLY
+                } else {
+                    SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL
+                };
+
+                if let Some(agent_item) = output
+                    .error
+                    .is_none()
+                    .then(|| output.items.get(item_id))
+                    .flatten()
+                    .filter(|item| !item.summary.trim().is_empty())
+                {
+                    warnings.extend(agent_item.warnings.clone());
+                    row["summary"] = Value::String(agent_item.summary.clone());
+                    row["summarySource"] = Value::String(SUMMARY_SOURCE_AGENT_SUMMARY.to_string());
+                    row["summaryConfidence"] = agent_item
+                        .confidence
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null);
+                    row["summaryKeywords"] = Value::Array(
+                        agent_item
+                            .keywords
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect::<Vec<_>>(),
+                    );
+                    row["summaryDegraded"] = Value::Bool(local_result.degraded);
+                    row["summaryWarnings"] = Value::Array(
+                        warnings
+                            .into_iter()
+                            .map(Value::String)
+                            .collect::<Vec<_>>(),
+                    );
+                } else {
+                    warnings.push(batch_failed_warning.clone());
+                    row["summary"] = Value::String(local_result.summary);
+                    row["summarySource"] = Value::String(fallback_source.to_string());
+                    row["summaryConfidence"] = Value::Null;
+                    row["summaryKeywords"] = row
+                        .get("summaryKeywords")
+                        .cloned()
+                        .unwrap_or(Value::Array(Vec::new()));
+                    row["summaryDegraded"] = Value::Bool(true);
+                    row["summaryWarnings"] = Value::Array(
+                        warnings
+                            .into_iter()
+                            .map(Value::String)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
         }
 
         let mut cluster_usage = TokenUsage::default();
         let mut cluster_failed = false;
+        let mut cluster_raw_output = String::new();
+        let mut cluster_error = String::new();
         let mut assignment_map: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
 
         if !text_route.api_key.trim().is_empty() {
@@ -2434,100 +3182,14 @@ async fn run_organize_task<R: Runtime>(
             )
             .await
             {
-                Ok((parsed, usage, _search_trace)) => {
-                    cluster_usage = usage;
-                    tree = normalize_ai_tree(&parsed, &tree);
-                    ensure_uncategorized_leaf(&mut tree);
-                    for assignment in parsed
-                        .get("assignments")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                    {
-                        let Some(item_id) = assignment.get("itemId").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let mut category_path = category_path_from_value(
-                            assignment
-                                .get("categoryPath")
-                                .or_else(|| assignment.get("leafPath")),
-                        );
-                        let leaf_node_id = if let Some(node_id) =
-                            assignment.get("leafNodeId").and_then(Value::as_str)
-                        {
-                            if let Some(path) = category_path_for_id(&tree, node_id) {
-                                category_path = path;
-                                node_id.to_string()
-                            } else if !category_path.is_empty() {
-                                ensure_path(&mut tree, &category_path)
-                            } else {
-                                ensure_uncategorized_leaf(&mut tree)
-                            }
-                        } else if !category_path.is_empty() {
-                            ensure_path(&mut tree, &category_path)
-                        } else {
-                            ensure_uncategorized_leaf(&mut tree)
-                        };
-                        if category_path.is_empty() {
-                            category_path = category_path_for_id(&tree, &leaf_node_id)
-                                .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
-                        }
-                        assignment_map.insert(
-                            item_id.to_string(),
-                            (
-                                leaf_node_id,
-                                category_path,
-                                assignment
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                            ),
-                        );
+                Ok(output) => {
+                    cluster_usage = output.usage;
+                    cluster_raw_output = output.raw_output;
+                    if let Some(search_error) = output.error {
+                        cluster_failed = true;
+                        cluster_error = search_error;
                     }
-                }
-                Err(_) => {
-                    cluster_failed = true;
-                }
-            }
-        } else if false {
-            cluster_failed = true;
-        }
-
-        if false && !text_route.api_key.trim().is_empty() {
-            let system_prompt = if is_zh_language(&task.response_language) {
-                format!(
-                    "你需要把一批文件摘要聚成一个分层分类树。只能返回 JSON，输出结构为 {{\"tree\":{{...}},\"assignments\":[{{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}}]}}。现有节点已经有稳定的 nodeId；当你复用、重命名或移动已有节点时，必须保留原 nodeId。分类名称请使用{}，并保持简短。",
-                    localized_language_name(&task.response_language, &task.response_language)
-                )
-            } else {
-                format!(
-                    "You cluster file summaries into a hierarchical category tree. Return JSON only with schema {{\"tree\":{{...}},\"assignments\":[{{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}}]}}. Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes. Use {} names and keep labels short.",
-                    localized_language_name(&task.response_language, &task.response_language)
-                )
-            };
-            let mut payload = json!({
-                "maxClusterDepth": max_cluster_depth,
-                "existingTree": category_tree_to_value(&tree),
-                "items": batch_rows,
-                "useWebSearch": use_web_search,
-            });
-            if let Some(structure) = reference_structure.as_ref() {
-                payload["referenceStructure"] = Value::String(structure.clone());
-            }
-            match chat_completion(
-                &text_route,
-                &system_prompt,
-                &payload.to_string(),
-                &task.stop,
-            )
-            .await
-            {
-                Ok((content, usage)) => {
-                    cluster_usage = usage;
-                    if let Ok(parsed) =
-                        serde_json::from_str::<Value>(&sanitize_json_block(&content))
-                    {
+                    if let Some(parsed) = output.parsed {
                         tree = normalize_ai_tree(&parsed, &tree);
                         ensure_uncategorized_leaf(&mut tree);
                         for assignment in parsed
@@ -2578,33 +3240,55 @@ async fn run_organize_task<R: Runtime>(
                                 ),
                             );
                         }
-                    } else {
-                        cluster_failed = true;
+                        if assignment_map.len() < batch_rows.len() {
+                            cluster_failed = true;
+                            if cluster_error.is_empty() {
+                                cluster_error = format!(
+                                    "classification response missing assignments for {} item(s)",
+                                    batch_rows.len().saturating_sub(assignment_map.len())
+                                );
+                            }
+                            assignment_map.clear();
+                        }
                     }
                 }
-                Err(_) => {
+                Err(err) => {
                     cluster_failed = true;
+                    cluster_error = err;
                 }
             }
-        } else {
-            cluster_failed = true;
         }
         if task.stop.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        for row in batch_rows {
+        for (row_offset, row) in batch_rows.into_iter().enumerate() {
             if task.stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
             let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
-            let (leaf_node_id, category_path, reason) =
-                assignment_map.get(item_id).cloned().unwrap_or_else(|| {
-                    let leaf = ensure_uncategorized_leaf(&mut tree);
-                    let path = category_path_for_id(&tree, &leaf)
-                        .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
-                    (leaf, path, "fallback_uncategorized".to_string())
-                });
+            let (leaf_node_id, category_path, category, reason) = if cluster_failed {
+                (
+                    String::new(),
+                    Vec::new(),
+                    CATEGORY_CLASSIFICATION_ERROR.to_string(),
+                    RESULT_REASON_CLASSIFICATION_ERROR.to_string(),
+                )
+            } else {
+                let (leaf_node_id, category_path, reason) =
+                    assignment_map.get(item_id).cloned().unwrap_or_else(|| {
+                        let leaf = ensure_uncategorized_leaf(&mut tree);
+                        let path = category_path_for_id(&tree, &leaf)
+                            .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
+                        (leaf, path, "fallback_uncategorized".to_string())
+                    });
+                (
+                    leaf_node_id,
+                    category_path.clone(),
+                    category_path_display(&category_path),
+                    reason,
+                )
+            };
             let warnings = row
                 .get("summaryWarnings")
                 .and_then(Value::as_array)
@@ -2617,21 +3301,28 @@ async fn run_organize_task<R: Runtime>(
             let result_row = json!({
                 "taskId": task.snapshot.lock().id,
                 "index": next_index,
+                "batchIndex": (batch_idx + 1) as u64,
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
                 "path": row.get("path").and_then(Value::as_str).unwrap_or(""),
                 "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
                 "size": row.get("size").and_then(Value::as_u64).unwrap_or(0),
                 "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                "summaryMode": row.get("summaryMode").cloned().unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
                 "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
+                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
+                "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
+                "summaryKeywords": row.get("summaryKeywords").cloned().unwrap_or(Value::Array(Vec::new())),
                 "leafNodeId": leaf_node_id,
                 "categoryPath": category_path,
-                "category": category_path_display(&category_path),
+                "category": category,
                 "reason": reason,
                 "degraded": cluster_failed || row.get("summaryDegraded").and_then(Value::as_bool).unwrap_or(false),
                 "warnings": warnings,
                 "provider": row.get("provider").and_then(Value::as_str).unwrap_or(""),
                 "model": row.get("model").and_then(Value::as_str).unwrap_or(""),
+                "classificationError": if row_offset == 0 { cluster_error.clone() } else { String::new() },
+                "modelRawOutput": if row_offset == 0 { cluster_raw_output.clone() } else { String::new() },
             });
             persist::upsert_organize_result(&state.db_path, &task.snapshot.lock().id, &result_row)?;
             {
@@ -2648,12 +3339,21 @@ async fn run_organize_task<R: Runtime>(
             snap.tree = category_tree_to_value(&tree);
             snap.tree_version = snap.tree_version.saturating_add(1);
             snap.processed_batches = (batch_idx + 1) as u64;
-            snap.token_usage.prompt = snap.token_usage.prompt.saturating_add(cluster_usage.prompt);
+            snap.token_usage.prompt = snap
+                .token_usage
+                .prompt
+                .saturating_add(summary_usage.prompt)
+                .saturating_add(cluster_usage.prompt);
             snap.token_usage.completion = snap
                 .token_usage
                 .completion
+                .saturating_add(summary_usage.completion)
                 .saturating_add(cluster_usage.completion);
-            snap.token_usage.total = snap.token_usage.total.saturating_add(cluster_usage.total);
+            snap.token_usage.total = snap
+                .token_usage
+                .total
+                .saturating_add(summary_usage.total)
+                .saturating_add(cluster_usage.total);
         }
         emit_snapshot(app, state, task).await?;
     }
@@ -2706,6 +3406,12 @@ pub async fn organize_start<R: Runtime>(
         return Err("rootPath is required".to_string());
     }
     let task_id = format!("org_{}", Uuid::new_v4().simple());
+    let settings = crate::backend::read_settings(&state.settings_path);
+    let extraction_tool = extraction_tool_config_from_settings(&settings);
+    let normalized_summary_mode = normalize_summary_mode(input.summary_mode.as_deref());
+    if normalized_summary_mode != SUMMARY_MODE_FILENAME_ONLY {
+        ensure_tika_server_running(state.inner(), &extraction_tool).await?;
+    }
     let routes = parse_routes(&input.model_routing);
     let text_route = routes.get("text").cloned().unwrap_or(RouteConfig {
         endpoint: "https://api.openai.com/v1".to_string(),
@@ -2724,6 +3430,7 @@ pub async fn organize_start<R: Runtime>(
         reference_original_structure: input.reference_original_structure.unwrap_or(false),
         excluded_patterns: normalize_excluded(input.excluded_patterns.clone()),
         batch_size: normalize_batch_size(input.batch_size),
+        summary_mode: normalized_summary_mode,
         max_cluster_depth: input.max_cluster_depth.filter(|value| *value > 0),
         use_web_search: input.use_web_search.unwrap_or(false),
         web_search_enabled: input.use_web_search.unwrap_or(false)
@@ -2762,6 +3469,7 @@ pub async fn organize_start<R: Runtime>(
         routes,
         search_api_key: input.search_api_key.unwrap_or_default(),
         response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
+        extraction_tool,
         job: Mutex::new(None),
     });
     state
@@ -2797,6 +3505,7 @@ pub async fn organize_start<R: Runtime>(
     *task.job.lock() = Some(handle);
     Ok(json!({
         "taskId": task_id,
+        "summaryMode": snapshot.summary_mode,
         "selectedModel": snapshot.selected_model,
         "selectedModels": snapshot.selected_models,
         "selectedProviders": snapshot.selected_providers,
@@ -2804,7 +3513,11 @@ pub async fn organize_start<R: Runtime>(
     }))
 }
 
-pub async fn organize_stop(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
+pub async fn organize_stop<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Value, String> {
     let task = state
         .organize_tasks
         .lock()
@@ -2812,6 +3525,13 @@ pub async fn organize_stop(state: State<'_, AppState>, task_id: String) -> Resul
         .cloned()
         .ok_or_else(|| "Task not found".to_string())?;
     task.stop.store(true, Ordering::Relaxed);
+    {
+        let mut snapshot = task.snapshot.lock();
+        if matches!(snapshot.status.as_str(), "scanning" | "classifying") {
+            snapshot.status = "stopping".to_string();
+        }
+    }
+    emit_snapshot(&app, state.inner(), &task).await?;
     Ok(json!({ "success": true }))
 }
 
@@ -3115,6 +3835,36 @@ mod tests {
         fs::write(path, b"test").expect("write file");
     }
 
+    fn write_text_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, content.as_bytes()).expect("write text file");
+    }
+
+    fn make_test_unit(path: &Path) -> OrganizeUnit {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        OrganizeUnit {
+            name,
+            path: path.to_string_lossy().to_string(),
+            relative_path: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            size: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+            created_at: None,
+            modified_at: None,
+            item_type: "file".to_string(),
+            modality: "text".to_string(),
+            directory_assessment: None,
+        }
+    }
+
     #[test]
     fn ensure_path_creates_nested_tree() {
         let mut tree = default_tree();
@@ -3139,6 +3889,161 @@ mod tests {
             preview[0].get("targetPath").and_then(Value::as_str),
             Some(r"C:\root\group\leaf\foo.txt")
         );
+    }
+
+    #[test]
+    fn build_preview_skips_classification_error_rows() {
+        let preview = build_preview(
+            r"C:\root",
+            &[
+                json!({
+                    "name": "bad.txt",
+                    "path": r"C:\root\bad.txt",
+                    "itemType": "file",
+                    "reason": RESULT_REASON_CLASSIFICATION_ERROR,
+                    "category": CATEGORY_CLASSIFICATION_ERROR
+                }),
+                json!({
+                    "name": "good.txt",
+                    "path": r"C:\root\good.txt",
+                    "itemType": "file",
+                    "leafNodeId": "leaf",
+                    "categoryPath": ["group", "leaf"]
+                }),
+            ],
+        );
+        assert_eq!(preview.len(), 1);
+        assert_eq!(
+            preview[0].get("sourcePath").and_then(Value::as_str),
+            Some(r"C:\root\good.txt")
+        );
+    }
+
+    #[test]
+    fn build_apply_plan_skips_classification_error_rows_even_if_preview_is_stale() {
+        let snapshot = OrganizeSnapshot {
+            id: "task_1".to_string(),
+            status: "completed".to_string(),
+            error: None,
+            root_path: r"C:\root".to_string(),
+            recursive: true,
+            reference_original_structure: false,
+            excluded_patterns: Vec::new(),
+            batch_size: 20,
+            summary_mode: SUMMARY_MODE_FILENAME_ONLY.to_string(),
+            max_cluster_depth: None,
+            use_web_search: false,
+            web_search_enabled: false,
+            selected_model: "deepseek-chat".to_string(),
+            selected_models: json!({}),
+            selected_providers: json!({}),
+            supports_multimodal: false,
+            tree: json!({}),
+            tree_version: 0,
+            processed_files: 1,
+            total_files: 1,
+            processed_batches: 1,
+            total_batches: 1,
+            token_usage: TokenUsage::default(),
+            results: vec![json!({
+                "name": "bad.txt",
+                "path": r"C:\root\bad.txt",
+                "itemType": "file",
+                "reason": RESULT_REASON_CLASSIFICATION_ERROR,
+                "category": CATEGORY_CLASSIFICATION_ERROR
+            })],
+            preview: vec![json!({
+                "sourcePath": r"C:\root\bad.txt",
+                "category": CATEGORY_OTHER_PENDING,
+                "categoryPath": ["鍏朵粬寰呭畾"],
+                "leafNodeId": "leaf",
+                "targetPath": r"C:\root\鍏朵粬寰呭畾\bad.txt",
+                "itemType": "file"
+            })],
+            created_at: "2026-03-28T00:00:00Z".to_string(),
+            completed_at: None,
+            job_id: None,
+        };
+        let plan = build_apply_plan(&snapshot);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn normalize_summary_mode_defaults_to_filename_only() {
+        assert_eq!(
+            normalize_summary_mode(None),
+            SUMMARY_MODE_FILENAME_ONLY.to_string()
+        );
+        assert_eq!(
+            normalize_summary_mode(Some("local_summary")),
+            SUMMARY_MODE_LOCAL_SUMMARY.to_string()
+        );
+        assert_eq!(
+            normalize_summary_mode(Some("agent_summary")),
+            SUMMARY_MODE_AGENT_SUMMARY.to_string()
+        );
+        assert_eq!(
+            normalize_summary_mode(Some("bad-mode")),
+            SUMMARY_MODE_FILENAME_ONLY.to_string()
+        );
+    }
+
+    #[test]
+    fn local_summary_skips_large_plain_text_inputs() {
+        let root = temp_dir("large-text-summary");
+        let path = root.join("notes.txt");
+        write_text_file(&path, "small content");
+        let mut unit = make_test_unit(&path);
+        unit.size = LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES + 1;
+        let extracted = extract_plain_text_summary(&unit);
+        assert!(extracted.excerpt.is_empty());
+        assert!(extracted
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("summary_input_too_large:")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_summary_falls_back_to_filename_for_unsupported_file() {
+        let root = temp_dir("filename-fallback");
+        let path = root.join("archive.bin");
+        write_text_file(&path, "not actually parsed");
+        let mut unit = make_test_unit(&path);
+        unit.modality = "binary".to_string();
+        let stop = AtomicBool::new(false);
+        let extracted = extract_unit_content_for_summary(&unit, "zh-CN", &stop);
+        let summary = build_local_summary(&unit, &extracted);
+        assert!(extracted.excerpt.is_empty());
+        assert_eq!(summary.source, SUMMARY_SOURCE_FILENAME_ONLY);
+        assert!(summary.degraded);
+        assert!(summary.summary.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_summary_agent_output_reads_items() {
+        let parsed = parse_summary_agent_output(
+            r#"{
+                "items": [
+                    {
+                        "itemId": "batch1_1",
+                        "summary": "预算表，包含项目负责人和金额。",
+                        "keywords": ["预算", "项目", "金额"],
+                        "confidence": "high",
+                        "warnings": ["source_sparse"]
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse summary agent output");
+        let item = parsed.get("batch1_1").expect("item exists");
+        assert_eq!(item.summary, "预算表，包含项目负责人和金额。");
+        assert_eq!(item.keywords, vec!["预算", "项目", "金额"]);
+        assert_eq!(item.confidence.as_deref(), Some("high"));
+        assert_eq!(item.warnings, vec!["source_sparse"]);
     }
 
     #[test]
@@ -3209,7 +4114,7 @@ mod tests {
     #[test]
     fn evaluates_whole_for_document_bundle_directory() {
         let root = temp_dir("doc-bundle");
-        fs::create_dir_all(root.join("我的女友孟飘渺（待续）")).expect("create child dir");
+        fs::create_dir_all(root.join("我的女友是冒险游戏（待续）")).expect("create child dir");
         for idx in 0..8 {
             write_file(&root.join(format!("chapter-{idx}.txt")));
         }
@@ -3246,14 +4151,13 @@ mod tests {
         );
 
         let units = collect_units(&root, true, &normalize_excluded(None), &stop);
-        assert!(
-            units.iter()
-                .any(|unit| unit.item_type == "directory" && unit.relative_path.ends_with("DwnlData\\32858"))
-        );
-        assert!(
-            !units.iter()
-                .any(|unit| unit.item_type == "directory" && unit.relative_path == "DwnlData")
-        );
+        assert!(units
+            .iter()
+            .any(|unit| unit.item_type == "directory"
+                && unit.relative_path.ends_with("DwnlData\\32858")));
+        assert!(!units
+            .iter()
+            .any(|unit| unit.item_type == "directory" && unit.relative_path == "DwnlData"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3331,8 +4235,8 @@ mod tests {
         write_file(&root.join("Dism++x64.exe"));
         write_file(&root.join("Dism++x86.exe"));
         write_file(&root.join("ReadMe for NCleaner.txt"));
-        write_file(&root.join("双击 Dism++x86 即可运行.txt"));
-        write_file(&root.join("请先解压，然后再运行！！！.txt"));
+        write_file(&root.join("ReadMe for Dism++x86.txt"));
+        write_file(&root.join("Dism++x86 usage notes.txt"));
 
         let stop = AtomicBool::new(false);
         let assessment =
@@ -3345,8 +4249,8 @@ mod tests {
 
     #[test]
     fn evaluates_whole_for_cursor_theme_pack_directory() {
-        let root = temp_dir("cursor-pack").join("Nagasaki Soyo-长崎素世");
-        fs::create_dir_all(root.join("可替换（需手动）")).expect("create alt dir");
+        let root = temp_dir("cursor-pack").join("Nagasaki Soyo-theme-pack");
+        fs::create_dir_all(root.join("optional-replacements")).expect("create alt dir");
         for name in [
             "Alternate.ani",
             "Busy.ani",
@@ -3369,9 +4273,9 @@ mod tests {
         ] {
             write_file(&root.join(name));
         }
-        write_file(&root.join("1.如何手动替换单个指针步骤.jpg"));
-        write_file(&root.join("【作者xe08 仅供学习禁止商用】.txt"));
-        write_file(&root.join("右键点击安装.inf"));
+        write_file(&root.join("cursor-preview.jpg"));
+        write_file(&root.join("license.txt"));
+        write_file(&root.join("install.inf"));
 
         let stop = AtomicBool::new(false);
         let assessment =
@@ -3384,30 +4288,30 @@ mod tests {
 
     #[test]
     fn evaluates_whole_for_document_collection_with_weak_name_families() {
-        let root = temp_dir("doc-collection").join("MC王大锤文章合集 (1)");
-        fs::create_dir_all(root.join("我的女友孟飘渺（待续）")).expect("create child dir");
+        let root = temp_dir("doc-collection").join("MC-article-collection-1");
+        fs::create_dir_all(root.join("我的女友是冒险游戏（待续）")).expect("create child dir");
         for name in [
-            "世间调制模式（坑）.txt",
-            "为了拯救被戒色宝典洗脑的固执男友.txt",
-            "主系统系列（坑）.txt",
-            "他还只是个孩子（待续）.txt",
-            "催眠剧本之荒岛求生（坑）.txt",
-            "催眠带湿（完）.txt",
-            "催眠手环番外之恐怖屋大冒险（坑）.txt",
-            "催眠死对头美女班长（完）.txt",
-            "关于我的借口被所有人相信这件事（坑）.txt",
-            "意外用俗语攻略了女友妹妹（完）.txt",
-            "我的姐姐是大演员之亵玩病人肉棒的痴女护士.txt",
-            "我的校花女神女友与巨乳萝莉小姨子.txt",
+            "article-01-prologue.txt",
+            "article-02-background.txt",
+            "article-03-character-notes.txt",
+            "article-04-worldbuilding.txt",
+            "article-05-chapter-outline.txt",
+            "article-06-dialogue-draft.txt",
+            "article-07-side-story.txt",
+            "article-08-ending-notes.txt",
+            "article-09-reading-guide.txt",
+            "article-10-author-commentary.txt",
+            "article-11-extra-scenes.txt",
+            "article-12-appendix.txt",
         ] {
             write_file(&root.join(name));
         }
         for name in [
-            "MC王大锤文章合集 (1).zip",
-            "世界调制模式同人（待续）.zip",
-            "催眠考核（待续）.zip",
-            "我的女友孟飘渺（待续）.zip",
-            "外传合集.7z",
+            "MC-article-collection-1.zip",
+            "article-drafts-backup.zip",
+            "reading-materials.zip",
+            "game-notes-archive.zip",
+            "extras.7z",
         ] {
             write_file(&root.join(name));
         }
@@ -3452,4 +4356,38 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn parse_chat_completion_http_body_extracts_content_and_usage() {
+        let raw_body = r#"{
+          "choices": [
+            {
+              "message": {
+                "content": "{\"tree\":{\"name\":\"\",\"nodeId\":\"root\",\"children\":[]},\"assignments\":[]}"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "total_tokens": 46
+          }
+        }"#;
+        let parsed =
+            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect("parse success");
+        assert!(parsed.content.contains("\"assignments\":[]"));
+        assert_eq!(parsed.usage.prompt, 12);
+        assert_eq!(parsed.usage.completion, 34);
+        assert_eq!(parsed.usage.total, 46);
+    }
+
+    #[test]
+    fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
+        let raw_body = "<html>upstream gateway error</html>";
+        let err = parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
+        assert!(err.message.contains("error decoding response body"));
+        assert!(err.message.contains("upstream gateway error"));
+        assert_eq!(err.raw_body, raw_body);
+    }
+
 }

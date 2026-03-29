@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Child;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -21,7 +22,13 @@ pub struct AppState {
     pub(crate) scan_tasks: Arc<Mutex<HashMap<String, Arc<crate::scan_runtime::ScanTaskRuntime>>>>,
     pub(crate) organize_tasks:
         Arc<Mutex<HashMap<String, Arc<crate::organizer_runtime::OrganizeTaskRuntime>>>>,
+    pub(crate) tika_process: Arc<Mutex<Option<ManagedTikaProcess>>>,
     credential_store: Arc<dyn CredentialStore>,
+}
+
+pub(crate) struct ManagedTikaProcess {
+    pub url: String,
+    pub child: Child,
 }
 
 trait CredentialStore: Send + Sync {
@@ -150,6 +157,7 @@ impl AppState {
             db_path,
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
             organize_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tika_process: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -160,6 +168,7 @@ impl AppState {
             db_path: std::env::temp_dir().join("aicleaner-test.sqlite"),
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
             organize_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tika_process: Arc::new(Mutex::new(None)),
             credential_store,
         }
     }
@@ -228,6 +237,8 @@ pub struct OrganizeSnapshot {
     pub reference_original_structure: bool,
     pub excluded_patterns: Vec<String>,
     pub batch_size: u32,
+    #[serde(default = "default_organize_summary_mode")]
+    pub summary_mode: String,
     pub max_cluster_depth: Option<u32>,
     pub use_web_search: bool,
     pub web_search_enabled: bool,
@@ -247,6 +258,10 @@ pub struct OrganizeSnapshot {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub job_id: Option<String>,
+}
+
+pub fn default_organize_summary_mode() -> String {
+    "filename_only".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +293,14 @@ fn default_settings() -> Value {
             "enabled": false,
             "apiKey": "",
             "scopes": { "scan": false, "classify": false, "organizer": false }
+        },
+        "contentExtraction": {
+            "tika": {
+                "enabled": false,
+                "url": "http://127.0.0.1:9998",
+                "autoStart": false,
+                "jarPath": ""
+            }
         },
         "credentialsMeta": {
             "providers": {},
@@ -537,6 +560,29 @@ fn normalize_settings_shape(value: &mut Value) {
                 "scan": scan_enabled,
                 "classify": classify_enabled,
                 "organizer": organizer_enabled
+            }
+        }),
+    );
+    let tika = obj
+        .get("contentExtraction")
+        .and_then(|value| value.get("tika"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    obj.insert(
+        "contentExtraction".to_string(),
+        json!({
+            "tika": {
+                "enabled": tika.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                "url": tika
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("http://127.0.0.1:9998"),
+                "autoStart": tika.get("autoStart").and_then(Value::as_bool).unwrap_or(false),
+                "jarPath": tika
+                    .get("jarPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
             }
         }),
     );
@@ -1242,6 +1288,7 @@ pub struct OrganizeStartInput {
     pub reference_original_structure: Option<bool>,
     pub excluded_patterns: Option<Vec<String>>,
     pub batch_size: Option<u32>,
+    pub summary_mode: Option<String>,
     pub max_cluster_depth: Option<u32>,
     pub use_web_search: Option<bool>,
     pub model_routing: Option<Value>,
@@ -1376,8 +1423,12 @@ pub async fn organize_start<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn organize_stop(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    crate::organizer_runtime::organize_stop(state, task_id).await
+pub async fn organize_stop<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Value, String> {
+    crate::organizer_runtime::organize_stop(app, state, task_id).await
 }
 
 #[tauri::command]
@@ -1516,6 +1567,42 @@ mod tests {
         assert!(saved.get("tavilyApiKey").is_none());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn organize_snapshot_defaults_summary_mode_when_missing() {
+        let snapshot: OrganizeSnapshot = serde_json::from_value(json!({
+            "id": "task_legacy",
+            "status": "completed",
+            "error": null,
+            "rootPath": "C:\\root",
+            "recursive": true,
+            "referenceOriginalStructure": false,
+            "excludedPatterns": [],
+            "batchSize": 20,
+            "maxClusterDepth": null,
+            "useWebSearch": false,
+            "webSearchEnabled": false,
+            "selectedModel": "deepseek-chat",
+            "selectedModels": {},
+            "selectedProviders": {},
+            "supportsMultimodal": false,
+            "tree": {},
+            "treeVersion": 0,
+            "totalFiles": 0,
+            "processedFiles": 0,
+            "totalBatches": 0,
+            "processedBatches": 0,
+            "tokenUsage": { "prompt": 0, "completion": 0, "total": 0 },
+            "results": [],
+            "preview": [],
+            "createdAt": "2026-03-28T00:00:00Z",
+            "completedAt": null,
+            "jobId": null
+        }))
+        .expect("deserialize legacy snapshot");
+
+        assert_eq!(snapshot.summary_mode, default_organize_summary_mode());
     }
 
     #[test]
