@@ -1086,7 +1086,6 @@ pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Re
     Ok(())
 }
 
-
 pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Result<(), String> {
     let conn = open_db(db_path)?;
     conn.execute(

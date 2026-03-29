@@ -492,6 +492,65 @@ function buildOrganizerLogEntry({
   };
 }
 
+function normalizeOrganizerLogStringList(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+}
+
+function getOrganizerSummarySourceLabel(source) {
+  if (source === 'agent_summary') return organizerText('Agent 摘要', 'Agent Summary');
+  if (source === 'agent_fallback_local') return organizerText('Agent 失败后回退本地摘要', 'Agent fallback to local summary');
+  if (source === 'local_summary') return organizerText('本地摘要', 'Local Summary');
+  if (source === 'filename_only') return organizerText('仅文件名', 'Filename Only');
+  return String(source || '').trim() || '-';
+}
+
+function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } = {}) {
+  if (!row || String(row.summaryMode || '').trim() === 'filename_only') return '';
+  const extraction = row?.localExtraction && typeof row.localExtraction === 'object' ? row.localExtraction : null;
+  const extractionKeywords = normalizeOrganizerLogStringList(extraction?.keywords);
+  const extractionWarnings = normalizeOrganizerLogStringList(extraction?.warnings);
+  const extractionMetadata = normalizeOrganizerLogStringList(extraction?.metadata);
+  const summaryKeywords = normalizeOrganizerLogStringList(row?.summaryKeywords);
+  const summaryWarnings = normalizeOrganizerLogStringList(row?.warnings);
+  const excerpt = String(extraction?.excerpt || '').trim();
+  const summary = String(row?.summary || '').trim();
+  const title = String(extraction?.title || '').trim();
+  const parser = String(extraction?.parser || '').trim();
+  const confidence = String(row?.summaryConfidence || '').trim();
+
+  if (
+    !extraction
+    && !summary
+    && !summaryWarnings.length
+    && !summaryKeywords.length
+  ) {
+    return '';
+  }
+
+  const detail = [
+    `${organizerText('文件', 'Item')}: ${String(row?.name || row?.path || '-').trim() || '-'}`,
+    `${organizerText('路径', 'Path')}: ${String(row?.path || '-').trim() || '-'}`,
+    `${organizerText('分类', 'Category')}: ${category}`,
+    `${organizerText('模型', 'Model')}: ${route}`,
+    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(row?.summaryMode || DEFAULT_SUMMARY_MODE)}`,
+    `${organizerText('摘要来源', 'Summary Source')}: ${getOrganizerSummarySourceLabel(row?.summarySource)}`,
+    parser ? `${organizerText('提取器', 'Extractor')}: ${parser}` : '',
+    title ? `${organizerText('标题', 'Title')}: ${title}` : '',
+    confidence ? `${organizerText('置信度', 'Confidence')}: ${confidence}` : '',
+    extractionKeywords.length ? `${organizerText('提取关键词', 'Extraction Keywords')}: ${extractionKeywords.join(', ')}` : '',
+    summaryKeywords.length ? `${organizerText('摘要关键词', 'Summary Keywords')}: ${summaryKeywords.join(', ')}` : '',
+    extractionWarnings.length ? `${organizerText('提取告警', 'Extraction Warnings')}: ${extractionWarnings.join(' | ')}` : '',
+    summaryWarnings.length ? `${organizerText('摘要告警', 'Summary Warnings')}: ${summaryWarnings.join(' | ')}` : '',
+    extractionMetadata.length ? `\n${organizerText('提取元数据', 'Extraction Metadata')}:\n${extractionMetadata.join('\n')}` : '',
+    excerpt ? `\n${organizerText('本地提取摘录', 'Local Extraction Excerpt')}:\n${excerpt}` : '',
+    summary ? `\n${organizerText('最终摘要', 'Final Summary')}:\n${summary}` : '',
+  ].filter(Boolean).join('\n');
+
+  return detail.trim();
+}
+
 function syncOrganizerRawBatchKeys() {
   loggedOrganizerRawBatchKeys.clear();
   for (const entry of organizerLogEntries) {
@@ -1013,6 +1072,19 @@ function recordOrganizerFileDoneLog(row) {
         taskId,
       }));
     }
+  }
+  const localSummaryDetail = buildOrganizerLocalSummaryDetail(row, { category, route });
+  if (localSummaryDetail) {
+    appendOrganizerLogEntry(buildOrganizerLogEntry({
+      type: 'agent_response',
+      kind: 'detail',
+      summary: organizerText(
+        `本地摘要 | ${row.name || row.path || '-'}`,
+        `Local summary | ${row.name || row.path || '-'}`,
+      ),
+      detail: localSummaryDetail,
+      taskId,
+    }));
   }
   if (isFallbackBatchRow) {
     return;

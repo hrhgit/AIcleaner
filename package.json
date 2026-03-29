@@ -9,7 +9,7 @@
         "build": "vite build",
         "tauri": "tauri",
         "pretauri:dev": "npm run scanner:sync",
-        "tauri:dev": "tauri dev",
+        "tauri:dev": "node scripts/tauri-dev.mjs",
         "pretauri:build": "npm run scanner:sync",
         "tauri:build": "tauri build",
         "start": "npm run tauri:dev"

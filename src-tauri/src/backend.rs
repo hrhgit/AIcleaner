@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::process::Child;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -296,9 +296,9 @@ fn default_settings() -> Value {
         },
         "contentExtraction": {
             "tika": {
-                "enabled": false,
+                "enabled": true,
                 "url": "http://127.0.0.1:9998",
-                "autoStart": false,
+                "autoStart": true,
                 "jarPath": ""
             }
         },
@@ -573,12 +573,12 @@ fn normalize_settings_shape(value: &mut Value) {
         "contentExtraction".to_string(),
         json!({
             "tika": {
-                "enabled": tika.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                "enabled": tika.get("enabled").and_then(Value::as_bool).unwrap_or(true),
                 "url": tika
                     .get("url")
                     .and_then(Value::as_str)
                     .unwrap_or("http://127.0.0.1:9998"),
-                "autoStart": tika.get("autoStart").and_then(Value::as_bool).unwrap_or(false),
+                "autoStart": tika.get("autoStart").and_then(Value::as_bool).unwrap_or(true),
                 "jarPath": tika
                     .get("jarPath")
                     .and_then(Value::as_str)

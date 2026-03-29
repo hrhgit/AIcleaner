@@ -1966,7 +1966,8 @@ mod tests {
     #[test]
     fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
         let raw_body = "<html>upstream gateway error</html>";
-        let err = parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
+        let err =
+            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
         assert!(err.message.contains("error decoding response body"));
         assert!(err.message.contains("upstream gateway error"));
         assert_eq!(err.raw_body, raw_body);

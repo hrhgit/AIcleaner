@@ -5,7 +5,7 @@
   "identifier": "com.hrhgit.aicleaner",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://127.0.0.1:4173",
+    "devUrl": "http://127.0.0.1:1420",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },

@@ -1,10 +1,8 @@
 use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
 use crate::persist;
-use crate::web_search::{
-    format_web_search_context, parse_web_search_request, tavily_search,
-};
+use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
 use parking_lot::Mutex;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +30,7 @@ const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_TIKA_URL: &str = "http://127.0.0.1:9998";
 
 const SUMMARY_MODE_FILENAME_ONLY: &str = "filename_only";
 const SUMMARY_MODE_LOCAL_SUMMARY: &str = "local_summary";
@@ -122,6 +121,7 @@ struct ExtractionToolConfig {
     tika_url: String,
     tika_auto_start: bool,
     tika_jar_path: String,
+    tika_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,11 +278,11 @@ fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfi
     let tika = settings
         .get("contentExtraction")
         .and_then(|value| value.get("tika"));
-    let tika_enabled = tika
+    let configured_tika_enabled = tika
         .and_then(|value| value.get("enabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let tika_auto_start = tika
+    let configured_tika_auto_start = tika
         .and_then(|value| value.get("autoStart"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
@@ -295,15 +295,23 @@ fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfi
     let tika_url = tika
         .and_then(|value| value.get("url"))
         .and_then(Value::as_str)
-        .unwrap_or("http://127.0.0.1:9998")
+        .unwrap_or(DEFAULT_TIKA_URL)
         .trim()
         .trim_end_matches('/')
         .to_string();
+    let legacy_default_config = !configured_tika_enabled
+        && !configured_tika_auto_start
+        && tika_url == DEFAULT_TIKA_URL
+        && tika_jar_path.is_empty();
     ExtractionToolConfig {
-        tika_enabled: tika_enabled && !tika_url.is_empty(),
+        tika_enabled: (configured_tika_enabled
+            || configured_tika_auto_start
+            || legacy_default_config)
+            && !tika_url.is_empty(),
         tika_url,
-        tika_auto_start,
+        tika_auto_start: configured_tika_auto_start || legacy_default_config,
         tika_jar_path,
+        tika_ready: false,
     }
 }
 
@@ -319,14 +327,91 @@ async fn is_tika_server_available(url: &str) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    match client
-        .get(format!("{normalized}/version"))
-        .send()
-        .await
-    {
+    match client.get(format!("{normalized}/version")).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
+}
+
+fn looks_like_tika_server_jar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.starts_with("tika-server-standard-") && lower.ends_with(".jar")
+        })
+        .unwrap_or(false)
+}
+
+fn find_tika_server_jar_in_dir(dir: &Path) -> Option<PathBuf> {
+    let mut candidates = fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && looks_like_tika_server_jar(path))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    candidates.into_iter().next()
+}
+
+fn resolve_tika_server_jar(state: &AppState, configured_path: &str) -> Option<PathBuf> {
+    let configured = configured_path.trim();
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(value) = std::env::var("TIKA_SERVER_JAR") {
+        let path = PathBuf::from(value.trim());
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let mut roots = Vec::<PathBuf>::new();
+    if let Ok(dir) = std::env::current_dir() {
+        roots.push(dir.clone());
+        roots.push(dir.join("bin"));
+        roots.push(dir.join("tools"));
+        roots.push(dir.join("resources"));
+    }
+    if let Some(data_dir) = state.settings_path.parent() {
+        roots.push(data_dir.to_path_buf());
+        roots.push(data_dir.join("bin"));
+        roots.push(data_dir.join("tools"));
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            roots.push(exe_dir.to_path_buf());
+            roots.push(exe_dir.join("bin"));
+            roots.push(exe_dir.join("resources"));
+            if let Some(parent) = exe_dir.parent() {
+                roots.push(parent.to_path_buf());
+                roots.push(parent.join("bin"));
+                roots.push(parent.join("resources"));
+            }
+        }
+    }
+
+    let mut seen = HashSet::<PathBuf>::new();
+    for root in roots {
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        if let Some(found) = find_tika_server_jar_in_dir(&root) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn parse_tika_binding(url: &str) -> Option<(String, u16)> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default()?;
+    Some((host, port))
 }
 
 fn managed_tika_process_alive(process: &mut crate::backend::ManagedTikaProcess) -> bool {
@@ -336,18 +421,23 @@ fn managed_tika_process_alive(process: &mut crate::backend::ManagedTikaProcess) 
     }
 }
 
-async fn ensure_tika_server_running(
-    state: &AppState,
-    extraction_tool: &ExtractionToolConfig,
-) -> Result<(), String> {
-    if !extraction_tool.tika_enabled || !extraction_tool.tika_auto_start {
-        return Ok(());
+async fn ensure_tika_server_running(state: &AppState, extraction_tool: &mut ExtractionToolConfig) {
+    extraction_tool.tika_ready = false;
+    if !extraction_tool.tika_enabled {
+        return;
     }
     if is_tika_server_available(&extraction_tool.tika_url).await {
-        return Ok(());
+        extraction_tool.tika_ready = true;
+        return;
+    }
+    if !extraction_tool.tika_auto_start {
+        return;
     }
     if extraction_tool.tika_jar_path.trim().is_empty() {
-        return Err("Tika auto-start is enabled but jarPath is empty".to_string());
+        let Some(path) = resolve_tika_server_jar(state, &extraction_tool.tika_jar_path) else {
+            return;
+        };
+        extraction_tool.tika_jar_path = path.to_string_lossy().to_string();
     }
     let waiting_for_existing_process = {
         let mut guard = state.tika_process.lock();
@@ -365,20 +455,23 @@ async fn ensure_tika_server_running(
     if waiting_for_existing_process {
         for _ in 0..25 {
             if is_tika_server_available(&extraction_tool.tika_url).await {
-                return Ok(());
+                extraction_tool.tika_ready = true;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        return Err("Tika process started by app did not become ready in time".to_string());
+        return;
     }
 
-    let child = Command::new("java")
-        .arg("-jar")
-        .arg(&extraction_tool.tika_jar_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start Tika Server: {e}"))?;
+    let mut command = Command::new("java");
+    command.arg("-jar").arg(&extraction_tool.tika_jar_path);
+    if let Some((host, port)) = parse_tika_binding(&extraction_tool.tika_url) {
+        command.arg("--host").arg(host);
+        command.arg("--port").arg(port.to_string());
+    }
+    let Ok(child) = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+        return;
+    };
     {
         let mut guard = state.tika_process.lock();
         *guard = Some(crate::backend::ManagedTikaProcess {
@@ -388,11 +481,11 @@ async fn ensure_tika_server_running(
     }
     for _ in 0..30 {
         if is_tika_server_available(&extraction_tool.tika_url).await {
-            return Ok(());
+            extraction_tool.tika_ready = true;
+            return;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err("Tika Server did not become ready in time".to_string())
 }
 
 fn sanitize_summary_confidence(value: Option<&str>) -> Option<String> {
@@ -678,8 +771,19 @@ fn is_package_doc_name(name: &str) -> bool {
     );
     is_doc_ext
         && [
-            "readme", "guide", "manual", "install", "setup", "usage", "license", "璇存槑", "瀹夎",
-            "浣跨敤", "鏁欑▼", "杩愯", "鐗堟潈",
+            "readme",
+            "guide",
+            "manual",
+            "install",
+            "setup",
+            "usage",
+            "license",
+            "璇存槑",
+            "瀹夎",
+            "浣跨敤",
+            "鏁欑▼",
+            "杩愯",
+            "鐗堟潈",
         ]
         .iter()
         .any(|token| lower.contains(token))
@@ -1636,7 +1740,9 @@ fn summarize_directory_for_prompt(unit: &OrganizeUnit, response_language: &str) 
         ),
     ];
     if is_zh_language(response_language) {
-        lines.push("该目录已是整体候选，默认按整体归类，除非摘要明确显示存在多个无关主题。".to_string());
+        lines.push(
+            "该目录已是整体候选，默认按整体归类，除非摘要明确显示存在多个无关主题。".to_string(),
+        );
     } else {
         lines.push(
             "This directory is already a bundle candidate. Default to classifying it as a whole unit unless the summary clearly indicates multiple unrelated themes."
@@ -1763,16 +1869,12 @@ fn category_path_display(path: &[String]) -> String {
 }
 
 fn row_has_classification_error(row: &Value) -> bool {
-    if row
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(str::trim)
+    if row.get("reason").and_then(Value::as_str).map(str::trim)
         == Some(RESULT_REASON_CLASSIFICATION_ERROR)
     {
         return true;
     }
-    !row
-        .get("classificationError")
+    !row.get("classificationError")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
@@ -1990,7 +2092,6 @@ fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
     out
 }
 
-
 fn build_empty_extraction(unit: &OrganizeUnit, warning: &str) -> SummaryExtraction {
     build_empty_extraction_with_warnings(unit, vec![warning.to_string()])
 }
@@ -2075,10 +2176,12 @@ fn extract_unit_content_for_summary(
     let ext = extension_key(Path::new(&unit.path));
     match ext.as_str() {
         ".txt" | ".md" | ".csv" | ".json" | ".yaml" | ".yml" | ".toml" | ".xml" | ".log"
-        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py"
-        | ".java" | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql"
-        | ".sh" | ".bat" | ".ps1" => extract_plain_text_summary(unit),
-        _ if unit.modality == "text" => extract_plain_text_summary(unit),
+        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py" | ".java"
+        | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql" | ".sh" | ".bat"
+        | ".ps1" => extract_plain_text_summary(unit),
+        _ if unit.modality == "text" && !supports_tika_extraction(unit) => {
+            extract_plain_text_summary(unit)
+        }
         _ => build_empty_extraction(unit, "filename_only_fallback"),
     }
 }
@@ -2167,7 +2270,7 @@ async fn extract_unit_content_for_summary_with_tools(
     stop: &AtomicBool,
     extraction_tool: &ExtractionToolConfig,
 ) -> SummaryExtraction {
-    if extraction_tool.tika_enabled && supports_tika_extraction(unit) {
+    if extraction_tool.tika_ready && supports_tika_extraction(unit) {
         match tika_extract_text(extraction_tool, unit, stop).await {
             Ok(text) => {
                 let excerpt = normalize_multiline_text(&text, LOCAL_TEXT_EXCERPT_CHARS);
@@ -2189,7 +2292,10 @@ async fn extract_unit_content_for_summary_with_tools(
                 }
                 return build_empty_extraction_with_warnings(
                     unit,
-                    vec!["tika_empty_text".to_string(), "filename_only_fallback".to_string()],
+                    vec![
+                        "tika_empty_text".to_string(),
+                        "filename_only_fallback".to_string(),
+                    ],
                 );
             }
             Err(err) if err == "stop_requested" => {
@@ -2205,10 +2311,7 @@ async fn extract_unit_content_for_summary_with_tools(
     extract_unit_content_for_summary(unit, response_language, stop)
 }
 
-fn build_local_summary(
-    unit: &OrganizeUnit,
-    extracted: &SummaryExtraction,
-) -> SummaryBuildResult {
+fn build_local_summary(unit: &OrganizeUnit, extracted: &SummaryExtraction) -> SummaryBuildResult {
     if unit.item_type != "directory" && extracted.excerpt.trim().is_empty() {
         return SummaryBuildResult {
             summary: String::new(),
@@ -2226,7 +2329,11 @@ fn build_local_summary(
         format!("modality={}", unit.modality),
         format!("parser={}", extracted.parser),
     ];
-    if let Some(title) = extracted.title.as_ref().filter(|value| !value.trim().is_empty()) {
+    if let Some(title) = extracted
+        .title
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
         lines.push(format!(
             "title={}",
             trim_to_chars(title, LOCAL_SUMMARY_EXCERPT_CHARS)
@@ -2242,7 +2349,10 @@ fn build_local_summary(
     if !extracted.excerpt.trim().is_empty() {
         lines.push(format!(
             "excerpt={}",
-            trim_to_chars(&normalize_multiline_text(&extracted.excerpt, LOCAL_TEXT_EXCERPT_CHARS), LOCAL_SUMMARY_EXCERPT_CHARS)
+            trim_to_chars(
+                &normalize_multiline_text(&extracted.excerpt, LOCAL_TEXT_EXCERPT_CHARS),
+                LOCAL_SUMMARY_EXCERPT_CHARS
+            )
         ));
     }
 
@@ -2328,11 +2438,7 @@ fn parse_chat_completion_http_body(
             .filter(|value| !value.is_empty())
             .unwrap_or("classification request failed");
         return Err(ChatCompletionError {
-            message: format!(
-                "{} (HTTP {})",
-                api_message,
-                status.as_u16()
-            ),
+            message: format!("{} (HTTP {})", api_message, status.as_u16()),
             raw_body: raw_body.to_string(),
         });
     }
@@ -2448,9 +2554,7 @@ fn build_summary_agent_system_prompt(response_language: &str) -> String {
     .join("\n")
 }
 
-fn parse_summary_agent_output(
-    content: &str,
-) -> Result<HashMap<String, SummaryAgentItem>, String> {
+fn parse_summary_agent_output(content: &str) -> Result<HashMap<String, SummaryAgentItem>, String> {
     let parsed: Value =
         serde_json::from_str(&sanitize_json_block(content)).map_err(|e| e.to_string())?;
     let items = parsed
@@ -2627,28 +2731,27 @@ async fn classify_organize_batch(
                 Value::String("Return the final tree and assignments JSON only.".to_string());
         }
 
-        let completion = match chat_completion(text_route, &system_prompt, &payload.to_string(), stop)
-            .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                append_batch_trace(
-                    &mut round_trace,
-                    round,
-                    text_route,
-                    "http_error",
-                    &err.raw_body,
-                    None,
-                    Some(&err.message),
-                );
-                return Ok(ClassifyOrganizeBatchOutput {
-                    parsed: None,
-                    usage: total_usage,
-                    raw_output: round_trace.join("\n\n====================\n\n"),
-                    error: Some(err.message),
-                });
-            }
-        };
+        let completion =
+            match chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await {
+                Ok(output) => output,
+                Err(err) => {
+                    append_batch_trace(
+                        &mut round_trace,
+                        round,
+                        text_route,
+                        "http_error",
+                        &err.raw_body,
+                        None,
+                        Some(&err.message),
+                    );
+                    return Ok(ClassifyOrganizeBatchOutput {
+                        parsed: None,
+                        usage: total_usage,
+                        raw_output: round_trace.join("\n\n====================\n\n"),
+                        error: Some(err.message),
+                    });
+                }
+            };
         total_usage.prompt = total_usage.prompt.saturating_add(completion.usage.prompt);
         total_usage.completion = total_usage
             .completion
@@ -3041,16 +3144,19 @@ async fn run_organize_task<R: Runtime>(
                     extracted.as_ref().unwrap_or(&SummaryExtraction::default()),
                 ),
             };
-            let extraction_json = extracted.as_ref().map(|value| {
-                json!({
-                    "parser": value.parser,
-                    "title": value.title,
-                    "excerpt": value.excerpt,
-                    "keywords": value.keywords,
-                    "metadata": value.metadata_lines,
-                    "warnings": value.warnings,
+            let extraction_json = extracted
+                .as_ref()
+                .map(|value| {
+                    json!({
+                        "parser": value.parser,
+                        "title": value.title,
+                        "excerpt": value.excerpt,
+                        "keywords": value.keywords,
+                        "metadata": value.metadata_lines,
+                        "warnings": value.warnings,
+                    })
                 })
-            }).unwrap_or(Value::Null);
+                .unwrap_or(Value::Null);
             batch_rows.push(json!({
                 "itemId": format!("batch{}_{}", batch_idx + 1, offset + 1),
                 "name": unit.name,
@@ -3094,10 +3200,7 @@ async fn run_organize_task<R: Runtime>(
                 .unwrap_or_else(|| "summary_agent_missing_items".to_string());
             for (idx, row) in batch_rows.iter_mut().enumerate() {
                 let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
-                let local_result = local_results
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let local_result = local_results.get(idx).cloned().unwrap_or_default();
                 let mut warnings = row
                     .get("summaryWarnings")
                     .and_then(Value::as_array)
@@ -3136,12 +3239,8 @@ async fn run_organize_task<R: Runtime>(
                             .collect::<Vec<_>>(),
                     );
                     row["summaryDegraded"] = Value::Bool(local_result.degraded);
-                    row["summaryWarnings"] = Value::Array(
-                        warnings
-                            .into_iter()
-                            .map(Value::String)
-                            .collect::<Vec<_>>(),
-                    );
+                    row["summaryWarnings"] =
+                        Value::Array(warnings.into_iter().map(Value::String).collect::<Vec<_>>());
                 } else {
                     warnings.push(batch_failed_warning.clone());
                     row["summary"] = Value::String(local_result.summary);
@@ -3152,12 +3251,8 @@ async fn run_organize_task<R: Runtime>(
                         .cloned()
                         .unwrap_or(Value::Array(Vec::new()));
                     row["summaryDegraded"] = Value::Bool(true);
-                    row["summaryWarnings"] = Value::Array(
-                        warnings
-                            .into_iter()
-                            .map(Value::String)
-                            .collect::<Vec<_>>(),
-                    );
+                    row["summaryWarnings"] =
+                        Value::Array(warnings.into_iter().map(Value::String).collect::<Vec<_>>());
                 }
             }
         }
@@ -3313,6 +3408,7 @@ async fn run_organize_task<R: Runtime>(
                 "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
                 "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
                 "summaryKeywords": row.get("summaryKeywords").cloned().unwrap_or(Value::Array(Vec::new())),
+                "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
                 "leafNodeId": leaf_node_id,
                 "categoryPath": category_path,
                 "category": category,
@@ -3407,10 +3503,10 @@ pub async fn organize_start<R: Runtime>(
     }
     let task_id = format!("org_{}", Uuid::new_v4().simple());
     let settings = crate::backend::read_settings(&state.settings_path);
-    let extraction_tool = extraction_tool_config_from_settings(&settings);
+    let mut extraction_tool = extraction_tool_config_from_settings(&settings);
     let normalized_summary_mode = normalize_summary_mode(input.summary_mode.as_deref());
     if normalized_summary_mode != SUMMARY_MODE_FILENAME_ONLY {
-        ensure_tika_server_running(state.inner(), &extraction_tool).await?;
+        ensure_tika_server_running(state.inner(), &mut extraction_tool).await;
     }
     let routes = parse_routes(&input.model_routing);
     let text_route = routes.get("text").cloned().unwrap_or(RouteConfig {
@@ -4024,6 +4120,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tika_defaults_are_upgraded_to_auto_start() {
+        let config = extraction_tool_config_from_settings(&json!({
+            "contentExtraction": {
+                "tika": {
+                    "enabled": false,
+                    "autoStart": false,
+                    "url": DEFAULT_TIKA_URL,
+                    "jarPath": ""
+                }
+            }
+        }));
+        assert!(config.tika_enabled);
+        assert!(config.tika_auto_start);
+        assert!(!config.tika_ready);
+    }
+
+    #[test]
+    fn local_summary_does_not_parse_pdf_binary_as_plain_text() {
+        let root = temp_dir("pdf-fallback");
+        let path = root.join("paper.pdf");
+        write_text_file(&path, "%PDF-1.7\nstream\n\x00\x01");
+        let mut unit = make_test_unit(&path);
+        unit.modality = "text".to_string();
+        let stop = AtomicBool::new(false);
+
+        let extracted = extract_unit_content_for_summary(&unit, "zh-CN", &stop);
+        assert_eq!(extracted.parser, "unavailable");
+        assert!(extracted.excerpt.is_empty());
+        assert!(extracted
+            .warnings
+            .iter()
+            .any(|warning| warning == "filename_only_fallback"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parse_summary_agent_output_reads_items() {
         let parsed = parse_summary_agent_output(
             r#"{
@@ -4384,10 +4517,10 @@ mod tests {
     #[test]
     fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
         let raw_body = "<html>upstream gateway error</html>";
-        let err = parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
+        let err =
+            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
         assert!(err.message.contains("error decoding response body"));
         assert!(err.message.contains("upstream gateway error"));
         assert_eq!(err.raw_body, raw_body);
     }
-
 }
