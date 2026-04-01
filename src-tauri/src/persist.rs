@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sha1::Digest;
 use std::path::Path;
 
-const ORGANIZER_SCHEMA_VERSION: &str = "tree_v1";
+const ORGANIZER_SCHEMA_VERSION: &str = "tree_v2";
 
 #[derive(Clone, Debug)]
 pub struct ScanNode {
@@ -70,6 +70,13 @@ fn bool_to_i64(value: bool) -> i64 {
     } else {
         0
     }
+}
+
+fn compact_organize_snapshot(snapshot: &OrganizeSnapshot) -> OrganizeSnapshot {
+    let mut compact = snapshot.clone();
+    compact.results.clear();
+    compact.preview.clear();
+    compact
 }
 
 fn organizer_tables_exist(conn: &Connection) -> Result<bool, String> {
@@ -460,25 +467,37 @@ pub fn save_scan_snapshot(db_path: &Path, snapshot: &ScanSnapshot) -> Result<(),
     conn.execute(
         "UPDATE scan_tasks SET
             status = ?2,
-            current_path = ?3,
-            current_depth = ?4,
-            scanned_count = ?5,
-            total_entries = ?6,
-            processed_entries = ?7,
-            deletable_count = ?8,
-            total_cleanable = ?9,
-            token_prompt = ?10,
-            token_completion = ?11,
-            token_total = ?12,
-            permission_denied_count = ?13,
-            permission_denied_paths = ?14,
-            error_message = ?15,
-            updated_at = ?16,
-            finished_at = ?17
+            scan_mode = ?3,
+            baseline_task_id = ?4,
+            visible_latest = ?5,
+            target_size = ?6,
+            max_depth = ?7,
+            auto_analyze = ?8,
+            current_path = ?9,
+            current_depth = ?10,
+            scanned_count = ?11,
+            total_entries = ?12,
+            processed_entries = ?13,
+            deletable_count = ?14,
+            total_cleanable = ?15,
+            token_prompt = ?16,
+            token_completion = ?17,
+            token_total = ?18,
+            permission_denied_count = ?19,
+            permission_denied_paths = ?20,
+            error_message = ?21,
+            updated_at = ?22,
+            finished_at = ?23
          WHERE task_id = ?1",
         params![
             snapshot.id,
             snapshot.status,
+            snapshot.scan_mode,
+            snapshot.baseline_task_id,
+            bool_to_i64(snapshot.visible_latest),
+            snapshot.target_size as i64,
+            snapshot.configured_max_depth.map(|value| value as i64),
+            bool_to_i64(snapshot.auto_analyze),
             snapshot.current_path,
             snapshot.current_depth as i64,
             snapshot.scanned_count as i64,
@@ -542,7 +561,7 @@ pub fn upsert_scan_finding(
         ],
     )
     .map_err(|e| e.to_string())?;
-    refresh_scan_stats(db_path, task_id)
+    Ok(())
 }
 
 pub fn refresh_scan_stats(db_path: &Path, task_id: &str) -> Result<(), String> {
@@ -953,30 +972,6 @@ pub fn load_scan_node_map(
         .collect())
 }
 
-pub fn clone_scan_task_data(
-    db_path: &Path,
-    from_task_id: &str,
-    to_task_id: &str,
-) -> Result<(), String> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT INTO scan_nodes (task_id, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext)
-         SELECT ?2, node_id, parent_id, path, name, type, depth, self_size, total_size, child_count, mtime_ms, ext
-         FROM scan_nodes WHERE task_id = ?1",
-        params![from_task_id, to_task_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT INTO scan_findings (task_id, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at)
-         SELECT ?2, path, name, type, size, classification, should_expand, purpose, reason, risk, source, created_at
-         FROM scan_findings WHERE task_id = ?1",
-        params![from_task_id, to_task_id],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
-}
-
 pub fn delete_scan_data_for_paths(
     db_path: &Path,
     task_id: &str,
@@ -1030,6 +1025,70 @@ pub fn delete_scan_data_for_paths(
              FROM temp_prune_paths p
              WHERE scan_nodes.path = p.path
                 OR scan_nodes.path LIKE p.path || '\\%'
+                OR scan_nodes.path LIKE p.path || '/%'
+           )",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute("DELETE FROM temp_prune_paths", [])
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    refresh_scan_stats(db_path, task_id)
+}
+
+pub fn delete_scan_descendants_for_paths(
+    db_path: &Path,
+    task_id: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return refresh_scan_stats(db_path, task_id);
+    }
+
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS temp_prune_paths (
+            path TEXT PRIMARY KEY
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM temp_prune_paths", [])
+        .map_err(|e| e.to_string())?;
+
+    {
+        let mut stmt = tx
+            .prepare_cached("INSERT OR IGNORE INTO temp_prune_paths(path) VALUES (?1)")
+            .map_err(|e| e.to_string())?;
+        for path in paths {
+            stmt.execute(params![path]).map_err(|e| e.to_string())?;
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM scan_findings
+         WHERE task_id = ?1
+           AND EXISTS (
+             SELECT 1
+             FROM temp_prune_paths p
+             WHERE scan_findings.path LIKE p.path || '\\%'
+                OR scan_findings.path LIKE p.path || '/%'
+           )",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "DELETE FROM scan_nodes
+         WHERE task_id = ?1
+           AND EXISTS (
+             SELECT 1
+             FROM temp_prune_paths p
+             WHERE scan_nodes.path LIKE p.path || '\\%'
                 OR scan_nodes.path LIKE p.path || '/%'
            )",
         params![task_id],
@@ -1102,6 +1161,7 @@ pub fn list_boundary_scan_nodes(
 pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result<(), String> {
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let compact_snapshot = compact_organize_snapshot(snapshot);
     tx.execute(
         "DELETE FROM organize_results WHERE task_id = ?1",
         params![snapshot.id],
@@ -1118,7 +1178,7 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
             snapshot.status,
             snapshot.created_at,
             snapshot.completed_at,
-            serde_json::to_string(snapshot).map_err(|e| e.to_string())?,
+            serde_json::to_string(&compact_snapshot).map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -1126,6 +1186,7 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
 }
 
 pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result<(), String> {
+    let compact_snapshot = compact_organize_snapshot(snapshot);
     let conn = open_db(db_path)?;
     conn.execute(
         "UPDATE organize_tasks SET
@@ -1141,25 +1202,38 @@ pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Re
             create_root_path_key(&snapshot.root_path),
             snapshot.status,
             snapshot.completed_at,
-            serde_json::to_string(snapshot).map_err(|e| e.to_string())?,
+            serde_json::to_string(&compact_snapshot).map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Result<(), String> {
-    let conn = open_db(db_path)?;
-    conn.execute(
-        "INSERT INTO organize_results (
-            task_id, idx, path, leaf_node_id, category_path_json, row_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(task_id, idx) DO UPDATE SET
-            path = excluded.path,
-            leaf_node_id = excluded.leaf_node_id,
-            category_path_json = excluded.category_path_json,
-            row_json = excluded.row_json",
-        params![
+pub fn upsert_organize_results(
+    db_path: &Path,
+    task_id: &str,
+    rows: &[Value],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO organize_results (
+                task_id, idx, path, leaf_node_id, category_path_json, row_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(task_id, idx) DO UPDATE SET
+                path = excluded.path,
+                leaf_node_id = excluded.leaf_node_id,
+                category_path_json = excluded.category_path_json,
+                row_json = excluded.row_json",
+        )
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        stmt.execute(params![
             task_id,
             row.get("index").and_then(Value::as_u64).unwrap_or(0) as i64,
             row.get("path").and_then(Value::as_str).unwrap_or(""),
@@ -1167,9 +1241,11 @@ pub fn upsert_organize_result(db_path: &Path, task_id: &str, row: &Value) -> Res
             serde_json::to_string(row.get("categoryPath").unwrap_or(&json!([])))
                 .map_err(|e| e.to_string())?,
             serde_json::to_string(row).map_err(|e| e.to_string())?,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+        ])
+        .map_err(|e| e.to_string())?;
+    }
+    drop(stmt);
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1210,6 +1286,7 @@ pub fn load_organize_snapshot(
     let mut snapshot =
         serde_json::from_str::<OrganizeSnapshot>(&snapshot_json).map_err(|e| e.to_string())?;
     snapshot.results = results;
+    snapshot.preview.clear();
     Ok(Some(snapshot))
 }
 
@@ -1380,4 +1457,309 @@ pub fn save_organize_rollback(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{default_organize_summary_mode, OrganizeSnapshot, ScanSnapshot, TokenUsage};
+    use std::fs;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wipeout-{name}-{}.sqlite", Uuid::new_v4()))
+    }
+
+    fn make_scan_snapshot(task_id: &str, root_path: &str) -> ScanSnapshot {
+        ScanSnapshot {
+            id: task_id.to_string(),
+            status: "idle".to_string(),
+            scan_mode: "full_rescan_incremental".to_string(),
+            baseline_task_id: None,
+            visible_latest: true,
+            root_path_key: create_root_path_key(root_path),
+            target_path: root_path.to_string(),
+            auto_analyze: true,
+            root_node_id: create_node_id(root_path),
+            configured_max_depth: Some(3),
+            max_scanned_depth: 0,
+            current_path: root_path.to_string(),
+            current_depth: 0,
+            scanned_count: 0,
+            total_entries: 0,
+            processed_entries: 0,
+            deletable_count: 0,
+            total_cleanable: 0,
+            target_size: 0,
+            token_usage: TokenUsage::default(),
+            deletable: Vec::new(),
+            permission_denied_count: 0,
+            permission_denied_paths: Vec::new(),
+            error_message: String::new(),
+        }
+    }
+
+    fn make_organize_snapshot(task_id: &str, root_path: &str) -> OrganizeSnapshot {
+        OrganizeSnapshot {
+            id: task_id.to_string(),
+            status: "completed".to_string(),
+            error: None,
+            root_path: root_path.to_string(),
+            recursive: true,
+            excluded_patterns: vec!["node_modules".to_string()],
+            batch_size: 20,
+            summary_mode: default_organize_summary_mode(),
+            max_cluster_depth: None,
+            use_web_search: false,
+            web_search_enabled: false,
+            selected_model: "gpt-4o-mini".to_string(),
+            selected_models: json!({ "text": "gpt-4o-mini" }),
+            selected_providers: json!({ "text": "https://api.openai.com/v1" }),
+            supports_multimodal: false,
+            tree: json!({ "nodeId": "root", "name": "", "children": [] }),
+            tree_version: 3,
+            total_files: 2,
+            processed_files: 2,
+            total_batches: 1,
+            processed_batches: 1,
+            token_usage: TokenUsage {
+                prompt: 10,
+                completion: 5,
+                total: 15,
+            },
+            results: vec![
+                json!({
+                    "index": 1,
+                    "path": format!("{root_path}\\alpha.txt"),
+                    "name": "alpha.txt",
+                    "leafNodeId": "leaf-a",
+                    "categoryPath": ["Docs"],
+                }),
+                json!({
+                    "index": 2,
+                    "path": format!("{root_path}\\beta.txt"),
+                    "name": "beta.txt",
+                    "leafNodeId": "leaf-b",
+                    "categoryPath": ["Docs", "Notes"],
+                }),
+            ],
+            preview: vec![json!({
+                "sourcePath": format!("{root_path}\\alpha.txt"),
+                "targetPath": format!("{root_path}\\Docs\\alpha.txt"),
+            })],
+            created_at: "2026-03-28T00:00:00Z".to_string(),
+            completed_at: Some("2026-03-28T00:05:00Z".to_string()),
+            job_id: Some("job_1".to_string()),
+        }
+    }
+
+    #[test]
+    fn organizer_snapshot_persistence_is_compacted_and_results_are_loaded_from_rows() {
+        let db_path = temp_db_path("organizer-compact");
+        init_db(&db_path).expect("init db");
+
+        let root_path = r"C:\root";
+        let snapshot = make_organize_snapshot("org_task", root_path);
+        init_organize_task(&db_path, &snapshot).expect("init organize task");
+        upsert_organize_results(&db_path, &snapshot.id, &snapshot.results).expect("write organize rows");
+        save_organize_snapshot(&db_path, &snapshot).expect("save compact snapshot");
+
+        let conn = open_db(&db_path).expect("open db");
+        let raw_snapshot = conn
+            .query_row(
+                "SELECT snapshot_json FROM organize_tasks WHERE task_id = ?1",
+                params![snapshot.id.clone()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read snapshot json");
+        let persisted_value: Value = serde_json::from_str(&raw_snapshot).expect("parse snapshot json");
+        assert_eq!(persisted_value.get("results"), Some(&Value::Array(Vec::new())));
+        assert_eq!(persisted_value.get("preview"), Some(&Value::Array(Vec::new())));
+
+        let loaded = load_organize_snapshot(&db_path, &snapshot.id)
+            .expect("load snapshot")
+            .expect("snapshot exists");
+        assert_eq!(loaded.results.len(), 2);
+        assert!(loaded.preview.is_empty());
+        assert_eq!(
+            loaded.results[1].get("path").and_then(Value::as_str),
+            Some(r"C:\root\beta.txt")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn organizer_batch_upsert_updates_existing_rows() {
+        let db_path = temp_db_path("organizer-batch-upsert");
+        init_db(&db_path).expect("init db");
+
+        let snapshot = make_organize_snapshot("org_batch", r"C:\root");
+        init_organize_task(&db_path, &snapshot).expect("init organize task");
+        upsert_organize_results(
+            &db_path,
+            &snapshot.id,
+            &[json!({
+                "index": 1,
+                "path": r"C:\root\alpha.txt",
+                "name": "alpha.txt",
+                "leafNodeId": "leaf-a",
+                "categoryPath": ["Docs"],
+            })],
+        )
+        .expect("insert first batch");
+        upsert_organize_results(
+            &db_path,
+            &snapshot.id,
+            &[json!({
+                "index": 1,
+                "path": r"C:\root\alpha.txt",
+                "name": "alpha.txt",
+                "leafNodeId": "leaf-b",
+                "categoryPath": ["Docs", "Updated"],
+            })],
+        )
+        .expect("update existing row");
+
+        let loaded = load_organize_snapshot(&db_path, &snapshot.id)
+            .expect("load snapshot")
+            .expect("snapshot exists");
+        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(
+            loaded.results[0]
+                .get("categoryPath")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            loaded.results[0].get("leafNodeId").and_then(Value::as_str),
+            Some("leaf-b")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn organizer_schema_version_is_upgraded() {
+        let db_path = temp_db_path("organizer-schema-version");
+        init_db(&db_path).expect("init db");
+
+        let conn = open_db(&db_path).expect("open db");
+        let version = conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = 'organizer_schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("load schema version");
+        assert_eq!(version, ORGANIZER_SCHEMA_VERSION);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn scan_finding_write_skips_immediate_stat_refresh_but_delete_paths_recomputes_stats() {
+        let db_path = temp_db_path("scan-finding-stats");
+        init_db(&db_path).expect("init db");
+
+        let task_id = "scan_task";
+        let root_path = r"C:\scan-root";
+        init_scan_task(
+            &db_path,
+            task_id,
+            root_path,
+            0,
+            Some(3),
+            true,
+            None,
+            "full_rescan_incremental",
+        )
+        .expect("init scan task");
+        let snapshot = make_scan_snapshot(task_id, root_path);
+        save_scan_snapshot(&db_path, &snapshot).expect("seed scan snapshot");
+
+        let item = ScanResultItem {
+            name: "alpha.txt".to_string(),
+            path: r"C:\scan-root\folder\alpha.txt".to_string(),
+            size: 4096,
+            item_type: "file".to_string(),
+            purpose: String::new(),
+            reason: "safe".to_string(),
+            risk: "low".to_string(),
+            classification: "safe_to_delete".to_string(),
+            source: "model".to_string(),
+        };
+        upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");
+
+        let before_refresh = load_scan_snapshot(&db_path, task_id)
+            .expect("load before refresh")
+            .expect("snapshot exists");
+        assert_eq!(before_refresh.deletable_count, 0);
+        assert_eq!(before_refresh.total_cleanable, 0);
+
+        refresh_scan_stats(&db_path, task_id).expect("refresh scan stats");
+        let after_refresh = load_scan_snapshot(&db_path, task_id)
+            .expect("load after refresh")
+            .expect("snapshot exists");
+        assert_eq!(after_refresh.deletable_count, 1);
+        assert_eq!(after_refresh.total_cleanable, 4096);
+
+        delete_scan_data_for_paths(&db_path, task_id, &[r"C:\scan-root\folder".to_string()])
+            .expect("delete scan data");
+        let after_delete = load_scan_snapshot(&db_path, task_id)
+            .expect("load after delete")
+            .expect("snapshot exists");
+        assert_eq!(after_delete.deletable_count, 0);
+        assert_eq!(after_delete.total_cleanable, 0);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn delete_scan_descendants_recomputes_stats_after_pruning() {
+        let db_path = temp_db_path("scan-descendants-stats");
+        init_db(&db_path).expect("init db");
+
+        let task_id = "scan_desc";
+        let root_path = r"C:\scan-root";
+        init_scan_task(
+            &db_path,
+            task_id,
+            root_path,
+            0,
+            Some(3),
+            true,
+            None,
+            "full_rescan_incremental",
+        )
+        .expect("init scan task");
+        let snapshot = make_scan_snapshot(task_id, root_path);
+        save_scan_snapshot(&db_path, &snapshot).expect("seed scan snapshot");
+
+        let item = ScanResultItem {
+            name: "deep.txt".to_string(),
+            path: r"C:\scan-root\folder\deep\deep.txt".to_string(),
+            size: 2048,
+            item_type: "file".to_string(),
+            purpose: String::new(),
+            reason: "safe".to_string(),
+            risk: "low".to_string(),
+            classification: "safe_to_delete".to_string(),
+            source: "model".to_string(),
+        };
+        upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");
+        refresh_scan_stats(&db_path, task_id).expect("refresh scan stats");
+
+        delete_scan_descendants_for_paths(&db_path, task_id, &[r"C:\scan-root\folder".to_string()])
+            .expect("delete descendants");
+        let after_delete = load_scan_snapshot(&db_path, task_id)
+            .expect("load after delete")
+            .expect("snapshot exists");
+        assert_eq!(after_delete.deletable_count, 0);
+        assert_eq!(after_delete.total_cleanable, 0);
+
+        let _ = fs::remove_file(db_path);
+    }
 }

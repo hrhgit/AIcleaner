@@ -331,8 +331,8 @@ class ScanTaskController {
   handleCache(info) {
     if (!info || typeof info !== 'object') return;
     const action = String(info.action || '').trim();
-    if (action === 'prepare_incremental_clone') {
-      this.addLog('analyzing', `继续深入：正在复制上一轮扫描结果（${info.count || 0} 个边界目录）`);
+    if (action === 'prepare_incremental_reuse_tree') {
+      this.addLog('analyzing', `继续深入：直接复用当前扫描树（${info.count || 0} 个边界目录）`);
       return;
     }
     if (action === 'prepare_incremental_prune') {

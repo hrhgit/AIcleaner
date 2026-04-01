@@ -230,6 +230,12 @@ struct IncrementalContext {
 }
 
 #[derive(Clone)]
+struct InPlaceBaselineCache {
+    nodes: HashMap<String, persist::ScanNode>,
+    findings: HashMap<String, persist::ScanFindingRecord>,
+}
+
+#[derive(Clone)]
 struct ScanAiConfig {
     endpoint: String,
     api_key: String,
@@ -249,6 +255,7 @@ pub struct ScanTaskRuntime {
     sidecar_roots: Vec<SidecarRoot>,
     ignored_paths: Vec<String>,
     prune_rules: Vec<ScanPruneRule>,
+    in_place_baseline: Option<InPlaceBaselineCache>,
     scan_count_offset: u64,
     pending_sidecar_nodes: Mutex<Vec<persist::ScanNodeUpsert>>,
     last_progress_persist_at: Mutex<Option<Instant>>,
@@ -948,12 +955,13 @@ fn prepare_incremental_context(
     } else {
         persist::load_scan_children(&state.db_path, &task_id, &snapshot.root_node_id, false)?
     };
-    if task
-        .baseline_task_id
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty()
+    if task.in_place_baseline.as_ref().is_none()
+        && task
+            .baseline_task_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
     {
         return Ok(Some(IncrementalContext {
             baseline_nodes: HashMap::new(),
@@ -962,9 +970,15 @@ fn prepare_incremental_context(
             deleted_count: 0,
         }));
     }
-    let baseline_task_id = task.baseline_task_id.clone().unwrap_or_default();
-    let baseline_nodes = persist::load_scan_node_map(&state.db_path, &baseline_task_id)?;
-    let baseline_findings = persist::load_scan_findings_map(&state.db_path, &baseline_task_id)?;
+    let (baseline_nodes, baseline_findings) = if let Some(cache) = task.in_place_baseline.as_ref() {
+        (cache.nodes.clone(), cache.findings.clone())
+    } else {
+        let baseline_task_id = task.baseline_task_id.clone().unwrap_or_default();
+        (
+            persist::load_scan_node_map(&state.db_path, &baseline_task_id)?,
+            persist::load_scan_findings_map(&state.db_path, &baseline_task_id)?,
+        )
+    };
     let deleted_count = if task.scan_mode == ScanMode::FullRescanIncremental {
         baseline_nodes
             .keys()
@@ -1424,10 +1438,6 @@ async fn prepare_runtime_scan_data<R: Runtime>(
         return Ok(());
     }
 
-    let baseline_task_id = task
-        .baseline_task_id
-        .clone()
-        .ok_or_else(|| "Missing baseline snapshot".to_string())?;
     let task_id = task.snapshot.lock().id.clone();
     let affected_paths = task
         .sidecar_roots
@@ -1438,13 +1448,11 @@ async fn prepare_runtime_scan_data<R: Runtime>(
     emit_cache_event(
         app,
         &task_id,
-        "prepare_incremental_clone",
+        "prepare_incremental_reuse_tree",
         None,
         Some(affected_paths.len() as u64),
     )
     .await?;
-
-    persist::clone_scan_task_data(&state.db_path, &baseline_task_id, &task_id)?;
 
     emit_cache_event(
         app,
@@ -1456,7 +1464,7 @@ async fn prepare_runtime_scan_data<R: Runtime>(
     .await?;
 
     if !affected_paths.is_empty() {
-        persist::delete_scan_data_for_paths(&state.db_path, &task_id, &affected_paths)?;
+        persist::delete_scan_descendants_for_paths(&state.db_path, &task_id, &affected_paths)?;
     }
     if !task.ignored_paths.is_empty() {
         persist::delete_scan_data_for_paths(&state.db_path, &task_id, &task.ignored_paths)?;
@@ -1503,7 +1511,6 @@ pub async fn scan_start<R: Runtime>(
     {
         return Err("API key is required for scan analysis".to_string());
     }
-    let task_id = format!("scan_{}", Uuid::new_v4().simple());
     let target_path = PathBuf::from(&input.target_path)
         .to_string_lossy()
         .to_string();
@@ -1523,6 +1530,18 @@ pub async fn scan_start<R: Runtime>(
     if matches!(scan_mode, ScanMode::DeepenIncremental) && baseline_snapshot.is_none() {
         return Err("A baseline task is required for deepen_incremental".to_string());
     }
+    let task_id = if matches!(scan_mode, ScanMode::DeepenIncremental) {
+        let existing_task_id = baseline_task_id
+            .as_ref()
+            .ok_or_else(|| "Missing baseline snapshot".to_string())?
+            .clone();
+        if state.scan_tasks.lock().contains_key(&existing_task_id) {
+            return Err("The selected scan task is already running".to_string());
+        }
+        existing_task_id
+    } else {
+        format!("scan_{}", Uuid::new_v4().simple())
+    };
     let deepen_boundary_nodes = if matches!(scan_mode, ScanMode::DeepenIncremental) {
         let baseline = baseline_snapshot
             .as_ref()
@@ -1533,6 +1552,14 @@ pub async fn scan_start<R: Runtime>(
             input.max_depth,
             &prune_rules,
         )?)
+    } else {
+        None
+    };
+    let in_place_baseline = if matches!(scan_mode, ScanMode::DeepenIncremental) {
+        Some(InPlaceBaselineCache {
+            nodes: persist::load_scan_node_map(&state.db_path, &task_id)?,
+            findings: persist::load_scan_findings_map(&state.db_path, &task_id)?,
+        })
     } else {
         None
     };
@@ -1553,45 +1580,69 @@ pub async fn scan_start<R: Runtime>(
         .target_size_gb
         .unwrap_or(1.0)
         .clamp(min_target_size_gb, max_target_size_gb);
-    let mut snapshot = ScanSnapshot {
-        id: task_id.clone(),
-        status: "idle".to_string(),
-        scan_mode: scan_mode.as_str().to_string(),
-        baseline_task_id: baseline_task_id.clone(),
-        visible_latest: true,
-        root_path_key: persist::create_root_path_key(&target_path),
-        target_path: target_path.clone(),
-        auto_analyze: input.auto_analyze.unwrap_or(true),
-        root_node_id: persist::create_node_id(&target_path),
-        configured_max_depth: max_depth,
-        max_scanned_depth: baseline_snapshot
-            .as_ref()
-            .map(|item| item.max_scanned_depth)
-            .unwrap_or(0),
-        current_path: target_path.clone(),
-        current_depth: 0,
-        scanned_count: 0,
-        total_entries: 0,
-        processed_entries: 0,
-        deletable_count: 0,
-        total_cleanable: 0,
-        target_size: (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
-        token_usage: TokenUsage::default(),
-        deletable: Vec::new(),
-        permission_denied_count: 0,
-        permission_denied_paths: Vec::new(),
-        error_message: String::new(),
+    let mut snapshot = if matches!(scan_mode, ScanMode::DeepenIncremental) {
+        let mut existing = baseline_snapshot
+            .clone()
+            .ok_or_else(|| "Missing baseline snapshot".to_string())?;
+        existing.status = "idle".to_string();
+        existing.scan_mode = scan_mode.as_str().to_string();
+        existing.baseline_task_id = None;
+        existing.visible_latest = true;
+        existing.root_path_key = persist::create_root_path_key(&target_path);
+        existing.target_path = target_path.clone();
+        existing.auto_analyze = input.auto_analyze.unwrap_or(true);
+        existing.root_node_id = persist::create_node_id(&target_path);
+        existing.configured_max_depth = max_depth;
+        existing.current_path = target_path.clone();
+        existing.current_depth = 0;
+        existing.scanned_count = 0;
+        existing.total_entries = 0;
+        existing.processed_entries = 0;
+        existing.target_size = (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        existing.error_message.clear();
+        existing.id = task_id.clone();
+        existing
+    } else {
+        persist::init_scan_task(
+            &state.db_path,
+            &task_id,
+            &target_path,
+            (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            max_depth,
+            input.auto_analyze.unwrap_or(true),
+            baseline_task_id.as_deref(),
+            scan_mode.as_str(),
+        )?;
+        ScanSnapshot {
+            id: task_id.clone(),
+            status: "idle".to_string(),
+            scan_mode: scan_mode.as_str().to_string(),
+            baseline_task_id: baseline_task_id.clone(),
+            visible_latest: true,
+            root_path_key: persist::create_root_path_key(&target_path),
+            target_path: target_path.clone(),
+            auto_analyze: input.auto_analyze.unwrap_or(true),
+            root_node_id: persist::create_node_id(&target_path),
+            configured_max_depth: max_depth,
+            max_scanned_depth: baseline_snapshot
+                .as_ref()
+                .map(|item| item.max_scanned_depth)
+                .unwrap_or(0),
+            current_path: target_path.clone(),
+            current_depth: 0,
+            scanned_count: 0,
+            total_entries: 0,
+            processed_entries: 0,
+            deletable_count: 0,
+            total_cleanable: 0,
+            target_size: (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            token_usage: TokenUsage::default(),
+            deletable: Vec::new(),
+            permission_denied_count: 0,
+            permission_denied_paths: Vec::new(),
+            error_message: String::new(),
+        }
     };
-    persist::init_scan_task(
-        &state.db_path,
-        &task_id,
-        &target_path,
-        snapshot.target_size,
-        max_depth,
-        snapshot.auto_analyze,
-        baseline_task_id.as_deref(),
-        scan_mode.as_str(),
-    )?;
     let mut sidecar_roots = vec![SidecarRoot {
         path: target_path.clone(),
         parent_id: None,
@@ -1626,6 +1677,7 @@ pub async fn scan_start<R: Runtime>(
         sidecar_roots,
         ignored_paths,
         prune_rules,
+        in_place_baseline,
         scan_count_offset: 0,
         pending_sidecar_nodes: Mutex::new(Vec::new()),
         last_progress_persist_at: Mutex::new(None),
@@ -2006,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn deepen_incremental_scan_preserves_baseline_and_adds_deeper_nodes() {
+    fn deepen_incremental_scan_updates_existing_tree_in_place() {
         let root = temp_path("deepen-root");
         let db_path = temp_path("deepen-db.sqlite");
         fs::create_dir_all(&root).expect("create root");
@@ -2054,29 +2106,15 @@ mod tests {
             "baseline boundary nodes missing"
         );
 
-        let deepen_task_id = format!("scan_{}", Uuid::new_v4().simple());
-        persist::init_scan_task(
+        persist::delete_scan_descendants_for_paths(
             &db_path,
-            &deepen_task_id,
-            &root_string,
-            0,
-            Some(2),
-            false,
-            Some(&baseline_task_id),
-            "deepen_incremental",
-        )
-        .expect("init deepen task");
-        persist::clone_scan_task_data(&db_path, &baseline_task_id, &deepen_task_id)
-            .expect("clone baseline task");
-        persist::delete_scan_data_for_paths(
-            &db_path,
-            &deepen_task_id,
+            &baseline_task_id,
             &boundary_nodes
                 .iter()
                 .map(|node| node.path.clone())
                 .collect::<Vec<_>>(),
         )
-        .expect("delete boundary nodes");
+        .expect("delete boundary descendants");
 
         let roots_json = temp_path("deepen-roots.json");
         let roots_payload = boundary_nodes
@@ -2100,7 +2138,7 @@ mod tests {
             "--db".to_string(),
             db_path.to_string_lossy().to_string(),
             "--task-id".to_string(),
-            deepen_task_id.clone(),
+            baseline_task_id.clone(),
             "--roots-json".to_string(),
             roots_json.to_string_lossy().to_string(),
             "--max-depth".to_string(),
@@ -2108,23 +2146,24 @@ mod tests {
         ]);
         apply_sidecar_output_to_db(
             &db_path,
-            &deepen_task_id,
+            &baseline_task_id,
             &root,
             "deepen_incremental",
-            Some(baseline_task_id.clone()),
+            None,
             Some(2),
             &deepen_lines,
         );
 
-        let deepen_snapshot = persist::load_scan_snapshot(&db_path, &deepen_task_id)
+        let deepen_snapshot = persist::load_scan_snapshot(&db_path, &baseline_task_id)
             .expect("load deepen snapshot")
             .expect("deepen snapshot exists");
         assert_eq!(deepen_snapshot.status, "done");
+        assert_eq!(deepen_snapshot.id, baseline_task_id);
         assert_eq!(deepen_snapshot.configured_max_depth, Some(2));
         assert_eq!(deepen_snapshot.max_scanned_depth, 2);
 
         let node_map =
-            persist::load_scan_node_map(&db_path, &deepen_task_id).expect("load node map");
+            persist::load_scan_node_map(&db_path, &baseline_task_id).expect("load node map");
         assert!(node_map.contains_key(&root.join("A").to_string_lossy().to_lowercase()));
         assert!(node_map.contains_key(
             &root
@@ -2144,7 +2183,7 @@ mod tests {
 
         let dir_a_id = persist::create_node_id(&root.join("A").to_string_lossy());
         let dir_a_children =
-            persist::load_scan_children(&db_path, &deepen_task_id, &dir_a_id, false)
+            persist::load_scan_children(&db_path, &baseline_task_id, &dir_a_id, false)
                 .expect("load A children");
         assert!(dir_a_children.iter().any(|node| node.name == "nested"));
         assert!(dir_a_children.iter().any(|node| node.name == "a.txt"));
@@ -2152,7 +2191,7 @@ mod tests {
         let latest = persist::find_latest_visible_scan_task_id_for_path(&db_path, &root_string)
             .expect("find latest task")
             .expect("latest task exists");
-        assert_eq!(latest, deepen_task_id);
+        assert_eq!(latest, baseline_task_id);
 
         let _ = fs::remove_file(&roots_json);
         let _ = fs::remove_dir_all(&root);
@@ -2201,24 +2240,19 @@ mod tests {
             &baseline_lines,
         );
 
-        let stopped_task_id = format!("scan_{}", Uuid::new_v4().simple());
-        persist::init_scan_task(
-            &db_path,
-            &stopped_task_id,
-            &root_string,
-            0,
-            Some(3),
-            false,
-            Some(&baseline_task_id),
-            "deepen_incremental",
-        )
-        .expect("init stopped deepen task");
-        persist::clone_scan_task_data(&db_path, &baseline_task_id, &stopped_task_id)
-            .expect("clone baseline task");
-
-        let stopped_snapshot = persist::load_scan_snapshot(&db_path, &stopped_task_id)
+        let mut stopped_snapshot = persist::load_scan_snapshot(&db_path, &baseline_task_id)
             .expect("load stopped snapshot")
             .expect("stopped snapshot exists");
+        stopped_snapshot.scan_mode = "deepen_incremental".to_string();
+        stopped_snapshot.configured_max_depth = Some(3);
+        stopped_snapshot.status = "stopped".to_string();
+        stopped_snapshot.current_path = root_string.clone();
+        stopped_snapshot.current_depth = 1;
+        persist::save_scan_snapshot(&db_path, &stopped_snapshot).expect("save stopped snapshot");
+
+        let stopped_snapshot = persist::load_scan_snapshot(&db_path, &baseline_task_id)
+            .expect("reload stopped snapshot")
+            .expect("reloaded stopped snapshot exists");
         assert_eq!(stopped_snapshot.configured_max_depth, Some(3));
         assert_eq!(stopped_snapshot.max_scanned_depth, 1);
 

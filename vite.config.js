@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 
-const devPort = Number(process.env.VITE_PORT || 1420);
+const devPort = Number(process.env.VITE_PORT || 5173);
 const strictPort = process.env.VITE_STRICT_PORT === 'true';
 
 export default defineConfig({

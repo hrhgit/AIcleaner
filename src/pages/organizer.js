@@ -35,7 +35,18 @@ const PERSIST_KEYS = {
   logCollapsed: 'wipeout.organizer.global.log_collapsed.v1',
   logRecordGroupCollapsed: 'wipeout.organizer.global.log_record_group_collapsed.v1',
   logTaskId: 'wipeout.organizer.global.log_task_id.v1',
+  runtimeCacheVersion: 'wipeout.organizer.global.runtime_cache_version.v1',
 };
+
+const ORGANIZER_RUNTIME_CACHE_VERSION = 2;
+const RUNTIME_CACHE_KEYS = [
+  PERSIST_KEYS.lastJobId,
+  PERSIST_KEYS.lastTaskId,
+  PERSIST_KEYS.lastSnapshot,
+  PERSIST_KEYS.lastApplyManifest,
+  PERSIST_KEYS.logEntries,
+  PERSIST_KEYS.logTaskId,
+];
 
 const LEGACY_PERSIST_KEYS = [
   'wipeout.organizer.global.root_path.v1',
@@ -206,6 +217,17 @@ function cleanupLegacyPersistedState() {
   for (const key of LEGACY_PERSIST_KEYS) {
     removePersisted(key);
   }
+}
+
+function invalidateOrganizerRuntimeCacheIfNeeded() {
+  const currentVersion = Number(getPersisted(PERSIST_KEYS.runtimeCacheVersion, 0) || 0);
+  if (currentVersion === ORGANIZER_RUNTIME_CACHE_VERSION) {
+    return;
+  }
+  for (const key of RUNTIME_CACHE_KEYS) {
+    removePersisted(key);
+  }
+  setPersisted(PERSIST_KEYS.runtimeCacheVersion, ORGANIZER_RUNTIME_CACHE_VERSION);
 }
 
 function getErrorMessage(err) {
@@ -2388,6 +2410,7 @@ export async function renderOrganizer(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
   cleanupLegacyPersistedState();
+  invalidateOrganizerRuntimeCacheIfNeeded();
   const defaults = restoreDefaults();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
   restoreOrganizerLogState(cachedSnapshot);
@@ -2626,6 +2649,8 @@ export async function renderOrganizer(container) {
 export async function renderOrganizerResults(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
+  cleanupLegacyPersistedState();
+  invalidateOrganizerRuntimeCacheIfNeeded();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
   restoreOrganizerLogState(cachedSnapshot);
   if (organizerProviderSettingsUpdatedHandler) {

@@ -252,7 +252,9 @@ pub struct OrganizeSnapshot {
     pub total_batches: u64,
     pub processed_batches: u64,
     pub token_usage: TokenUsage,
+    #[serde(default)]
     pub results: Vec<Value>,
+    #[serde(default)]
     pub preview: Vec<Value>,
     pub created_at: String,
     pub completed_at: Option<String>,

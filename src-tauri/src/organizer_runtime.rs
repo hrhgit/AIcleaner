@@ -2681,6 +2681,7 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
         "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
         "When an item summary includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the summary clearly shows unrelated mixed content.".to_string(),
         "Some items may have an empty summary and only provide file name, path, type, or modality. In that case, classify using those fields instead of assuming missing content.".to_string(),
+        "The classification payload only includes normalized summaries and lightweight metadata, not raw extraction text.".to_string(),
         "Prefer using summary first when it exists; otherwise fall back to name, relativePath, itemType, and modality.".to_string(),
         format!("Use {output_language} names and keep labels short."),
         format!("The assignment \"reason\" field must be written in {output_language} only."),
@@ -2692,6 +2693,32 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
         );
     }
     lines.join("\n")
+}
+
+fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Value> {
+    batch_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
+                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
+                "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
+                "summaryKeywords": row
+                    .get("summaryKeywords")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+                "summaryWarnings": row
+                    .get("summaryWarnings")
+                    .cloned()
+                    .unwrap_or(Value::Array(Vec::new())),
+            })
+        })
+        .collect()
 }
 
 async fn classify_organize_batch(
@@ -2710,6 +2737,7 @@ async fn classify_organize_batch(
     let mut search_context = None::<String>;
     let mut round_trace = Vec::new();
     let max_rounds = if search_allowed { 2 } else { 1 };
+    let classification_items = build_classification_batch_items(batch_rows);
 
     for round_idx in 0..max_rounds {
         let round = round_idx + 1;
@@ -2728,7 +2756,7 @@ async fn classify_organize_batch(
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
                 "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
             })).collect::<Vec<_>>(),
-            "items": batch_rows,
+            "items": classification_items.clone(),
             "useWebSearch": use_web_search,
         });
         if let Some(structure) = reference_structure {
@@ -2902,6 +2930,11 @@ fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
         }));
     }
     out
+}
+
+fn hydrate_loaded_snapshot(mut snapshot: OrganizeSnapshot) -> OrganizeSnapshot {
+    snapshot.preview = build_preview(&snapshot.root_path, &snapshot.results);
+    snapshot
 }
 
 fn normalize_path_key(path: &Path) -> String {
@@ -3410,6 +3443,11 @@ async fn run_organize_task<R: Runtime>(
             return Ok(());
         }
 
+        let batch_base_index = {
+            let snap = task.snapshot.lock();
+            snap.processed_files
+        };
+        let mut persisted_rows = Vec::with_capacity(batch_rows.len());
         for (row_offset, row) in batch_rows.into_iter().enumerate() {
             if task.stop.load(Ordering::Relaxed) {
                 return Ok(());
@@ -3442,13 +3480,9 @@ async fn run_organize_task<R: Runtime>(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let next_index = {
-                let snap = task.snapshot.lock();
-                snap.processed_files + 1
-            };
             let result_row = json!({
-                "taskId": task.snapshot.lock().id,
-                "index": next_index,
+                "taskId": task_id.clone(),
+                "index": batch_base_index + row_offset as u64 + 1,
                 "batchIndex": (batch_idx + 1) as u64,
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
                 "path": row.get("path").and_then(Value::as_str).unwrap_or(""),
@@ -3473,13 +3507,18 @@ async fn run_organize_task<R: Runtime>(
                 "classificationError": if row_offset == 0 { cluster_error.clone() } else { String::new() },
                 "modelRawOutput": if row_offset == 0 { cluster_raw_output.clone() } else { String::new() },
             });
-            persist::upsert_organize_result(&state.db_path, &task.snapshot.lock().id, &result_row)?;
-            {
-                let mut snap = task.snapshot.lock();
-                snap.results.push(result_row.clone());
-                snap.processed_files = snap.processed_files.saturating_add(1);
-            }
-            app.emit("organize_file_done", result_row)
+            persisted_rows.push(result_row.clone());
+        }
+        persist::upsert_organize_results(&state.db_path, &task_id, &persisted_rows)?;
+        {
+            let mut snap = task.snapshot.lock();
+            snap.processed_files = snap
+                .processed_files
+                .saturating_add(persisted_rows.len() as u64);
+            snap.results.extend(persisted_rows.iter().cloned());
+        }
+        for row in persisted_rows {
+            app.emit("organize_file_done", row)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -3694,12 +3733,14 @@ pub async fn organize_get_result(
     }
     let snapshot = persist::load_organize_snapshot(&state.db_path, &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
-    serde_json::to_value(snapshot).map_err(|e| e.to_string())
+    serde_json::to_value(hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
 }
 
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    let mut snapshot = persist::load_organize_snapshot(&state.db_path, &task_id)?
-        .ok_or_else(|| "Task not found".to_string())?;
+    let mut snapshot = hydrate_loaded_snapshot(
+        persist::load_organize_snapshot(&state.db_path, &task_id)?
+            .ok_or_else(|| "Task not found".to_string())?,
+    );
     if snapshot.status != "completed" && snapshot.status != "done" {
         return Err(format!(
             "task status is {}, cannot apply move",
@@ -3947,6 +3988,7 @@ pub async fn organize_rollback(
     if failed == 0 {
         if let Some(task_id) = task_id {
             if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path, &task_id)? {
+                snapshot = hydrate_loaded_snapshot(snapshot);
                 snapshot.status = "completed".to_string();
                 snapshot.job_id = None;
                 persist::save_organize_snapshot(&state.db_path, &snapshot)?;
@@ -4245,6 +4287,44 @@ mod tests {
         assert_eq!(item.keywords, vec!["预算", "项目", "金额"]);
         assert_eq!(item.confidence.as_deref(), Some("high"));
         assert_eq!(item.warnings, vec!["source_sparse"]);
+    }
+
+    #[test]
+    fn classification_batch_items_exclude_raw_extraction_fields() {
+        let items = build_classification_batch_items(&[json!({
+            "itemId": "batch1_1",
+            "name": "report.pdf",
+            "path": "E:\\docs\\report.pdf",
+            "relativePath": "docs\\report.pdf",
+            "size": 1234,
+            "itemType": "file",
+            "modality": "text",
+            "summary": "季度财务报告",
+            "summarySource": "agent_summary",
+            "summaryConfidence": "high",
+            "summaryKeywords": ["财务", "季度"],
+            "summaryWarnings": ["source_sparse"],
+            "localExtraction": {
+                "parser": "tika",
+                "excerpt": "very long raw extraction text"
+            }
+        })]);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(
+            item.get("summary").and_then(Value::as_str),
+            Some("季度财务报告")
+        );
+        assert_eq!(
+            item.get("summaryKeywords")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(item.get("localExtraction").is_none());
+        assert!(item.get("path").is_none());
+        assert!(item.get("size").is_none());
     }
 
     #[test]

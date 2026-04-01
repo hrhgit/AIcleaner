@@ -90,7 +90,7 @@ async function recoverRecentContinueTask({ baselineTaskId, targetPath, depth, un
 
       return !!taskId
         && task?.scanMode === 'deepen_incremental'
-        && taskBaselineId === baselineId
+        && (taskBaselineId === baselineId || taskId === baselineId)
         && taskPath === normalizedTargetPath
         && depthMatches
         && statusMatches

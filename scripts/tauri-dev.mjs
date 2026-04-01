@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 const HOST = '127.0.0.1';
-const DEFAULT_PORT = 1420;
-const MAX_PORT = 1499;
+const DEFAULT_PORT = 5173;
+const MAX_PORT = 5272;
 
 function tauriBinary() {
   return process.platform === 'win32'
