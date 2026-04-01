@@ -22,21 +22,6 @@ pub struct ScanNode {
 }
 
 #[derive(Clone, Debug)]
-pub struct ScanNodeUpsert {
-    pub node_id: String,
-    pub parent_id: Option<String>,
-    pub path: String,
-    pub name: String,
-    pub node_type: String,
-    pub depth: u32,
-    pub self_size: u64,
-    pub size: u64,
-    pub child_count: u64,
-    pub mtime_ms: Option<i64>,
-    pub ext: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct ScanFindingRecord {
     pub item: ScanResultItem,
     pub should_expand: bool,
@@ -581,56 +566,6 @@ pub fn refresh_scan_stats(db_path: &Path, task_id: &str) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-pub fn upsert_scan_nodes(
-    db_path: &Path,
-    task_id: &str,
-    nodes: &[ScanNodeUpsert],
-) -> Result<(), String> {
-    if nodes.is_empty() {
-        return Ok(());
-    }
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut stmt = tx
-        .prepare_cached(
-            "INSERT INTO scan_nodes (
-                task_id, node_id, parent_id, path, name, type, depth,
-                self_size, total_size, child_count, mtime_ms, ext
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(task_id, node_id) DO UPDATE SET
-                parent_id = excluded.parent_id,
-                path = excluded.path,
-                name = excluded.name,
-                type = excluded.type,
-                depth = excluded.depth,
-                self_size = excluded.self_size,
-                total_size = excluded.total_size,
-                child_count = excluded.child_count,
-                mtime_ms = excluded.mtime_ms,
-                ext = excluded.ext",
-        )
-        .map_err(|e| e.to_string())?;
-    for node in nodes {
-        stmt.execute(params![
-            task_id,
-            node.node_id,
-            node.parent_id,
-            node.path,
-            node.name,
-            node.node_type,
-            node.depth as i64,
-            node.self_size as i64,
-            node.size as i64,
-            node.child_count as i64,
-            node.mtime_ms,
-            node.ext,
-        ])
-        .map_err(|e| e.to_string())?;
-    }
-    drop(stmt);
-    tx.commit().map_err(|e| e.to_string())
 }
 
 fn load_scan_findings(conn: &Connection, task_id: &str) -> Result<Vec<ScanResultItem>, String> {

@@ -11,7 +11,7 @@ import { t } from './i18n.js';
 
 const ACTIVE_SCAN_STATUSES = new Set(['idle', 'scanning', 'analyzing']);
 const SCAN_LOG_CACHE_KEY = 'wipeout.scanner.global.log.v1';
-const PROGRESS_LOG_INTERVAL_MS = 250;
+const PROGRESS_LOG_INTERVAL_MS = 1000;
 
 function isActiveScanStatus(status) {
   return ACTIVE_SCAN_STATUSES.has(String(status || '').trim());
@@ -99,6 +99,12 @@ class ScanTaskController {
     });
   }
 
+  maybePersistScanLog(force = false) {
+    if (force || !this.state.activeTaskId) {
+      this.persistScanLog();
+    }
+  }
+
   replaceLogEntries(nextEntries = [], { persist = true } = {}) {
     this.state.logEntries = normalizePersistedLogEntries(nextEntries);
     const maxId = this.state.logEntries.reduce((acc, entry) => Math.max(acc, Number.isFinite(entry.id) ? entry.id : -1), -1);
@@ -113,25 +119,20 @@ class ScanTaskController {
   }
 
   trimLogEntries() {
-    let trimmed = false;
     while (this.state.logEntries.length > 200) {
-      trimmed = true;
       this.state.logEntries.shift();
-    }
-    if (trimmed) {
-      this.persistScanLog();
     }
   }
 
-  addLog(type, text) {
+  addLog(type, text, { persist = false } = {}) {
     const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     this.state.logEntries.push({ kind: 'simple', type, text, time });
-    this.persistScanLog();
     this.trimLogEntries();
+    this.maybePersistScanLog(persist);
     this.notifyState();
   }
 
-  addDetailLog(type, summary, detailHtml) {
+  addDetailLog(type, summary, detailHtml, { persist = false } = {}) {
     const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     this.state.logEntries.push({
       id: this.state.nextLogEntryId++,
@@ -141,8 +142,8 @@ class ScanTaskController {
       detailHtml,
       time,
     });
-    this.persistScanLog();
     this.trimLogEntries();
+    this.maybePersistScanLog(persist);
     this.notifyState();
   }
 
@@ -369,6 +370,7 @@ class ScanTaskController {
       this.addLog('analyzing', permissionText);
     }
     this.resetActiveTask();
+    this.persistScanLog();
     this.emit('done', { data, doneText, permissionText });
   }
 
@@ -379,6 +381,7 @@ class ScanTaskController {
     }
     this.addLog('analyzing', `${t('scanner.toast_failed_detail')}${message}`);
     this.resetActiveTask();
+    this.persistScanLog();
     this.emit('error', { error: err, message });
   }
 
@@ -389,6 +392,7 @@ class ScanTaskController {
     this.updateSnapshot(data, { persist: true });
     this.addLog('scanning', t('scanner.stopped'));
     this.resetActiveTask();
+    this.persistScanLog();
     this.emit('stopped', { data });
   }
 

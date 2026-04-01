@@ -5,7 +5,6 @@ use crate::web_search::{
 };
 use parking_lot::Mutex;
 use reqwest::StatusCode;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,8 +20,7 @@ use uuid::Uuid;
 
 const TARGET_SIZE_MIN_GB: f64 = 0.1;
 const TARGET_SIZE_DEFAULT_MAX_GB: f64 = 20.0;
-const SCAN_NODE_FLUSH_THRESHOLD: usize = 1024;
-const SCAN_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(750);
+const SCAN_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(1000);
 const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
 const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 
@@ -256,8 +254,6 @@ pub struct ScanTaskRuntime {
     ignored_paths: Vec<String>,
     prune_rules: Vec<ScanPruneRule>,
     in_place_baseline: Option<InPlaceBaselineCache>,
-    scan_count_offset: u64,
-    pending_sidecar_nodes: Mutex<Vec<persist::ScanNodeUpsert>>,
     last_progress_persist_at: Mutex<Option<Instant>>,
     ai: ScanAiConfig,
     pub job: Mutex<Option<JoinHandle<()>>>,
@@ -284,27 +280,6 @@ struct ChatResponse {
 struct ChatCompletionError {
     message: String,
     raw_body: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SidecarNodeBatchEvent {
-    nodes: Vec<SidecarNodeRecord>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SidecarNodeRecord {
-    node_id: String,
-    parent_id: Option<String>,
-    path: String,
-    name: String,
-    node_type: String,
-    depth: u32,
-    self_size: i64,
-    total_size: i64,
-    child_count: i64,
-    mtime_ms: Option<i64>,
-    ext: String,
 }
 
 fn format_size(n: u64) -> String {
@@ -884,9 +859,6 @@ async fn emit_progress_with_options<R: Runtime>(
     task: &Arc<ScanTaskRuntime>,
     persist_snapshot: bool,
 ) -> Result<(), String> {
-    if persist_snapshot {
-        flush_pending_sidecar_nodes(state, task)?;
-    }
     let snap = task.snapshot.lock().clone();
     if persist_snapshot {
         persist::save_scan_snapshot(&state.db_path, &snap)?;
@@ -896,32 +868,6 @@ async fn emit_progress_with_options<R: Runtime>(
         serde_json::to_value(&snap).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
-}
-
-fn queue_sidecar_nodes(
-    task: &Arc<ScanTaskRuntime>,
-    mut rows: Vec<persist::ScanNodeUpsert>,
-) -> usize {
-    let mut pending = task.pending_sidecar_nodes.lock();
-    pending.append(&mut rows);
-    pending.len()
-}
-
-fn flush_pending_sidecar_nodes(
-    state: &AppState,
-    task: &Arc<ScanTaskRuntime>,
-) -> Result<usize, String> {
-    let rows = {
-        let mut pending = task.pending_sidecar_nodes.lock();
-        if pending.is_empty() {
-            return Ok(0);
-        }
-        std::mem::take(&mut *pending)
-    };
-    let task_id = task.snapshot.lock().id.clone();
-    let row_count = rows.len();
-    persist::upsert_scan_nodes(&state.db_path, &task_id, &rows)?;
-    Ok(row_count)
 }
 
 fn should_persist_scan_progress(task: &Arc<ScanTaskRuntime>, force: bool) -> bool {
@@ -1173,30 +1119,6 @@ async fn handle_sidecar_line<R: Runtime>(
 ) -> Result<(), String> {
     let task_id = task.snapshot.lock().id.clone();
     match payload.get("type").and_then(Value::as_str).unwrap_or("") {
-        "node_batch" => {
-            let batch: SidecarNodeBatchEvent =
-                serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
-            let rows = batch
-                .nodes
-                .into_iter()
-                .map(|node| persist::ScanNodeUpsert {
-                    node_id: node.node_id,
-                    parent_id: node.parent_id,
-                    path: node.path,
-                    name: node.name,
-                    node_type: node.node_type,
-                    depth: node.depth,
-                    self_size: node.self_size.max(0) as u64,
-                    size: node.total_size.max(0) as u64,
-                    child_count: node.child_count.max(0) as u64,
-                    mtime_ms: node.mtime_ms,
-                    ext: node.ext,
-                })
-                .collect::<Vec<_>>();
-            if queue_sidecar_nodes(task, rows) >= SCAN_NODE_FLUSH_THRESHOLD {
-                flush_pending_sidecar_nodes(state, task)?;
-            }
-        }
         "task_started" | "scan_progress" | "scan_completed" => {
             let force_persist = matches!(
                 payload.get("type").and_then(Value::as_str).unwrap_or(""),
@@ -1220,8 +1142,8 @@ async fn handle_sidecar_line<R: Runtime>(
                     .get("total_entries")
                     .and_then(Value::as_u64)
                     .unwrap_or(scanned_delta);
-                snap.scanned_count = task.scan_count_offset.saturating_add(scanned_delta);
-                snap.total_entries = task.scan_count_offset.saturating_add(total_delta);
+                snap.scanned_count = scanned_delta;
+                snap.total_entries = total_delta;
                 snap.max_scanned_depth = snap.max_scanned_depth.max(snap.current_depth);
             }
             emit_progress_with_options(
@@ -1375,7 +1297,6 @@ async fn run_sidecar_scan<R: Runtime>(
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = stderr_handle.join();
     *task.child_pid.lock() = None;
-    flush_pending_sidecar_nodes(state, task)?;
     if let Some(file_path) = roots_path {
         let _ = fs::remove_file(file_path);
     }
@@ -1411,7 +1332,6 @@ async fn run_scan_task<R: Runtime>(
     emit_progress(app, state, task).await?;
     prepare_runtime_scan_data(app, state, task).await?;
     run_sidecar_scan(app, state, task).await?;
-    flush_pending_sidecar_nodes(state, task)?;
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -1678,8 +1598,6 @@ pub async fn scan_start<R: Runtime>(
         ignored_paths,
         prune_rules,
         in_place_baseline,
-        scan_count_offset: 0,
-        pending_sidecar_nodes: Mutex::new(Vec::new()),
         last_progress_persist_at: Mutex::new(None),
         ai: ScanAiConfig {
             endpoint: input
@@ -1853,7 +1771,10 @@ mod tests {
     fn test_scanner_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("bin")
+            .join("native")
+            .join("scanner")
+            .join("target")
+            .join("debug")
             .join("scanner.exe")
     }
 
@@ -1903,7 +1824,6 @@ mod tests {
         stdout_lines: &[String],
     ) {
         let mut snapshot = make_snapshot(task_id, root, max_depth, scan_mode, baseline_task_id);
-        let mut pending = Vec::<persist::ScanNodeUpsert>::new();
 
         for line in stdout_lines {
             let payload: Value = serde_json::from_str(line).expect("parse sidecar event");
@@ -1928,23 +1848,6 @@ mod tests {
                         snapshot.max_scanned_depth.max(snapshot.current_depth);
                     snapshot.status = "scanning".to_string();
                 }
-                "node_batch" => {
-                    let batch: SidecarNodeBatchEvent =
-                        serde_json::from_value(payload).expect("parse node batch");
-                    pending.extend(batch.nodes.into_iter().map(|node| persist::ScanNodeUpsert {
-                        node_id: node.node_id,
-                        parent_id: node.parent_id,
-                        path: node.path,
-                        name: node.name,
-                        node_type: node.node_type,
-                        depth: node.depth,
-                        self_size: node.self_size.max(0) as u64,
-                        size: node.total_size.max(0) as u64,
-                        child_count: node.child_count.max(0) as u64,
-                        mtime_ms: node.mtime_ms,
-                        ext: node.ext,
-                    }));
-                }
                 "permission_denied" => {
                     snapshot.permission_denied_count =
                         snapshot.permission_denied_count.saturating_add(1);
@@ -1956,14 +1859,22 @@ mod tests {
             }
         }
 
-        if !pending.is_empty() {
-            persist::upsert_scan_nodes(db_path, task_id, &pending).expect("persist node batch");
-        }
         snapshot.status = "done".to_string();
         persist::save_scan_snapshot(db_path, &snapshot).expect("save final snapshot");
     }
 
     fn run_scanner_command(args: &[String]) -> Vec<String> {
+        let scanner_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("native")
+            .join("scanner");
+        let build_status = Command::new("cargo")
+            .arg("build")
+            .current_dir(&scanner_dir)
+            .status()
+            .expect("build scanner");
+        assert!(build_status.success(), "scanner build failed with {build_status}");
+
         let scanner = test_scanner_path();
         assert!(
             scanner.exists(),
