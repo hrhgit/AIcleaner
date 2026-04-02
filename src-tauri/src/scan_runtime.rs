@@ -699,9 +699,13 @@ fn build_node_fingerprint(
     }
 }
 
-fn portrait_summary_lines(portrait: &DirectoryPortrait) -> String {
+fn portrait_summary_lines(portrait: &DirectoryPortrait, response_language: &str) -> String {
     let top_children = if portrait.top_children.is_empty() {
-        "(none)".to_string()
+        if is_zh_language(response_language) {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
         portrait
             .top_children
@@ -718,7 +722,11 @@ fn portrait_summary_lines(portrait: &DirectoryPortrait) -> String {
             .join("\n")
     };
     let top_extensions = if portrait.top_file_extensions.is_empty() {
-        "(none)".to_string()
+        if is_zh_language(response_language) {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
         portrait
             .top_file_extensions
@@ -728,19 +736,35 @@ fn portrait_summary_lines(portrait: &DirectoryPortrait) -> String {
             .join(", ")
     };
     let name_tags = if portrait.name_tags.is_empty() {
-        "(none)".to_string()
+        if is_zh_language(response_language) {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
         portrait.name_tags.join(", ")
     };
-    format!(
-        "Directory portrait:\n- Direct files: {}\n- Direct directories: {}\n- Name tags: {}\n- Freshness: {}\n- Top child nodes:\n{}\n- Top file extensions: {}",
-        portrait.direct_file_count,
-        portrait.direct_dir_count,
-        name_tags,
-        portrait.freshness_bucket,
-        top_children,
-        top_extensions,
-    )
+    if is_zh_language(response_language) {
+        format!(
+            "目录画像：\n- 直接文件数：{}\n- 直接子目录数：{}\n- 名称标签：{}\n- 新旧程度：{}\n- 主要子节点：\n{}\n- 主要文件扩展名：{}",
+            portrait.direct_file_count,
+            portrait.direct_dir_count,
+            name_tags,
+            portrait.freshness_bucket,
+            top_children,
+            top_extensions,
+        )
+    } else {
+        format!(
+            "Directory portrait:\n- Direct files: {}\n- Direct directories: {}\n- Name tags: {}\n- Freshness: {}\n- Top child nodes:\n{}\n- Top file extensions: {}",
+            portrait.direct_file_count,
+            portrait.direct_dir_count,
+            name_tags,
+            portrait.freshness_bucket,
+            top_children,
+            top_extensions,
+        )
+    }
 }
 
 fn is_exact_top_children_match(left: &[ScanRuleTopChild], right: &[ScanRuleTopChild]) -> bool {
@@ -1054,7 +1078,7 @@ fn maybe_store_persistent_rule(
     let mut rules = task.persistent_rules.lock();
     let changed = insert_persistent_rule(&mut rules, record);
     if changed {
-    backend::save_scan_persistent_rules(&state.settings_path(), &rules)?;
+        backend::save_scan_persistent_rules(&state.settings_path(), &rules)?;
     }
     Ok(changed)
 }
@@ -1249,23 +1273,74 @@ fn build_scan_system_prompt(
     allow_web_search: bool,
 ) -> String {
     let response_language_name = localized_language_name(response_language, response_language);
-    let final_schema =
-        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}";
+    let (delete_all, keep_all, expand_analysis) =
+        scan_prompt_classification_tokens(response_language);
+    let final_schema = format!(
+        "{{\"classification\":\"{delete_all}|{keep_all}|{expand_analysis}\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}}"
+    );
 
-    let mut lines = vec![
-        "You are a disk cleanup safety assistant.".to_string(),
-        "Return JSON only.".to_string(),
-        format!("Final schema: {final_schema}"),
-        "Be conservative. If unsure, use suspicious.".to_string(),
-        format!("The \"reason\" field must be written in {response_language_name} only."),
-    ];
+    let mut lines = if is_zh_language(response_language) {
+        vec![
+            "你是一个磁盘清理安全分析助手。".to_string(),
+            "只能返回 JSON。".to_string(),
+            format!("输出结构：{final_schema}"),
+            format!(
+                "分类含义：{delete_all} = 整个项目都可以删除，{keep_all} = 整个项目都应该保留，{expand_analysis} = 需要继续深入分析或人工复核。"
+            ),
+            format!("保持保守判断；如果不确定，优先使用 {expand_analysis}，不要使用 {delete_all}。"),
+            format!("`reason` 字段只能使用 {response_language_name}。"),
+        ]
+    } else {
+        vec![
+            "You are a disk cleanup safety assistant.".to_string(),
+            "Return JSON only.".to_string(),
+            format!("Final schema: {final_schema}"),
+            format!(
+                "Classification meanings: {delete_all} = delete the whole item, {keep_all} = keep the whole item, {expand_analysis} = inspect deeper or require manual review."
+            ),
+            format!(
+                "Be conservative. If unsure, prefer {expand_analysis} over {delete_all}."
+            ),
+            format!("The \"reason\" field must be written in {response_language_name} only."),
+        ]
+    };
     if allow_web_search {
-        lines.push(
+        lines.push(if is_zh_language(response_language) {
+            "如果本地元数据不足且确实需要外部上下文，你可以返回 {\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"} 来替代最终结构。只使用一条简洁查询。"
+                .to_string()
+        } else {
             "If local metadata is insufficient and external context is necessary, you may return {\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"} instead of the final schema. Use one concise query only."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     lines.join("\n")
+}
+
+fn scan_prompt_classification_tokens(
+    response_language: &str,
+) -> (&'static str, &'static str, &'static str) {
+    if is_zh_language(response_language) {
+        ("全部删除", "全部保留", "展开分析")
+    } else {
+        ("delete_all", "keep_all", "expand_analysis")
+    }
+}
+
+fn normalize_scan_ai_classification(raw: Option<&str>) -> String {
+    let normalized = raw.unwrap_or("").trim();
+    let lowered = normalized.to_ascii_lowercase();
+    match normalized {
+        "全部删除" => "safe_to_delete",
+        "全部保留" => "keep",
+        "展开分析" => "suspicious",
+        _ => match lowered.as_str() {
+            "safe_to_delete" | "delete_all" | "all_delete" => "safe_to_delete",
+            "keep" | "keep_all" | "all_keep" => "keep",
+            "suspicious" | "expand_analysis" | "analyze_further" | "manual_review" => "suspicious",
+            _ => "suspicious",
+        },
+    }
+    .to_string()
 }
 
 async fn analyze_scan_node(
@@ -1275,7 +1350,11 @@ async fn analyze_scan_node(
     portrait: Option<&DirectoryPortrait>,
 ) -> ScanReview {
     let child_summary = if child_dirs.is_empty() {
-        "(none)".to_string()
+        if is_zh_language(&ai.response_language) {
+            "（无）".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
         child_dirs
             .iter()
@@ -1287,23 +1366,85 @@ async fn analyze_scan_node(
 
     let user_prompt = if node.node_type == "directory" {
         let portrait_summary = portrait
-            .map(portrait_summary_lines)
-            .unwrap_or_else(|| "Directory portrait:\n(none)".to_string());
-        format!(
-            "Type: directory\nPath: {}\nName: {}\nSize: {}\n{}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely. If it should not be deleted directly but still looks worth drilling into, return classification=suspicious.",
-            node.path,
-            node.name,
-            format_size(node.size),
-            portrait_summary,
-            child_summary
-        )
+            .map(|value| portrait_summary_lines(value, &ai.response_language))
+            .unwrap_or_else(|| {
+                if is_zh_language(&ai.response_language) {
+                    "目录画像：\n（无）".to_string()
+                } else {
+                    "Directory portrait:\n(none)".to_string()
+                }
+            });
+        let (delete_all, keep_all, expand_analysis) =
+            scan_prompt_classification_tokens(&ai.response_language);
+        if is_zh_language(&ai.response_language) {
+            format!(
+                "类型：目录\n路径：{}\n名称：{}\n大小：{}\n{}\n直接子目录：\n{}\n只能选择一个 classification：{}、{}、{}。只有当整个目录都可以安全删除时，才能使用 {}。当整个目录都应保留时，使用 {}。只要任一子项需要继续深入判断，或者你无法确定，就使用 {}。如果不确定，优先使用 {}，不要使用 {}。",
+                node.path,
+                node.name,
+                format_size(node.size),
+                portrait_summary,
+                child_summary,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                expand_analysis,
+                delete_all
+            )
+        } else {
+            format!(
+                "Type: directory\nPath: {}\nName: {}\nSize: {}\n{}\nDirect child directories:\n{}\nChoose one classification only: {}, {}, or {}. Use {} only when the whole directory can be deleted safely. Use {} when the whole directory should be kept. Use {} when any child needs deeper inspection or when you are uncertain. If unsure, prefer {} over {}.",
+                node.path,
+                node.name,
+                format_size(node.size),
+                portrait_summary,
+                child_summary,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                expand_analysis,
+                delete_all
+            )
+        }
     } else {
-        format!(
-            "Type: file\nPath: {}\nName: {}\nSize: {}\nJudge whether the file can be deleted safely.",
-            node.path,
-            node.name,
-            format_size(node.size)
-        )
+        let (delete_all, keep_all, expand_analysis) =
+            scan_prompt_classification_tokens(&ai.response_language);
+        if is_zh_language(&ai.response_language) {
+            format!(
+                "类型：文件\n路径：{}\n名称：{}\n大小：{}\n只能选择一个 classification：{}、{}、{}。只有当文件可以安全删除时，才能使用 {}。当文件应保留时，使用 {}。如果无法确定，就使用 {}。如果不确定，优先使用 {}，不要使用 {}。",
+                node.path,
+                node.name,
+                format_size(node.size),
+                delete_all,
+                keep_all,
+                expand_analysis,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                expand_analysis,
+                delete_all
+            )
+        } else {
+            format!(
+                "Type: file\nPath: {}\nName: {}\nSize: {}\nChoose one classification only: {}, {}, or {}. Use {} only when the file can be deleted safely. Use {} when the file should be kept. Use {} when you are uncertain. If unsure, prefer {} over {}.",
+                node.path,
+                node.name,
+                format_size(node.size),
+                delete_all,
+                keep_all,
+                expand_analysis,
+                delete_all,
+                keep_all,
+                expand_analysis,
+                expand_analysis,
+                delete_all
+            )
+        }
     };
 
     let search_allowed = ai.use_web_search && !ai.search_api_key.trim().is_empty();
@@ -1319,9 +1460,17 @@ async fn analyze_scan_node(
             search_allowed && search_context.is_none(),
         );
         let current_user_prompt = if let Some(context) = search_context.as_ref() {
-            format!(
-                "{user_prompt}\n\nWeb search context:\n{context}\n\nReturn the final classification JSON only."
-            )
+            let (delete_all, keep_all, expand_analysis) =
+                scan_prompt_classification_tokens(&ai.response_language);
+            if is_zh_language(&ai.response_language) {
+                format!(
+                    "{user_prompt}\n\n网页搜索上下文：\n{context}\n\n只返回最终分类 JSON，classification 只能是 {delete_all}|{keep_all}|{expand_analysis}。"
+                )
+            } else {
+                format!(
+                    "{user_prompt}\n\nWeb search context:\n{context}\n\nReturn the final classification JSON only using classification={delete_all}|{keep_all}|{expand_analysis}."
+                )
+            }
         } else {
             user_prompt.clone()
         };
@@ -1376,11 +1525,9 @@ async fn analyze_scan_node(
                 }
 
                 return ScanReview {
-                    classification: parsed
-                        .get("classification")
-                        .and_then(Value::as_str)
-                        .unwrap_or("suspicious")
-                        .to_string(),
+                    classification: normalize_scan_ai_classification(
+                        parsed.get("classification").and_then(Value::as_str),
+                    ),
                     reason: parsed
                         .get("reason")
                         .and_then(Value::as_str)
@@ -1544,7 +1691,7 @@ async fn emit_progress_with_options<R: Runtime>(
 ) -> Result<(), String> {
     let snap = task.snapshot.lock().clone();
     if persist_snapshot {
-    persist::save_scan_snapshot(&state.db_path(), &snap)?;
+        persist::save_scan_snapshot(&state.db_path(), &snap)?;
     }
     app.emit(
         "scan_progress",
@@ -1583,7 +1730,7 @@ fn prepare_incremental_context(
             .collect::<Vec<_>>()
     } else {
         persist::load_scan_children_exact_for_task(
-        &state.db_path(),
+            &state.db_path(),
             &task_id,
             &snapshot.root_node_id,
             false,
@@ -1610,8 +1757,8 @@ fn prepare_incremental_context(
     } else {
         let baseline_task_id = task.baseline_task_id.clone().unwrap_or_default();
         (
-                persist::load_effective_scan_node_map(&state.db_path(), &baseline_task_id)?,
-                persist::load_effective_scan_findings_map(&state.db_path(), &baseline_task_id)?,
+            persist::load_effective_scan_node_map(&state.db_path(), &baseline_task_id)?,
+            persist::load_effective_scan_findings_map(&state.db_path(), &baseline_task_id)?,
         )
     };
     let deleted_count = if task.scan_mode == ScanMode::FullRescanIncremental {
@@ -1668,7 +1815,7 @@ async fn run_auto_analyze<R: Runtime>(
         emit_progress(app, state, task).await?;
 
         let direct_children = if node.node_type == "directory" {
-                        persist::load_scan_children_exact_for_task(&state.db_path(), &task_id, &node.id, false)?
+            persist::load_scan_children_exact_for_task(&state.db_path(), &task_id, &node.id, false)?
         } else {
             Vec::new()
         };
@@ -1731,7 +1878,7 @@ async fn run_auto_analyze<R: Runtime>(
             resolve_persistent_rule(&rules, &node, portrait.as_ref())
         };
         if let Some((item, should_expand)) = persistent_match {
-                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
+            persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
             let reached_target = {
                 let mut snap = task.snapshot.lock();
                 snap.processed_entries = snap.processed_entries.saturating_add(1);
@@ -1774,7 +1921,7 @@ async fn run_auto_analyze<R: Runtime>(
         );
 
         if let Some((item, should_expand)) = reusable_finding {
-                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
+            persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
             let reached_target = {
                 let mut snap = task.snapshot.lock();
                 snap.processed_entries = snap.processed_entries.saturating_add(1);
@@ -1851,7 +1998,7 @@ async fn run_auto_analyze<R: Runtime>(
         .map_err(|e| e.to_string())?;
 
         let item = build_finding_item(&node, &review);
-                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
+        persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
         if should_promote_ai_rule(&review) {
             let _ = maybe_store_persistent_rule(
                 state,
@@ -1999,7 +2146,7 @@ async fn run_sidecar_scan<R: Runtime>(
     child
         .arg("scan")
         .arg("--db")
-            .arg(state.db_path())
+        .arg(state.db_path())
         .arg("--task-id")
         .arg(&snap.id)
         .stdout(Stdio::piped())
@@ -2143,9 +2290,9 @@ async fn run_scan_task<R: Runtime>(
             snap.visible_latest = true;
         }
         snap.status = "done".to_string();
-    persist::save_scan_snapshot(&state.db_path(), &snap)?;
+        persist::save_scan_snapshot(&state.db_path(), &snap)?;
         if task.scan_mode == ScanMode::FullRescanIncremental {
-        persist::finalize_full_scan_draft(&state.db_path(), &snap.id)?;
+            persist::finalize_full_scan_draft(&state.db_path(), &snap.id)?;
         }
         let payload = serde_json::to_value(&*snap).map_err(|e| e.to_string())?;
         drop(snap);
@@ -2195,7 +2342,7 @@ async fn prepare_runtime_scan_data<R: Runtime>(
         persist::delete_scan_data_for_paths(&state.db_path(), &task_id, &task.ignored_paths)?;
     }
 
-        if let Some(prepared_snapshot) = persist::load_scan_snapshot(&state.db_path(), &task_id)? {
+    if let Some(prepared_snapshot) = persist::load_scan_snapshot(&state.db_path(), &task_id)? {
         let mut snap = task.snapshot.lock();
         snap.deletable = prepared_snapshot.deletable;
         snap.deletable_count = prepared_snapshot.deletable_count;
@@ -2220,7 +2367,7 @@ fn resolve_latest_baseline_task_id(
     if !requested.is_empty() {
         return Ok(Some(requested.to_string()));
     }
-        persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), target_path)
+    persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), target_path)
 }
 
 pub async fn scan_start<R: Runtime>(
@@ -2280,7 +2427,7 @@ pub async fn scan_start<R: Runtime>(
             .as_ref()
             .ok_or_else(|| "Missing baseline snapshot".to_string())?;
         Some(resolve_deepen_boundary_nodes(
-        &state.db_path(),
+            &state.db_path(),
             baseline,
             input.max_depth,
             &prune_rules,
@@ -2337,7 +2484,7 @@ pub async fn scan_start<R: Runtime>(
         existing
     } else {
         persist::init_full_scan_draft(
-        &state.db_path(),
+            &state.db_path(),
             &task_id,
             &target_path,
             (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
@@ -2403,7 +2550,7 @@ pub async fn scan_start<R: Runtime>(
         crate::backend::read_scan_persistent_rules_with_cleanup(&state.settings_path());
     if persistent_rules_cleaned {
         let _ =
-    crate::backend::save_scan_persistent_rules(&state.settings_path(), &persistent_rules)?;
+            crate::backend::save_scan_persistent_rules(&state.settings_path(), &persistent_rules)?;
     }
     let task = Arc::new(ScanTaskRuntime {
         stop: AtomicBool::new(false),
@@ -2449,9 +2596,10 @@ pub async fn scan_start<R: Runtime>(
                 let payload =
                     json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
                 if runtime.scan_mode == ScanMode::FullRescanIncremental {
-                let _ = persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
+                    let _ =
+                        persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
                 } else {
-                let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
+                    let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
                 }
                 drop(snap);
                 let _ = app_clone.emit("scan_error", payload);
@@ -2460,9 +2608,10 @@ pub async fn scan_start<R: Runtime>(
                 snap.status = "stopped".to_string();
                 let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
                 if runtime.scan_mode == ScanMode::FullRescanIncremental {
-                let _ = persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
+                    let _ =
+                        persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
                 } else {
-                let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
+                    let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
                 }
                 drop(snap);
                 let _ = app_clone.emit("scan_stopped", payload);
@@ -2537,7 +2686,8 @@ pub async fn scan_find_latest_for_path(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Value, String> {
-    let Some(task_id) = persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), &path)?
+    let Some(task_id) =
+        persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), &path)?
     else {
         return Ok(Value::Null);
     };
@@ -2762,16 +2912,8 @@ mod tests {
 
         let task_id = format!("scan_{}", Uuid::new_v4().simple());
         let root_string = root.to_string_lossy().to_string();
-        persist::init_full_scan_draft(
-            &db_path,
-            &task_id,
-            &root_string,
-            0,
-            Some(1),
-            false,
-            None,
-        )
-        .expect("init full scan task");
+        persist::init_full_scan_draft(&db_path, &task_id, &root_string, 0, Some(1), false, None)
+            .expect("init full scan task");
 
         let lines = run_scanner_command(&[
             "scan".to_string(),
@@ -3073,11 +3215,8 @@ mod tests {
 
         let deep_txt = root.join("A").join("nested").join("deep.txt");
         fs::remove_file(&deep_txt).expect("remove deep file");
-        fs::write(
-            root.join("A").join("nested").join("fresh.txt"),
-            b"fresh",
-        )
-        .expect("write fresh file");
+        fs::write(root.join("A").join("nested").join("fresh.txt"), b"fresh")
+            .expect("write fresh file");
 
         let child_root = root.join("A");
         let child_task_id = format!("scan_{}", Uuid::new_v4().simple());
@@ -3113,7 +3252,8 @@ mod tests {
             &child_lines,
         );
 
-        let root_node_map = persist::load_scan_node_map(&db_path, &root_task_id).expect("root node map");
+        let root_node_map =
+            persist::load_scan_node_map(&db_path, &root_task_id).expect("root node map");
         assert!(root_node_map.contains_key(&child_root_string.to_lowercase()));
         assert!(!root_node_map.contains_key(&deep_txt.to_string_lossy().to_lowercase()));
         assert!(!root_node_map.contains_key(
@@ -3155,9 +3295,10 @@ mod tests {
         assert!(nested_children.iter().any(|node| node.name == "fresh.txt"));
         assert!(!nested_children.iter().any(|node| node.name == "deep.txt"));
 
-        let latest_child = persist::find_latest_visible_scan_task_id_for_path(&db_path, &child_root_string)
-            .expect("find child owner")
-            .expect("child owner exists");
+        let latest_child =
+            persist::find_latest_visible_scan_task_id_for_path(&db_path, &child_root_string)
+                .expect("find child owner")
+                .expect("child owner exists");
         assert_eq!(latest_child, child_task_id);
 
         let _ = fs::remove_dir_all(&root);
@@ -3207,8 +3348,8 @@ mod tests {
 
         let child_root = root.join("A");
         let child_root_string = child_root.to_string_lossy().to_string();
-        let root_before_discard = persist::load_scan_node_map(&db_path, &root_task_id)
-            .expect("load root baseline");
+        let root_before_discard =
+            persist::load_scan_node_map(&db_path, &root_task_id).expect("load root baseline");
         let baseline_child_size = root_before_discard
             .get(&child_root_string.to_lowercase())
             .expect("baseline child node")
@@ -3444,6 +3585,40 @@ mod tests {
         assert_eq!(portrait.top_children[0].name, child_dir.name);
         assert_eq!(portrait.top_file_extensions[0].extension, ".tmp");
         assert_eq!(portrait.top_file_extensions[0].count, 2);
+    }
+
+    #[test]
+    fn scan_prompt_classification_tokens_follow_response_language() {
+        assert_eq!(
+            scan_prompt_classification_tokens("zh-CN"),
+            ("全部删除", "全部保留", "展开分析")
+        );
+        assert_eq!(
+            scan_prompt_classification_tokens("en"),
+            ("delete_all", "keep_all", "expand_analysis")
+        );
+    }
+
+    #[test]
+    fn normalize_scan_ai_classification_accepts_localized_values() {
+        assert_eq!(
+            normalize_scan_ai_classification(Some("全部删除")),
+            "safe_to_delete"
+        );
+        assert_eq!(normalize_scan_ai_classification(Some("全部保留")), "keep");
+        assert_eq!(
+            normalize_scan_ai_classification(Some("展开分析")),
+            "suspicious"
+        );
+        assert_eq!(
+            normalize_scan_ai_classification(Some("delete_all")),
+            "safe_to_delete"
+        );
+        assert_eq!(normalize_scan_ai_classification(Some("keep_all")), "keep");
+        assert_eq!(
+            normalize_scan_ai_classification(Some("expand_analysis")),
+            "suspicious"
+        );
     }
 
     #[test]

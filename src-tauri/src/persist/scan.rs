@@ -13,8 +13,10 @@ pub(crate) fn normalize_existing_root_path_keys(conn: &Connection) -> Result<(),
     let scan_rows = conn
         .prepare("SELECT task_id, root_path FROM scan_tasks")
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .map_err(|e| e.to_string())?;
     for (task_id, root_path) in scan_rows {
@@ -28,8 +30,10 @@ pub(crate) fn normalize_existing_root_path_keys(conn: &Connection) -> Result<(),
     let draft_rows = conn
         .prepare("SELECT task_id, root_path FROM scan_drafts")
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .map_err(|e| e.to_string())?;
     for (task_id, root_path) in draft_rows {
@@ -43,8 +47,10 @@ pub(crate) fn normalize_existing_root_path_keys(conn: &Connection) -> Result<(),
     let organize_rows = conn
         .prepare("SELECT task_id, root_path FROM organize_tasks")
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .map_err(|e| e.to_string())?;
     for (task_id, root_path) in organize_rows {
@@ -104,12 +110,21 @@ fn choose_exact_root_task<'a>(tasks: &'a [ScanTaskMeta]) -> Option<&'a ScanTaskM
 }
 
 fn delete_scan_task_rows(tx: &Connection, task_id: &str) -> Result<(), String> {
-    tx.execute("DELETE FROM scan_findings WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_nodes WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_tasks WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_findings WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_nodes WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_tasks WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -117,7 +132,10 @@ fn compact_scan_tasks_by_exact_root(conn: &mut Connection) -> Result<(), String>
     let tasks = load_scan_task_meta(conn)?;
     let mut grouped = HashMap::<String, Vec<ScanTaskMeta>>::new();
     for task in tasks {
-        grouped.entry(task.root_path_key.clone()).or_default().push(task);
+        grouped
+            .entry(task.root_path_key.clone())
+            .or_default()
+            .push(task);
     }
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -179,14 +197,23 @@ fn dedupe_organize_latest_trees(conn: &mut Connection) -> Result<(), String> {
             "INSERT INTO organize_latest_trees (
                 root_path_key, root_path, tree_version, tree_json, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![root_path_key, root_path, tree_version, tree_json, updated_at],
+            params![
+                root_path_key,
+                root_path,
+                tree_version,
+                tree_json,
+                updated_at
+            ],
         )
         .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())
 }
 
-pub(crate) fn run_scan_cache_maintenance(db_path: &Path, conn: &mut Connection) -> Result<(), String> {
+pub(crate) fn run_scan_cache_maintenance(
+    db_path: &Path,
+    conn: &mut Connection,
+) -> Result<(), String> {
     let current = conn
         .query_row(
             "SELECT value FROM app_meta WHERE key = 'scan_cache_maintenance_version'",
@@ -257,7 +284,10 @@ fn init_scan_task_in_storage(
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
-        &format!("DELETE FROM {} WHERE task_id = ?1", storage.findings_table()),
+        &format!(
+            "DELETE FROM {} WHERE task_id = ?1",
+            storage.findings_table()
+        ),
         params![task_id],
     )
     .map_err(|e| e.to_string())?;
@@ -418,7 +448,10 @@ pub fn save_scan_snapshot(db_path: &Path, snapshot: &ScanSnapshot) -> Result<(),
 }
 
 #[cfg(test)]
-pub fn save_full_scan_draft_snapshot(db_path: &Path, snapshot: &ScanSnapshot) -> Result<(), String> {
+pub fn save_full_scan_draft_snapshot(
+    db_path: &Path,
+    snapshot: &ScanSnapshot,
+) -> Result<(), String> {
     let conn = open_db(db_path)?;
     save_scan_snapshot_in_storage(&conn, ScanStorage::Draft, snapshot)
 }
@@ -584,7 +617,10 @@ fn load_scan_findings_map_exact_in_storage(
         .collect())
 }
 
-pub fn load_scan_findings_map(db_path: &Path, task_id: &str) -> Result<HashMap<String, ScanFindingRecord>, String> {
+pub fn load_scan_findings_map(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<HashMap<String, ScanFindingRecord>, String> {
     let conn = open_db(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     load_scan_findings_map_exact_in_storage(&conn, storage, task_id)
@@ -617,7 +653,8 @@ fn merge_effective_scan_findings_map(
     let Some(root_path) = load_scan_task_root_path(conn, task_id)? else {
         return Ok(());
     };
-    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)? {
+    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)?
+    {
         merge_effective_scan_findings_map(conn, &descendant_task_id, out, visited)?;
     }
     Ok(())
@@ -865,7 +902,14 @@ fn copy_scan_subtree_between_tasks(
             "UPDATE scan_nodes
              SET self_size = ?3, total_size = ?4, child_count = ?5, mtime_ms = ?6
              WHERE task_id = ?1 AND path = ?2",
-            params![dest_task_id, root_path, self_size, total_size, child_count, mtime_ms],
+            params![
+                dest_task_id,
+                root_path,
+                self_size,
+                total_size,
+                child_count,
+                mtime_ms
+            ],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -1077,8 +1121,11 @@ pub fn discard_full_scan_draft(db_path: &Path, task_id: &str) -> Result<bool, St
         params![task_id],
     )
     .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_drafts WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_drafts WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -1212,13 +1259,17 @@ fn merge_effective_scan_node_map(
     let Some(root_path) = load_scan_task_root_path(conn, task_id)? else {
         return Ok(());
     };
-    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)? {
+    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)?
+    {
         merge_effective_scan_node_map(conn, &descendant_task_id, out, visited)?;
     }
     Ok(())
 }
 
-pub fn load_effective_scan_node_map(db_path: &Path, task_id: &str) -> Result<HashMap<String, ScanNode>, String> {
+pub fn load_effective_scan_node_map(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<HashMap<String, ScanNode>, String> {
     let conn = open_db(db_path)?;
     let mut out = HashMap::new();
     let mut visited = HashSet::new();
@@ -1275,7 +1326,10 @@ pub fn load_scan_children_exact_for_task(
     load_scan_children_exact_in_storage(&conn, storage, task_id, node_id, dirs_only)
 }
 
-pub fn load_scan_node_map(db_path: &Path, task_id: &str) -> Result<HashMap<String, ScanNode>, String> {
+pub fn load_scan_node_map(
+    db_path: &Path,
+    task_id: &str,
+) -> Result<HashMap<String, ScanNode>, String> {
     let conn = open_db(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     load_scan_node_map_exact_in_storage(&conn, storage, task_id)
@@ -1483,7 +1537,10 @@ fn list_visible_descendant_scan_task_ids_for_root_path(
     let root_key = create_root_path_key(root_path);
     let mut tasks = load_visible_scan_tasks(conn)?
         .into_iter()
-        .filter(|task| task.root_path_key != root_key && is_same_or_descendant_path(&task.root_path_key, &root_key))
+        .filter(|task| {
+            task.root_path_key != root_key
+                && is_same_or_descendant_path(&task.root_path_key, &root_key)
+        })
         .collect::<Vec<_>>();
     tasks.sort_by(|left, right| {
         path_depth(&right.root_path)
@@ -1532,7 +1589,10 @@ pub fn find_owner_visible_scan_task_for_path(
             .then_with(|| right.updated_at.cmp(&left.updated_at))
             .then_with(|| right.task_id.cmp(&left.task_id))
     });
-    Ok(tasks.into_iter().next().map(|task| (task.task_id, task.root_path)))
+    Ok(tasks
+        .into_iter()
+        .next()
+        .map(|task| (task.task_id, task.root_path)))
 }
 
 fn sync_committed_ancestor_boundary_node_from_draft(
@@ -1565,7 +1625,14 @@ fn sync_committed_ancestor_boundary_node_from_draft(
         "UPDATE scan_nodes
          SET self_size = ?3, total_size = ?4, child_count = ?5, mtime_ms = ?6
          WHERE task_id = ?1 AND path = ?2",
-        params![ancestor_task_id, root_path, self_size, total_size, child_count, mtime_ms],
+        params![
+            ancestor_task_id,
+            root_path,
+            self_size,
+            total_size,
+            child_count,
+            mtime_ms
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1597,7 +1664,12 @@ pub fn finalize_full_scan_draft(db_path: &Path, task_id: &str) -> Result<bool, S
 
     let descendant_roots = list_visible_descendant_scan_root_paths(&tx, &root_path)?;
     if !descendant_roots.is_empty() {
-        delete_scan_descendants_for_paths_in_tx(&tx, ScanStorage::Draft, task_id, &descendant_roots)?;
+        delete_scan_descendants_for_paths_in_tx(
+            &tx,
+            ScanStorage::Draft,
+            task_id,
+            &descendant_roots,
+        )?;
         refresh_scan_stats_in_storage(&tx, ScanStorage::Draft, task_id)?;
     }
 
@@ -1612,7 +1684,12 @@ pub fn finalize_full_scan_draft(db_path: &Path, task_id: &str) -> Result<bool, S
             ancestor_task_id,
             std::slice::from_ref(&root_path),
         )?;
-        sync_committed_ancestor_boundary_node_from_draft(&tx, task_id, ancestor_task_id, &root_path)?;
+        sync_committed_ancestor_boundary_node_from_draft(
+            &tx,
+            task_id,
+            ancestor_task_id,
+            &root_path,
+        )?;
         refresh_scan_stats_in_storage(&tx, ScanStorage::Committed, ancestor_task_id)?;
     }
 
@@ -1630,12 +1707,21 @@ pub fn finalize_full_scan_draft(db_path: &Path, task_id: &str) -> Result<bool, S
         delete_scan_task_rows(&tx, &stale_task_id)?;
     }
 
-    tx.execute("DELETE FROM scan_findings WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_nodes WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_tasks WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_findings WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_nodes WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_tasks WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT INTO scan_tasks (
             task_id, root_path, root_path_key, status, scan_mode, baseline_task_id, visible_latest, target_size, max_depth, auto_analyze,
@@ -1683,8 +1769,11 @@ pub fn finalize_full_scan_draft(db_path: &Path, task_id: &str) -> Result<bool, S
         params![task_id],
     )
     .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM scan_drafts WHERE task_id = ?1", params![task_id])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM scan_drafts WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -1726,4 +1815,3 @@ pub fn list_boundary_scan_nodes(
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(Result::ok).collect())
 }
-

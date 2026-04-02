@@ -126,7 +126,10 @@ impl ScanStorage {
     }
 }
 
-fn resolve_scan_storage_by_task_id(conn: &Connection, task_id: &str) -> Result<ScanStorage, String> {
+fn resolve_scan_storage_by_task_id(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<ScanStorage, String> {
     let is_draft = conn
         .query_row(
             "SELECT 1 FROM scan_drafts WHERE task_id = ?1 LIMIT 1",
@@ -142,7 +145,6 @@ fn resolve_scan_storage_by_task_id(conn: &Connection, task_id: &str) -> Result<S
         ScanStorage::Committed
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -480,8 +482,8 @@ mod tests {
         assert_eq!(before_cleanup.status, "scanning");
 
         init_db(&db_path).expect("re-init db cleans drafts");
-        let after_cleanup = load_full_scan_draft_snapshot(&db_path, task_id)
-            .expect("load draft after cleanup");
+        let after_cleanup =
+            load_full_scan_draft_snapshot(&db_path, task_id).expect("load draft after cleanup");
         assert!(after_cleanup.is_none());
 
         let _ = fs::remove_file(db_path);

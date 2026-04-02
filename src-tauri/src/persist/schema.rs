@@ -1,6 +1,8 @@
-use super::*;
 use super::organize::{create_organizer_tables, drop_organizer_tables, organizer_tables_exist};
-use super::scan::{cleanup_scan_drafts, normalize_existing_root_path_keys, run_scan_cache_maintenance};
+use super::scan::{
+    cleanup_scan_drafts, normalize_existing_root_path_keys, run_scan_cache_maintenance,
+};
+use super::*;
 
 pub fn init_db(db_path: &Path) -> Result<(), String> {
     let mut conn = open_db(db_path)?;
@@ -295,4 +297,3 @@ pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-

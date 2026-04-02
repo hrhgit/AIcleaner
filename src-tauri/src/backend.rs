@@ -290,7 +290,10 @@ fn validate_data_dir_target(current_data_dir: &Path, target_data_dir: &Path) -> 
     if is_same_or_descendant_path(target_data_dir, current_data_dir)
         || is_same_or_descendant_path(current_data_dir, target_data_dir)
     {
-        return Err("The new cache directory cannot be the current directory or its parent/child.".to_string());
+        return Err(
+            "The new cache directory cannot be the current directory or its parent/child."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -325,7 +328,10 @@ fn copy_dir_contents_recursive(
     Ok(())
 }
 
-fn remove_dir_contents_recursive(source_dir: &Path, skip_paths: &HashSet<String>) -> Result<(), String> {
+fn remove_dir_contents_recursive(
+    source_dir: &Path,
+    skip_paths: &HashSet<String>,
+) -> Result<(), String> {
     if !source_dir.exists() {
         return Ok(());
     }
@@ -1341,7 +1347,10 @@ pub struct SettingsDataDirInput {
 
 fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String> {
     if !state.scan_tasks.lock().is_empty() || !state.organize_tasks.lock().is_empty() {
-        return Err("Please stop running scan or organize tasks before moving the cache directory.".to_string());
+        return Err(
+            "Please stop running scan or organize tasks before moving the cache directory."
+                .to_string(),
+        );
     }
 
     let current_data_dir = state.data_dir();
@@ -1349,7 +1358,8 @@ fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String
     validate_data_dir_target(&current_data_dir, &target_data_dir)?;
     fs::create_dir_all(&target_data_dir).map_err(|e| e.to_string())?;
 
-    let bootstrap_key = crate::persist::normalize_root_path(&state.bootstrap_path.to_string_lossy());
+    let bootstrap_key =
+        crate::persist::normalize_root_path(&state.bootstrap_path.to_string_lossy());
     let mut skip_paths = HashSet::new();
     skip_paths.insert(bootstrap_key);
 
@@ -1366,7 +1376,11 @@ fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String
     crate::persist::init_db(&target_paths.db_path)?;
     crate::persist::mark_stale_tasks(&target_paths.db_path)?;
 
-    write_storage_location_config(&state.base_data_dir, &state.bootstrap_path, &target_data_dir)?;
+    write_storage_location_config(
+        &state.base_data_dir,
+        &state.bootstrap_path,
+        &target_data_dir,
+    )?;
     state.set_data_dir(target_data_dir.clone());
 
     let cleanup_warning = remove_dir_contents_recursive(&current_data_dir, &skip_paths).err();
@@ -2487,8 +2501,8 @@ mod tests {
         .expect("write settings");
         fs::write(state.data_dir().join("marker.txt"), b"marker").expect("write marker");
 
-        let response = migrate_data_dir(&state, &target_dir.to_string_lossy())
-            .expect("migrate data dir");
+        let response =
+            migrate_data_dir(&state, &target_dir.to_string_lossy()).expect("migrate data dir");
 
         assert!(same_path(&state.data_dir(), &target_dir));
         assert!(state.settings_path().exists());

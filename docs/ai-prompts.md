@@ -34,8 +34,9 @@ Code / 代码位置:
 ```text
 你是一个磁盘清理安全分析助手。
 只能返回 JSON。
-输出结构：{"classification":"safe_to_delete|suspicious|keep","reason":"...","risk":"low|medium|high","hasPotentialDeletableSubfolders":true}
-保持保守判断；如果不确定，使用 suspicious。
+输出结构：{"classification":"全部删除|全部保留|展开分析","reason":"...","risk":"low|medium|high"}
+分类含义：全部删除 = 整个项目都可以删除，全部保留 = 整个项目都应该保留，展开分析 = 需要继续深入分析或人工复核。
+保持保守判断；如果不确定，优先使用展开分析，不要使用全部删除。
 `reason` 字段只能使用{response_language}。
 ```
 
@@ -44,8 +45,9 @@ English template:
 ```text
 You are a disk cleanup safety assistant.
 Return JSON only.
-Schema: {"classification":"safe_to_delete|suspicious|keep","reason":"...","risk":"low|medium|high","hasPotentialDeletableSubfolders":true}
-Be conservative. If unsure, use suspicious.
+Final schema: {"classification":"delete_all|keep_all|expand_analysis","reason":"...","risk":"low|medium|high"}
+Classification meanings: delete_all = delete the whole item, keep_all = keep the whole item, expand_analysis = inspect deeper or require manual review.
+Be conservative. If unsure, prefer expand_analysis over delete_all.
 The "reason" field must be written in {response_language} only.
 ```
 
@@ -58,9 +60,15 @@ The "reason" field must be written in {response_language} only.
 路径：{path}
 名称：{name}
 大小：{formatted_size}
+目录画像：
+{portrait_summary}
 直接子目录：
 {child_summary}
-请判断整个目录是否可以安全删除，以及它是否可能包含可删除的子目录。
+只能选择一个 classification：全部删除、全部保留、展开分析。
+只有当整个目录都可以安全删除时，才能使用全部删除。
+当整个目录都应保留时，使用全部保留。
+只要任一子项需要继续深入判断，或者你无法确定，就使用展开分析。
+如果不确定，优先使用展开分析，不要使用全部删除。
 ```
 
 English template:
@@ -70,9 +78,15 @@ Type: directory
 Path: {path}
 Name: {name}
 Size: {formatted_size}
+Directory portrait:
+{portrait_summary}
 Direct child directories:
 {child_summary}
-Judge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.
+Choose one classification only: delete_all, keep_all, or expand_analysis.
+Use delete_all only when the whole directory can be deleted safely.
+Use keep_all when the whole directory should be kept.
+Use expand_analysis when any child needs deeper inspection or when you are uncertain.
+If unsure, prefer expand_analysis over delete_all.
 ```
 
 #### File System Prompt / 文件 system prompt
@@ -82,8 +96,9 @@ Judge whether the whole directory can be deleted safely, and whether it may cont
 ```text
 你是一个磁盘清理安全分析助手。
 只能返回 JSON。
-输出结构：{"classification":"safe_to_delete|suspicious|keep","reason":"...","risk":"low|medium|high"}
-保持保守判断；如果不确定，使用 suspicious。
+输出结构：{"classification":"全部删除|全部保留|展开分析","reason":"...","risk":"low|medium|high"}
+分类含义：全部删除 = 整个项目都可以删除，全部保留 = 整个项目都应该保留，展开分析 = 需要继续深入分析或人工复核。
+保持保守判断；如果不确定，优先使用展开分析，不要使用全部删除。
 `reason` 字段只能使用{response_language}。
 ```
 
@@ -92,8 +107,9 @@ English template:
 ```text
 You are a disk cleanup safety assistant.
 Return JSON only.
-Schema: {"classification":"safe_to_delete|suspicious|keep","reason":"...","risk":"low|medium|high"}
-Be conservative. If unsure, use suspicious.
+Final schema: {"classification":"delete_all|keep_all|expand_analysis","reason":"...","risk":"low|medium|high"}
+Classification meanings: delete_all = delete the whole item, keep_all = keep the whole item, expand_analysis = inspect deeper or require manual review.
+Be conservative. If unsure, prefer expand_analysis over delete_all.
 The "reason" field must be written in {response_language} only.
 ```
 
@@ -106,7 +122,11 @@ The "reason" field must be written in {response_language} only.
 路径：{path}
 名称：{name}
 大小：{formatted_size}
-请判断该文件是否可以安全删除。
+只能选择一个 classification：全部删除、全部保留、展开分析。
+只有当文件可以安全删除时，才能使用全部删除。
+当文件应保留时，使用全部保留。
+如果无法确定，就使用展开分析。
+如果不确定，优先使用展开分析，不要使用全部删除。
 ```
 
 English template:
@@ -116,7 +136,11 @@ Type: file
 Path: {path}
 Name: {name}
 Size: {formatted_size}
-Judge whether the file can be deleted safely.
+Choose one classification only: delete_all, keep_all, or expand_analysis.
+Use delete_all only when the file can be deleted safely.
+Use keep_all when the file should be kept.
+Use expand_analysis when you are uncertain.
+If unsure, prefer expand_analysis over delete_all.
 ```
 
 ### 2. Organizer Tree Clustering / Organizer 树状聚类

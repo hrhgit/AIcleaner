@@ -3508,7 +3508,7 @@ async fn run_organize_task<R: Runtime>(
             });
             persisted_rows.push(result_row.clone());
         }
-    persist::upsert_organize_results(&state.db_path(), &task_id, &persisted_rows)?;
+        persist::upsert_organize_results(&state.db_path(), &task_id, &persisted_rows)?;
         {
             let mut snap = task.snapshot.lock();
             snap.processed_files = snap
@@ -3607,7 +3607,7 @@ pub async fn organize_start<R: Runtime>(
         model: "gpt-4o-mini".to_string(),
     });
     let (tree, tree_version) =
-    persist::load_latest_organize_tree(&state.db_path(), &input.root_path)?
+        persist::load_latest_organize_tree(&state.db_path(), &input.root_path)?
             .unwrap_or_else(|| (category_tree_to_value(&default_tree()), 0));
     let snapshot = OrganizeSnapshot {
         id: task_id.clone(),
@@ -3737,7 +3737,7 @@ pub async fn organize_get_result(
 
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
     let mut snapshot = hydrate_loaded_snapshot(
-    persist::load_organize_snapshot(&state.db_path(), &task_id)?
+        persist::load_organize_snapshot(&state.db_path(), &task_id)?
             .ok_or_else(|| "Task not found".to_string())?,
     );
     if snapshot.status != "completed" && snapshot.status != "done" {
@@ -3986,11 +3986,12 @@ pub async fn organize_rollback(
         .unwrap_or(0);
     if failed == 0 {
         if let Some(task_id) = task_id {
-    if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path(), &task_id)? {
+            if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path(), &task_id)?
+            {
                 snapshot = hydrate_loaded_snapshot(snapshot);
                 snapshot.status = "completed".to_string();
                 snapshot.job_id = None;
-        persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
+                persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
                 if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
                     *task.snapshot.lock() = snapshot;
                 }
