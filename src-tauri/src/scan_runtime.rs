@@ -1054,7 +1054,7 @@ fn maybe_store_persistent_rule(
     let mut rules = task.persistent_rules.lock();
     let changed = insert_persistent_rule(&mut rules, record);
     if changed {
-        backend::save_scan_persistent_rules(&state.settings_path, &rules)?;
+    backend::save_scan_persistent_rules(&state.settings_path(), &rules)?;
     }
     Ok(changed)
 }
@@ -1544,7 +1544,7 @@ async fn emit_progress_with_options<R: Runtime>(
 ) -> Result<(), String> {
     let snap = task.snapshot.lock().clone();
     if persist_snapshot {
-        persist::save_scan_snapshot(&state.db_path, &snap)?;
+    persist::save_scan_snapshot(&state.db_path(), &snap)?;
     }
     app.emit(
         "scan_progress",
@@ -1575,14 +1575,19 @@ fn prepare_incremental_context(
 ) -> Result<Option<IncrementalContext>, String> {
     let snapshot = task.snapshot.lock().clone();
     let task_id = snapshot.id.clone();
-    let current_nodes = persist::load_scan_node_map(&state.db_path, &task_id)?;
+    let current_nodes = persist::load_scan_node_map(&state.db_path(), &task_id)?;
     let analyze_roots = if task.scan_mode == ScanMode::DeepenIncremental {
         task.sidecar_roots
             .iter()
             .filter_map(|root| current_nodes.get(&root.path.to_lowercase()).cloned())
             .collect::<Vec<_>>()
     } else {
-        persist::load_scan_children(&state.db_path, &task_id, &snapshot.root_node_id, false)?
+        persist::load_scan_children_exact_for_task(
+        &state.db_path(),
+            &task_id,
+            &snapshot.root_node_id,
+            false,
+        )?
     };
     if task.in_place_baseline.as_ref().is_none()
         && task
@@ -1605,8 +1610,8 @@ fn prepare_incremental_context(
     } else {
         let baseline_task_id = task.baseline_task_id.clone().unwrap_or_default();
         (
-            persist::load_scan_node_map(&state.db_path, &baseline_task_id)?,
-            persist::load_scan_findings_map(&state.db_path, &baseline_task_id)?,
+                persist::load_effective_scan_node_map(&state.db_path(), &baseline_task_id)?,
+                persist::load_effective_scan_findings_map(&state.db_path(), &baseline_task_id)?,
         )
     };
     let deleted_count = if task.scan_mode == ScanMode::FullRescanIncremental {
@@ -1663,7 +1668,7 @@ async fn run_auto_analyze<R: Runtime>(
         emit_progress(app, state, task).await?;
 
         let direct_children = if node.node_type == "directory" {
-            persist::load_scan_children(&state.db_path, &task_id, &node.id, false)?
+                        persist::load_scan_children_exact_for_task(&state.db_path(), &task_id, &node.id, false)?
         } else {
             Vec::new()
         };
@@ -1689,7 +1694,7 @@ async fn run_auto_analyze<R: Runtime>(
                 local_rule.source,
             );
             persist::upsert_scan_finding(
-                &state.db_path,
+                &state.db_path(),
                 &task_id,
                 &item,
                 local_rule.should_expand,
@@ -1726,7 +1731,7 @@ async fn run_auto_analyze<R: Runtime>(
             resolve_persistent_rule(&rules, &node, portrait.as_ref())
         };
         if let Some((item, should_expand)) = persistent_match {
-            persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
             let reached_target = {
                 let mut snap = task.snapshot.lock();
                 snap.processed_entries = snap.processed_entries.saturating_add(1);
@@ -1769,7 +1774,7 @@ async fn run_auto_analyze<R: Runtime>(
         );
 
         if let Some((item, should_expand)) = reusable_finding {
-            persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
             let reached_target = {
                 let mut snap = task.snapshot.lock();
                 snap.processed_entries = snap.processed_entries.saturating_add(1);
@@ -1846,7 +1851,7 @@ async fn run_auto_analyze<R: Runtime>(
         .map_err(|e| e.to_string())?;
 
         let item = build_finding_item(&node, &review);
-        persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+                persist::upsert_scan_finding(&state.db_path(), &task_id, &item, should_expand)?;
         if should_promote_ai_rule(&review) {
             let _ = maybe_store_persistent_rule(
                 state,
@@ -1994,7 +1999,7 @@ async fn run_sidecar_scan<R: Runtime>(
     child
         .arg("scan")
         .arg("--db")
-        .arg(&state.db_path)
+            .arg(state.db_path())
         .arg("--task-id")
         .arg(&snap.id)
         .stdout(Stdio::piped())
@@ -2134,8 +2139,14 @@ async fn run_scan_task<R: Runtime>(
     }
     if !task.stop.load(Ordering::Relaxed) {
         let mut snap = task.snapshot.lock();
+        if task.scan_mode == ScanMode::FullRescanIncremental {
+            snap.visible_latest = true;
+        }
         snap.status = "done".to_string();
-        persist::save_scan_snapshot(&state.db_path, &snap)?;
+    persist::save_scan_snapshot(&state.db_path(), &snap)?;
+        if task.scan_mode == ScanMode::FullRescanIncremental {
+        persist::finalize_full_scan_draft(&state.db_path(), &snap.id)?;
+        }
         let payload = serde_json::to_value(&*snap).map_err(|e| e.to_string())?;
         drop(snap);
         app.emit("scan_done", payload).map_err(|e| e.to_string())?;
@@ -2178,13 +2189,13 @@ async fn prepare_runtime_scan_data<R: Runtime>(
     .await?;
 
     if !affected_paths.is_empty() {
-        persist::delete_scan_descendants_for_paths(&state.db_path, &task_id, &affected_paths)?;
+        persist::delete_scan_descendants_for_paths(&state.db_path(), &task_id, &affected_paths)?;
     }
     if !task.ignored_paths.is_empty() {
-        persist::delete_scan_data_for_paths(&state.db_path, &task_id, &task.ignored_paths)?;
+        persist::delete_scan_data_for_paths(&state.db_path(), &task_id, &task.ignored_paths)?;
     }
 
-    if let Some(prepared_snapshot) = persist::load_scan_snapshot(&state.db_path, &task_id)? {
+        if let Some(prepared_snapshot) = persist::load_scan_snapshot(&state.db_path(), &task_id)? {
         let mut snap = task.snapshot.lock();
         snap.deletable = prepared_snapshot.deletable;
         snap.deletable_count = prepared_snapshot.deletable_count;
@@ -2209,7 +2220,7 @@ fn resolve_latest_baseline_task_id(
     if !requested.is_empty() {
         return Ok(Some(requested.to_string()));
     }
-    persist::find_latest_visible_scan_task_id_for_path(&state.db_path, target_path)
+        persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), target_path)
 }
 
 pub async fn scan_start<R: Runtime>(
@@ -2228,16 +2239,24 @@ pub async fn scan_start<R: Runtime>(
     let target_path = PathBuf::from(&input.target_path)
         .to_string_lossy()
         .to_string();
-    let ignored_paths = crate::backend::read_scan_ignore_paths(&state.settings_path);
+    let ignored_paths = crate::backend::read_scan_ignore_paths(&state.settings_path());
     let scan_mode = ScanMode::parse(input.scan_mode.as_deref());
     let prune_rules = build_scan_prune_rules(&target_path);
+    let target_root_key = persist::create_root_path_key(&target_path);
+    if state.scan_tasks.lock().values().any(|task| {
+        let snapshot = task.snapshot.lock();
+        matches!(snapshot.status.as_str(), "idle" | "scanning" | "analyzing")
+            && snapshot.root_path_key == target_root_key
+    }) {
+        return Err("A scan task for this path is already running".to_string());
+    }
     let baseline_task_id = resolve_latest_baseline_task_id(
         state.inner(),
         &target_path,
         input.baseline_task_id.as_deref(),
     )?;
     let baseline_snapshot = if let Some(task_id) = baseline_task_id.as_deref() {
-        persist::load_scan_snapshot(&state.db_path, task_id)?
+        persist::load_scan_snapshot(&state.db_path(), task_id)?
     } else {
         None
     };
@@ -2261,7 +2280,7 @@ pub async fn scan_start<R: Runtime>(
             .as_ref()
             .ok_or_else(|| "Missing baseline snapshot".to_string())?;
         Some(resolve_deepen_boundary_nodes(
-            &state.db_path,
+        &state.db_path(),
             baseline,
             input.max_depth,
             &prune_rules,
@@ -2271,8 +2290,8 @@ pub async fn scan_start<R: Runtime>(
     };
     let in_place_baseline = if matches!(scan_mode, ScanMode::DeepenIncremental) {
         Some(InPlaceBaselineCache {
-            nodes: persist::load_scan_node_map(&state.db_path, &task_id)?,
-            findings: persist::load_scan_findings_map(&state.db_path, &task_id)?,
+            nodes: persist::load_scan_node_map(&state.db_path(), &task_id)?,
+            findings: persist::load_scan_findings_map(&state.db_path(), &task_id)?,
         })
     } else {
         None
@@ -2317,22 +2336,21 @@ pub async fn scan_start<R: Runtime>(
         existing.id = task_id.clone();
         existing
     } else {
-        persist::init_scan_task(
-            &state.db_path,
+        persist::init_full_scan_draft(
+        &state.db_path(),
             &task_id,
             &target_path,
             (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
             max_depth,
             input.auto_analyze.unwrap_or(true),
             baseline_task_id.as_deref(),
-            scan_mode.as_str(),
         )?;
         ScanSnapshot {
             id: task_id.clone(),
             status: "idle".to_string(),
             scan_mode: scan_mode.as_str().to_string(),
             baseline_task_id: baseline_task_id.clone(),
-            visible_latest: true,
+            visible_latest: false,
             root_path_key: persist::create_root_path_key(&target_path),
             target_path: target_path.clone(),
             auto_analyze: input.auto_analyze.unwrap_or(true),
@@ -2380,12 +2398,12 @@ pub async fn scan_start<R: Runtime>(
             })
             .collect();
     }
-    persist::save_scan_snapshot(&state.db_path, &snapshot)?;
+    persist::save_scan_snapshot(&state.db_path(), &snapshot)?;
     let (persistent_rules, persistent_rules_cleaned) =
-        crate::backend::read_scan_persistent_rules_with_cleanup(&state.settings_path);
+        crate::backend::read_scan_persistent_rules_with_cleanup(&state.settings_path());
     if persistent_rules_cleaned {
         let _ =
-            crate::backend::save_scan_persistent_rules(&state.settings_path, &persistent_rules)?;
+    crate::backend::save_scan_persistent_rules(&state.settings_path(), &persistent_rules)?;
     }
     let task = Arc::new(ScanTaskRuntime {
         stop: AtomicBool::new(false),
@@ -2428,16 +2446,24 @@ pub async fn scan_start<R: Runtime>(
                 let mut snap = runtime.snapshot.lock();
                 snap.status = "error".to_string();
                 snap.error_message = err.clone();
-                let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
                 let payload =
                     json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
+                if runtime.scan_mode == ScanMode::FullRescanIncremental {
+                let _ = persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
+                } else {
+                let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
+                }
                 drop(snap);
                 let _ = app_clone.emit("scan_error", payload);
             } else if runtime.stop.load(Ordering::Relaxed) {
                 let mut snap = runtime.snapshot.lock();
                 snap.status = "stopped".to_string();
-                let _ = persist::save_scan_snapshot(&state_clone.db_path, &snap);
                 let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
+                if runtime.scan_mode == ScanMode::FullRescanIncremental {
+                let _ = persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
+                } else {
+                let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
+                }
                 drop(snap);
                 let _ = app_clone.emit("scan_stopped", payload);
             }
@@ -2504,18 +2530,18 @@ pub async fn scan_list_history(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<Value>, String> {
-    persist::list_scan_history(&state.db_path, limit.unwrap_or(20).clamp(1, 200))
+    persist::list_scan_history(&state.db_path(), limit.unwrap_or(20).clamp(1, 200))
 }
 
 pub async fn scan_find_latest_for_path(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Value, String> {
-    let Some(task_id) = persist::find_latest_visible_scan_task_id_for_path(&state.db_path, &path)?
+    let Some(task_id) = persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), &path)?
     else {
         return Ok(Value::Null);
     };
-    let snapshot = persist::load_scan_snapshot_summary(&state.db_path, &task_id)?
+    let snapshot = persist::load_scan_snapshot_summary(&state.db_path(), &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
     serde_json::to_value(snapshot).map_err(|e| e.to_string())
 }
@@ -2530,7 +2556,7 @@ pub async fn scan_delete_history(
             return Err("Task is still running".to_string());
         }
     }
-    if !persist::delete_scan_task(&state.db_path, &task_id)? {
+    if !persist::delete_committed_scan_task(&state.db_path(), &task_id)? {
         return Err("Task not found".to_string());
     }
     Ok(json!({ "success": true }))
@@ -2541,7 +2567,7 @@ pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Res
         let snap = task.snapshot.lock().clone();
         return serde_json::to_value(snap).map_err(|e| e.to_string());
     }
-    let snapshot = persist::load_scan_snapshot(&state.db_path, &task_id)?
+    let snapshot = persist::load_scan_snapshot(&state.db_path(), &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
     serde_json::to_value(snapshot).map_err(|e| e.to_string())
 }
@@ -2615,7 +2641,7 @@ mod tests {
         }
     }
 
-    fn apply_sidecar_output_to_db(
+    fn apply_sidecar_output_to_db_internal(
         db_path: &Path,
         task_id: &str,
         root: &Path,
@@ -2623,6 +2649,7 @@ mod tests {
         baseline_task_id: Option<String>,
         max_depth: Option<u32>,
         stdout_lines: &[String],
+        finalize_full_scan: bool,
     ) {
         let mut snapshot = make_snapshot(task_id, root, max_depth, scan_mode, baseline_task_id);
 
@@ -2662,6 +2689,30 @@ mod tests {
 
         snapshot.status = "done".to_string();
         persist::save_scan_snapshot(db_path, &snapshot).expect("save final snapshot");
+        if finalize_full_scan && scan_mode == "full_rescan_incremental" {
+            persist::finalize_full_scan_draft(db_path, task_id).expect("finalize full scan draft");
+        }
+    }
+
+    fn apply_sidecar_output_to_db(
+        db_path: &Path,
+        task_id: &str,
+        root: &Path,
+        scan_mode: &str,
+        baseline_task_id: Option<String>,
+        max_depth: Option<u32>,
+        stdout_lines: &[String],
+    ) {
+        apply_sidecar_output_to_db_internal(
+            db_path,
+            task_id,
+            root,
+            scan_mode,
+            baseline_task_id,
+            max_depth,
+            stdout_lines,
+            true,
+        )
     }
 
     fn run_scanner_command(args: &[String]) -> Vec<String> {
@@ -2711,7 +2762,7 @@ mod tests {
 
         let task_id = format!("scan_{}", Uuid::new_v4().simple());
         let root_string = root.to_string_lossy().to_string();
-        persist::init_scan_task(
+        persist::init_full_scan_draft(
             &db_path,
             &task_id,
             &root_string,
@@ -2719,7 +2770,6 @@ mod tests {
             Some(1),
             false,
             None,
-            "full_rescan_incremental",
         )
         .expect("init full scan task");
 
@@ -2782,7 +2832,7 @@ mod tests {
 
         let baseline_task_id = format!("scan_{}", Uuid::new_v4().simple());
         let root_string = root.to_string_lossy().to_string();
-        persist::init_scan_task(
+        persist::init_full_scan_draft(
             &db_path,
             &baseline_task_id,
             &root_string,
@@ -2790,7 +2840,6 @@ mod tests {
             Some(1),
             false,
             None,
-            "full_rescan_incremental",
         )
         .expect("init baseline task");
         let baseline_lines = run_scanner_command(&[
@@ -2923,7 +2972,7 @@ mod tests {
 
         let baseline_task_id = format!("scan_{}", Uuid::new_v4().simple());
         let root_string = root.to_string_lossy().to_string();
-        persist::init_scan_task(
+        persist::init_full_scan_draft(
             &db_path,
             &baseline_task_id,
             &root_string,
@@ -2931,7 +2980,6 @@ mod tests {
             Some(1),
             false,
             None,
-            "full_rescan_incremental",
         )
         .expect("init baseline task");
         let baseline_lines = run_scanner_command(&[
@@ -2977,6 +3025,250 @@ mod tests {
         assert_eq!(boundary_depth, 1);
         assert!(boundary_nodes.iter().any(|node| node.name == "A"));
         assert!(boundary_nodes.iter().any(|node| node.name == "B"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn full_scan_draft_finalize_prunes_ancestor_cache_and_switches_owner() {
+        let root = temp_path("child-owner-root");
+        let db_path = temp_path("child-owner-db.sqlite");
+        fs::create_dir_all(&root).expect("create root");
+        create_scan_fixture(&root);
+        persist::init_db(&db_path).expect("init db");
+
+        let root_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let root_string = root.to_string_lossy().to_string();
+        persist::init_full_scan_draft(
+            &db_path,
+            &root_task_id,
+            &root_string,
+            0,
+            Some(3),
+            false,
+            None,
+        )
+        .expect("init root draft");
+        let root_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            root_task_id.clone(),
+            "--root".to_string(),
+            root_string.clone(),
+            "--max-depth".to_string(),
+            "3".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &root_task_id,
+            &root,
+            "full_rescan_incremental",
+            None,
+            Some(3),
+            &root_lines,
+        );
+
+        let deep_txt = root.join("A").join("nested").join("deep.txt");
+        fs::remove_file(&deep_txt).expect("remove deep file");
+        fs::write(
+            root.join("A").join("nested").join("fresh.txt"),
+            b"fresh",
+        )
+        .expect("write fresh file");
+
+        let child_root = root.join("A");
+        let child_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let child_root_string = child_root.to_string_lossy().to_string();
+        persist::init_full_scan_draft(
+            &db_path,
+            &child_task_id,
+            &child_root_string,
+            0,
+            Some(2),
+            false,
+            Some(&root_task_id),
+        )
+        .expect("init child draft");
+        let child_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            child_task_id.clone(),
+            "--root".to_string(),
+            child_root_string.clone(),
+            "--max-depth".to_string(),
+            "2".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &child_task_id,
+            &child_root,
+            "full_rescan_incremental",
+            Some(root_task_id.clone()),
+            Some(2),
+            &child_lines,
+        );
+
+        let root_node_map = persist::load_scan_node_map(&db_path, &root_task_id).expect("root node map");
+        assert!(root_node_map.contains_key(&child_root_string.to_lowercase()));
+        assert!(!root_node_map.contains_key(&deep_txt.to_string_lossy().to_lowercase()));
+        assert!(!root_node_map.contains_key(
+            &root
+                .join("A")
+                .join("nested")
+                .join("fresh.txt")
+                .to_string_lossy()
+                .to_lowercase()
+        ));
+
+        let child_node_map =
+            persist::load_scan_node_map(&db_path, &child_task_id).expect("child node map");
+        assert_eq!(
+            root_node_map
+                .get(&child_root_string.to_lowercase())
+                .expect("ancestor boundary node")
+                .size,
+            child_node_map
+                .get(&child_root_string.to_lowercase())
+                .expect("child root node")
+                .size
+        );
+
+        let dir_a_id = persist::create_node_id(&child_root_string);
+        let handed_off_children =
+            persist::load_scan_children(&db_path, &root_task_id, &dir_a_id, false)
+                .expect("load handed off children");
+        assert!(handed_off_children.iter().any(|node| node.name == "nested"));
+        assert!(handed_off_children.iter().any(|node| node.name == "a.txt"));
+
+        let nested_children = persist::load_scan_children(
+            &db_path,
+            &child_task_id,
+            &persist::create_node_id(&root.join("A").join("nested").to_string_lossy()),
+            false,
+        )
+        .expect("load nested children");
+        assert!(nested_children.iter().any(|node| node.name == "fresh.txt"));
+        assert!(!nested_children.iter().any(|node| node.name == "deep.txt"));
+
+        let latest_child = persist::find_latest_visible_scan_task_id_for_path(&db_path, &child_root_string)
+            .expect("find child owner")
+            .expect("child owner exists");
+        assert_eq!(latest_child, child_task_id);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn discarding_full_scan_draft_keeps_ancestor_cache_unchanged() {
+        let root = temp_path("discard-draft-root");
+        let db_path = temp_path("discard-draft-db.sqlite");
+        fs::create_dir_all(&root).expect("create root");
+        create_scan_fixture(&root);
+        persist::init_db(&db_path).expect("init db");
+
+        let root_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        let root_string = root.to_string_lossy().to_string();
+        persist::init_full_scan_draft(
+            &db_path,
+            &root_task_id,
+            &root_string,
+            0,
+            Some(2),
+            false,
+            None,
+        )
+        .expect("init root draft");
+        let root_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            root_task_id.clone(),
+            "--root".to_string(),
+            root_string.clone(),
+            "--max-depth".to_string(),
+            "2".to_string(),
+        ]);
+        apply_sidecar_output_to_db(
+            &db_path,
+            &root_task_id,
+            &root,
+            "full_rescan_incremental",
+            None,
+            Some(2),
+            &root_lines,
+        );
+
+        let child_root = root.join("A");
+        let child_root_string = child_root.to_string_lossy().to_string();
+        let root_before_discard = persist::load_scan_node_map(&db_path, &root_task_id)
+            .expect("load root baseline");
+        let baseline_child_size = root_before_discard
+            .get(&child_root_string.to_lowercase())
+            .expect("baseline child node")
+            .size;
+
+        fs::remove_file(root.join("A").join("nested").join("deep.txt")).expect("remove deep file");
+        let draft_task_id = format!("scan_{}", Uuid::new_v4().simple());
+        persist::init_full_scan_draft(
+            &db_path,
+            &draft_task_id,
+            &child_root_string,
+            0,
+            Some(2),
+            false,
+            Some(&root_task_id),
+        )
+        .expect("init child draft");
+        let child_lines = run_scanner_command(&[
+            "scan".to_string(),
+            "--db".to_string(),
+            db_path.to_string_lossy().to_string(),
+            "--task-id".to_string(),
+            draft_task_id.clone(),
+            "--root".to_string(),
+            child_root_string.clone(),
+            "--max-depth".to_string(),
+            "2".to_string(),
+        ]);
+        apply_sidecar_output_to_db_internal(
+            &db_path,
+            &draft_task_id,
+            &child_root,
+            "full_rescan_incremental",
+            Some(root_task_id.clone()),
+            Some(2),
+            &child_lines,
+            false,
+        );
+
+        assert!(
+            persist::load_full_scan_draft_snapshot(&db_path, &draft_task_id)
+                .expect("load draft snapshot")
+                .is_some()
+        );
+        persist::discard_full_scan_draft(&db_path, &draft_task_id).expect("discard child draft");
+
+        let root_after_discard =
+            persist::load_scan_node_map(&db_path, &root_task_id).expect("load root after discard");
+        assert_eq!(
+            root_after_discard
+                .get(&child_root_string.to_lowercase())
+                .expect("child node after discard")
+                .size,
+            baseline_child_size
+        );
+        assert!(
+            persist::load_full_scan_draft_snapshot(&db_path, &draft_task_id)
+                .expect("reload draft snapshot")
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&db_path);

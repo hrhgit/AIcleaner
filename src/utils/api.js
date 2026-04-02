@@ -54,6 +54,10 @@ export async function saveSettings(data) {
   return call('settings_save', { data });
 }
 
+export async function moveDataDir(path) {
+  return call('settings_move_data_dir', { data: { path } });
+}
+
 export async function getCredentials() {
   return call('credentials_get');
 }

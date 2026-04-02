@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::{Digest, Sha1};
@@ -553,16 +553,30 @@ fn spawn_writer(
 
 fn writer_loop(db_path: PathBuf, task_id: String, rx: Receiver<Vec<NodeRecord>>) -> Result<(), String> {
     let mut conn = open_db(&db_path)?;
+    let node_table = if conn
+        .query_row(
+            "SELECT 1 FROM scan_drafts WHERE task_id = ?1 LIMIT 1",
+            params![task_id.as_str()],
+            |_row| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        "scan_draft_nodes"
+    } else {
+        "scan_nodes"
+    };
     let mut pending = Vec::<NodeRecord>::with_capacity(WRITE_BATCH_SIZE);
     while let Ok(mut batch) = rx.recv() {
         pending.append(&mut batch);
         if pending.len() >= WRITE_BATCH_SIZE {
-            flush_node_records(&mut conn, &task_id, &pending)?;
+            flush_node_records(&mut conn, node_table, &task_id, &pending)?;
             pending.clear();
         }
     }
     if !pending.is_empty() {
-        flush_node_records(&mut conn, &task_id, &pending)?;
+        flush_node_records(&mut conn, node_table, &task_id, &pending)?;
     }
     Ok(())
 }
@@ -905,14 +919,20 @@ fn open_db(db_path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn flush_node_records(conn: &mut Connection, task_id: &str, nodes: &[NodeRecord]) -> Result<(), String> {
+fn flush_node_records(
+    conn: &mut Connection,
+    node_table: &str,
+    task_id: &str,
+    nodes: &[NodeRecord],
+) -> Result<(), String> {
     if nodes.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut stmt = tx
         .prepare_cached(
-            "INSERT INTO scan_nodes (
+            &format!(
+                "INSERT INTO {} (
                 task_id, node_id, parent_id, path, name, type, depth,
                 self_size, total_size, child_count, mtime_ms, ext
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -927,6 +947,8 @@ fn flush_node_records(conn: &mut Connection, task_id: &str, nodes: &[NodeRecord]
                 child_count = excluded.child_count,
                 mtime_ms = excluded.mtime_ms,
                 ext = excluded.ext",
+                node_table
+            ),
         )
         .map_err(|e| e.to_string())?;
     for node in nodes {

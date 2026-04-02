@@ -14,11 +14,36 @@ use tauri::{Runtime, State};
 
 const CREDENTIAL_SERVICE: &str = "aicleaner";
 const SEARCH_SECRET_KEY: &str = "search:tavily:apiKey";
+const STORAGE_LOCATION_FILE: &str = "storage-location.json";
+
+#[derive(Clone, Debug)]
+struct AppPaths {
+    data_dir: PathBuf,
+    settings_path: PathBuf,
+    db_path: PathBuf,
+}
+
+impl AppPaths {
+    fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self {
+            settings_path: data_dir.join("settings.json"),
+            db_path: data_dir.join("scan-cache.sqlite"),
+            data_dir,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageLocationConfig {
+    data_dir: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
-    pub settings_path: PathBuf,
-    pub db_path: PathBuf,
+    pub base_data_dir: PathBuf,
+    pub bootstrap_path: PathBuf,
+    paths: Arc<Mutex<AppPaths>>,
     pub(crate) scan_tasks: Arc<Mutex<HashMap<String, Arc<crate::scan_runtime::ScanTaskRuntime>>>>,
     pub(crate) organize_tasks:
         Arc<Mutex<HashMap<String, Arc<crate::organizer_runtime::OrganizeTaskRuntime>>>>,
@@ -138,23 +163,26 @@ fn default_model_for_endpoint(endpoint: &str) -> &'static str {
 }
 
 impl AppState {
-    pub fn bootstrap(data_dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-        let settings_path = data_dir.join("settings.json");
-        let db_path = data_dir.join("scan-cache.sqlite");
-        if !settings_path.exists() {
+    pub fn bootstrap(base_data_dir: PathBuf) -> Result<Self, String> {
+        fs::create_dir_all(&base_data_dir).map_err(|e| e.to_string())?;
+        let bootstrap_path = base_data_dir.join(STORAGE_LOCATION_FILE);
+        let resolved_data_dir = resolve_storage_data_dir(&base_data_dir, &bootstrap_path);
+        fs::create_dir_all(&resolved_data_dir).map_err(|e| e.to_string())?;
+        let paths = AppPaths::from_data_dir(resolved_data_dir);
+        if !paths.settings_path.exists() {
             fs::write(
-                &settings_path,
+                &paths.settings_path,
                 serde_json::to_vec_pretty(&default_settings()).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
         }
-        crate::persist::init_db(&db_path)?;
-        crate::persist::mark_stale_tasks(&db_path)?;
+        crate::persist::init_db(&paths.db_path)?;
+        crate::persist::mark_stale_tasks(&paths.db_path)?;
         Ok(Self {
             credential_store: Arc::new(WindowsCredentialStore::new(CREDENTIAL_SERVICE)),
-            settings_path,
-            db_path,
+            base_data_dir,
+            bootstrap_path,
+            paths: Arc::new(Mutex::new(paths)),
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
             organize_tasks: Arc::new(Mutex::new(HashMap::new())),
             tika_process: Arc::new(Mutex::new(None)),
@@ -163,15 +191,160 @@ impl AppState {
 
     #[cfg(test)]
     fn with_store(settings_path: PathBuf, credential_store: Arc<dyn CredentialStore>) -> Self {
+        let data_dir = settings_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         Self {
-            settings_path,
-            db_path: std::env::temp_dir().join("aicleaner-test.sqlite"),
+            base_data_dir: data_dir.clone(),
+            bootstrap_path: data_dir.join(STORAGE_LOCATION_FILE),
+            paths: Arc::new(Mutex::new(AppPaths {
+                data_dir,
+                settings_path,
+                db_path: std::env::temp_dir().join("aicleaner-test.sqlite"),
+            })),
             scan_tasks: Arc::new(Mutex::new(HashMap::new())),
             organize_tasks: Arc::new(Mutex::new(HashMap::new())),
             tika_process: Arc::new(Mutex::new(None)),
             credential_store,
         }
     }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.paths.lock().data_dir.clone()
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.paths.lock().settings_path.clone()
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.paths.lock().db_path.clone()
+    }
+
+    pub fn uses_custom_data_dir(&self) -> bool {
+        !same_path(&self.data_dir(), &self.base_data_dir)
+    }
+
+    fn set_data_dir(&self, data_dir: PathBuf) {
+        *self.paths.lock() = AppPaths::from_data_dir(data_dir);
+    }
+}
+
+fn resolve_storage_data_dir(base_data_dir: &Path, bootstrap_path: &Path) -> PathBuf {
+    fs::read_to_string(bootstrap_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<StorageLocationConfig>(&raw).ok())
+        .and_then(|config| config.data_dir)
+        .map(|value| PathBuf::from(value.trim()))
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| base_data_dir.to_path_buf())
+}
+
+fn write_storage_location_config(
+    base_data_dir: &Path,
+    bootstrap_path: &Path,
+    active_data_dir: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(base_data_dir).map_err(|e| e.to_string())?;
+    if same_path(active_data_dir, base_data_dir) {
+        if bootstrap_path.exists() {
+            fs::remove_file(bootstrap_path).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    let payload = StorageLocationConfig {
+        data_dir: Some(active_data_dir.to_string_lossy().to_string()),
+    };
+    fs::write(
+        bootstrap_path,
+        serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    crate::persist::normalize_root_path(&left.to_string_lossy())
+        == crate::persist::normalize_root_path(&right.to_string_lossy())
+}
+
+fn is_same_or_descendant_path(candidate: &Path, parent: &Path) -> bool {
+    let candidate = crate::persist::normalize_root_path(&candidate.to_string_lossy());
+    let parent = crate::persist::normalize_root_path(&parent.to_string_lossy());
+    if candidate == parent {
+        return true;
+    }
+    let Some(stripped) = candidate.strip_prefix(&parent) else {
+        return false;
+    };
+    stripped.starts_with('\\')
+}
+
+fn validate_data_dir_target(current_data_dir: &Path, target_data_dir: &Path) -> Result<(), String> {
+    if target_data_dir.as_os_str().is_empty() {
+        return Err("Missing target data directory.".to_string());
+    }
+    if same_path(current_data_dir, target_data_dir) {
+        return Err("The selected directory is already the current cache location.".to_string());
+    }
+    if is_same_or_descendant_path(target_data_dir, current_data_dir)
+        || is_same_or_descendant_path(current_data_dir, target_data_dir)
+    {
+        return Err("The new cache directory cannot be the current directory or its parent/child.".to_string());
+    }
+    Ok(())
+}
+
+fn copy_dir_contents_recursive(
+    source_dir: &Path,
+    target_dir: &Path,
+    skip_paths: &HashSet<String>,
+) -> Result<(), String> {
+    fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source_path = entry.path();
+        let source_key = crate::persist::normalize_root_path(&source_path.to_string_lossy());
+        if skip_paths.contains(&source_key) {
+            continue;
+        }
+        let target_path = target_dir.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            copy_dir_contents_recursive(&source_path, &target_path, skip_paths)?;
+        } else if file_type.is_file() {
+            if target_path.exists() {
+                return Err(format!(
+                    "Target already contains {}.",
+                    target_path.to_string_lossy()
+                ));
+            }
+            fs::copy(&source_path, &target_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_dir_contents_recursive(source_dir: &Path, skip_paths: &HashSet<String>) -> Result<(), String> {
+    if !source_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source_path = entry.path();
+        let source_key = crate::persist::normalize_root_path(&source_path.to_string_lossy());
+        if skip_paths.contains(&source_key) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            remove_dir_contents_recursive(&source_path, skip_paths)?;
+            let _ = fs::remove_dir(&source_path);
+        } else if file_type.is_file() {
+            fs::remove_file(&source_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -991,6 +1164,14 @@ fn redact_settings_for_client(state: &AppState, raw_settings: &Value) -> Value {
     strip_secret_fields(&mut sanitized);
     if let Some(obj) = sanitized.as_object_mut() {
         obj.insert(
+            "storage".to_string(),
+            json!({
+                "dataDir": state.data_dir().to_string_lossy().to_string(),
+                "defaultDataDir": state.base_data_dir.to_string_lossy().to_string(),
+                "customized": state.uses_custom_data_dir(),
+            }),
+        );
+        obj.insert(
             "credentialsStatus".to_string(),
             build_credentials_status_value(state, raw_settings),
         );
@@ -1003,9 +1184,10 @@ fn update_credentials_meta_in_settings(
     provider_meta: &HashMap<String, bool>,
     search_has_api_key: bool,
 ) -> Result<Value, String> {
-    let mut settings = read_settings(&state.settings_path);
+    let settings_path = state.settings_path();
+    let mut settings = read_settings(&settings_path);
     apply_credentials_meta(&mut settings, provider_meta, search_has_api_key);
-    write_settings(&state.settings_path, &settings)?;
+    write_settings(&settings_path, &settings)?;
     Ok(settings)
 }
 
@@ -1045,7 +1227,7 @@ pub(crate) fn resolve_provider_endpoint_and_model(
     endpoint_hint: Option<&str>,
     model_hint: Option<&str>,
 ) -> (String, String) {
-    let settings = read_settings(&state.settings_path);
+    let settings = read_settings(&state.settings_path());
     let endpoint = endpoint_hint
         .unwrap_or("")
         .trim()
@@ -1117,7 +1299,7 @@ pub(crate) fn resolve_provider_api_key(state: &AppState, endpoint: &str) -> Resu
     {
         return Ok(api_key);
     }
-    legacy_provider_api_key_from_settings(&read_settings(&state.settings_path), endpoint)
+    legacy_provider_api_key_from_settings(&read_settings(&state.settings_path()), endpoint)
         .ok_or_else(|| "Credential not found.".to_string())
 }
 
@@ -1129,29 +1311,86 @@ pub(crate) fn resolve_search_api_key(state: &AppState) -> Result<String, String>
     {
         return Ok(api_key);
     }
-    legacy_search_api_key_from_settings(&read_settings(&state.settings_path))
+    legacy_search_api_key_from_settings(&read_settings(&state.settings_path()))
         .ok_or_else(|| "Credential not found.".to_string())
 }
 
 #[tauri::command]
 pub async fn settings_get(state: State<'_, AppState>) -> Result<Value, String> {
-    let raw = read_settings(&state.settings_path);
+    let settings_path = state.settings_path();
+    let raw = read_settings(&settings_path);
     Ok(redact_settings_for_client(state.inner(), &raw))
 }
 
 #[tauri::command]
 pub async fn settings_save(state: State<'_, AppState>, data: Value) -> Result<Value, String> {
-    write_settings(&state.settings_path, &data)?;
-    let raw = read_settings(&state.settings_path);
+    let settings_path = state.settings_path();
+    write_settings(&settings_path, &data)?;
+    let raw = read_settings(&settings_path);
     Ok(json!({
         "success": true,
         "settings": redact_settings_for_client(state.inner(), &raw)
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsDataDirInput {
+    path: String,
+}
+
+fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String> {
+    if !state.scan_tasks.lock().is_empty() || !state.organize_tasks.lock().is_empty() {
+        return Err("Please stop running scan or organize tasks before moving the cache directory.".to_string());
+    }
+
+    let current_data_dir = state.data_dir();
+    let target_data_dir = PathBuf::from(target_path.trim());
+    validate_data_dir_target(&current_data_dir, &target_data_dir)?;
+    fs::create_dir_all(&target_data_dir).map_err(|e| e.to_string())?;
+
+    let bootstrap_key = crate::persist::normalize_root_path(&state.bootstrap_path.to_string_lossy());
+    let mut skip_paths = HashSet::new();
+    skip_paths.insert(bootstrap_key);
+
+    copy_dir_contents_recursive(&current_data_dir, &target_data_dir, &skip_paths)?;
+
+    let target_paths = AppPaths::from_data_dir(target_data_dir.clone());
+    if !target_paths.settings_path.exists() {
+        fs::write(
+            &target_paths.settings_path,
+            serde_json::to_vec_pretty(&default_settings()).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    crate::persist::init_db(&target_paths.db_path)?;
+    crate::persist::mark_stale_tasks(&target_paths.db_path)?;
+
+    write_storage_location_config(&state.base_data_dir, &state.bootstrap_path, &target_data_dir)?;
+    state.set_data_dir(target_data_dir.clone());
+
+    let cleanup_warning = remove_dir_contents_recursive(&current_data_dir, &skip_paths).err();
+    let settings = read_settings(&target_paths.settings_path);
+    Ok(json!({
+        "success": true,
+        "dataDir": target_data_dir.to_string_lossy().to_string(),
+        "cleanupWarning": cleanup_warning,
+        "settings": redact_settings_for_client(state, &settings)
+    }))
+}
+
+#[tauri::command]
+pub async fn settings_move_data_dir(
+    state: State<'_, AppState>,
+    data: SettingsDataDirInput,
+) -> Result<Value, String> {
+    migrate_data_dir(state.inner(), &data.path)
+}
+
 #[tauri::command]
 pub async fn credentials_get(state: State<'_, AppState>) -> Result<Value, String> {
-    let settings = read_settings(&state.settings_path);
+    let settings_path = state.settings_path();
+    let settings = read_settings(&settings_path);
     let mut provider_key_map = HashMap::new();
     let mut secret_keys = Vec::new();
     if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
@@ -1202,7 +1441,8 @@ fn save_credentials_internal(
     data: CredentialsSaveInput,
 ) -> Result<Value, String> {
     let started_at = Instant::now();
-    let settings = read_settings(&state.settings_path);
+    let settings_path = state.settings_path();
+    let settings = read_settings(&settings_path);
     let provider_secrets = data.provider_secrets.unwrap_or_default();
     let mut entries = Vec::new();
     if let Some(configs) = settings.get("providerConfigs").and_then(Value::as_object) {
@@ -1465,8 +1705,9 @@ pub async fn files_clean(
     }
     let mut scan_snapshot = Value::Null;
     if let Some(task_id) = data.scan_task_id.as_deref() {
-        let _ = crate::persist::delete_scan_data_for_paths(&state.db_path, task_id, &cleaned);
-        if let Ok(Some(snapshot)) = crate::persist::load_scan_snapshot(&state.db_path, task_id) {
+        let db_path = state.db_path();
+        let _ = crate::persist::delete_scan_data_for_paths(&db_path, task_id, &cleaned);
+        if let Ok(Some(snapshot)) = crate::persist::load_scan_snapshot(&db_path, task_id) {
             scan_snapshot = serde_json::to_value(snapshot).unwrap_or(Value::Null);
         }
     }
@@ -1558,7 +1799,7 @@ pub async fn scan_start<R: Runtime>(
         input.api_key = Some(String::new());
     }
     if input.use_web_search.is_none() {
-        let settings = read_settings(&state.settings_path);
+        let settings = read_settings(&state.settings_path());
         let scan_enabled = settings
             .pointer("/searchApi/scopes/scan")
             .and_then(Value::as_bool)
@@ -1998,7 +2239,7 @@ mod tests {
 
         let state =
             AppState::with_store(path.clone(), Arc::new(InMemoryCredentialStore::default()));
-        let raw = read_settings(&state.settings_path);
+        let raw = read_settings(&state.settings_path());
         let status = build_credentials_status_value(&state, &raw);
 
         assert_eq!(
@@ -2038,7 +2279,7 @@ mod tests {
             search_api_key: Some("tvly-test".to_string()),
         };
 
-        let settings = read_settings(&state.settings_path);
+        let settings = read_settings(&state.settings_path());
         let mut provider_meta = HashMap::new();
         provider_meta.insert("https://api.openai.com/v1".to_string(), true);
         state
@@ -2098,7 +2339,7 @@ mod tests {
             ])
             .expect("clear credentials");
 
-        let status = build_credentials_status_value(&state, &read_settings(&state.settings_path));
+        let status = build_credentials_status_value(&state, &read_settings(&state.settings_path()));
 
         assert_eq!(
             saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
@@ -2152,7 +2393,7 @@ mod tests {
             Some("tvly-existing".to_string())
         );
 
-        let saved = read_settings(&state.settings_path);
+        let saved = read_settings(&state.settings_path());
         assert_eq!(
             saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
             Value::Bool(true)
@@ -2214,7 +2455,7 @@ mod tests {
             None
         );
 
-        let saved = read_settings(&state.settings_path);
+        let saved = read_settings(&state.settings_path());
         assert_eq!(
             saved["credentialsMeta"]["providers"]["https://api.openai.com/v1"],
             Value::Bool(false)
@@ -2226,5 +2467,46 @@ mod tests {
         assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(false));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrate_data_dir_moves_settings_and_database() {
+        let base_dir = std::env::temp_dir().join(format!("aicleaner-data-root-{}", Uuid::new_v4()));
+        let target_dir =
+            std::env::temp_dir().join(format!("aicleaner-data-target-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base_dir).expect("create base dir");
+
+        let state = AppState::bootstrap(base_dir.clone()).expect("bootstrap state");
+        write_settings(
+            &state.settings_path(),
+            &json!({
+                "scanPath": "D:\\data",
+                "targetSizeGB": 2
+            }),
+        )
+        .expect("write settings");
+        fs::write(state.data_dir().join("marker.txt"), b"marker").expect("write marker");
+
+        let response = migrate_data_dir(&state, &target_dir.to_string_lossy())
+            .expect("migrate data dir");
+
+        assert!(same_path(&state.data_dir(), &target_dir));
+        assert!(state.settings_path().exists());
+        assert!(state.db_path().exists());
+        assert!(state.data_dir().join("marker.txt").exists());
+        assert_eq!(
+            response["settings"]["storage"]["dataDir"],
+            Value::String(target_dir.to_string_lossy().to_string())
+        );
+        assert_eq!(
+            resolve_storage_data_dir(&base_dir, &state.bootstrap_path),
+            target_dir
+        );
+        assert!(!base_dir.join("settings.json").exists());
+        assert!(!base_dir.join("scan-cache.sqlite").exists());
+
+        let _ = fs::remove_dir_all(&target_dir);
+        let _ = fs::remove_file(&state.bootstrap_path);
+        let _ = fs::remove_dir_all(&base_dir);
     }
 }

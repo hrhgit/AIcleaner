@@ -168,9 +168,13 @@ a {
 
 .sidebar-provider-action {
   padding: 8px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
-.sidebar-provider-action .btn-provider-manager {
+.sidebar-provider-action .btn-provider-manager,
+.sidebar-provider-action .btn-sidebar-action {
   width: 100%;
   justify-content: flex-start;
 }

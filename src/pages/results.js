@@ -715,7 +715,7 @@ function renderTable(data) {
           showToast(t('results.toast_open_failed') + res.error, 'error');
         }
       } catch (err) {
-        showToast(t('results.toast_open_failed') + err.message, 'error');
+        showToast(t('results.toast_open_failed') + getErrorMessage(err), 'error');
       } finally {
         setActionButtonBusy(btn, false);
       }
@@ -792,7 +792,7 @@ async function addPathToWhitelist(path) {
     renderTable(getFilteredData());
     showToast(t('results.whitelist_added'), 'success');
   } catch (err) {
-    showToast(t('results.whitelist_failed') + err.message, 'error');
+    showToast(t('results.whitelist_failed') + getErrorMessage(err), 'error');
   }
 }
 
@@ -856,7 +856,7 @@ async function loadHistoryTask(taskId) {
     await refreshHistoryList();
     showToast(t('scanner.history_loaded'), 'success');
   } catch (err) {
-    showToast(t('scanner.history_load_failed') + err.message, 'error');
+    showToast(t('scanner.history_load_failed') + getErrorMessage(err), 'error');
   }
 }
 
@@ -871,11 +871,12 @@ async function deleteHistoryTask(taskId) {
     await refreshHistoryList();
     showToast(t('scanner.history_deleted'), 'success');
   } catch (err) {
-    if (/still running/i.test(err.message)) {
+    const errorMessage = getErrorMessage(err);
+    if (/still running/i.test(errorMessage)) {
       showToast(t('scanner.history_running'), 'error');
       return;
     }
-    showToast(t('scanner.history_delete_failed') + err.message, 'error');
+    showToast(t('scanner.history_delete_failed') + errorMessage, 'error');
   }
 }
 
@@ -912,7 +913,7 @@ async function refreshSnapshot({ silent = false, expectedRenderVersion = null } 
       clearCurrentSnapshot();
     }
     if (!silent) {
-      showToast(t('scanner.history_load_failed') + err.message, 'error');
+      showToast(t('scanner.history_load_failed') + getErrorMessage(err), 'error');
     }
   } finally {
     if (refreshBtn) refreshBtn.disabled = false;
@@ -968,12 +969,12 @@ async function handleBatchClean() {
             handleElevationTransition({ showToast, t });
           }
         } catch (err) {
-          showToast(t('settings.elevation_failed') + err.message, 'error');
+          showToast(t('settings.elevation_failed') + getErrorMessage(err), 'error');
         }
       }
     }
   } catch (err) {
-    showToast(t('results.toast_clean_failed') + err.message, 'error');
+    showToast(t('results.toast_clean_failed') + getErrorMessage(err), 'error');
   } finally {
     if (batchDeleteBtn) {
       batchDeleteBtn.disabled = false;

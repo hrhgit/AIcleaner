@@ -21,6 +21,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backend::settings_get,
             backend::settings_save,
+            backend::settings_move_data_dir,
             backend::credentials_get,
             backend::credentials_save,
             backend::settings_get_provider_models,

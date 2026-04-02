@@ -385,11 +385,10 @@ fn resolve_tika_server_jar(state: &AppState, configured_path: &str) -> Option<Pa
         roots.push(dir.join("tools"));
         roots.push(dir.join("resources"));
     }
-    if let Some(data_dir) = state.settings_path.parent() {
-        roots.push(data_dir.to_path_buf());
-        roots.push(data_dir.join("bin"));
-        roots.push(data_dir.join("tools"));
-    }
+    let data_dir = state.data_dir();
+    roots.push(data_dir.clone());
+    roots.push(data_dir.join("bin"));
+    roots.push(data_dir.join("tools"));
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             roots.push(exe_dir.to_path_buf());
@@ -3095,7 +3094,7 @@ async fn emit_snapshot<R: Runtime>(
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
     let snap = task.snapshot.lock().clone();
-    persist::save_organize_snapshot(&state.db_path, &snap)?;
+    persist::save_organize_snapshot(&state.db_path(), &snap)?;
     app.emit(
         "organize_progress",
         serde_json::to_value(&snap).map_err(|e| e.to_string())?,
@@ -3509,7 +3508,7 @@ async fn run_organize_task<R: Runtime>(
             });
             persisted_rows.push(result_row.clone());
         }
-        persist::upsert_organize_results(&state.db_path, &task_id, &persisted_rows)?;
+    persist::upsert_organize_results(&state.db_path(), &task_id, &persisted_rows)?;
         {
             let mut snap = task.snapshot.lock();
             snap.processed_files = snap
@@ -3556,9 +3555,9 @@ async fn run_organize_task<R: Runtime>(
         snap.completed_at = Some(now_iso());
         snap.clone()
     };
-    persist::save_organize_snapshot(&state.db_path, &final_snapshot)?;
+    persist::save_organize_snapshot(&state.db_path(), &final_snapshot)?;
     persist::save_latest_organize_tree(
-        &state.db_path,
+        &state.db_path(),
         &final_snapshot.root_path,
         &final_snapshot.tree,
         final_snapshot.tree_version,
@@ -3572,7 +3571,7 @@ async fn run_organize_task<R: Runtime>(
 }
 
 pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
-    let settings = crate::backend::read_settings(&state.settings_path);
+    let settings = crate::backend::read_settings(&state.settings_path());
     let (endpoint, model) =
         crate::backend::resolve_provider_endpoint_and_model(state.inner(), None, None);
     Ok(json!({
@@ -3594,7 +3593,7 @@ pub async fn organize_start<R: Runtime>(
         return Err("rootPath is required".to_string());
     }
     let task_id = format!("org_{}", Uuid::new_v4().simple());
-    let settings = crate::backend::read_settings(&state.settings_path);
+    let settings = crate::backend::read_settings(&state.settings_path());
     let mut extraction_tool = extraction_tool_config_from_settings(&settings);
     let normalized_summary_mode = normalize_summary_mode(input.summary_mode.as_deref());
     if normalized_summary_mode != SUMMARY_MODE_FILENAME_ONLY {
@@ -3608,7 +3607,7 @@ pub async fn organize_start<R: Runtime>(
         model: "gpt-4o-mini".to_string(),
     });
     let (tree, tree_version) =
-        persist::load_latest_organize_tree(&state.db_path, &input.root_path)?
+    persist::load_latest_organize_tree(&state.db_path(), &input.root_path)?
             .unwrap_or_else(|| (category_tree_to_value(&default_tree()), 0));
     let snapshot = OrganizeSnapshot {
         id: task_id.clone(),
@@ -3650,7 +3649,7 @@ pub async fn organize_start<R: Runtime>(
         completed_at: None,
         job_id: None,
     };
-    persist::init_organize_task(&state.db_path, &snapshot)?;
+    persist::init_organize_task(&state.db_path(), &snapshot)?;
     let task = Arc::new(OrganizeTaskRuntime {
         stop: AtomicBool::new(false),
         snapshot: Mutex::new(snapshot.clone()),
@@ -3674,7 +3673,7 @@ pub async fn organize_start<R: Runtime>(
             let mut snap = runtime.snapshot.lock();
             snap.status = "stopped".to_string();
             snap.completed_at = Some(now_iso());
-            let _ = persist::save_organize_snapshot(&state_clone.db_path, &snap);
+            let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
             drop(snap);
             let _ = app_clone.emit("organize_stopped", payload);
@@ -3683,7 +3682,7 @@ pub async fn organize_start<R: Runtime>(
             snap.status = "error".to_string();
             snap.error = Some(err.clone());
             snap.completed_at = Some(now_iso());
-            let _ = persist::save_organize_snapshot(&state_clone.db_path, &snap);
+            let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
             drop(snap);
             let _ = app_clone.emit("organize_error", payload);
@@ -3731,14 +3730,14 @@ pub async fn organize_get_result(
         let snap = task.snapshot.lock().clone();
         return serde_json::to_value(snap).map_err(|e| e.to_string());
     }
-    let snapshot = persist::load_organize_snapshot(&state.db_path, &task_id)?
+    let snapshot = persist::load_organize_snapshot(&state.db_path(), &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
     serde_json::to_value(hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
 }
 
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
     let mut snapshot = hydrate_loaded_snapshot(
-        persist::load_organize_snapshot(&state.db_path, &task_id)?
+    persist::load_organize_snapshot(&state.db_path(), &task_id)?
             .ok_or_else(|| "Task not found".to_string())?,
     );
     if snapshot.status != "completed" && snapshot.status != "done" {
@@ -3748,7 +3747,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         ));
     }
     snapshot.status = "moving".to_string();
-    persist::save_organize_snapshot(&state.db_path, &snapshot)?;
+    persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
 
     let plan = build_apply_plan(&snapshot);
     let mut entries = Vec::new();
@@ -3863,13 +3862,13 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             "total": entries.len()
         }
     });
-    persist::save_organize_manifest(&state.db_path, &manifest)?;
+    persist::save_organize_manifest(&state.db_path(), &manifest)?;
     snapshot.status = "done".to_string();
     snapshot.job_id = manifest
         .get("jobId")
         .and_then(Value::as_str)
         .map(|x| x.to_string());
-    persist::save_organize_snapshot(&state.db_path, &snapshot)?;
+    persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
     if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
         *task.snapshot.lock() = snapshot;
     }
@@ -3880,7 +3879,7 @@ pub async fn organize_rollback(
     state: State<'_, AppState>,
     job_id: String,
 ) -> Result<Value, String> {
-    let manifest = persist::load_organize_job(&state.db_path, &job_id)?
+    let manifest = persist::load_organize_job(&state.db_path(), &job_id)?
         .ok_or_else(|| "job manifest not found".to_string())?;
     let task_id = manifest
         .get("taskId")
@@ -3892,7 +3891,7 @@ pub async fn organize_rollback(
             .and_then(Value::as_str)
             .unwrap_or(""),
     );
-    let mut entries = persist::load_organize_job_entries(&state.db_path, &job_id)?;
+    let mut entries = persist::load_organize_job_entries(&state.db_path(), &job_id)?;
     entries.reverse();
     let mut rollback_entries = Vec::new();
     for entry in entries {
@@ -3978,7 +3977,7 @@ pub async fn organize_rollback(
             "total": rollback_entries.len()
         }
     });
-    persist::save_organize_rollback(&state.db_path, &job_id, &rollback)?;
+    persist::save_organize_rollback(&state.db_path(), &job_id, &rollback)?;
 
     let failed = rollback
         .get("summary")
@@ -3987,11 +3986,11 @@ pub async fn organize_rollback(
         .unwrap_or(0);
     if failed == 0 {
         if let Some(task_id) = task_id {
-            if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path, &task_id)? {
+    if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path(), &task_id)? {
                 snapshot = hydrate_loaded_snapshot(snapshot);
                 snapshot.status = "completed".to_string();
                 snapshot.job_id = None;
-                persist::save_organize_snapshot(&state.db_path, &snapshot)?;
+        persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
                 if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
                     *task.snapshot.lock() = snapshot;
                 }

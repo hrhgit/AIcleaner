@@ -5,8 +5,8 @@
 import { renderScanner } from './pages/scanner.js';
 import { renderResults } from './pages/results.js';
 import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
-import { openExternalUrl } from './utils/api.js';
-import { emitLangChange, registerLangChangeHandler, setLang, getLang } from './utils/i18n.js';
+import { browseFolder, getSettings, moveDataDir, openExternalUrl } from './utils/api.js';
+import { emitLangChange, registerLangChangeHandler, setLang, getLang, t } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
 
 const pages = {
@@ -76,6 +76,53 @@ async function handleExternalLinkClick(event) {
     }
 }
 
+async function refreshMoveDataDirButtonMeta() {
+    const btn = document.getElementById('move-data-dir-sidebar-btn');
+    if (!btn) return;
+    try {
+        const settings = await getSettings();
+        const storage = settings?.storage && typeof settings.storage === 'object' ? settings.storage : {};
+        const activePath = String(storage.dataDir || '').trim();
+        const defaultPath = String(storage.defaultDataDir || '').trim();
+        btn.title = storage.customized
+            ? t('settings.cache_dir_custom', { defaultPath })
+            : t('settings.cache_dir_default', { defaultPath: defaultPath || activePath });
+    } catch {
+        btn.title = t('settings.cache_dir_hint');
+    }
+}
+
+function initMoveDataDirButton() {
+    const btn = document.getElementById('move-data-dir-sidebar-btn');
+    if (!btn) return;
+
+    btn.addEventListener('click', async () => {
+        const originalText = btn.textContent || t('settings.cache_dir_apply');
+        btn.disabled = true;
+        btn.innerHTML = `<span class="spinner"></span> ${t('settings.browsing')}`;
+        try {
+            const picked = await browseFolder();
+            if (picked?.cancelled || !picked?.path) {
+                return;
+            }
+            btn.innerHTML = `<span class="spinner"></span> ${t('settings.cache_dir_moving')}`;
+            const result = await moveDataDir(picked.path);
+            showToast(t('settings.toast_cache_dir_moved') + (result?.dataDir || picked.path), 'success');
+            if (result?.cleanupWarning) {
+                showToast(t('settings.cache_dir_cleanup_warning') + result.cleanupWarning, 'info');
+            }
+            await refreshMoveDataDirButtonMeta();
+        } catch (err) {
+            showToast(t('settings.toast_cache_dir_move_failed') + (err?.message || err), 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = originalText;
+        }
+    });
+
+    refreshMoveDataDirButtonMeta();
+}
+
 // Event listeners
 window.addEventListener('hashchange', () => {
     navigate(getPageFromHash());
@@ -83,6 +130,7 @@ window.addEventListener('hashchange', () => {
 
 document.addEventListener('DOMContentLoaded', () => {
     initProviderManager();
+    initMoveDataDirButton();
     document.addEventListener('click', handleExternalLinkClick);
 
     // Nav link clicks
@@ -107,6 +155,7 @@ document.addEventListener('DOMContentLoaded', () => {
             setLang(opt.dataset.lang);
             emitLangChange();
             updateLangUI();
+            refreshMoveDataDirButtonMeta();
         });
     });
 
