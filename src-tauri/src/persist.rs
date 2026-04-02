@@ -1397,7 +1397,9 @@ pub fn save_organize_rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{default_organize_summary_mode, OrganizeSnapshot, ScanSnapshot, TokenUsage};
+    use crate::backend::{
+        default_organize_summary_mode, OrganizeSnapshot, ScanSnapshot, TokenUsage,
+    };
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -1497,7 +1499,8 @@ mod tests {
         let root_path = r"C:\root";
         let snapshot = make_organize_snapshot("org_task", root_path);
         init_organize_task(&db_path, &snapshot).expect("init organize task");
-        upsert_organize_results(&db_path, &snapshot.id, &snapshot.results).expect("write organize rows");
+        upsert_organize_results(&db_path, &snapshot.id, &snapshot.results)
+            .expect("write organize rows");
         save_organize_snapshot(&db_path, &snapshot).expect("save compact snapshot");
 
         let conn = open_db(&db_path).expect("open db");
@@ -1508,9 +1511,16 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .expect("read snapshot json");
-        let persisted_value: Value = serde_json::from_str(&raw_snapshot).expect("parse snapshot json");
-        assert_eq!(persisted_value.get("results"), Some(&Value::Array(Vec::new())));
-        assert_eq!(persisted_value.get("preview"), Some(&Value::Array(Vec::new())));
+        let persisted_value: Value =
+            serde_json::from_str(&raw_snapshot).expect("parse snapshot json");
+        assert_eq!(
+            persisted_value.get("results"),
+            Some(&Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            persisted_value.get("preview"),
+            Some(&Value::Array(Vec::new()))
+        );
 
         let loaded = load_organize_snapshot(&db_path, &snapshot.id)
             .expect("load snapshot")

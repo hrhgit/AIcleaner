@@ -272,6 +272,42 @@ pub struct CredentialsSaveInput {
     search_api_key: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScanRuleTopChild {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub item_type: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScanPersistentRuleRecord {
+    pub path: String,
+    pub node_type: String,
+    pub classification: String,
+    pub reason: String,
+    pub risk: String,
+    pub source: String,
+    pub size: u64,
+    pub self_size: u64,
+    pub child_count: u64,
+    #[serde(default)]
+    pub name_tags: Vec<String>,
+    #[serde(default)]
+    pub top_children: Vec<ScanRuleTopChild>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScanPersistentRules {
+    #[serde(default)]
+    pub keep_exact: Vec<ScanPersistentRuleRecord>,
+    #[serde(default)]
+    pub safe_delete_exact: Vec<ScanPersistentRuleRecord>,
+}
+
 fn default_settings() -> Value {
     json!({
         "defaultProviderEndpoint": "https://api.openai.com/v1",
@@ -288,6 +324,10 @@ fn default_settings() -> Value {
         "maxDepth": 5,
         "maxDepthUnlimited": false,
         "scanIgnorePaths": [],
+        "scanPersistentRules": {
+            "keepExact": [],
+            "safeDeleteExact": []
+        },
         "lastScanTime": null,
         "searchApi": {
             "provider": "tavily",
@@ -564,6 +604,16 @@ fn normalize_settings_shape(value: &mut Value) {
             }
         }),
     );
+    let persistent_rules = normalize_scan_persistent_rules(obj.get("scanPersistentRules"));
+    obj.insert(
+        "scanPersistentRules".to_string(),
+        serde_json::to_value(&persistent_rules).unwrap_or_else(|_| {
+            json!({
+                "keepExact": [],
+                "safeDeleteExact": []
+            })
+        }),
+    );
     let tika = obj
         .get("contentExtraction")
         .and_then(|value| value.get("tika"))
@@ -660,9 +710,155 @@ pub(crate) fn normalize_scan_ignore_paths(value: Option<&Value>) -> Vec<String> 
         .collect()
 }
 
+fn normalize_scan_rule_top_children(records: &[ScanRuleTopChild]) -> Vec<ScanRuleTopChild> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let name = record.name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let item_type = match record.item_type.trim() {
+                "directory" => "directory",
+                "file" => "file",
+                _ => return None,
+            };
+            Some(ScanRuleTopChild {
+                name: name.to_string(),
+                item_type: item_type.to_string(),
+                size: record.size,
+            })
+        })
+        .take(5)
+        .collect()
+}
+
+fn normalize_scan_rule_name_tags(tags: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tags.iter()
+        .filter_map(|tag| {
+            let normalized = tag.trim().to_ascii_lowercase();
+            if normalized.is_empty() || !seen.insert(normalized.clone()) {
+                return None;
+            }
+            Some(normalized)
+        })
+        .collect()
+}
+
+fn normalize_scan_persistent_rule_record(
+    raw: ScanPersistentRuleRecord,
+    fallback_classification: &str,
+) -> Option<ScanPersistentRuleRecord> {
+    let path = PathBuf::from(raw.path.trim()).to_string_lossy().to_string();
+    if path.trim().is_empty() {
+        return None;
+    }
+    let node_type = match raw.node_type.trim() {
+        "directory" => "directory",
+        "file" => "file",
+        _ => return None,
+    }
+    .to_string();
+    let classification = match raw.classification.trim() {
+        "keep" => "keep",
+        "safe_to_delete" => "safe_to_delete",
+        _ => fallback_classification,
+    }
+    .to_string();
+    let source = if raw.source.trim().is_empty() {
+        "ai_promoted".to_string()
+    } else {
+        raw.source.trim().to_string()
+    };
+    let risk = if raw.risk.trim().is_empty() {
+        if classification == "keep" {
+            "high".to_string()
+        } else {
+            "low".to_string()
+        }
+    } else {
+        raw.risk.trim().to_string()
+    };
+
+    Some(ScanPersistentRuleRecord {
+        path,
+        node_type,
+        classification,
+        reason: raw.reason.trim().to_string(),
+        risk,
+        source,
+        size: raw.size,
+        self_size: raw.self_size,
+        child_count: raw.child_count,
+        name_tags: normalize_scan_rule_name_tags(&raw.name_tags),
+        top_children: normalize_scan_rule_top_children(&raw.top_children),
+    })
+}
+
+fn normalize_scan_persistent_rule_records(
+    value: Option<&Value>,
+    fallback_classification: &str,
+) -> Vec<ScanPersistentRuleRecord> {
+    let mut seen = HashSet::new();
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| serde_json::from_value::<ScanPersistentRuleRecord>(item.clone()).ok())
+        .filter_map(|item| normalize_scan_persistent_rule_record(item, fallback_classification))
+        .filter(|record| seen.insert(record.path.to_lowercase()))
+        .collect()
+}
+
+fn remove_local_rule_records(rules: &mut ScanPersistentRules) -> bool {
+    let keep_before = rules.keep_exact.len();
+    let safe_before = rules.safe_delete_exact.len();
+    rules
+        .keep_exact
+        .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
+    rules
+        .safe_delete_exact
+        .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
+    keep_before != rules.keep_exact.len() || safe_before != rules.safe_delete_exact.len()
+}
+
+pub(crate) fn normalize_scan_persistent_rules(value: Option<&Value>) -> ScanPersistentRules {
+    ScanPersistentRules {
+        keep_exact: normalize_scan_persistent_rule_records(
+            value.and_then(|rules| rules.get("keepExact")),
+            "keep",
+        ),
+        safe_delete_exact: normalize_scan_persistent_rule_records(
+            value.and_then(|rules| rules.get("safeDeleteExact")),
+            "safe_to_delete",
+        ),
+    }
+}
+
 pub(crate) fn read_scan_ignore_paths(path: &Path) -> Vec<String> {
     let settings = read_settings(path);
     normalize_scan_ignore_paths(settings.get("scanIgnorePaths"))
+}
+
+pub(crate) fn read_scan_persistent_rules_with_cleanup(path: &Path) -> (ScanPersistentRules, bool) {
+    let settings = read_settings(path);
+    let mut rules = normalize_scan_persistent_rules(settings.get("scanPersistentRules"));
+    let cleaned = remove_local_rule_records(&mut rules);
+    (rules, cleaned)
+}
+
+pub(crate) fn save_scan_persistent_rules(
+    path: &Path,
+    rules: &ScanPersistentRules,
+) -> Result<Value, String> {
+    write_settings(
+        path,
+        &json!({
+            "scanPersistentRules": rules,
+        }),
+    )?;
+    Ok(read_settings(path))
 }
 
 fn strip_secret_fields(v: &mut Value) {
@@ -1500,6 +1696,126 @@ mod tests {
             Value::Bool(true)
         );
         assert_eq!(saved["credentialsMeta"]["searchApi"], Value::Bool(true));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_settings_normalizes_scan_persistent_rules_shape() {
+        let path = temp_settings_path();
+        let seeded = json!({
+            "scanPersistentRules": {
+                "keepExact": [
+                    {
+                        "path": "C:\\Users\\tester\\Documents",
+                        "nodeType": "directory",
+                        "reason": "keep this",
+                        "risk": "high",
+                        "source": "ai_promoted",
+                        "size": 10,
+                        "selfSize": 0,
+                        "childCount": 2,
+                        "nameTags": ["user_content", "user_content"],
+                        "topChildren": [
+                            { "name": "Docs", "type": "directory", "size": 10 }
+                        ]
+                    }
+                ],
+                "safeDeleteExact": [
+                    {
+                        "path": "C:\\Users\\tester\\AppData\\Local\\Temp",
+                        "nodeType": "directory",
+                        "classification": "safe_to_delete",
+                        "reason": "temp",
+                        "risk": "low",
+                        "source": "local_rule",
+                        "size": 1,
+                        "selfSize": 0,
+                        "childCount": 1,
+                        "nameTags": ["temp"],
+                        "topChildren": [
+                            { "name": "foo.tmp", "type": "file", "size": 1 }
+                        ]
+                    }
+                ]
+            }
+        });
+        write_settings(&path, &seeded).expect("write settings");
+
+        let saved = read_settings(&path);
+        assert_eq!(
+            saved["scanPersistentRules"]["keepExact"][0]["classification"],
+            Value::String("keep".to_string())
+        );
+        assert_eq!(
+            saved["scanPersistentRules"]["keepExact"][0]["nameTags"],
+            json!(["user_content"])
+        );
+        assert_eq!(
+            saved["scanPersistentRules"]["safeDeleteExact"][0]["classification"],
+            Value::String("safe_to_delete".to_string())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_scan_persistent_rules_with_cleanup_filters_local_rule_records() {
+        let path = temp_settings_path();
+        let seeded = json!({
+            "scanPersistentRules": {
+                "keepExact": [
+                    {
+                        "path": "C:\\Users\\tester\\Documents",
+                        "nodeType": "directory",
+                        "classification": "keep",
+                        "reason": "keep this",
+                        "risk": "high",
+                        "source": "ai_promoted",
+                        "size": 10,
+                        "selfSize": 0,
+                        "childCount": 2,
+                        "nameTags": ["user_content"],
+                        "topChildren": []
+                    }
+                ],
+                "safeDeleteExact": [
+                    {
+                        "path": "C:\\Users\\tester\\AppData\\Local\\Temp",
+                        "nodeType": "directory",
+                        "classification": "safe_to_delete",
+                        "reason": "temp",
+                        "risk": "low",
+                        "source": "local_rule",
+                        "size": 1,
+                        "selfSize": 0,
+                        "childCount": 1,
+                        "nameTags": ["temp"],
+                        "topChildren": []
+                    },
+                    {
+                        "path": "C:\\Users\\tester\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache",
+                        "nodeType": "directory",
+                        "classification": "safe_to_delete",
+                        "reason": "browser cache",
+                        "risk": "low",
+                        "source": "ai_promoted",
+                        "size": 2,
+                        "selfSize": 0,
+                        "childCount": 1,
+                        "nameTags": ["cache"],
+                        "topChildren": []
+                    }
+                ]
+            }
+        });
+        write_settings(&path, &seeded).expect("write settings");
+
+        let (rules, cleaned) = read_scan_persistent_rules_with_cleanup(&path);
+        assert!(cleaned);
+        assert_eq!(rules.keep_exact.len(), 1);
+        assert_eq!(rules.safe_delete_exact.len(), 1);
+        assert_eq!(rules.safe_delete_exact[0].source, "ai_promoted");
 
         let _ = fs::remove_file(path);
     }

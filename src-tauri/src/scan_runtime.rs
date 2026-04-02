@@ -1,4 +1,7 @@
-use crate::backend::{AppState, ScanResultItem, ScanSnapshot, ScanStartInput, TokenUsage};
+use crate::backend::{
+    self, AppState, ScanPersistentRuleRecord, ScanPersistentRules, ScanResultItem,
+    ScanRuleTopChild, ScanSnapshot, ScanStartInput, TokenUsage,
+};
 use crate::persist;
 use crate::web_search::{
     format_web_search_context, parse_web_search_request, tavily_search, web_search_trace_to_value,
@@ -23,6 +26,10 @@ const TARGET_SIZE_DEFAULT_MAX_GB: f64 = 20.0;
 const SCAN_PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(1000);
 const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
 const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
+const SOURCE_LOCAL_RULE: &str = "local_rule";
+const SOURCE_PERSISTENT_RULE: &str = "persistent_rule";
+const SOURCE_BASELINE_REUSE: &str = "baseline_reuse";
+const SOURCE_AI: &str = "ai";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanMode {
@@ -219,10 +226,45 @@ struct SidecarRoot {
     depth: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryExtensionCount {
+    extension: String,
+    count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryPortrait {
+    direct_file_count: u64,
+    direct_dir_count: u64,
+    top_children: Vec<ScanRuleTopChild>,
+    top_file_extensions: Vec<DirectoryExtensionCount>,
+    name_tags: Vec<String>,
+    freshness_bucket: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NodeFingerprint {
+    size: u64,
+    self_size: u64,
+    child_count: u64,
+    name_tags: Vec<String>,
+    top_children: Vec<ScanRuleTopChild>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalRuleDecision {
+    classification: String,
+    reason: String,
+    risk: String,
+    should_expand: bool,
+    source: &'static str,
+}
+
 #[derive(Clone)]
 struct IncrementalContext {
     baseline_nodes: HashMap<String, persist::ScanNode>,
     baseline_findings: HashMap<String, persist::ScanFindingRecord>,
+    baseline_children_by_parent: HashMap<String, Vec<persist::ScanNode>>,
     analyze_roots: Vec<persist::ScanNode>,
     deleted_count: u64,
 }
@@ -254,6 +296,7 @@ pub struct ScanTaskRuntime {
     ignored_paths: Vec<String>,
     prune_rules: Vec<ScanPruneRule>,
     in_place_baseline: Option<InPlaceBaselineCache>,
+    persistent_rules: Mutex<ScanPersistentRules>,
     last_progress_persist_at: Mutex<Option<Instant>>,
     ai: ScanAiConfig,
     pub job: Mutex<Option<JoinHandle<()>>>,
@@ -264,7 +307,6 @@ struct ScanReview {
     classification: String,
     reason: String,
     risk: String,
-    has_potential_deletable_subfolders: bool,
     token_usage: TokenUsage,
     trace: Value,
 }
@@ -427,6 +469,683 @@ fn default_analysis_failed_reason(value: &str, err: &str) -> String {
     }
 }
 
+fn localized_local_rule_reason(language: &str, message_en: &str, message_zh: &str) -> String {
+    if is_zh_language(language) {
+        message_zh.to_string()
+    } else {
+        message_en.to_string()
+    }
+}
+
+fn split_normalized_path(path: &str) -> Vec<&str> {
+    path.split('\\')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn path_has_segment(path: &str, needle: &str) -> bool {
+    split_normalized_path(path)
+        .iter()
+        .any(|segment| *segment == needle)
+}
+
+fn path_contains_segment_sequence(path: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+    let segments = split_normalized_path(path);
+    if segments.len() < sequence.len() {
+        return false;
+    }
+    segments
+        .windows(sequence.len())
+        .any(|window| window == sequence)
+}
+
+fn local_appdata_suffix<'a>(path: &'a str) -> Option<Vec<&'a str>> {
+    let segments = split_normalized_path(path);
+    if segments.len() < 5
+        || !segments[0].ends_with(':')
+        || segments[1] != "users"
+        || segments[2].is_empty()
+        || segments[3] != "appdata"
+        || segments[4] != "local"
+    {
+        return None;
+    }
+    Some(segments[5..].to_vec())
+}
+
+fn matches_browser_cache_suffix(suffix: &[&str], prefix: &[&str]) -> bool {
+    suffix.len() >= prefix.len() + 2
+        && suffix.starts_with(prefix)
+        && !suffix[prefix.len()].is_empty()
+        && matches!(suffix[prefix.len() + 1], "cache" | "code cache")
+}
+
+fn is_known_browser_cache_path(path: &str) -> bool {
+    let Some(suffix) = local_appdata_suffix(path) else {
+        return false;
+    };
+    matches_browser_cache_suffix(&suffix, &["google", "chrome", "user data"])
+        || matches_browser_cache_suffix(&suffix, &["microsoft", "edge", "user data"])
+}
+
+fn extract_file_extension(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let (_, extension) = trimmed.rsplit_once('.')?;
+    let normalized = extension.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(format!(".{normalized}"))
+}
+
+fn freshness_bucket(mtime_ms: Option<i64>) -> String {
+    let Some(mtime_ms) = mtime_ms else {
+        return "older".to_string();
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(mtime_ms);
+    let age_ms = now_ms.saturating_sub(mtime_ms);
+    let recent_7d = 7_i64 * 24 * 60 * 60 * 1000;
+    let recent_30d = 30_i64 * 24 * 60 * 60 * 1000;
+    if age_ms <= recent_7d {
+        "recent_7d".to_string()
+    } else if age_ms <= recent_30d {
+        "recent_30d".to_string()
+    } else {
+        "older".to_string()
+    }
+}
+
+fn extract_name_tags(path: &str) -> Vec<String> {
+    let normalized = normalize_scan_path_key(path);
+    let mut tags = Vec::new();
+    let mut push_tag = |tag: &str| {
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    };
+
+    if path_has_segment(&normalized, "cache")
+        || path_has_segment(&normalized, "caches")
+        || normalized.contains("\\npm-cache")
+        || normalized.contains("\\pip\\cache")
+    {
+        push_tag("cache");
+    }
+    if path_has_segment(&normalized, "temp")
+        || path_has_segment(&normalized, "tmp")
+        || normalized.ends_with("\\windows\\temp")
+        || normalized.contains("\\appdata\\local\\temp")
+    {
+        push_tag("temp");
+    }
+    if path_has_segment(&normalized, "downloads") || path_has_segment(&normalized, "download") {
+        push_tag("download");
+    }
+    if path_has_segment(&normalized, "backup") || path_has_segment(&normalized, "backups") {
+        push_tag("backup");
+    }
+    if path_has_segment(&normalized, ".git")
+        || path_has_segment(&normalized, "node_modules")
+        || path_has_segment(&normalized, ".venv")
+        || path_has_segment(&normalized, "venv")
+    {
+        push_tag("dev");
+    }
+    if path_has_segment(&normalized, "dist")
+        || path_has_segment(&normalized, "build")
+        || path_has_segment(&normalized, "target")
+        || path_has_segment(&normalized, "out")
+        || path_has_segment(&normalized, ".next")
+        || path_has_segment(&normalized, ".nuxt")
+    {
+        push_tag("build");
+    }
+    if is_same_or_descendant_path(&normalized, "c:\\windows")
+        || is_same_or_descendant_path(&normalized, "c:\\program files")
+        || is_same_or_descendant_path(&normalized, "c:\\program files (x86)")
+        || is_same_or_descendant_path(&normalized, "c:\\programdata")
+    {
+        push_tag("system");
+    }
+    let segments = split_normalized_path(&normalized);
+    if segments.len() >= 4
+        && segments[0].ends_with(':')
+        && segments[1] == "users"
+        && matches!(
+            segments[3],
+            "desktop" | "documents" | "pictures" | "videos" | "music"
+        )
+    {
+        push_tag("user_content");
+    }
+    tags
+}
+
+fn build_directory_portrait(
+    node: &persist::ScanNode,
+    children: &[persist::ScanNode],
+) -> DirectoryPortrait {
+    let mut direct_file_count = 0_u64;
+    let mut direct_dir_count = 0_u64;
+    let mut extension_counts = HashMap::<String, u64>::new();
+    let mut sorted_children = children.to_vec();
+    sorted_children.sort_by(|a, b| {
+        b.size
+            .cmp(&a.size)
+            .then_with(|| a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+    });
+
+    for child in children {
+        if child.node_type == "directory" {
+            direct_dir_count = direct_dir_count.saturating_add(1);
+        } else {
+            direct_file_count = direct_file_count.saturating_add(1);
+            if let Some(extension) = extract_file_extension(&child.name) {
+                *extension_counts.entry(extension).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut top_file_extensions = extension_counts
+        .into_iter()
+        .map(|(extension, count)| DirectoryExtensionCount { extension, count })
+        .collect::<Vec<_>>();
+    top_file_extensions.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
+    top_file_extensions.truncate(5);
+
+    DirectoryPortrait {
+        direct_file_count,
+        direct_dir_count,
+        top_children: sorted_children
+            .into_iter()
+            .take(5)
+            .map(|child| ScanRuleTopChild {
+                name: child.name,
+                item_type: child.node_type,
+                size: child.size,
+            })
+            .collect(),
+        top_file_extensions,
+        name_tags: extract_name_tags(&node.path),
+        freshness_bucket: freshness_bucket(node.mtime_ms),
+    }
+}
+
+fn build_node_fingerprint(
+    node: &persist::ScanNode,
+    portrait: Option<&DirectoryPortrait>,
+) -> NodeFingerprint {
+    NodeFingerprint {
+        size: node.size,
+        self_size: node.self_size,
+        child_count: node.child_count,
+        name_tags: portrait
+            .map(|item| item.name_tags.clone())
+            .unwrap_or_else(|| extract_name_tags(&node.path)),
+        top_children: portrait
+            .map(|item| item.top_children.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn portrait_summary_lines(portrait: &DirectoryPortrait) -> String {
+    let top_children = if portrait.top_children.is_empty() {
+        "(none)".to_string()
+    } else {
+        portrait
+            .top_children
+            .iter()
+            .map(|child| {
+                format!(
+                    "- {} [{}] ({})",
+                    child.name,
+                    child.item_type,
+                    format_size(child.size)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let top_extensions = if portrait.top_file_extensions.is_empty() {
+        "(none)".to_string()
+    } else {
+        portrait
+            .top_file_extensions
+            .iter()
+            .map(|item| format!("{} x{}", item.extension, item.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let name_tags = if portrait.name_tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        portrait.name_tags.join(", ")
+    };
+    format!(
+        "Directory portrait:\n- Direct files: {}\n- Direct directories: {}\n- Name tags: {}\n- Freshness: {}\n- Top child nodes:\n{}\n- Top file extensions: {}",
+        portrait.direct_file_count,
+        portrait.direct_dir_count,
+        name_tags,
+        portrait.freshness_bucket,
+        top_children,
+        top_extensions,
+    )
+}
+
+fn is_exact_top_children_match(left: &[ScanRuleTopChild], right: &[ScanRuleTopChild]) -> bool {
+    left == right
+}
+
+fn top_child_overlap(left: &[ScanRuleTopChild], right: &[ScanRuleTopChild], limit: usize) -> usize {
+    let mut matched = 0;
+    for candidate in left.iter().take(limit) {
+        if right.iter().take(limit).any(|other| {
+            other.name.eq_ignore_ascii_case(&candidate.name)
+                && other.item_type == candidate.item_type
+        }) {
+            matched += 1;
+        }
+    }
+    matched
+}
+
+fn within_delta(current: u64, baseline: u64, absolute_delta: u64, percent_delta: f64) -> bool {
+    let diff = current.abs_diff(baseline);
+    let percent_limit = ((baseline as f64) * percent_delta).ceil() as u64;
+    diff <= absolute_delta.max(percent_limit)
+}
+
+fn matches_keep_directory_similarity(
+    current: &NodeFingerprint,
+    baseline: &NodeFingerprint,
+    current_child_count: u64,
+    baseline_child_count: u64,
+) -> bool {
+    current.name_tags == baseline.name_tags
+        && within_delta(current.size, baseline.size, 32 * 1024 * 1024, 0.05)
+        && within_delta(current.self_size, baseline.self_size, 8 * 1024 * 1024, 0.10)
+        && current_child_count.abs_diff(baseline_child_count) <= 2
+        && top_child_overlap(&current.top_children, &baseline.top_children, 3) >= 2
+}
+
+fn matches_suspicious_directory_similarity(
+    current: &NodeFingerprint,
+    baseline: &NodeFingerprint,
+    current_child_count: u64,
+    baseline_child_count: u64,
+) -> bool {
+    current.name_tags == baseline.name_tags
+        && within_delta(current.size, baseline.size, 64 * 1024 * 1024, 0.15)
+        && within_delta(
+            current.self_size,
+            baseline.self_size,
+            16 * 1024 * 1024,
+            0.20,
+        )
+        && current_child_count.abs_diff(baseline_child_count) <= 4
+        && top_child_overlap(&current.top_children, &baseline.top_children, 3) >= 1
+}
+
+fn matches_loose_file_similarity(
+    current: &persist::ScanNode,
+    baseline: &persist::ScanNode,
+) -> bool {
+    current.node_type == baseline.node_type
+        && current.name.eq_ignore_ascii_case(&baseline.name)
+        && within_delta(current.size, baseline.size, 4 * 1024 * 1024, 0.10)
+        && extract_file_extension(&current.name) == extract_file_extension(&baseline.name)
+}
+
+fn build_scan_result_item(
+    node: &persist::ScanNode,
+    classification: &str,
+    reason: String,
+    risk: &str,
+    source: &str,
+) -> ScanResultItem {
+    ScanResultItem {
+        name: node.name.clone(),
+        path: node.path.clone(),
+        size: node.size,
+        item_type: if node.node_type == "directory" {
+            "directory".to_string()
+        } else {
+            "file".to_string()
+        },
+        purpose: String::new(),
+        reason,
+        risk: risk.to_string(),
+        classification: classification.to_string(),
+        source: source.to_string(),
+    }
+}
+
+fn maybe_local_rule_decision(
+    language: &str,
+    node: &persist::ScanNode,
+    portrait: Option<&DirectoryPortrait>,
+) -> Option<LocalRuleDecision> {
+    let normalized = normalize_scan_path_key(&node.path);
+    let is_keep = node.node_type == "directory"
+        && (normalized == "c:\\windows"
+            || normalized == "c:\\program files"
+            || normalized == "c:\\program files (x86)"
+            || normalized == "c:\\programdata"
+            || split_normalized_path(&normalized).last().copied() == Some(".git")
+            || {
+                let segments = split_normalized_path(&normalized);
+                segments.len() >= 4
+                    && segments[0].ends_with(':')
+                    && segments[1] == "users"
+                    && matches!(
+                        segments[3],
+                        "desktop" | "documents" | "pictures" | "videos" | "music"
+                    )
+            });
+    if is_keep {
+        return Some(LocalRuleDecision {
+            classification: "keep".to_string(),
+            reason: localized_local_rule_reason(
+                language,
+                "Protected system or user-content root; keep it.",
+                "命中受保护的系统或用户内容根目录，保留。",
+            ),
+            risk: "high".to_string(),
+            should_expand: false,
+            source: SOURCE_LOCAL_RULE,
+        });
+    }
+
+    let is_safe_dir = node.node_type == "directory"
+        && (normalized == "c:\\windows\\temp"
+            || normalized.contains("\\appdata\\local\\temp")
+            || normalized.contains("\\appdata\\local\\npm-cache")
+            || normalized.contains("\\appdata\\local\\pip\\cache")
+            || path_contains_segment_sequence(&normalized, &[".next", "cache"])
+            || path_contains_segment_sequence(&normalized, &[".nuxt"])
+            || path_contains_segment_sequence(&normalized, &["node_modules", ".cache"])
+            || is_known_browser_cache_path(&normalized)
+            || portrait
+                .map(|item| {
+                    item.name_tags
+                        .iter()
+                        .any(|tag| tag == "cache" || tag == "temp")
+                })
+                .unwrap_or(false)
+                && (normalized.contains("\\appdata\\local\\temp")
+                    || normalized.contains("\\appdata\\local\\npm-cache")
+                    || normalized.contains("\\appdata\\local\\pip\\cache")));
+    if is_safe_dir {
+        return Some(LocalRuleDecision {
+            classification: "safe_to_delete".to_string(),
+            reason: localized_local_rule_reason(
+                language,
+                "Matched a known temporary or package-cache path; safe to delete.",
+                "命中已知临时文件或包管理缓存路径，可安全删除。",
+            ),
+            risk: "low".to_string(),
+            should_expand: false,
+            source: SOURCE_LOCAL_RULE,
+        });
+    }
+
+    let is_safe_file = node.node_type == "file"
+        && extract_file_extension(&node.name)
+            .map(|extension| {
+                matches!(
+                    extension.as_str(),
+                    ".tmp" | ".temp" | ".crdownload" | ".part"
+                )
+            })
+            .unwrap_or(false);
+    if is_safe_file {
+        return Some(LocalRuleDecision {
+            classification: "safe_to_delete".to_string(),
+            reason: localized_local_rule_reason(
+                language,
+                "Matched a known temporary or partial-download file type; safe to delete.",
+                "命中已知临时文件或未完成下载文件类型，可安全删除。",
+            ),
+            risk: "low".to_string(),
+            should_expand: false,
+            source: SOURCE_LOCAL_RULE,
+        });
+    }
+
+    None
+}
+
+fn persistent_rule_record_matches(
+    rule: &ScanPersistentRuleRecord,
+    node: &persist::ScanNode,
+    fingerprint: &NodeFingerprint,
+) -> bool {
+    let normalized_rule_path = normalize_scan_path_key(&rule.path);
+    if normalized_rule_path != normalize_scan_path_key(&node.path)
+        || rule.node_type != node.node_type
+    {
+        return false;
+    }
+    match rule.classification.as_str() {
+        "safe_to_delete" => {
+            rule.size == node.size
+                && rule.self_size == node.self_size
+                && rule.child_count == node.child_count
+                && rule.name_tags == fingerprint.name_tags
+                && is_exact_top_children_match(&rule.top_children, &fingerprint.top_children)
+        }
+        "keep" => {
+            if node.node_type == "file" {
+                rule.size == node.size && rule.self_size == node.self_size
+            } else {
+                rule.name_tags == fingerprint.name_tags
+                    && within_delta(node.size, rule.size, 32 * 1024 * 1024, 0.05)
+                    && within_delta(node.self_size, rule.self_size, 8 * 1024 * 1024, 0.10)
+                    && node.child_count.abs_diff(rule.child_count) <= 2
+                    && top_child_overlap(&fingerprint.top_children, &rule.top_children, 3) >= 2
+            }
+        }
+        _ => false,
+    }
+}
+
+fn resolve_persistent_rule(
+    rules: &ScanPersistentRules,
+    node: &persist::ScanNode,
+    portrait: Option<&DirectoryPortrait>,
+) -> Option<(ScanResultItem, bool)> {
+    let fingerprint = build_node_fingerprint(node, portrait);
+    let candidate = rules
+        .keep_exact
+        .iter()
+        .find(|rule| persistent_rule_record_matches(rule, node, &fingerprint))
+        .or_else(|| {
+            rules
+                .safe_delete_exact
+                .iter()
+                .find(|rule| persistent_rule_record_matches(rule, node, &fingerprint))
+        })?;
+
+    let item = build_scan_result_item(
+        node,
+        &candidate.classification,
+        if candidate.reason.trim().is_empty() {
+            "Matched persistent exact-path rule.".to_string()
+        } else {
+            candidate.reason.clone()
+        },
+        &candidate.risk,
+        SOURCE_PERSISTENT_RULE,
+    );
+    let should_expand = node.node_type == "directory" && item.classification == "suspicious";
+    Some((item, should_expand))
+}
+
+fn make_persistent_rule_record(
+    node: &persist::ScanNode,
+    portrait: Option<&DirectoryPortrait>,
+    classification: &str,
+    reason: &str,
+    risk: &str,
+    source: &str,
+) -> ScanPersistentRuleRecord {
+    let fingerprint = build_node_fingerprint(node, portrait);
+    ScanPersistentRuleRecord {
+        path: node.path.clone(),
+        node_type: node.node_type.clone(),
+        classification: classification.to_string(),
+        reason: reason.to_string(),
+        risk: risk.to_string(),
+        source: source.to_string(),
+        size: fingerprint.size,
+        self_size: fingerprint.self_size,
+        child_count: fingerprint.child_count,
+        name_tags: fingerprint.name_tags,
+        top_children: fingerprint.top_children,
+    }
+}
+
+fn should_promote_ai_rule(review: &ScanReview) -> bool {
+    matches!(review.classification.as_str(), "keep")
+        || (review.classification == "safe_to_delete" && review.risk == "low")
+}
+
+fn insert_persistent_rule(
+    rules: &mut ScanPersistentRules,
+    record: ScanPersistentRuleRecord,
+) -> bool {
+    let path_key = normalize_scan_path_key(&record.path);
+    rules
+        .keep_exact
+        .retain(|existing| normalize_scan_path_key(&existing.path) != path_key);
+    rules
+        .safe_delete_exact
+        .retain(|existing| normalize_scan_path_key(&existing.path) != path_key);
+    let target = if record.classification == "keep" {
+        &mut rules.keep_exact
+    } else if record.classification == "safe_to_delete" {
+        &mut rules.safe_delete_exact
+    } else {
+        return false;
+    };
+    let changed = !target.iter().any(|existing| existing == &record);
+    if changed {
+        target.push(record);
+    }
+    changed
+}
+
+fn maybe_store_persistent_rule(
+    state: &AppState,
+    task: &Arc<ScanTaskRuntime>,
+    record: ScanPersistentRuleRecord,
+) -> Result<bool, String> {
+    let mut rules = task.persistent_rules.lock();
+    let changed = insert_persistent_rule(&mut rules, record);
+    if changed {
+        backend::save_scan_persistent_rules(&state.settings_path, &rules)?;
+    }
+    Ok(changed)
+}
+
+fn build_children_by_parent(
+    nodes: &HashMap<String, persist::ScanNode>,
+) -> HashMap<String, Vec<persist::ScanNode>> {
+    let mut groups = HashMap::<String, Vec<persist::ScanNode>>::new();
+    for node in nodes.values() {
+        if let Some(parent_id) = node.parent_id.clone() {
+            groups.entry(parent_id).or_default().push(node.clone());
+        }
+    }
+    groups
+}
+
+fn resolve_reusable_finding(
+    node: &persist::ScanNode,
+    portrait: Option<&DirectoryPortrait>,
+    baseline_node: Option<&persist::ScanNode>,
+    baseline_finding: Option<&persist::ScanFindingRecord>,
+    baseline_children: &[persist::ScanNode],
+) -> Option<(ScanResultItem, bool)> {
+    let baseline_node = baseline_node?;
+    let baseline_finding = baseline_finding?;
+    let baseline_portrait = if baseline_node.node_type == "directory" {
+        Some(build_directory_portrait(baseline_node, baseline_children))
+    } else {
+        None
+    };
+    let current_fp = build_node_fingerprint(node, portrait);
+    let baseline_fp = build_node_fingerprint(baseline_node, baseline_portrait.as_ref());
+
+    let reusable = match baseline_finding.item.classification.as_str() {
+        "safe_to_delete" => {
+            if node.node_type == "directory" {
+                nodes_match(node, baseline_node)
+                    && current_fp.name_tags == baseline_fp.name_tags
+                    && is_exact_top_children_match(
+                        &current_fp.top_children,
+                        &baseline_fp.top_children,
+                    )
+            } else {
+                nodes_match(node, baseline_node)
+            }
+        }
+        "keep" => {
+            if node.node_type == "directory" {
+                matches_keep_directory_similarity(
+                    &current_fp,
+                    &baseline_fp,
+                    node.child_count,
+                    baseline_node.child_count,
+                )
+            } else {
+                nodes_match(node, baseline_node)
+            }
+        }
+        "suspicious" => {
+            if node.node_type == "directory" {
+                matches_suspicious_directory_similarity(
+                    &current_fp,
+                    &baseline_fp,
+                    node.child_count,
+                    baseline_node.child_count,
+                )
+            } else {
+                matches_loose_file_similarity(node, baseline_node)
+            }
+        }
+        _ => false,
+    };
+
+    if !reusable {
+        return None;
+    }
+
+    let item = ScanResultItem {
+        source: SOURCE_BASELINE_REUSE.to_string(),
+        ..baseline_finding.item.clone()
+    };
+    let should_expand = if node.node_type != "directory" {
+        false
+    } else if item.classification == "suspicious" {
+        true
+    } else {
+        baseline_finding.should_expand
+    };
+    Some((item, should_expand))
+}
+
 fn scanner_binary_candidates<R: Runtime>(app: &AppHandle<R>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
@@ -526,15 +1245,12 @@ async fn chat_completion(
 
 fn build_scan_system_prompt(
     response_language: &str,
-    is_directory: bool,
+    _is_directory: bool,
     allow_web_search: bool,
 ) -> String {
     let response_language_name = localized_language_name(response_language, response_language);
-    let final_schema = if is_directory {
-        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"hasPotentialDeletableSubfolders\":true}"
-    } else {
-        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}"
-    };
+    let final_schema =
+        "{\"classification\":\"safe_to_delete|suspicious|keep\",\"reason\":\"...\",\"risk\":\"low|medium|high\"}";
 
     let mut lines = vec![
         "You are a disk cleanup safety assistant.".to_string(),
@@ -556,14 +1272,10 @@ async fn analyze_scan_node(
     ai: &ScanAiConfig,
     node: &persist::ScanNode,
     child_dirs: &[persist::ScanNode],
+    portrait: Option<&DirectoryPortrait>,
 ) -> ScanReview {
-    let prompt_in_zh = is_zh_language(&ai.response_language);
     let child_summary = if child_dirs.is_empty() {
-        if prompt_in_zh {
-            "（无）".to_string()
-        } else {
-            "(none)".to_string()
-        }
+        "(none)".to_string()
     } else {
         child_dirs
             .iter()
@@ -574,29 +1286,16 @@ async fn analyze_scan_node(
     };
 
     let user_prompt = if node.node_type == "directory" {
-        if prompt_in_zh {
-            format!(
-                "类型：目录\n路径：{}\n名称：{}\n大小：{}\n直接子目录：\n{}\n请判断整个目录是否可以安全删除，以及它是否可能包含可删除的子目录。",
-                node.path,
-                node.name,
-                format_size(node.size),
-                child_summary
-            )
-        } else {
-            format!(
-                "Type: directory\nPath: {}\nName: {}\nSize: {}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely, and whether it may contain deletable subfolders.",
-                node.path,
-                node.name,
-                format_size(node.size),
-                child_summary
-            )
-        }
-    } else if prompt_in_zh {
+        let portrait_summary = portrait
+            .map(portrait_summary_lines)
+            .unwrap_or_else(|| "Directory portrait:\n(none)".to_string());
         format!(
-            "类型：文件\n路径：{}\n名称：{}\n大小：{}\n请判断该文件是否可以安全删除。",
+            "Type: directory\nPath: {}\nName: {}\nSize: {}\n{}\nDirect child directories:\n{}\nJudge whether the whole directory can be deleted safely. If it should not be deleted directly but still looks worth drilling into, return classification=suspicious.",
             node.path,
             node.name,
-            format_size(node.size)
+            format_size(node.size),
+            portrait_summary,
+            child_summary
         )
     } else {
         format!(
@@ -654,8 +1353,6 @@ async fn analyze_scan_node(
                                         &format!("web search failed: {err}"),
                                     ),
                                     risk: "high".to_string(),
-                                    has_potential_deletable_subfolders: node.node_type
-                                        == "directory",
                                     token_usage: total_usage,
                                     trace: json!({
                                         "model": ai.model,
@@ -694,10 +1391,6 @@ async fn analyze_scan_node(
                         .and_then(Value::as_str)
                         .unwrap_or("medium")
                         .to_string(),
-                    has_potential_deletable_subfolders: parsed
-                        .get("hasPotentialDeletableSubfolders")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(node.node_type == "directory"),
                     token_usage: total_usage,
                     trace: json!({
                         "model": ai.model,
@@ -716,7 +1409,6 @@ async fn analyze_scan_node(
                     classification: "suspicious".to_string(),
                     reason: default_analysis_failed_reason(&ai.response_language, &err.message),
                     risk: "high".to_string(),
-                    has_potential_deletable_subfolders: node.node_type == "directory",
                     token_usage: total_usage,
                     trace: json!({
                         "model": ai.model,
@@ -739,7 +1431,6 @@ async fn analyze_scan_node(
             "model requested web search but did not return a final classification",
         ),
         risk: "high".to_string(),
-        has_potential_deletable_subfolders: node.node_type == "directory",
         token_usage: total_usage,
         trace: json!({
             "model": ai.model,
@@ -768,27 +1459,19 @@ fn nodes_match(current: &persist::ScanNode, baseline: &persist::ScanNode) -> boo
 }
 
 fn build_finding_item(node: &persist::ScanNode, review: &ScanReview) -> ScanResultItem {
-    ScanResultItem {
-        name: node.name.clone(),
-        path: node.path.clone(),
-        size: node.size,
-        item_type: if node.node_type == "directory" {
-            "directory".to_string()
-        } else {
-            "file".to_string()
-        },
-        purpose: String::new(),
-        reason: review.reason.clone(),
-        risk: review.risk.clone(),
-        classification: review.classification.clone(),
-        source: "priority_queue".to_string(),
-    }
+    build_scan_result_item(
+        node,
+        &review.classification,
+        review.reason.clone(),
+        &review.risk,
+        SOURCE_AI,
+    )
 }
 
 fn should_expand_node(node: &persist::ScanNode, review: &ScanReview) -> bool {
     node.node_type == "directory"
         && review.classification != "safe_to_delete"
-        && review.has_potential_deletable_subfolders
+        && review.classification != "keep"
 }
 
 fn apply_finding_to_snapshot<R: Runtime>(
@@ -912,6 +1595,7 @@ fn prepare_incremental_context(
         return Ok(Some(IncrementalContext {
             baseline_nodes: HashMap::new(),
             baseline_findings: HashMap::new(),
+            baseline_children_by_parent: HashMap::new(),
             analyze_roots,
             deleted_count: 0,
         }));
@@ -933,9 +1617,11 @@ fn prepare_incremental_context(
     } else {
         0
     };
+    let baseline_children_by_parent = build_children_by_parent(&baseline_nodes);
     Ok(Some(IncrementalContext {
         baseline_nodes,
         baseline_findings,
+        baseline_children_by_parent,
         analyze_roots,
         deleted_count,
     }))
@@ -976,45 +1662,132 @@ async fn run_auto_analyze<R: Runtime>(
         }
         emit_progress(app, state, task).await?;
 
-        let child_dirs = if node.node_type == "directory" {
-            persist::load_scan_children(&state.db_path, &task_id, &node.id, true)?
+        let direct_children = if node.node_type == "directory" {
+            persist::load_scan_children(&state.db_path, &task_id, &node.id, false)?
         } else {
             Vec::new()
         };
+        let child_dirs = direct_children
+            .iter()
+            .filter(|child| child.node_type == "directory")
+            .cloned()
+            .collect::<Vec<_>>();
+        let portrait = if node.node_type == "directory" {
+            Some(build_directory_portrait(&node, &direct_children))
+        } else {
+            None
+        };
 
-        let node_key = node.path.to_lowercase();
-        let reusable_finding = ctx
-            .baseline_nodes
-            .get(&node_key)
-            .filter(|baseline| nodes_match(&node, baseline))
-            .and_then(|_| ctx.baseline_findings.get(&node_key).cloned());
-
-        if let Some(reused) = reusable_finding {
+        if let Some(local_rule) =
+            maybe_local_rule_decision(&task.ai.response_language, &node, portrait.as_ref())
+        {
+            let item = build_scan_result_item(
+                &node,
+                &local_rule.classification,
+                local_rule.reason.clone(),
+                &local_rule.risk,
+                local_rule.source,
+            );
             persist::upsert_scan_finding(
                 &state.db_path,
                 &task_id,
-                &reused.item,
-                reused.should_expand,
+                &item,
+                local_rule.should_expand,
             )?;
-            let (should_enqueue_children, reached_target) = {
+            let reached_target = {
                 let mut snap = task.snapshot.lock();
                 snap.processed_entries = snap.processed_entries.saturating_add(1);
                 snap.current_path = node.path.clone();
                 snap.current_depth = node.depth;
-                apply_finding_to_snapshot(app, &task_id, &mut snap, &reused.item)?;
-                (reused.should_expand, should_stop_for_target(&snap))
+                apply_finding_to_snapshot(app, &task_id, &mut snap, &item)?;
+                should_stop_for_target(&snap)
             };
-            emit_cache_event(app, &task_id, "reuse", Some(&node), None).await?;
+            emit_cache_event(app, &task_id, "local_rule", Some(&node), None).await?;
             emit_progress(app, state, task).await?;
-            if should_enqueue_children {
-                for child in persist::load_scan_children(&state.db_path, &task_id, &node.id, false)?
-                {
+            if local_rule.should_expand {
+                for child in &direct_children {
                     let key = child.path.to_lowercase();
                     if analyzed.contains(&key) || queued.contains(&key) {
                         continue;
                     }
                     queued.insert(key);
-                    queue.push(child);
+                    queue.push(child.clone());
+                }
+                sort_queue(&mut queue);
+            }
+            if reached_target {
+                break;
+            }
+            continue;
+        }
+
+        let persistent_match = {
+            let rules = task.persistent_rules.lock().clone();
+            resolve_persistent_rule(&rules, &node, portrait.as_ref())
+        };
+        if let Some((item, should_expand)) = persistent_match {
+            persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+            let reached_target = {
+                let mut snap = task.snapshot.lock();
+                snap.processed_entries = snap.processed_entries.saturating_add(1);
+                snap.current_path = node.path.clone();
+                snap.current_depth = node.depth;
+                apply_finding_to_snapshot(app, &task_id, &mut snap, &item)?;
+                should_stop_for_target(&snap)
+            };
+            emit_cache_event(app, &task_id, "persistent_rule", Some(&node), None).await?;
+            emit_progress(app, state, task).await?;
+            if should_expand {
+                for child in &direct_children {
+                    let key = child.path.to_lowercase();
+                    if analyzed.contains(&key) || queued.contains(&key) {
+                        continue;
+                    }
+                    queued.insert(key);
+                    queue.push(child.clone());
+                }
+                sort_queue(&mut queue);
+            }
+            if reached_target {
+                break;
+            }
+            continue;
+        }
+
+        let node_key = node.path.to_lowercase();
+        let baseline_node = ctx.baseline_nodes.get(&node_key);
+        let baseline_children = baseline_node
+            .and_then(|baseline| ctx.baseline_children_by_parent.get(&baseline.id))
+            .map(|children| children.as_slice())
+            .unwrap_or(&[]);
+        let reusable_finding = resolve_reusable_finding(
+            &node,
+            portrait.as_ref(),
+            baseline_node,
+            ctx.baseline_findings.get(&node_key),
+            baseline_children,
+        );
+
+        if let Some((item, should_expand)) = reusable_finding {
+            persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+            let reached_target = {
+                let mut snap = task.snapshot.lock();
+                snap.processed_entries = snap.processed_entries.saturating_add(1);
+                snap.current_path = node.path.clone();
+                snap.current_depth = node.depth;
+                apply_finding_to_snapshot(app, &task_id, &mut snap, &item)?;
+                should_stop_for_target(&snap)
+            };
+            emit_cache_event(app, &task_id, "reuse", Some(&node), None).await?;
+            emit_progress(app, state, task).await?;
+            if should_expand {
+                for child in &direct_children {
+                    let key = child.path.to_lowercase();
+                    if analyzed.contains(&key) || queued.contains(&key) {
+                        continue;
+                    }
+                    queued.insert(key);
+                    queue.push(child.clone());
                 }
                 sort_queue(&mut queue);
             }
@@ -1036,12 +1809,19 @@ async fn run_auto_analyze<R: Runtime>(
                 "nodePath": node.path,
                 "nodeName": node.name,
                 "nodeSize": node.size,
+                "directoryPortrait": portrait.as_ref().map(|item| json!({
+                    "directFileCount": item.direct_file_count,
+                    "directDirCount": item.direct_dir_count,
+                    "freshnessBucket": item.freshness_bucket,
+                    "nameTags": item.name_tags,
+                    "topChildren": item.top_children,
+                })).unwrap_or(Value::Null),
                 "childDirectories": child_dirs.iter().map(|x| json!({"name": x.name, "path": x.path, "size": x.size})).collect::<Vec<_>>(),
             }),
         )
         .map_err(|e| e.to_string())?;
 
-        let review = analyze_scan_node(&task.ai, &node, &child_dirs).await;
+        let review = analyze_scan_node(&task.ai, &node, &child_dirs, portrait.as_ref()).await;
         let should_expand = should_expand_node(&node, &review);
         app.emit(
             "scan_agent_response",
@@ -1055,7 +1835,7 @@ async fn run_auto_analyze<R: Runtime>(
                 "classification": review.classification,
                 "reason": review.reason,
                 "risk": review.risk,
-                "hasPotentialDeletableSubfolders": review.has_potential_deletable_subfolders,
+                "shouldExpand": should_expand,
                 "tokenUsage": review.token_usage,
                 "rawContent": review.trace.get("rawContent").cloned().unwrap_or(Value::Null),
                 "userPrompt": review.trace.get("userPrompt").cloned().unwrap_or(Value::Null),
@@ -1067,6 +1847,20 @@ async fn run_auto_analyze<R: Runtime>(
 
         let item = build_finding_item(&node, &review);
         persist::upsert_scan_finding(&state.db_path, &task_id, &item, should_expand)?;
+        if should_promote_ai_rule(&review) {
+            let _ = maybe_store_persistent_rule(
+                state,
+                task,
+                make_persistent_rule_record(
+                    &node,
+                    portrait.as_ref(),
+                    &review.classification,
+                    &review.reason,
+                    &review.risk,
+                    "ai_promoted",
+                ),
+            )?;
+        }
 
         let reached_target = {
             let mut snap = task.snapshot.lock();
@@ -1092,13 +1886,13 @@ async fn run_auto_analyze<R: Runtime>(
         emit_progress(app, state, task).await?;
 
         if should_expand {
-            for child in persist::load_scan_children(&state.db_path, &task_id, &node.id, false)? {
+            for child in &direct_children {
                 let key = child.path.to_lowercase();
                 if analyzed.contains(&key) || queued.contains(&key) {
                     continue;
                 }
                 queued.insert(key);
-                queue.push(child);
+                queue.push(child.clone());
             }
             sort_queue(&mut queue);
         }
@@ -1587,6 +2381,12 @@ pub async fn scan_start<R: Runtime>(
             .collect();
     }
     persist::save_scan_snapshot(&state.db_path, &snapshot)?;
+    let (persistent_rules, persistent_rules_cleaned) =
+        crate::backend::read_scan_persistent_rules_with_cleanup(&state.settings_path);
+    if persistent_rules_cleaned {
+        let _ =
+            crate::backend::save_scan_persistent_rules(&state.settings_path, &persistent_rules)?;
+    }
     let task = Arc::new(ScanTaskRuntime {
         stop: AtomicBool::new(false),
         child_pid: Mutex::new(None),
@@ -1598,6 +2398,7 @@ pub async fn scan_start<R: Runtime>(
         ignored_paths,
         prune_rules,
         in_place_baseline,
+        persistent_rules: Mutex::new(persistent_rules),
         last_progress_persist_at: Mutex::new(None),
         ai: ScanAiConfig {
             endpoint: input
@@ -1873,7 +2674,10 @@ mod tests {
             .current_dir(&scanner_dir)
             .status()
             .expect("build scanner");
-        assert!(build_status.success(), "scanner build failed with {build_status}");
+        assert!(
+            build_status.success(),
+            "scanner build failed with {build_status}"
+        );
 
         let scanner = test_scanner_path();
         assert!(
@@ -2211,6 +3015,227 @@ mod tests {
         assert!(err.message.contains("error decoding response body"));
         assert!(err.message.contains("upstream gateway error"));
         assert_eq!(err.raw_body, raw_body);
+    }
+
+    fn make_scan_node(
+        path: &str,
+        node_type: &str,
+        size: u64,
+        child_count: u64,
+    ) -> persist::ScanNode {
+        let normalized_path = PathBuf::from(path).to_string_lossy().to_string();
+        let name = PathBuf::from(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(path)
+            .to_string();
+        persist::ScanNode {
+            id: persist::create_node_id(&normalized_path),
+            parent_id: None,
+            path: normalized_path,
+            name,
+            node_type: node_type.to_string(),
+            depth: 1,
+            self_size: size,
+            size,
+            child_count,
+            mtime_ms: None,
+        }
+    }
+
+    #[test]
+    fn local_rules_match_protected_and_temp_paths() {
+        let keep_node = make_scan_node(r"C:\Windows", "directory", 0, 1);
+        let temp_node = make_scan_node(r"C:\Users\tester\AppData\Local\Temp", "directory", 1024, 1);
+        let temp_file = make_scan_node(r"C:\Users\tester\Downloads\foo.tmp", "file", 64, 0);
+
+        let keep_rule =
+            maybe_local_rule_decision("zh", &keep_node, None).expect("keep rule should match");
+        let delete_rule =
+            maybe_local_rule_decision("zh", &temp_node, None).expect("temp rule should match");
+        let file_rule =
+            maybe_local_rule_decision("zh", &temp_file, None).expect("tmp file rule should match");
+
+        assert_eq!(keep_rule.classification, "keep");
+        assert!(!keep_rule.should_expand);
+        assert_eq!(delete_rule.classification, "safe_to_delete");
+        assert!(!delete_rule.should_expand);
+        assert_eq!(file_rule.classification, "safe_to_delete");
+    }
+
+    #[test]
+    fn local_rules_match_build_and_browser_cache_paths() {
+        let next_cache = make_scan_node(r"E:\repo\frontend\.next\cache", "directory", 1024, 1);
+        let node_modules_cache = make_scan_node(
+            r"E:\repo\frontend\node_modules\.cache",
+            "directory",
+            1024,
+            1,
+        );
+        let chrome_cache = make_scan_node(
+            r"C:\Users\tester\AppData\Local\Google\Chrome\User Data\Default\Cache",
+            "directory",
+            1024,
+            1,
+        );
+        let chrome_code_cache = make_scan_node(
+            r"C:\Users\tester\AppData\Local\Google\Chrome\User Data\Profile 1\Code Cache",
+            "directory",
+            1024,
+            1,
+        );
+        let edge_cache = make_scan_node(
+            r"C:\Users\tester\AppData\Local\Microsoft\Edge\User Data\Default\Cache",
+            "directory",
+            1024,
+            1,
+        );
+        let nuxt_dir = make_scan_node(r"E:\repo\frontend\.nuxt", "directory", 1024, 1);
+
+        for node in [
+            &next_cache,
+            &node_modules_cache,
+            &chrome_cache,
+            &chrome_code_cache,
+            &edge_cache,
+            &nuxt_dir,
+        ] {
+            let rule = maybe_local_rule_decision("zh", node, None)
+                .expect("expected known build or browser cache path to match");
+            assert_eq!(rule.classification, "safe_to_delete");
+            assert!(!rule.should_expand);
+        }
+    }
+
+    #[test]
+    fn local_rules_do_not_match_generic_or_unsupported_cache_paths() {
+        let generic_cache = make_scan_node(r"E:\repo\frontend\Cache", "directory", 1024, 1);
+        let firefox_cache = make_scan_node(
+            r"C:\Users\tester\AppData\Local\Mozilla\Firefox\Profiles\abc.default-release\cache2",
+            "directory",
+            1024,
+            1,
+        );
+        let downloads = make_scan_node(r"C:\Users\tester\Downloads", "directory", 1024, 1);
+        let logs = make_scan_node(r"E:\repo\logs", "directory", 1024, 1);
+        let archives = make_scan_node(r"E:\repo\archives", "directory", 1024, 1);
+
+        for node in [&generic_cache, &firefox_cache, &downloads, &logs, &archives] {
+            assert!(
+                maybe_local_rule_decision("zh", node, None).is_none(),
+                "path should not match static local rule: {}",
+                node.path
+            );
+        }
+    }
+
+    #[test]
+    fn build_directory_portrait_summarizes_children() {
+        let dir = make_scan_node(r"C:\Users\tester\AppData\Local\Temp", "directory", 0, 3);
+        let mut child_dir = make_scan_node(
+            r"C:\Users\tester\AppData\Local\Temp\cache",
+            "directory",
+            2048,
+            0,
+        );
+        child_dir.parent_id = Some(dir.id.clone());
+        let mut file_a = make_scan_node(r"C:\Users\tester\AppData\Local\Temp\a.tmp", "file", 64, 0);
+        file_a.parent_id = Some(dir.id.clone());
+        let mut file_b = make_scan_node(r"C:\Users\tester\AppData\Local\Temp\b.tmp", "file", 32, 0);
+        file_b.parent_id = Some(dir.id.clone());
+
+        let portrait =
+            build_directory_portrait(&dir, &[child_dir.clone(), file_a.clone(), file_b.clone()]);
+        assert_eq!(portrait.direct_dir_count, 1);
+        assert_eq!(portrait.direct_file_count, 2);
+        assert!(portrait.name_tags.iter().any(|tag| tag == "temp"));
+        assert_eq!(portrait.top_children[0].name, child_dir.name);
+        assert_eq!(portrait.top_file_extensions[0].extension, ".tmp");
+        assert_eq!(portrait.top_file_extensions[0].count, 2);
+    }
+
+    #[test]
+    fn suspicious_directories_always_expand() {
+        let dir = make_scan_node(r"C:\Users\tester\Misc", "directory", 1024, 2);
+        let review = ScanReview {
+            classification: "suspicious".to_string(),
+            reason: "manual review".to_string(),
+            risk: "medium".to_string(),
+            token_usage: TokenUsage::default(),
+            trace: Value::Null,
+        };
+        assert!(should_expand_node(&dir, &review));
+    }
+
+    #[test]
+    fn ai_rule_promotion_only_allows_keep_and_low_risk_safe_delete() {
+        let keep = ScanReview {
+            classification: "keep".to_string(),
+            reason: "keep".to_string(),
+            risk: "high".to_string(),
+            token_usage: TokenUsage::default(),
+            trace: Value::Null,
+        };
+        let safe_low = ScanReview {
+            classification: "safe_to_delete".to_string(),
+            reason: "safe".to_string(),
+            risk: "low".to_string(),
+            token_usage: TokenUsage::default(),
+            trace: Value::Null,
+        };
+        let safe_medium = ScanReview {
+            classification: "safe_to_delete".to_string(),
+            reason: "review".to_string(),
+            risk: "medium".to_string(),
+            token_usage: TokenUsage::default(),
+            trace: Value::Null,
+        };
+        let suspicious = ScanReview {
+            classification: "suspicious".to_string(),
+            reason: "suspicious".to_string(),
+            risk: "medium".to_string(),
+            token_usage: TokenUsage::default(),
+            trace: Value::Null,
+        };
+
+        assert!(should_promote_ai_rule(&keep));
+        assert!(should_promote_ai_rule(&safe_low));
+        assert!(!should_promote_ai_rule(&safe_medium));
+        assert!(!should_promote_ai_rule(&suspicious));
+    }
+
+    #[test]
+    fn suspicious_directory_reuse_forces_expand() {
+        let current = make_scan_node(r"C:\Users\tester\Misc", "directory", 1024, 2);
+        let baseline = current.clone();
+        let child = make_scan_node(r"C:\Users\tester\Misc\cache", "directory", 512, 0);
+        let reused = resolve_reusable_finding(
+            &current,
+            Some(&build_directory_portrait(
+                &current,
+                std::slice::from_ref(&child),
+            )),
+            Some(&baseline),
+            Some(&persist::ScanFindingRecord {
+                item: ScanResultItem {
+                    name: current.name.clone(),
+                    path: current.path.clone(),
+                    size: current.size,
+                    item_type: "directory".to_string(),
+                    purpose: String::new(),
+                    reason: "old suspicious".to_string(),
+                    risk: "medium".to_string(),
+                    classification: "suspicious".to_string(),
+                    source: SOURCE_AI.to_string(),
+                },
+                should_expand: false,
+            }),
+            std::slice::from_ref(&child),
+        )
+        .expect("reuse should match");
+
+        assert_eq!(reused.0.source, SOURCE_BASELINE_REUSE);
+        assert!(reused.1);
     }
 
     #[test]

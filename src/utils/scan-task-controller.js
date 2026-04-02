@@ -422,8 +422,8 @@ class ScanTaskController {
     const elapsed = Number(data.elapsed || 0) / 1000;
     const classStr = String(data.classification || 'suspicious');
     const riskStr = String(data.risk || 'medium');
-    const hasSubfolders = data.nodeType === 'directory'
-      ? (data.hasPotentialDeletableSubfolders ? 'true' : 'false')
+    const shouldExpand = data.nodeType === 'directory'
+      ? (data.shouldExpand ? 'true' : 'false')
       : 'n/a';
 
     let detailSections = '';
@@ -432,7 +432,7 @@ class ScanTaskController {
     </div>`;
 
     detailSections += `<div style="margin-bottom: 10px;"><strong>Path:</strong> ${this.escHtml(data.nodePath)}</div>`;
-    detailSections += `<div style="margin-bottom: 10px;"><strong>Classification:</strong> ${this.escHtml(classStr)} | <strong>Risk:</strong> ${this.escHtml(riskStr)} | <strong>HasPotentialDeletableSubfolders:</strong> ${this.escHtml(hasSubfolders)}</div>`;
+    detailSections += `<div style="margin-bottom: 10px;"><strong>Classification:</strong> ${this.escHtml(classStr)} | <strong>Risk:</strong> ${this.escHtml(riskStr)} | <strong>Expand Decision:</strong> ${this.escHtml(shouldExpand)}</div>`;
 
     if (data.error) {
       detailSections += `<div style="margin-bottom: 10px; color: var(--accent-danger);"><strong>Error:</strong> ${this.escHtml(data.error)}</div>`;
