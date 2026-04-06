@@ -5,6 +5,7 @@ import {
   saveCredentials,
   saveSettings,
 } from '../utils/api.js';
+import { getErrorMessage } from '../utils/errors.js';
 import { showToast } from '../main.js';
 import {
   refreshCredentialsStatus,
@@ -101,16 +102,6 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
-}
-
-function getErrorMessage(err) {
-  if (typeof err === 'string') return err;
-  if (err && typeof err.message === 'string' && err.message.trim()) return err.message;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err || 'Unknown error');
-  }
 }
 
 function normalizeModels(models) {

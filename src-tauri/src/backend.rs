@@ -16,6 +16,188 @@ const CREDENTIAL_SERVICE: &str = "aicleaner";
 const SEARCH_SECRET_KEY: &str = "search:tavily:apiKey";
 const STORAGE_LOCATION_FILE: &str = "storage-location.json";
 
+pub type AppResult<T> = Result<T, AppError>;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AppErrorContext {
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AppError {
+    pub code: String,
+    pub message: String,
+    pub user_message: String,
+    pub retryable: bool,
+    pub context: AppErrorContext,
+}
+
+impl AppError {
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        user_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            user_message: user_message.into(),
+            retryable: false,
+            context: AppErrorContext::default(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new("INTERNAL_ERROR", message.clone(), message)
+    }
+
+    pub fn required_field(field: &str) -> Self {
+        Self::new(
+            "VALIDATION_REQUIRED_FIELD",
+            format!("Missing required field: {field}"),
+            format!("缺少必填项: {field}"),
+        )
+    }
+
+    pub fn invalid_state(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new("VALIDATION_INVALID_STATE", message.clone(), message)
+    }
+
+    pub fn task_running(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new("TASK_RUNNING", message.clone(), message)
+    }
+
+    pub fn task_not_found(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new("TASK_NOT_FOUND", message.clone(), message)
+    }
+
+    pub fn auth_api_key_missing(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::new("AUTH_API_KEY_MISSING", message.clone(), message)
+    }
+
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.context.operation = operation.into();
+        self
+    }
+
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.context.task_id = Some(task_id.into());
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.context.path = Some(path.into());
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.context.endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.context.model = Some(model.into());
+        self
+    }
+
+    pub fn with_stage(mut self, stage: impl Into<String>) -> Self {
+        self.context.stage = Some(stage.into());
+        self
+    }
+
+    pub fn with_http_status(mut self, http_status: u16) -> Self {
+        self.context.http_status = Some(http_status);
+        self
+    }
+
+    pub fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+
+    pub fn ensure_operation(mut self, operation: &str) -> Self {
+        if self.context.operation.trim().is_empty() {
+            self.context.operation = operation.to_string();
+        }
+        self
+    }
+}
+
+impl From<String> for AppError {
+    fn from(value: String) -> Self {
+        Self::internal(value)
+    }
+}
+
+impl From<&str> for AppError {
+    fn from(value: &str) -> Self {
+        Self::internal(value.to_string())
+    }
+}
+
+fn io_error_code(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::NotFound => "FS_NOT_FOUND",
+        ErrorKind::PermissionDenied => "FS_PERMISSION_DENIED",
+        ErrorKind::WouldBlock => "FS_BUSY",
+        _ => {
+            let text = err.to_string().to_lowercase();
+            if text.contains("being used by another process")
+                || text.contains("used by another process")
+                || text.contains("resource busy")
+            {
+                "FS_BUSY"
+            } else {
+                "FS_IO_FAILED"
+            }
+        }
+    }
+}
+
+pub fn file_system_error(
+    operation: &str,
+    path: impl Into<String>,
+    err: &std::io::Error,
+) -> AppError {
+    let code = io_error_code(err);
+    let retryable = matches!(code, "FS_BUSY");
+    let user_message = match code {
+        "FS_NOT_FOUND" => "文件或目录不存在",
+        "FS_PERMISSION_DENIED" => "权限不足，无法访问文件或目录",
+        "FS_BUSY" => "文件或目录正在被占用",
+        _ => "文件系统操作失败",
+    };
+    AppError::new(code, err.to_string(), user_message)
+        .with_operation(operation)
+        .with_path(path)
+        .retryable(retryable)
+}
+
+pub fn ensure_operation(operation: &str, err: impl Into<AppError>) -> AppError {
+    err.into().ensure_operation(operation)
+}
+
 #[derive(Clone, Debug)]
 struct AppPaths {
     data_dir: PathBuf,
@@ -402,6 +584,8 @@ pub struct ScanSnapshot {
     pub deletable: Vec<ScanResultItem>,
     pub permission_denied_count: u64,
     pub permission_denied_paths: Vec<String>,
+    #[serde(default)]
+    pub last_error: Option<AppError>,
     pub error_message: String,
 }
 
@@ -410,6 +594,8 @@ pub struct ScanSnapshot {
 pub struct OrganizeSnapshot {
     pub id: String,
     pub status: String,
+    #[serde(default)]
+    pub last_error: Option<AppError>,
     pub error: Option<String>,
     pub root_path: String,
     pub recursive: bool,
@@ -482,9 +668,9 @@ pub struct ScanPersistentRuleRecord {
 #[serde(default, rename_all = "camelCase")]
 pub struct ScanPersistentRules {
     #[serde(default)]
-    pub keep_exact: Vec<ScanPersistentRuleRecord>,
+    pub keep_all_exact: Vec<ScanPersistentRuleRecord>,
     #[serde(default)]
-    pub safe_delete_exact: Vec<ScanPersistentRuleRecord>,
+    pub delete_all_exact: Vec<ScanPersistentRuleRecord>,
 }
 
 fn default_settings() -> Value {
@@ -504,8 +690,8 @@ fn default_settings() -> Value {
         "maxDepthUnlimited": false,
         "scanIgnorePaths": [],
         "scanPersistentRules": {
-            "keepExact": [],
-            "safeDeleteExact": []
+            "keepAllExact": [],
+            "deleteAllExact": []
         },
         "lastScanTime": null,
         "searchApi": {
@@ -788,8 +974,8 @@ fn normalize_settings_shape(value: &mut Value) {
         "scanPersistentRules".to_string(),
         serde_json::to_value(&persistent_rules).unwrap_or_else(|_| {
             json!({
-                "keepExact": [],
-                "safeDeleteExact": []
+                "keepAllExact": [],
+                "deleteAllExact": []
             })
         }),
     );
@@ -940,8 +1126,9 @@ fn normalize_scan_persistent_rule_record(
     }
     .to_string();
     let classification = match raw.classification.trim() {
-        "keep" => "keep",
-        "safe_to_delete" => "safe_to_delete",
+        "keep" | "keep_all" => "keep_all",
+        "safe_to_delete" | "delete_all" => "delete_all",
+        "suspicious" | "expand_analysis" => "expand_analysis",
         _ => fallback_classification,
     }
     .to_string();
@@ -951,7 +1138,7 @@ fn normalize_scan_persistent_rule_record(
         raw.source.trim().to_string()
     };
     let risk = if raw.risk.trim().is_empty() {
-        if classification == "keep" {
+        if classification == "keep_all" {
             "high".to_string()
         } else {
             "low".to_string()
@@ -991,26 +1178,28 @@ fn normalize_scan_persistent_rule_records(
 }
 
 fn remove_local_rule_records(rules: &mut ScanPersistentRules) -> bool {
-    let keep_before = rules.keep_exact.len();
-    let safe_before = rules.safe_delete_exact.len();
+    let keep_before = rules.keep_all_exact.len();
+    let delete_before = rules.delete_all_exact.len();
     rules
-        .keep_exact
+        .keep_all_exact
         .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
     rules
-        .safe_delete_exact
+        .delete_all_exact
         .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
-    keep_before != rules.keep_exact.len() || safe_before != rules.safe_delete_exact.len()
+    keep_before != rules.keep_all_exact.len() || delete_before != rules.delete_all_exact.len()
 }
 
 pub(crate) fn normalize_scan_persistent_rules(value: Option<&Value>) -> ScanPersistentRules {
     ScanPersistentRules {
-        keep_exact: normalize_scan_persistent_rule_records(
-            value.and_then(|rules| rules.get("keepExact")),
-            "keep",
+        keep_all_exact: normalize_scan_persistent_rule_records(
+            value.and_then(|rules| rules.get("keepAllExact"))
+                .or_else(|| value.and_then(|rules| rules.get("keepExact"))),
+            "keep_all",
         ),
-        safe_delete_exact: normalize_scan_persistent_rule_records(
-            value.and_then(|rules| rules.get("safeDeleteExact")),
-            "safe_to_delete",
+        delete_all_exact: normalize_scan_persistent_rule_records(
+            value.and_then(|rules| rules.get("deleteAllExact"))
+                .or_else(|| value.and_then(|rules| rules.get("safeDeleteExact"))),
+            "delete_all",
         ),
     }
 }
@@ -1322,16 +1511,16 @@ pub(crate) fn resolve_search_api_key(state: &AppState) -> Result<String, String>
 }
 
 #[tauri::command]
-pub async fn settings_get(state: State<'_, AppState>) -> Result<Value, String> {
+pub async fn settings_get(state: State<'_, AppState>) -> AppResult<Value> {
     let settings_path = state.settings_path();
     let raw = read_settings(&settings_path);
     Ok(redact_settings_for_client(state.inner(), &raw))
 }
 
 #[tauri::command]
-pub async fn settings_save(state: State<'_, AppState>, data: Value) -> Result<Value, String> {
+pub async fn settings_save(state: State<'_, AppState>, data: Value) -> AppResult<Value> {
     let settings_path = state.settings_path();
-    write_settings(&settings_path, &data)?;
+    write_settings(&settings_path, &data).map_err(|err| ensure_operation("settings_save", err))?;
     let raw = read_settings(&settings_path);
     Ok(json!({
         "success": true,
@@ -1345,42 +1534,56 @@ pub struct SettingsDataDirInput {
     path: String,
 }
 
-fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String> {
+fn migrate_data_dir(state: &AppState, target_path: &str) -> AppResult<Value> {
     if !state.scan_tasks.lock().is_empty() || !state.organize_tasks.lock().is_empty() {
-        return Err(
-            "Please stop running scan or organize tasks before moving the cache directory."
-                .to_string(),
-        );
+        return Err(AppError::task_running(
+            "Please stop running scan or organize tasks before moving the cache directory.",
+        )
+        .with_operation("settings_move_data_dir"));
     }
 
     let current_data_dir = state.data_dir();
     let target_data_dir = PathBuf::from(target_path.trim());
-    validate_data_dir_target(&current_data_dir, &target_data_dir)?;
-    fs::create_dir_all(&target_data_dir).map_err(|e| e.to_string())?;
+    validate_data_dir_target(&current_data_dir, &target_data_dir)
+        .map_err(|err| ensure_operation("settings_move_data_dir", err))?;
+    fs::create_dir_all(&target_data_dir).map_err(|e| {
+        file_system_error("settings_move_data_dir", target_data_dir.to_string_lossy(), &e)
+    })?;
 
     let bootstrap_key =
         crate::persist::normalize_root_path(&state.bootstrap_path.to_string_lossy());
     let mut skip_paths = HashSet::new();
     skip_paths.insert(bootstrap_key);
 
-    copy_dir_contents_recursive(&current_data_dir, &target_data_dir, &skip_paths)?;
+    copy_dir_contents_recursive(&current_data_dir, &target_data_dir, &skip_paths)
+        .map_err(|err| ensure_operation("settings_move_data_dir", err))?;
 
     let target_paths = AppPaths::from_data_dir(target_data_dir.clone());
     if !target_paths.settings_path.exists() {
         fs::write(
             &target_paths.settings_path,
-            serde_json::to_vec_pretty(&default_settings()).map_err(|e| e.to_string())?,
+            serde_json::to_vec_pretty(&default_settings())
+                .map_err(|e| ensure_operation("settings_move_data_dir", e.to_string()))?,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            file_system_error(
+                "settings_move_data_dir",
+                target_paths.settings_path.to_string_lossy(),
+                &e,
+            )
+        })?;
     }
-    crate::persist::init_db(&target_paths.db_path)?;
-    crate::persist::mark_stale_tasks(&target_paths.db_path)?;
+    crate::persist::init_db(&target_paths.db_path)
+        .map_err(|err| ensure_operation("settings_move_data_dir", err))?;
+    crate::persist::mark_stale_tasks(&target_paths.db_path)
+        .map_err(|err| ensure_operation("settings_move_data_dir", err))?;
 
     write_storage_location_config(
         &state.base_data_dir,
         &state.bootstrap_path,
         &target_data_dir,
-    )?;
+    )
+    .map_err(|err| ensure_operation("settings_move_data_dir", err))?;
     state.set_data_dir(target_data_dir.clone());
 
     let cleanup_warning = remove_dir_contents_recursive(&current_data_dir, &skip_paths).err();
@@ -1397,12 +1600,12 @@ fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String
 pub async fn settings_move_data_dir(
     state: State<'_, AppState>,
     data: SettingsDataDirInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     migrate_data_dir(state.inner(), &data.path)
 }
 
 #[tauri::command]
-pub async fn credentials_get(state: State<'_, AppState>) -> Result<Value, String> {
+pub async fn credentials_get(state: State<'_, AppState>) -> AppResult<Value> {
     let settings_path = state.settings_path();
     let settings = read_settings(&settings_path);
     let mut provider_key_map = HashMap::new();
@@ -1424,7 +1627,10 @@ pub async fn credentials_get(state: State<'_, AppState>) -> Result<Value, String
         }
     }
     secret_keys.push(SEARCH_SECRET_KEY.to_string());
-    let secret_values = state.credential_store.get_many(&secret_keys)?;
+    let secret_values = state
+        .credential_store
+        .get_many(&secret_keys)
+        .map_err(|err| ensure_operation("credentials_get", err))?;
     let mut providers = HashMap::new();
     for (endpoint, secret_key) in provider_key_map {
         providers.insert(
@@ -1446,14 +1652,14 @@ pub async fn credentials_get(state: State<'_, AppState>) -> Result<Value, String
 pub async fn credentials_save(
     state: State<'_, AppState>,
     data: CredentialsSaveInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     save_credentials_internal(state.inner(), data)
 }
 
 fn save_credentials_internal(
     state: &AppState,
     data: CredentialsSaveInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     let started_at = Instant::now();
     let settings_path = state.settings_path();
     let settings = read_settings(&settings_path);
@@ -1479,12 +1685,16 @@ fn save_credentials_internal(
         ));
     }
     if !entries.is_empty() {
-        state.credential_store.set_many(&entries)?;
+        state
+            .credential_store
+            .set_many(&entries)
+            .map_err(|err| ensure_operation("credentials_save", err))?;
     }
     let latest_status = build_credentials_status_value(state, &settings);
     let (provider_meta, search_has_api_key) = extract_credentials_meta(&latest_status);
     let next_settings =
-        update_credentials_meta_in_settings(state, &provider_meta, search_has_api_key)?;
+        update_credentials_meta_in_settings(state, &provider_meta, search_has_api_key)
+            .map_err(|err| ensure_operation("credentials_save", err))?;
     log::info!(
         "credentials_save completed in {} ms (entries={})",
         started_at.elapsed().as_millis(),
@@ -1507,10 +1717,12 @@ pub struct ProviderModelsInput {
 pub async fn settings_get_provider_models(
     state: State<'_, AppState>,
     data: ProviderModelsInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     let endpoint = data.endpoint.trim();
     if endpoint.is_empty() {
-        return Err("Missing endpoint".to_string());
+        return Err(
+            AppError::required_field("endpoint").with_operation("settings_get_provider_models"),
+        );
     }
     let api_key = if let Some(raw) = data.api_key {
         raw.trim().to_string()
@@ -1521,7 +1733,12 @@ pub async fn settings_get_provider_models(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            AppError::new("HTTP_REQUEST_FAILED", e.to_string(), "初始化模型服务请求失败")
+                .with_operation("settings_get_provider_models")
+                .with_endpoint(endpoint)
+                .retryable(true)
+        })?;
     let mut req = client.get(url).header("Accept", "application/json");
     if !api_key.is_empty() {
         req = req
@@ -1529,14 +1746,30 @@ pub async fn settings_get_provider_models(
             .header("x-api-key", api_key.clone())
             .header("api-key", api_key.clone());
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(|e| {
+        AppError::new("HTTP_REQUEST_FAILED", e.to_string(), "获取模型列表失败")
+            .with_operation("settings_get_provider_models")
+            .with_endpoint(endpoint)
+            .retryable(true)
+    })?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "Failed to fetch models ({})",
-            resp.status().as_u16()
-        ));
+        return Err(
+            AppError::new(
+                "HTTP_BAD_STATUS",
+                format!("Failed to fetch models ({})", resp.status().as_u16()),
+                "模型服务返回异常状态",
+            )
+            .with_operation("settings_get_provider_models")
+            .with_endpoint(endpoint)
+            .with_http_status(resp.status().as_u16())
+            .retryable(resp.status().is_server_error()),
+        );
     }
-    let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let payload: Value = resp.json().await.map_err(|e| {
+        AppError::new("MODEL_RESPONSE_INVALID", e.to_string(), "模型列表响应格式无效")
+            .with_operation("settings_get_provider_models")
+            .with_endpoint(endpoint)
+    })?;
     let raw = payload
         .get("data")
         .and_then(Value::as_array)
@@ -1565,10 +1798,10 @@ pub async fn settings_get_provider_models(
 }
 
 #[tauri::command]
-pub async fn settings_browse_folder() -> Result<Value, String> {
+pub async fn settings_browse_folder() -> AppResult<Value> {
     let picked = tauri::async_runtime::spawn_blocking(|| rfd::FileDialog::new().pick_folder())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ensure_operation("settings_browse_folder", e.to_string()))?;
     if let Some(path) = picked {
         Ok(
             json!({ "success": true, "cancelled": false, "path": path.to_string_lossy().to_string() }),
@@ -1579,7 +1812,7 @@ pub async fn settings_browse_folder() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn system_get_privilege() -> Result<Value, String> {
+pub async fn system_get_privilege() -> AppResult<Value> {
     Ok(json!({
         "platform": if cfg!(windows) { "win32" } else { std::env::consts::OS },
         "isAdmin": if cfg!(windows) { check_elevation::is_elevated().unwrap_or(false) } else { false }
@@ -1587,14 +1820,18 @@ pub async fn system_get_privilege() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn system_request_elevation() -> Result<Value, String> {
+pub async fn system_request_elevation() -> AppResult<Value> {
     if !cfg!(windows) {
-        return Err("Elevation is only supported on Windows.".to_string());
+        return Err(
+            AppError::invalid_state("Elevation is only supported on Windows.")
+                .with_operation("system_request_elevation"),
+        );
     }
     if check_elevation::is_elevated().unwrap_or(false) {
         return Ok(json!({ "success": true, "alreadyAdmin": true }));
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe()
+        .map_err(|e| ensure_operation("system_request_elevation", e.to_string()))?;
     let exe_str = exe.to_string_lossy().replace('\'', "''");
     let work_dir = exe
         .parent()
@@ -1612,9 +1849,16 @@ pub async fn system_request_elevation() -> Result<Value, String> {
         .arg("-Command")
         .arg(ps)
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ensure_operation("system_request_elevation", e.to_string()))?;
     if !status.success() {
-        return Err("Failed to request elevation.".to_string());
+        return Err(
+            AppError::new(
+                "INTERNAL_ERROR",
+                "Failed to request elevation.",
+                "请求管理员权限失败",
+            )
+            .with_operation("system_request_elevation"),
+        );
     }
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(250));
@@ -1630,13 +1874,23 @@ pub struct OpenExternalUrlInput {
 }
 
 #[tauri::command]
-pub async fn system_open_external_url(data: OpenExternalUrlInput) -> Result<Value, String> {
-    let parsed = Url::parse(data.url.trim()).map_err(|e| e.to_string())?;
+pub async fn system_open_external_url(data: OpenExternalUrlInput) -> AppResult<Value> {
+    let parsed = Url::parse(data.url.trim()).map_err(|e| {
+        AppError::invalid_state(e.to_string()).with_operation("system_open_external_url")
+    })?;
     match parsed.scheme() {
         "http" | "https" => {}
-        _ => return Err("Only http(s) URLs are allowed.".to_string()),
+        _ => {
+            return Err(
+                AppError::invalid_state("Only http(s) URLs are allowed.")
+                    .with_operation("system_open_external_url"),
+            )
+        }
     }
-    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|e| e.to_string())?;
+    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>).map_err(|e| {
+        AppError::new("INTERNAL_ERROR", e.to_string(), "打开外部链接失败")
+            .with_operation("system_open_external_url")
+    })?;
     Ok(json!({ "success": true, "url": parsed.as_str() }))
 }
 
@@ -1647,10 +1901,18 @@ pub struct OpenLocationInput {
 }
 
 #[tauri::command]
-pub async fn files_open_location(data: OpenLocationInput) -> Result<Value, String> {
+pub async fn files_open_location(data: OpenLocationInput) -> AppResult<Value> {
     let path = PathBuf::from(data.path);
     if !path.exists() {
-        return Err("File or directory does not exist".to_string());
+        return Err(
+            AppError::new(
+                "FS_NOT_FOUND",
+                "File or directory does not exist",
+                "文件或目录不存在",
+            )
+            .with_operation("files_open_location")
+            .with_path(path.to_string_lossy()),
+        );
     }
     if cfg!(windows) {
         let _ = Command::new("explorer.exe")
@@ -1667,16 +1929,16 @@ pub struct CleanFilesInput {
     scan_task_id: Option<String>,
 }
 
-fn clean_one_target(path: &Path) -> Result<(bool, bool), String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+fn clean_one_target(path: &Path) -> std::io::Result<(bool, bool)> {
+    let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() && !meta.file_type().is_symlink() {
-        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-            let child = entry.map_err(|e| e.to_string())?.path();
+        for entry in fs::read_dir(path)? {
+            let child = entry?.path();
             let _ = clean_one_target(&child)?;
         }
         Ok((true, false))
     } else {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
+        fs::remove_file(path)?;
         Ok((true, true))
     }
 }
@@ -1685,9 +1947,9 @@ fn clean_one_target(path: &Path) -> Result<(bool, bool), String> {
 pub async fn files_clean(
     state: State<'_, AppState>,
     data: CleanFilesInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     if data.paths.is_empty() {
-        return Err("Paths array is required".to_string());
+        return Err(AppError::required_field("paths").with_operation("files_clean"));
     }
     let mut cleaned = Vec::new();
     let mut removed = Vec::new();
@@ -1695,7 +1957,18 @@ pub async fn files_clean(
     for raw in &data.paths {
         let path = PathBuf::from(raw);
         if !path.exists() {
-            failed.push(json!({"path": raw, "error": "Not found", "code": "ENOENT", "skipped": false, "permissionDenied": false, "requiresElevation": false}));
+            let app_error = AppError::new("FS_NOT_FOUND", "Not found", "文件或目录不存在")
+                .with_operation("files_clean")
+                .with_path(raw);
+            failed.push(json!({
+                "path": raw,
+                "code": app_error.code,
+                "message": app_error.message,
+                "userMessage": app_error.user_message,
+                "skipped": false,
+                "permissionDenied": false,
+                "requiresElevation": false
+            }));
             continue;
         }
         match clean_one_target(&path) {
@@ -1707,14 +1980,19 @@ pub async fn files_clean(
                     removed.push(path.to_string_lossy().to_string());
                 }
             }
-            Err(err) => failed.push(json!({
-                "path": path.to_string_lossy().to_string(),
-                "error": err,
-                "code": "UNKNOWN",
-                "skipped": false,
-                "permissionDenied": true,
-                "requiresElevation": cfg!(windows) && !check_elevation::is_elevated().unwrap_or(false)
-            })),
+            Err(err) => {
+                let app_error =
+                    file_system_error("files_clean", path.to_string_lossy(), &err);
+                failed.push(json!({
+                    "path": path.to_string_lossy().to_string(),
+                    "code": app_error.code,
+                    "message": app_error.message,
+                    "userMessage": app_error.user_message,
+                    "skipped": false,
+                    "permissionDenied": app_error.code == "FS_PERMISSION_DENIED",
+                    "requiresElevation": app_error.code == "FS_PERMISSION_DENIED" && cfg!(windows) && !check_elevation::is_elevated().unwrap_or(false)
+                }));
+            }
         }
     }
     let mut scan_snapshot = Value::Null;
@@ -1799,7 +2077,7 @@ pub async fn scan_start<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     mut input: ScanStartInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     let (endpoint, model) = resolve_provider_endpoint_and_model(
         state.inner(),
         input.api_endpoint.as_deref(),
@@ -1808,7 +2086,13 @@ pub async fn scan_start<R: Runtime>(
     input.api_endpoint = Some(endpoint.clone());
     input.model = Some(model);
     if input.auto_analyze.unwrap_or(true) {
-        input.api_key = Some(resolve_provider_api_key(state.inner(), &endpoint)?);
+        input.api_key = Some(
+            resolve_provider_api_key(state.inner(), &endpoint).map_err(|_| {
+                AppError::auth_api_key_missing("API key is required for scan analysis")
+                    .with_operation("scan_start")
+                    .with_endpoint(endpoint.clone())
+            })?,
+        );
     } else if input.api_key.is_none() {
         input.api_key = Some(String::new());
     }
@@ -1827,51 +2111,67 @@ pub async fn scan_start<R: Runtime>(
     if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
         input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
     }
-    crate::scan_runtime::scan_start(app, state, input).await
+    crate::scan_runtime::scan_start(app, state, input)
+        .await
+        .map_err(|err| ensure_operation("scan_start", err))
 }
 
 #[tauri::command]
-pub async fn scan_get_active(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
-    crate::scan_runtime::scan_get_active(state).await
+pub async fn scan_get_active(state: State<'_, AppState>) -> AppResult<Vec<Value>> {
+    crate::scan_runtime::scan_get_active(state)
+        .await
+        .map_err(|err| ensure_operation("scan_get_active", err))
 }
 
 #[tauri::command]
 pub async fn scan_list_history(
     state: State<'_, AppState>,
     limit: Option<u32>,
-) -> Result<Vec<Value>, String> {
-    crate::scan_runtime::scan_list_history(state, limit).await
+) -> AppResult<Vec<Value>> {
+    crate::scan_runtime::scan_list_history(state, limit)
+        .await
+        .map_err(|err| ensure_operation("scan_list_history", err))
 }
 
 #[tauri::command]
 pub async fn scan_find_latest_for_path(
     state: State<'_, AppState>,
     path: String,
-) -> Result<Value, String> {
-    crate::scan_runtime::scan_find_latest_for_path(state, path).await
+) -> AppResult<Value> {
+    crate::scan_runtime::scan_find_latest_for_path(state, path)
+        .await
+        .map_err(|err| ensure_operation("scan_find_latest_for_path", err))
 }
 
 #[tauri::command]
 pub async fn scan_delete_history(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
-    crate::scan_runtime::scan_delete_history(state, task_id).await
+) -> AppResult<Value> {
+    crate::scan_runtime::scan_delete_history(state, task_id)
+        .await
+        .map_err(|err| ensure_operation("scan_delete_history", err))
 }
 
 #[tauri::command]
-pub async fn scan_stop(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    crate::scan_runtime::scan_stop(state, task_id).await
+pub async fn scan_stop(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
+    crate::scan_runtime::scan_stop(state, task_id)
+        .await
+        .map_err(|err| ensure_operation("scan_stop", err))
 }
 
 #[tauri::command]
-pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    crate::scan_runtime::scan_get_result(state, task_id).await
+pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
+    crate::scan_runtime::scan_get_result(state, task_id)
+        .await
+        .map_err(|err| ensure_operation("scan_get_result", err))
 }
 
 #[tauri::command]
-pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
-    crate::organizer_runtime::organize_get_capability(state).await
+pub async fn organize_get_capability(state: State<'_, AppState>) -> AppResult<Value> {
+    crate::organizer_runtime::organize_get_capability(state)
+        .await
+        .map_err(|err| ensure_operation("organize_get_capability", err))
 }
 
 #[tauri::command]
@@ -1879,12 +2179,14 @@ pub async fn organize_start<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     mut input: OrganizeStartInput,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     input.model_routing = hydrate_model_routing_with_secrets(state.inner(), &input.model_routing);
     if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
         input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
     }
-    crate::organizer_runtime::organize_start(app, state, input).await
+    crate::organizer_runtime::organize_start(app, state, input)
+        .await
+        .map_err(|err| ensure_operation("organize_start", err))
 }
 
 #[tauri::command]
@@ -1892,29 +2194,37 @@ pub async fn organize_stop<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
-    crate::organizer_runtime::organize_stop(app, state, task_id).await
+) -> AppResult<Value> {
+    crate::organizer_runtime::organize_stop(app, state, task_id)
+        .await
+        .map_err(|err| ensure_operation("organize_stop", err))
 }
 
 #[tauri::command]
 pub async fn organize_get_result(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
-    crate::organizer_runtime::organize_get_result(state, task_id).await
+) -> AppResult<Value> {
+    crate::organizer_runtime::organize_get_result(state, task_id)
+        .await
+        .map_err(|err| ensure_operation("organize_get_result", err))
 }
 
 #[tauri::command]
-pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    crate::organizer_runtime::organize_apply(state, task_id).await
+pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
+    crate::organizer_runtime::organize_apply(state, task_id)
+        .await
+        .map_err(|err| ensure_operation("organize_apply", err))
 }
 
 #[tauri::command]
 pub async fn organize_rollback(
     state: State<'_, AppState>,
     job_id: String,
-) -> Result<Value, String> {
-    crate::organizer_runtime::organize_rollback(state, job_id).await
+) -> AppResult<Value> {
+    crate::organizer_runtime::organize_rollback(state, job_id)
+        .await
+        .map_err(|err| ensure_operation("organize_rollback", err))
 }
 
 #[cfg(test)]
@@ -1960,7 +2270,7 @@ mod tests {
         let path = temp_settings_path();
         let seeded = json!({
             "scanPersistentRules": {
-                "keepExact": [
+                "keepAllExact": [
                     {
                         "path": "C:\\Users\\tester\\Documents",
                         "nodeType": "directory",
@@ -1976,11 +2286,11 @@ mod tests {
                         ]
                     }
                 ],
-                "safeDeleteExact": [
+                "deleteAllExact": [
                     {
                         "path": "C:\\Users\\tester\\AppData\\Local\\Temp",
                         "nodeType": "directory",
-                        "classification": "safe_to_delete",
+                        "classification": "delete_all",
                         "reason": "temp",
                         "risk": "low",
                         "source": "local_rule",
@@ -1999,16 +2309,16 @@ mod tests {
 
         let saved = read_settings(&path);
         assert_eq!(
-            saved["scanPersistentRules"]["keepExact"][0]["classification"],
-            Value::String("keep".to_string())
+            saved["scanPersistentRules"]["keepAllExact"][0]["classification"],
+            Value::String("keep_all".to_string())
         );
         assert_eq!(
-            saved["scanPersistentRules"]["keepExact"][0]["nameTags"],
+            saved["scanPersistentRules"]["keepAllExact"][0]["nameTags"],
             json!(["user_content"])
         );
         assert_eq!(
-            saved["scanPersistentRules"]["safeDeleteExact"][0]["classification"],
-            Value::String("safe_to_delete".to_string())
+            saved["scanPersistentRules"]["deleteAllExact"][0]["classification"],
+            Value::String("delete_all".to_string())
         );
 
         let _ = fs::remove_file(path);
@@ -2019,11 +2329,11 @@ mod tests {
         let path = temp_settings_path();
         let seeded = json!({
             "scanPersistentRules": {
-                "keepExact": [
+                "keepAllExact": [
                     {
                         "path": "C:\\Users\\tester\\Documents",
                         "nodeType": "directory",
-                        "classification": "keep",
+                        "classification": "keep_all",
                         "reason": "keep this",
                         "risk": "high",
                         "source": "ai_promoted",
@@ -2034,11 +2344,11 @@ mod tests {
                         "topChildren": []
                     }
                 ],
-                "safeDeleteExact": [
+                "deleteAllExact": [
                     {
                         "path": "C:\\Users\\tester\\AppData\\Local\\Temp",
                         "nodeType": "directory",
-                        "classification": "safe_to_delete",
+                        "classification": "delete_all",
                         "reason": "temp",
                         "risk": "low",
                         "source": "local_rule",
@@ -2051,7 +2361,7 @@ mod tests {
                     {
                         "path": "C:\\Users\\tester\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache",
                         "nodeType": "directory",
-                        "classification": "safe_to_delete",
+                        "classification": "delete_all",
                         "reason": "browser cache",
                         "risk": "low",
                         "source": "ai_promoted",
@@ -2068,9 +2378,9 @@ mod tests {
 
         let (rules, cleaned) = read_scan_persistent_rules_with_cleanup(&path);
         assert!(cleaned);
-        assert_eq!(rules.keep_exact.len(), 1);
-        assert_eq!(rules.safe_delete_exact.len(), 1);
-        assert_eq!(rules.safe_delete_exact[0].source, "ai_promoted");
+        assert_eq!(rules.keep_all_exact.len(), 1);
+        assert_eq!(rules.delete_all_exact.len(), 1);
+        assert_eq!(rules.delete_all_exact[0].source, "ai_promoted");
 
         let _ = fs::remove_file(path);
     }

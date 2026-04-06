@@ -11,6 +11,7 @@ import {
   saveSettings,
 } from '../utils/api.js';
 import { handleElevationTransition } from '../utils/elevation.js';
+import { getErrorCode, getErrorMessage } from '../utils/errors.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
 import { scanTaskController } from '../utils/scan-task-controller.js';
@@ -45,22 +46,6 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = String(str ?? '');
   return div.innerHTML;
-}
-
-function getErrorMessage(err) {
-  if (typeof err === 'string' && err.trim()) {
-    return err.trim();
-  }
-  if (err && typeof err === 'object') {
-    if (typeof err.message === 'string' && err.message.trim()) {
-      return err.message.trim();
-    }
-    if (typeof err.error === 'string' && err.error.trim()) {
-      return err.error.trim();
-    }
-  }
-  const text = String(err ?? '').trim();
-  return text && text !== '[object Object]' ? text : t('toast.error');
 }
 
 function normalizeComparablePath(value) {
@@ -871,8 +856,9 @@ async function deleteHistoryTask(taskId) {
     await refreshHistoryList();
     showToast(t('scanner.history_deleted'), 'success');
   } catch (err) {
+    const errorCode = getErrorCode(err);
     const errorMessage = getErrorMessage(err);
-    if (/still running/i.test(errorMessage)) {
+    if (errorCode === 'TASK_RUNNING') {
       showToast(t('scanner.history_running'), 'error');
       return;
     }

@@ -1,4 +1,4 @@
-use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
+use crate::backend::{AppError, AppResult, AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
 use crate::persist;
 use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
 use parking_lot::Mutex;
@@ -73,6 +73,27 @@ struct ChatCompletionOutput {
 struct ChatCompletionError {
     message: String,
     raw_body: String,
+}
+
+impl ChatCompletionError {
+    fn into_app_error(self, route: &RouteConfig, stage: &str) -> AppError {
+        let code = if self.raw_body.is_empty() {
+            "HTTP_REQUEST_FAILED"
+        } else if self.message.contains("HTTP ") {
+            "HTTP_BAD_STATUS"
+        } else {
+            "MODEL_RESPONSE_INVALID"
+        };
+        let mut error = AppError::new(code, self.message, "整理任务调用模型失败")
+            .with_operation("organize_task")
+            .with_endpoint(route.endpoint.clone())
+            .with_model(route.model.clone())
+            .with_stage(stage);
+        if code == "HTTP_REQUEST_FAILED" {
+            error = error.retryable(true);
+        }
+        error
+    }
 }
 
 struct ClassifyOrganizeBatchOutput {
@@ -220,6 +241,57 @@ pub struct OrganizeTaskRuntime {
     response_language: String,
     extraction_tool: ExtractionToolConfig,
     pub job: Mutex<Option<JoinHandle<()>>>,
+}
+
+fn build_organize_task_error(task: &OrganizeTaskRuntime, task_id: &str, root_path: &str, err: String) -> AppError {
+    let trimmed = err.trim();
+    let stage = if trimmed.is_empty() {
+        "organize_task"
+    } else if trimmed.contains("classification")
+        || trimmed.contains("summary_agent")
+        || trimmed.contains("chat completion")
+        || trimmed.contains("response body")
+        || trimmed.contains("HTTP ")
+    {
+        "classify"
+    } else if trimmed.contains("tika_") || trimmed.contains("extract") {
+        "extract"
+    } else if trimmed.contains("move") || trimmed.contains("rollback") {
+        "move"
+    } else {
+        "organize_task"
+    };
+    let route = task.routes.get("text");
+    let mut app_error = AppError::internal(err)
+        .with_operation("organize_task")
+        .with_task_id(task_id.to_string())
+        .with_path(root_path.to_string())
+        .with_stage(stage);
+    if let Some(route) = route {
+        app_error = app_error
+            .with_endpoint(route.endpoint.clone())
+            .with_model(route.model.clone());
+    }
+    app_error
+}
+
+fn log_organize_task_error(error: &AppError) {
+    log::error!(
+        "organize task failed: task_id={}, operation={}, root_path={}, stage={}, error_code={}, error_message={}, endpoint={}, model={}, http_status={}",
+        error.context.task_id.as_deref().unwrap_or(""),
+        error.context.operation,
+        error.context.path.as_deref().unwrap_or(""),
+        error.context.stage.as_deref().unwrap_or(""),
+        error.code,
+        error.message,
+        error.context.endpoint.as_deref().unwrap_or(""),
+        error.context.model.as_deref().unwrap_or(""),
+        error
+            .context
+            .http_status
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
 }
 
 fn now_iso() -> String {
@@ -3612,6 +3684,7 @@ pub async fn organize_start<R: Runtime>(
     let snapshot = OrganizeSnapshot {
         id: task_id.clone(),
         status: "idle".to_string(),
+        last_error: None,
         error: None,
         root_path: input.root_path.clone(),
         recursive: true,
@@ -3679,13 +3752,22 @@ pub async fn organize_start<R: Runtime>(
             let _ = app_clone.emit("organize_stopped", payload);
         } else if let Err(err) = result {
             let mut snap = runtime.snapshot.lock();
+            let app_error = build_organize_task_error(&runtime, &task_id_clone, &snap.root_path, err);
+            log_organize_task_error(&app_error);
             snap.status = "error".to_string();
-            snap.error = Some(err.clone());
+            snap.last_error = Some(app_error.clone());
+            snap.error = Some(app_error.user_message.clone());
             snap.completed_at = Some(now_iso());
             let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
-            let payload = json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
+            let payload = json!({ "taskId": task_id_clone, "error": app_error, "snapshot": &*snap });
             drop(snap);
-            let _ = app_clone.emit("organize_error", payload);
+            if let Err(emit_err) = app_clone.emit("organize_error", payload) {
+                log::error!(
+                    "organize task error event emit failed: task_id={}, event=organize_error, error={}",
+                    task_id_clone,
+                    emit_err
+                );
+            }
         }
         state_clone.organize_tasks.lock().remove(&task_id_clone);
     });
@@ -3704,13 +3786,13 @@ pub async fn organize_stop<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     let task = state
         .organize_tasks
         .lock()
         .get(&task_id)
         .cloned()
-        .ok_or_else(|| "Task not found".to_string())?;
+        .ok_or_else(|| AppError::task_not_found("Task not found"))?;
     task.stop.store(true, Ordering::Relaxed);
     {
         let mut snapshot = task.snapshot.lock();
@@ -3725,26 +3807,26 @@ pub async fn organize_stop<R: Runtime>(
 pub async fn organize_get_result(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
         let snap = task.snapshot.lock().clone();
-        return serde_json::to_value(snap).map_err(|e| e.to_string());
+        return serde_json::to_value(snap).map_err(|e| AppError::internal(e.to_string()));
     }
     let snapshot = persist::load_organize_snapshot(&state.db_path(), &task_id)?
-        .ok_or_else(|| "Task not found".to_string())?;
-    serde_json::to_value(hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
+        .ok_or_else(|| AppError::task_not_found("Task not found"))?;
+    serde_json::to_value(hydrate_loaded_snapshot(snapshot)).map_err(|e| AppError::internal(e.to_string()))
 }
 
-pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
+pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
     let mut snapshot = hydrate_loaded_snapshot(
         persist::load_organize_snapshot(&state.db_path(), &task_id)?
-            .ok_or_else(|| "Task not found".to_string())?,
+            .ok_or_else(|| AppError::task_not_found("Task not found"))?,
     );
     if snapshot.status != "completed" && snapshot.status != "done" {
-        return Err(format!(
+        return Err(AppError::invalid_state(format!(
             "task status is {}, cannot apply move",
             snapshot.status
-        ));
+        )));
     }
     snapshot.status = "moving".to_string();
     persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
@@ -3878,9 +3960,9 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
 pub async fn organize_rollback(
     state: State<'_, AppState>,
     job_id: String,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     let manifest = persist::load_organize_job(&state.db_path(), &job_id)?
-        .ok_or_else(|| "job manifest not found".to_string())?;
+        .ok_or_else(|| AppError::task_not_found("job manifest not found"))?;
     let task_id = manifest
         .get("taskId")
         .and_then(Value::as_str)
@@ -4114,6 +4196,7 @@ mod tests {
         let snapshot = OrganizeSnapshot {
             id: "task_1".to_string(),
             status: "completed".to_string(),
+            last_error: None,
             error: None,
             root_path: r"C:\root".to_string(),
             recursive: true,

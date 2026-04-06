@@ -1,6 +1,6 @@
 {
     "name": "aicleaner",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "description": "AI-driven space cleaning desktop app powered by Tauri v2 and Rust",
     "type": "module",
     "scripts": {
@@ -17,6 +17,7 @@
     "dependencies": {
         "@tauri-apps/api": "^2.8.0",
         "@tauri-apps/plugin-dialog": "^2.6.0",
+        "@tauri-apps/plugin-log": "^2.8.0",
         "@tauri-apps/plugin-stronghold": "^2.3.1"
     },
     "devDependencies": {

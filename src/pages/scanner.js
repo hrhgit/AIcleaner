@@ -13,6 +13,7 @@ import {
   saveSettings,
 } from '../utils/api.js';
 import { handleElevationTransition } from '../utils/elevation.js';
+import { getErrorMessage } from '../utils/errors.js';
 import { formatSize } from '../utils/storage.js';
 import * as storage from '../utils/storage.js';
 import { showToast } from '../main.js';
@@ -33,6 +34,7 @@ let scannerWhitelistExpanded = false;
 let renderVersion = 0;
 let scannerTaskUnsubscribe = null;
 const expandedDetailLogIds = new Set();
+const collapsedDetailLogIds = new Set();
 let renderedLogKeys = [];
 const SCANNER_FORM_DRAFT_KEY = 'wipeout.scanner.global.form.v2';
 const SCANNER_FORM_DRAFT_VERSION = 2;
@@ -345,12 +347,13 @@ function replaceLogEntries(nextEntries = [], { persist = true } = {}) {
   scanTaskController.replaceLogEntries(nextEntries, { persist });
   logEntries = scanTaskController.getState().logEntries;
   expandedDetailLogIds.clear();
+  collapsedDetailLogIds.clear();
   syncRenderedLogEntries({ force: true });
   refreshScanLogPanel();
 }
 
 function isScanLogCollapsed() {
-  return !!storage.get(SCAN_LOG_COLLAPSED_KEY, true);
+  return !!storage.get(SCAN_LOG_COLLAPSED_KEY, false);
 }
 
 function setScanLogCollapsed(collapsed) {
@@ -404,9 +407,17 @@ function setDetailLogExpanded(entryId, expanded) {
   if (entryId == null) return;
   if (expanded) {
     expandedDetailLogIds.add(entryId);
+    collapsedDetailLogIds.delete(entryId);
   } else {
     expandedDetailLogIds.delete(entryId);
+    collapsedDetailLogIds.add(entryId);
   }
+}
+
+function isDetailLogExpanded(entry) {
+  if (!entry || entry.id == null) return false;
+  if (expandedDetailLogIds.has(entry.id)) return true;
+  return !!entry.expandByDefault && !collapsedDetailLogIds.has(entry.id);
 }
 
 function isLogPinnedToBottom(log) {
@@ -419,11 +430,12 @@ function isGroupedScanLogType(type) {
 }
 
 function getLogIcon(type) {
-  if (type === 'found') return '+';
-  if (type === 'analyzing') return '*';
-  if (type === 'agent_call') return '>';
-  if (type === 'agent_response') return '<';
-  return '-';
+  if (type === 'found') return '✅';
+  if (type === 'analyzing') return '🧠';
+  if (type === 'agent_call') return '⚡';
+  if (type === 'agent_response') return '🤖';
+  if (type === 'scanning') return '🔍';
+  return '•';
 }
 
 function createSimpleLogEntryElement(entry) {
@@ -438,7 +450,7 @@ function createSimpleLogEntryElement(entry) {
 }
 
 function createDetailLogEntryElement(entry) {
-  const expanded = expandedDetailLogIds.has(entry.id);
+  const expanded = isDetailLogExpanded(entry);
   const wrapper = document.createElement('div');
   wrapper.className = `scan-log-entry ${entry.type}`;
   wrapper.innerHTML = `
@@ -446,7 +458,7 @@ function createDetailLogEntryElement(entry) {
     <div class="log-content">
       <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
         <span class="log-time" style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
-        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">></span>
+        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">▶</span>
         <span class="log-summary">${entry.summary}</span>
       </div>
       <div class="log-detail-body" style="display: ${expanded ? 'block' : 'none'}; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
@@ -477,7 +489,7 @@ function createScanRecordGroupElement(entries) {
   header.className = 'scan-log-group-header';
   header.innerHTML = `
     <div class="scan-log-group-title">
-      <span class="scan-log-group-arrow">></span>
+      <span class="scan-log-group-arrow">▶</span>
       <span>${t('scanner.scan_records')} (${entries.length})</span>
     </div>
   `;
@@ -566,6 +578,7 @@ function getLogEntryKey(entry) {
     entry?.text ?? '',
     entry?.summary ?? '',
     entry?.detailHtml ?? '',
+    entry?.expandByDefault ?? false,
   ]);
 }
 
@@ -1292,22 +1305,6 @@ function syncTaskViewState(state = scanTaskController.getState()) {
   logEntries = Array.isArray(state?.logEntries) ? state.logEntries : [];
 }
 
-function getErrorMessage(err) {
-  if (typeof err === 'string' && err.trim()) {
-    return err.trim();
-  }
-  if (err && typeof err === 'object') {
-    if (typeof err.message === 'string' && err.message.trim()) {
-      return err.message.trim();
-    }
-    if (typeof err.error === 'string' && err.error.trim()) {
-      return err.error.trim();
-    }
-  }
-  const text = String(err ?? '').trim();
-  return text && text !== '[object Object]' ? text : t('toast.error');
-}
-
 function applyTaskControllerState(state = scanTaskController.getState()) {
   syncTaskViewState(state);
   refreshScanLogPanel();
@@ -1550,7 +1547,7 @@ export async function renderScanner(container) {
         <h2 class="card-title">${t('scanner.activity_log')}</h2>
         <div style="display:flex; gap:8px; align-items:center;">
           <button id="toggle-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.log_expand')}</button>
-          <button id="clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">Clear</button>
+          <button id="clear-log-btn" class="btn btn-ghost" style="padding: 6px 12px; font-size: 0.75rem;">${t('scanner.log_clear')}</button>
         </div>
       </div>
       <div id="scan-log-panel" class="scan-log-panel">
@@ -1559,7 +1556,7 @@ export async function renderScanner(container) {
           <div id="scan-log-collapsed-hint" class="scan-log-collapsed-hint" style="display:none;">${t('scanner.log_preview_hint')}</div>
         </div>
         <div id="scan-empty" class="empty-state" style="padding:30px;">
-          <div class="empty-state-icon">...</div>
+          <div class="empty-state-icon">🧭</div>
           <div class="empty-state-text">${t('scanner.prepare')}</div>
           <div class="empty-state-hint">${t('scanner.not_set')}</div>
         </div>

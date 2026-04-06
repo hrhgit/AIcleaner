@@ -6,11 +6,26 @@ mod web_search;
 
 use backend::AppState;
 use tauri::Manager;
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .clear_targets()
+                .target(Target::new(TargetKind::Stdout))
+                .target(Target::new(TargetKind::LogDir {
+                    file_name: Some("rust".into()),
+                }))
+                .rotation_strategy(RotationStrategy::KeepSome(5))
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;

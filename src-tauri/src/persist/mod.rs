@@ -185,6 +185,7 @@ mod tests {
             deletable: Vec::new(),
             permission_denied_count: 0,
             permission_denied_paths: Vec::new(),
+            last_error: None,
             error_message: String::new(),
         }
     }
@@ -193,6 +194,7 @@ mod tests {
         OrganizeSnapshot {
             id: task_id.to_string(),
             status: "completed".to_string(),
+            last_error: None,
             error: None,
             root_path: root_path.to_string(),
             recursive: true,
@@ -386,7 +388,7 @@ mod tests {
             purpose: String::new(),
             reason: "safe".to_string(),
             risk: "low".to_string(),
-            classification: "safe_to_delete".to_string(),
+            classification: "delete_all".to_string(),
             source: "model".to_string(),
         };
         upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");
@@ -445,7 +447,7 @@ mod tests {
             purpose: String::new(),
             reason: "safe".to_string(),
             risk: "low".to_string(),
-            classification: "safe_to_delete".to_string(),
+            classification: "delete_all".to_string(),
             source: "model".to_string(),
         };
         upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");

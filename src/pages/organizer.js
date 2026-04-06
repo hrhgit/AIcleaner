@@ -11,6 +11,7 @@
   startOrganize,
   stopOrganize,
 } from '../utils/api.js';
+import { getErrorMessage } from '../utils/errors.js';
 import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
 import {
@@ -228,22 +229,6 @@ function invalidateOrganizerRuntimeCacheIfNeeded() {
     removePersisted(key);
   }
   setPersisted(PERSIST_KEYS.runtimeCacheVersion, ORGANIZER_RUNTIME_CACHE_VERSION);
-}
-
-function getErrorMessage(err) {
-  if (typeof err === 'string' && err.trim()) {
-    return err.trim();
-  }
-  if (err && typeof err === 'object') {
-    if (typeof err.message === 'string' && err.message.trim()) {
-      return err.message.trim();
-    }
-    if (typeof err.error === 'string' && err.error.trim()) {
-      return err.error.trim();
-    }
-  }
-  const text = String(err ?? '').trim();
-  return text && text !== '[object Object]' ? text : 'unknown error';
 }
 
 function getMoveResultText(key) {

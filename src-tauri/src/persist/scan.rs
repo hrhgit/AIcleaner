@@ -401,9 +401,10 @@ fn save_scan_snapshot_in_storage(
                 token_total = ?18,
                 permission_denied_count = ?19,
                 permission_denied_paths = ?20,
-                error_message = ?21,
-                updated_at = ?22,
-                finished_at = ?23
+                last_error_json = ?21,
+                error_message = ?22,
+                updated_at = ?23,
+                finished_at = ?24
              WHERE task_id = ?1",
             storage.tasks_table()
         ),
@@ -428,6 +429,12 @@ fn save_scan_snapshot_in_storage(
             snapshot.token_usage.total as i64,
             snapshot.permission_denied_count as i64,
             serde_json::to_string(&snapshot.permission_denied_paths).map_err(|e| e.to_string())?,
+            snapshot
+                .last_error
+                .as_ref()
+                .map(|value| serde_json::to_string(value))
+                .transpose()
+                .map_err(|e| e.to_string())?,
             if snapshot.error_message.is_empty() {
                 None::<String>
             } else {
@@ -521,7 +528,7 @@ fn refresh_scan_stats_in_storage(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(size), 0)
                  FROM {}
-                 WHERE task_id = ?1 AND classification = 'safe_to_delete'",
+                 WHERE task_id = ?1 AND classification = 'delete_all'",
                 storage.findings_table()
             ),
             params![task_id],
@@ -553,7 +560,7 @@ fn load_scan_findings_in_storage(
         .prepare(&format!(
             "SELECT name, path, size, type, purpose, reason, risk, classification, source
              FROM {}
-             WHERE task_id = ?1 AND classification = 'safe_to_delete'
+             WHERE task_id = ?1 AND classification = 'delete_all'
              ORDER BY size DESC, path ASC",
             storage.findings_table()
         ))
@@ -684,7 +691,7 @@ fn load_scan_snapshot_from_conn(
                         auto_analyze, max_depth, current_path, current_depth, scanned_count,
                         total_entries, processed_entries, deletable_count, total_cleanable, target_size,
                         token_prompt, token_completion, token_total, permission_denied_count,
-                        permission_denied_paths, error_message
+                        permission_denied_paths, last_error_json, error_message
                  FROM {} WHERE task_id = ?1",
                 storage.tasks_table()
             ),
@@ -713,6 +720,7 @@ fn load_scan_snapshot_from_conn(
                     row.get::<_, i64>(19)?,
                     row.get::<_, String>(20)?,
                     row.get::<_, Option<String>>(21)?,
+                    row.get::<_, Option<String>>(22)?,
                 ))
             },
         )
@@ -765,7 +773,8 @@ fn load_scan_snapshot_from_conn(
         deletable: findings,
         permission_denied_count: row.19 as u64,
         permission_denied_paths: parse_json_or_default(Some(row.20)),
-        error_message: row.21.unwrap_or_default(),
+        last_error: parse_json_or_default(row.21),
+        error_message: row.22.unwrap_or_default(),
     }))
 }
 
@@ -1792,7 +1801,7 @@ pub fn list_boundary_scan_nodes(
              WHERE n.task_id = ?1
                AND n.type = 'directory'
                AND n.depth = ?2
-               AND COALESCE(f.classification, '') <> 'safe_to_delete'
+               AND COALESCE(f.classification, '') <> 'delete_all'
                AND COALESCE(f.should_expand, 1) <> 0
              ORDER BY n.total_size DESC, n.path COLLATE NOCASE ASC",
         )

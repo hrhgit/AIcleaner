@@ -31,6 +31,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             token_total INTEGER NOT NULL DEFAULT 0,
             permission_denied_count INTEGER NOT NULL DEFAULT 0,
             permission_denied_paths TEXT NOT NULL DEFAULT '[]',
+            last_error_json TEXT,
             error_message TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -101,6 +102,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
             token_total INTEGER NOT NULL DEFAULT 0,
             permission_denied_count INTEGER NOT NULL DEFAULT 0,
             permission_denied_paths TEXT NOT NULL DEFAULT '[]',
+            last_error_json TEXT,
             error_message TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -192,6 +194,27 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
     if !scan_task_columns.iter().any(|col| col == "visible_latest") {
         conn.execute(
             "ALTER TABLE scan_tasks ADD COLUMN visible_latest INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !scan_task_columns.iter().any(|col| col == "last_error_json") {
+        conn.execute(
+            "ALTER TABLE scan_tasks ADD COLUMN last_error_json TEXT",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let scan_draft_columns = conn
+        .prepare("PRAGMA table_info(scan_drafts)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .map_err(|e| e.to_string())?;
+    if !scan_draft_columns.iter().any(|col| col == "last_error_json") {
+        conn.execute(
+            "ALTER TABLE scan_drafts ADD COLUMN last_error_json TEXT",
             [],
         )
         .map_err(|e| e.to_string())?;

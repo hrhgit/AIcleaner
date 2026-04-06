@@ -1,6 +1,6 @@
 use crate::backend::{
-    self, AppState, ScanPersistentRuleRecord, ScanPersistentRules, ScanResultItem,
-    ScanRuleTopChild, ScanSnapshot, ScanStartInput, TokenUsage,
+    self, AppError, AppResult, AppState, ScanPersistentRuleRecord, ScanPersistentRules,
+    ScanResultItem, ScanRuleTopChild, ScanSnapshot, ScanStartInput, TokenUsage,
 };
 use crate::persist;
 use crate::web_search::{
@@ -30,6 +30,9 @@ const SOURCE_LOCAL_RULE: &str = "local_rule";
 const SOURCE_PERSISTENT_RULE: &str = "persistent_rule";
 const SOURCE_BASELINE_REUSE: &str = "baseline_reuse";
 const SOURCE_AI: &str = "ai";
+const CLASS_DELETE_ALL: &str = "delete_all";
+const CLASS_KEEP_ALL: &str = "keep_all";
+const CLASS_EXPAND_ANALYSIS: &str = "expand_analysis";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanMode {
@@ -324,6 +327,73 @@ struct ChatCompletionError {
     raw_body: String,
 }
 
+impl ChatCompletionError {
+    fn into_app_error(self, ai: &ScanAiConfig, stage: &str) -> AppError {
+        let code = if self.raw_body.is_empty() {
+            "HTTP_REQUEST_FAILED"
+        } else if self.message.contains("HTTP ") {
+            "HTTP_BAD_STATUS"
+        } else {
+            "MODEL_RESPONSE_INVALID"
+        };
+        AppError::new(code, self.message.clone(), "扫描分析服务调用失败")
+            .with_operation("scan_task")
+            .with_endpoint(ai.endpoint.clone())
+            .with_model(ai.model.clone())
+            .with_stage(stage)
+            .retryable(code == "HTTP_REQUEST_FAILED")
+    }
+}
+
+fn build_scan_task_error(task: &ScanTaskRuntime, task_id: &str, root_path: &str, err: String) -> AppError {
+    let trimmed = err.trim();
+    let stage = if trimmed.is_empty() {
+        "scan_task"
+    } else if trimmed.contains("chat completion")
+        || trimmed.contains("response body")
+        || trimmed.contains("HTTP ")
+        || trimmed.contains("web search")
+    {
+        "analysis"
+    } else if trimmed.contains("scanner.exe")
+        || trimmed.contains("scan_data")
+        || trimmed.contains("scan stream")
+    {
+        "scan"
+    } else if trimmed.contains("prepare_incremental") || trimmed.contains("baseline") {
+        "prepare"
+    } else {
+        "scan_task"
+    };
+
+    AppError::internal(err)
+        .with_operation("scan_task")
+        .with_task_id(task_id.to_string())
+        .with_path(root_path.to_string())
+        .with_endpoint(task.ai.endpoint.clone())
+        .with_model(task.ai.model.clone())
+        .with_stage(stage)
+}
+
+fn log_scan_task_error(error: &AppError) {
+    log::error!(
+        "scan task failed: task_id={}, operation={}, root_path={}, stage={}, error_code={}, error_message={}, endpoint={}, model={}, http_status={}",
+        error.context.task_id.as_deref().unwrap_or(""),
+        error.context.operation,
+        error.context.path.as_deref().unwrap_or(""),
+        error.context.stage.as_deref().unwrap_or(""),
+        error.code,
+        error.message,
+        error.context.endpoint.as_deref().unwrap_or(""),
+        error.context.model.as_deref().unwrap_or(""),
+        error
+            .context
+            .http_status
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
+}
+
 fn format_size(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -529,6 +599,28 @@ fn is_known_browser_cache_path(path: &str) -> bool {
     };
     matches_browser_cache_suffix(&suffix, &["google", "chrome", "user data"])
         || matches_browser_cache_suffix(&suffix, &["microsoft", "edge", "user data"])
+}
+
+fn is_local_appdata_expand_root(path: &str) -> bool {
+    let segments = split_normalized_path(path);
+    if segments.len() < 5
+        || !segments[0].ends_with(':')
+        || segments[1] != "users"
+        || segments[3] != "appdata"
+        || segments[4] != "local"
+    {
+        return false;
+    }
+    if segments.len() == 5 {
+        return true;
+    }
+    if segments.len() != 6 {
+        return false;
+    }
+    matches!(
+        segments[5],
+        "packages" | "microsoft" | "google" | "adobe" | "jetbrains" | "nvidia" | "crashdumps"
+    )
 }
 
 fn extract_file_extension(name: &str) -> Option<String> {
@@ -803,7 +895,7 @@ fn matches_keep_directory_similarity(
         && top_child_overlap(&current.top_children, &baseline.top_children, 3) >= 2
 }
 
-fn matches_suspicious_directory_similarity(
+fn matches_expand_analysis_directory_similarity(
     current: &NodeFingerprint,
     baseline: &NodeFingerprint,
     current_child_count: u64,
@@ -879,7 +971,7 @@ fn maybe_local_rule_decision(
             });
     if is_keep {
         return Some(LocalRuleDecision {
-            classification: "keep".to_string(),
+            classification: CLASS_KEEP_ALL.to_string(),
             reason: localized_local_rule_reason(
                 language,
                 "Protected system or user-content root; keep it.",
@@ -887,6 +979,21 @@ fn maybe_local_rule_decision(
             ),
             risk: "high".to_string(),
             should_expand: false,
+            source: SOURCE_LOCAL_RULE,
+        });
+    }
+
+    let is_expand_dir = node.node_type == "directory" && is_local_appdata_expand_root(&normalized);
+    if is_expand_dir {
+        return Some(LocalRuleDecision {
+            classification: CLASS_EXPAND_ANALYSIS.to_string(),
+            reason: localized_local_rule_reason(
+                language,
+                "Matched a Local AppData container path; inspect direct child folders before deciding.",
+                "命中 Local AppData 容器目录，先展开直接子文件夹再判断。",
+            ),
+            risk: "medium".to_string(),
+            should_expand: true,
             source: SOURCE_LOCAL_RULE,
         });
     }
@@ -912,7 +1019,7 @@ fn maybe_local_rule_decision(
                     || normalized.contains("\\appdata\\local\\pip\\cache")));
     if is_safe_dir {
         return Some(LocalRuleDecision {
-            classification: "safe_to_delete".to_string(),
+            classification: CLASS_DELETE_ALL.to_string(),
             reason: localized_local_rule_reason(
                 language,
                 "Matched a known temporary or package-cache path; safe to delete.",
@@ -935,7 +1042,7 @@ fn maybe_local_rule_decision(
             .unwrap_or(false);
     if is_safe_file {
         return Some(LocalRuleDecision {
-            classification: "safe_to_delete".to_string(),
+            classification: CLASS_DELETE_ALL.to_string(),
             reason: localized_local_rule_reason(
                 language,
                 "Matched a known temporary or partial-download file type; safe to delete.",
@@ -962,14 +1069,14 @@ fn persistent_rule_record_matches(
         return false;
     }
     match rule.classification.as_str() {
-        "safe_to_delete" => {
+        CLASS_DELETE_ALL => {
             rule.size == node.size
                 && rule.self_size == node.self_size
                 && rule.child_count == node.child_count
                 && rule.name_tags == fingerprint.name_tags
                 && is_exact_top_children_match(&rule.top_children, &fingerprint.top_children)
         }
-        "keep" => {
+        CLASS_KEEP_ALL => {
             if node.node_type == "file" {
                 rule.size == node.size && rule.self_size == node.self_size
             } else {
@@ -991,12 +1098,12 @@ fn resolve_persistent_rule(
 ) -> Option<(ScanResultItem, bool)> {
     let fingerprint = build_node_fingerprint(node, portrait);
     let candidate = rules
-        .keep_exact
+        .keep_all_exact
         .iter()
         .find(|rule| persistent_rule_record_matches(rule, node, &fingerprint))
         .or_else(|| {
             rules
-                .safe_delete_exact
+                .delete_all_exact
                 .iter()
                 .find(|rule| persistent_rule_record_matches(rule, node, &fingerprint))
         })?;
@@ -1012,7 +1119,8 @@ fn resolve_persistent_rule(
         &candidate.risk,
         SOURCE_PERSISTENT_RULE,
     );
-    let should_expand = node.node_type == "directory" && item.classification == "suspicious";
+    let should_expand =
+        node.node_type == "directory" && item.classification == CLASS_EXPAND_ANALYSIS;
     Some((item, should_expand))
 }
 
@@ -1041,8 +1149,8 @@ fn make_persistent_rule_record(
 }
 
 fn should_promote_ai_rule(review: &ScanReview) -> bool {
-    matches!(review.classification.as_str(), "keep")
-        || (review.classification == "safe_to_delete" && review.risk == "low")
+    matches!(review.classification.as_str(), CLASS_KEEP_ALL)
+        || (review.classification == CLASS_DELETE_ALL && review.risk == "low")
 }
 
 fn insert_persistent_rule(
@@ -1051,15 +1159,15 @@ fn insert_persistent_rule(
 ) -> bool {
     let path_key = normalize_scan_path_key(&record.path);
     rules
-        .keep_exact
+        .keep_all_exact
         .retain(|existing| normalize_scan_path_key(&existing.path) != path_key);
     rules
-        .safe_delete_exact
+        .delete_all_exact
         .retain(|existing| normalize_scan_path_key(&existing.path) != path_key);
-    let target = if record.classification == "keep" {
-        &mut rules.keep_exact
-    } else if record.classification == "safe_to_delete" {
-        &mut rules.safe_delete_exact
+    let target = if record.classification == CLASS_KEEP_ALL {
+        &mut rules.keep_all_exact
+    } else if record.classification == CLASS_DELETE_ALL {
+        &mut rules.delete_all_exact
     } else {
         return false;
     };
@@ -1113,7 +1221,7 @@ fn resolve_reusable_finding(
     let baseline_fp = build_node_fingerprint(baseline_node, baseline_portrait.as_ref());
 
     let reusable = match baseline_finding.item.classification.as_str() {
-        "safe_to_delete" => {
+        CLASS_DELETE_ALL => {
             if node.node_type == "directory" {
                 nodes_match(node, baseline_node)
                     && current_fp.name_tags == baseline_fp.name_tags
@@ -1125,7 +1233,7 @@ fn resolve_reusable_finding(
                 nodes_match(node, baseline_node)
             }
         }
-        "keep" => {
+        CLASS_KEEP_ALL => {
             if node.node_type == "directory" {
                 matches_keep_directory_similarity(
                     &current_fp,
@@ -1137,9 +1245,9 @@ fn resolve_reusable_finding(
                 nodes_match(node, baseline_node)
             }
         }
-        "suspicious" => {
+        CLASS_EXPAND_ANALYSIS => {
             if node.node_type == "directory" {
-                matches_suspicious_directory_similarity(
+                matches_expand_analysis_directory_similarity(
                     &current_fp,
                     &baseline_fp,
                     node.child_count,
@@ -1162,7 +1270,7 @@ fn resolve_reusable_finding(
     };
     let should_expand = if node.node_type != "directory" {
         false
-    } else if item.classification == "suspicious" {
+    } else if item.classification == CLASS_EXPAND_ANALYSIS {
         true
     } else {
         baseline_finding.should_expand
@@ -1330,14 +1438,16 @@ fn normalize_scan_ai_classification(raw: Option<&str>) -> String {
     let normalized = raw.unwrap_or("").trim();
     let lowered = normalized.to_ascii_lowercase();
     match normalized {
-        "全部删除" => "safe_to_delete",
-        "全部保留" => "keep",
-        "展开分析" => "suspicious",
+        "全部删除" => CLASS_DELETE_ALL,
+        "全部保留" => CLASS_KEEP_ALL,
+        "展开分析" => CLASS_EXPAND_ANALYSIS,
         _ => match lowered.as_str() {
-            "safe_to_delete" | "delete_all" | "all_delete" => "safe_to_delete",
-            "keep" | "keep_all" | "all_keep" => "keep",
-            "suspicious" | "expand_analysis" | "analyze_further" | "manual_review" => "suspicious",
-            _ => "suspicious",
+            "safe_to_delete" | "delete_all" | "all_delete" => CLASS_DELETE_ALL,
+            "keep" | "keep_all" | "all_keep" => CLASS_KEEP_ALL,
+            "suspicious" | "expand_analysis" | "analyze_further" | "manual_review" => {
+                CLASS_EXPAND_ANALYSIS
+            }
+            _ => CLASS_EXPAND_ANALYSIS,
         },
     }
     .to_string()
@@ -1496,7 +1606,7 @@ async fn analyze_scan_node(
                             }
                             Err(err) => {
                                 return ScanReview {
-                                    classification: "suspicious".to_string(),
+                                    classification: CLASS_EXPAND_ANALYSIS.to_string(),
                                     reason: default_analysis_failed_reason(
                                         &ai.response_language,
                                         &format!("web search failed: {err}"),
@@ -1553,7 +1663,7 @@ async fn analyze_scan_node(
             }
             Err(err) => {
                 return ScanReview {
-                    classification: "suspicious".to_string(),
+                    classification: CLASS_EXPAND_ANALYSIS.to_string(),
                     reason: default_analysis_failed_reason(&ai.response_language, &err.message),
                     risk: "high".to_string(),
                     token_usage: total_usage,
@@ -1572,7 +1682,7 @@ async fn analyze_scan_node(
     }
 
     ScanReview {
-        classification: "suspicious".to_string(),
+        classification: CLASS_EXPAND_ANALYSIS.to_string(),
         reason: default_analysis_failed_reason(
             &ai.response_language,
             "model requested web search but did not return a final classification",
@@ -1617,8 +1727,8 @@ fn build_finding_item(node: &persist::ScanNode, review: &ScanReview) -> ScanResu
 
 fn should_expand_node(node: &persist::ScanNode, review: &ScanReview) -> bool {
     node.node_type == "directory"
-        && review.classification != "safe_to_delete"
-        && review.classification != "keep"
+        && review.classification != CLASS_DELETE_ALL
+        && review.classification != CLASS_KEEP_ALL
 }
 
 fn apply_finding_to_snapshot<R: Runtime>(
@@ -1627,7 +1737,7 @@ fn apply_finding_to_snapshot<R: Runtime>(
     snap: &mut ScanSnapshot,
     item: &ScanResultItem,
 ) -> Result<(), String> {
-    if item.classification == "safe_to_delete"
+    if item.classification == CLASS_DELETE_ALL
         && !snap
             .deletable
             .iter()
@@ -1989,6 +2099,8 @@ async fn run_auto_analyze<R: Runtime>(
                 "risk": review.risk,
                 "shouldExpand": should_expand,
                 "tokenUsage": review.token_usage,
+                "elapsed": review.trace.get("elapsed").cloned().unwrap_or(Value::Null),
+                "reasoning": review.trace.get("reasoning").cloned().unwrap_or(Value::Null),
                 "rawContent": review.trace.get("rawContent").cloned().unwrap_or(Value::Null),
                 "userPrompt": review.trace.get("userPrompt").cloned().unwrap_or(Value::Null),
                 "search": review.trace.get("search").cloned().unwrap_or(Value::Null),
@@ -2350,6 +2462,7 @@ async fn prepare_runtime_scan_data<R: Runtime>(
         snap.token_usage = prepared_snapshot.token_usage;
         snap.permission_denied_count = prepared_snapshot.permission_denied_count;
         snap.permission_denied_paths = prepared_snapshot.permission_denied_paths;
+        snap.last_error = prepared_snapshot.last_error;
         snap.error_message = prepared_snapshot.error_message;
     }
 
@@ -2479,6 +2592,7 @@ pub async fn scan_start<R: Runtime>(
         existing.total_entries = 0;
         existing.processed_entries = 0;
         existing.target_size = (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        existing.last_error = None;
         existing.error_message.clear();
         existing.id = task_id.clone();
         existing
@@ -2519,6 +2633,7 @@ pub async fn scan_start<R: Runtime>(
             deletable: Vec::new(),
             permission_denied_count: 0,
             permission_denied_paths: Vec::new(),
+            last_error: None,
             error_message: String::new(),
         }
     };
@@ -2591,10 +2706,16 @@ pub async fn scan_start<R: Runtime>(
             let result = run_scan_task(&app_clone, &state_clone, &runtime).await;
             if let Err(err) = result {
                 let mut snap = runtime.snapshot.lock();
+                let app_error = build_scan_task_error(&runtime, &task_id_clone, &snap.target_path, err);
+                log_scan_task_error(&app_error);
                 snap.status = "error".to_string();
-                snap.error_message = err.clone();
-                let payload =
-                    json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
+                snap.last_error = Some(app_error.clone());
+                snap.error_message = app_error.user_message.clone();
+                let payload = json!({
+                    "taskId": task_id_clone,
+                    "error": app_error,
+                    "snapshot": &*snap
+                });
                 if runtime.scan_mode == ScanMode::FullRescanIncremental {
                     let _ =
                         persist::discard_full_scan_draft(&state_clone.db_path(), &task_id_clone);
@@ -2602,7 +2723,13 @@ pub async fn scan_start<R: Runtime>(
                     let _ = persist::save_scan_snapshot(&state_clone.db_path(), &snap);
                 }
                 drop(snap);
-                let _ = app_clone.emit("scan_error", payload);
+                if let Err(emit_err) = app_clone.emit("scan_error", payload) {
+                    log::error!(
+                        "scan task error event emit failed: task_id={}, event=scan_error, error={}",
+                        task_id_clone,
+                        emit_err
+                    );
+                }
             } else if runtime.stop.load(Ordering::Relaxed) {
                 let mut snap = runtime.snapshot.lock();
                 snap.status = "stopped".to_string();
@@ -2623,13 +2750,13 @@ pub async fn scan_start<R: Runtime>(
     Ok(json!({ "taskId": task_id, "status": "started" }))
 }
 
-pub async fn scan_stop(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
+pub async fn scan_stop(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
     let task = state
         .scan_tasks
         .lock()
         .get(&task_id)
         .cloned()
-        .ok_or_else(|| "Task not found".to_string())?;
+        .ok_or_else(|| AppError::task_not_found("Task not found"))?;
     task.stop.store(true, Ordering::Relaxed);
     if let Some(pid) = *task.child_pid.lock() {
         let _ = kill_pid(pid);
@@ -2669,6 +2796,7 @@ pub async fn scan_get_active(state: State<'_, AppState>) -> Result<Vec<Value>, S
                 "deletable": snap.deletable,
                 "permissionDeniedCount": snap.permission_denied_count,
                 "permissionDeniedPaths": snap.permission_denied_paths,
+                "lastError": snap.last_error,
                 "errorMessage": snap.error_message
             })
         })
@@ -2699,27 +2827,27 @@ pub async fn scan_find_latest_for_path(
 pub async fn scan_delete_history(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Value, String> {
+) -> AppResult<Value> {
     if let Some(task) = state.scan_tasks.lock().get(&task_id).cloned() {
         let status = task.snapshot.lock().status.clone();
         if matches!(status.as_str(), "idle" | "scanning" | "analyzing") {
-            return Err("Task is still running".to_string());
+            return Err(AppError::task_running("Task is still running"));
         }
     }
     if !persist::delete_committed_scan_task(&state.db_path(), &task_id)? {
-        return Err("Task not found".to_string());
+        return Err(AppError::task_not_found("Task not found"));
     }
     Ok(json!({ "success": true }))
 }
 
-pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
+pub async fn scan_get_result(state: State<'_, AppState>, task_id: String) -> AppResult<Value> {
     if let Some(task) = state.scan_tasks.lock().get(&task_id).cloned() {
         let snap = task.snapshot.lock().clone();
-        return serde_json::to_value(snap).map_err(|e| e.to_string());
+        return serde_json::to_value(snap).map_err(|e| AppError::internal(e.to_string()));
     }
     let snapshot = persist::load_scan_snapshot(&state.db_path(), &task_id)?
-        .ok_or_else(|| "Task not found".to_string())?;
-    serde_json::to_value(snapshot).map_err(|e| e.to_string())
+        .ok_or_else(|| AppError::task_not_found("Task not found"))?;
+    serde_json::to_value(snapshot).map_err(|e| AppError::internal(e.to_string()))
 }
 
 #[cfg(test)]
@@ -2787,6 +2915,7 @@ mod tests {
             deletable: Vec::new(),
             permission_denied_count: 0,
             permission_denied_paths: Vec::new(),
+            last_error: None,
             error_message: String::new(),
         }
     }
@@ -3489,11 +3618,11 @@ mod tests {
         let file_rule =
             maybe_local_rule_decision("zh", &temp_file, None).expect("tmp file rule should match");
 
-        assert_eq!(keep_rule.classification, "keep");
+        assert_eq!(keep_rule.classification, CLASS_KEEP_ALL);
         assert!(!keep_rule.should_expand);
-        assert_eq!(delete_rule.classification, "safe_to_delete");
+        assert_eq!(delete_rule.classification, CLASS_DELETE_ALL);
         assert!(!delete_rule.should_expand);
-        assert_eq!(file_rule.classification, "safe_to_delete");
+        assert_eq!(file_rule.classification, CLASS_DELETE_ALL);
     }
 
     #[test]
@@ -3535,7 +3664,7 @@ mod tests {
         ] {
             let rule = maybe_local_rule_decision("zh", node, None)
                 .expect("expected known build or browser cache path to match");
-            assert_eq!(rule.classification, "safe_to_delete");
+            assert_eq!(rule.classification, CLASS_DELETE_ALL);
             assert!(!rule.should_expand);
         }
     }
@@ -3603,29 +3732,29 @@ mod tests {
     fn normalize_scan_ai_classification_accepts_localized_values() {
         assert_eq!(
             normalize_scan_ai_classification(Some("全部删除")),
-            "safe_to_delete"
+            CLASS_DELETE_ALL
         );
-        assert_eq!(normalize_scan_ai_classification(Some("全部保留")), "keep");
+        assert_eq!(normalize_scan_ai_classification(Some("全部保留")), CLASS_KEEP_ALL);
         assert_eq!(
             normalize_scan_ai_classification(Some("展开分析")),
-            "suspicious"
+            CLASS_EXPAND_ANALYSIS
         );
         assert_eq!(
             normalize_scan_ai_classification(Some("delete_all")),
-            "safe_to_delete"
+            CLASS_DELETE_ALL
         );
-        assert_eq!(normalize_scan_ai_classification(Some("keep_all")), "keep");
+        assert_eq!(normalize_scan_ai_classification(Some("keep_all")), CLASS_KEEP_ALL);
         assert_eq!(
             normalize_scan_ai_classification(Some("expand_analysis")),
-            "suspicious"
+            CLASS_EXPAND_ANALYSIS
         );
     }
 
     #[test]
-    fn suspicious_directories_always_expand() {
+    fn expand_analysis_directories_always_expand() {
         let dir = make_scan_node(r"C:\Users\tester\Misc", "directory", 1024, 2);
         let review = ScanReview {
-            classification: "suspicious".to_string(),
+            classification: CLASS_EXPAND_ANALYSIS.to_string(),
             reason: "manual review".to_string(),
             risk: "medium".to_string(),
             token_usage: TokenUsage::default(),
@@ -3637,29 +3766,29 @@ mod tests {
     #[test]
     fn ai_rule_promotion_only_allows_keep_and_low_risk_safe_delete() {
         let keep = ScanReview {
-            classification: "keep".to_string(),
+            classification: CLASS_KEEP_ALL.to_string(),
             reason: "keep".to_string(),
             risk: "high".to_string(),
             token_usage: TokenUsage::default(),
             trace: Value::Null,
         };
         let safe_low = ScanReview {
-            classification: "safe_to_delete".to_string(),
+            classification: CLASS_DELETE_ALL.to_string(),
             reason: "safe".to_string(),
             risk: "low".to_string(),
             token_usage: TokenUsage::default(),
             trace: Value::Null,
         };
         let safe_medium = ScanReview {
-            classification: "safe_to_delete".to_string(),
+            classification: CLASS_DELETE_ALL.to_string(),
             reason: "review".to_string(),
             risk: "medium".to_string(),
             token_usage: TokenUsage::default(),
             trace: Value::Null,
         };
-        let suspicious = ScanReview {
-            classification: "suspicious".to_string(),
-            reason: "suspicious".to_string(),
+        let expand_analysis = ScanReview {
+            classification: CLASS_EXPAND_ANALYSIS.to_string(),
+            reason: "expand_analysis".to_string(),
             risk: "medium".to_string(),
             token_usage: TokenUsage::default(),
             trace: Value::Null,
@@ -3668,11 +3797,11 @@ mod tests {
         assert!(should_promote_ai_rule(&keep));
         assert!(should_promote_ai_rule(&safe_low));
         assert!(!should_promote_ai_rule(&safe_medium));
-        assert!(!should_promote_ai_rule(&suspicious));
+        assert!(!should_promote_ai_rule(&expand_analysis));
     }
 
     #[test]
-    fn suspicious_directory_reuse_forces_expand() {
+    fn expand_analysis_directory_reuse_forces_expand() {
         let current = make_scan_node(r"C:\Users\tester\Misc", "directory", 1024, 2);
         let baseline = current.clone();
         let child = make_scan_node(r"C:\Users\tester\Misc\cache", "directory", 512, 0);
@@ -3690,9 +3819,9 @@ mod tests {
                     size: current.size,
                     item_type: "directory".to_string(),
                     purpose: String::new(),
-                    reason: "old suspicious".to_string(),
+                    reason: "old expand_analysis".to_string(),
                     risk: "medium".to_string(),
-                    classification: "suspicious".to_string(),
+                    classification: CLASS_EXPAND_ANALYSIS.to_string(),
                     source: SOURCE_AI.to_string(),
                 },
                 should_expand: false,

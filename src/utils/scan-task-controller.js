@@ -29,6 +29,7 @@ function normalizePersistedLogEntries(raw) {
       summary: String(entry.summary || ''),
       detailHtml: String(entry.detailHtml || ''),
       time: String(entry.time || ''),
+      expandByDefault: !!entry.expandByDefault,
     }))
     .slice(-200);
 }
@@ -132,8 +133,15 @@ class ScanTaskController {
     this.notifyState();
   }
 
-  addDetailLog(type, summary, detailHtml, { persist = false } = {}) {
+  addDetailLog(type, summary, detailHtml, { persist = false, expandByDefault = false } = {}) {
     const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    if (expandByDefault) {
+      for (const entry of this.state.logEntries) {
+        if (entry?.kind === 'detail') {
+          entry.expandByDefault = false;
+        }
+      }
+    }
     this.state.logEntries.push({
       id: this.state.nextLogEntryId++,
       kind: 'detail',
@@ -141,6 +149,7 @@ class ScanTaskController {
       summary,
       detailHtml,
       time,
+      expandByDefault,
     });
     this.trimLogEntries();
     this.maybePersistScanLog(persist);
@@ -313,14 +322,18 @@ class ScanTaskController {
     }
 
     if (data?.status === 'analyzing') {
-      this.addLog('analyzing', `${t('scanner.analyzing')}: ${data.currentPath}`);
+      this.addLog('analyzing', t('scanner.log_ai_analyzing', { path: data.currentPath || '-' }));
     } else if (data?.status === 'scanning') {
-      this.addLog('scanning', `${t('scanner.scanning')}: ${data.currentPath}`);
+      this.addLog('scanning', t('scanner.log_scanning_path', { path: data.currentPath || '-' }));
     }
   }
 
   handleFound(item) {
-    this.addLog('found', `${t('results.safe_to_clean')}: ${item.name} (${formatSize(item.size)}) - ${item.reason}`);
+    this.addLog('found', t('scanner.log_found_item', {
+      name: item?.name || '-',
+      size: formatSize(item?.size || 0),
+      reason: item?.reason || '-',
+    }));
   }
 
   handleWarning(info) {
@@ -420,7 +433,7 @@ class ScanTaskController {
 
   handleAgentResponse(data) {
     const elapsed = Number(data.elapsed || 0) / 1000;
-    const classStr = String(data.classification || 'suspicious');
+    const classStr = String(data.classification || 'expand_analysis');
     const riskStr = String(data.risk || 'medium');
     const shouldExpand = data.nodeType === 'directory'
       ? (data.shouldExpand ? 'true' : 'false')
@@ -488,6 +501,213 @@ class ScanTaskController {
       'agent_response',
       `${statusIcon} LLM response - ${data.nodeType}: ${data.nodeName} (${classStr})`,
       detailSections
+    );
+  }
+
+  getNodeTypeLabel(nodeType) {
+    return nodeType === 'directory'
+      ? t('scanner.log_type_directory')
+      : t('scanner.log_type_file');
+  }
+
+  getClassificationLabel(classification) {
+    const key = `scanner.classification_${String(classification || 'expand_analysis')}`;
+    const translated = t(key);
+    return translated === key ? String(classification || 'expand_analysis') : translated;
+  }
+
+  getRiskLabel(risk) {
+    const key = `scanner.risk_${String(risk || 'medium')}`;
+    const translated = t(key);
+    return translated === key ? String(risk || 'medium') : translated;
+  }
+
+  formatSearchContext(search) {
+    const request = search && typeof search === 'object' ? search.request : null;
+    const query = String(request?.query || '').trim();
+    if (!query) return '';
+
+    const reason = String(request?.reason || '').trim();
+    const results = Array.isArray(search?.results) ? search.results : [];
+    const formattedResults = results
+      .slice(0, 5)
+      .map((item, index) => {
+        const title = String(item?.title || '').trim() || `Result ${index + 1}`;
+        const url = String(item?.url || '').trim();
+        const content = String(item?.content || '').trim();
+        return [title, url, content].filter(Boolean).join('\n');
+      })
+      .filter(Boolean)
+      .join('\n\n');
+
+    return [
+      `${t('scanner.log_search_query')}: ${query}`,
+      reason ? `${t('scanner.log_search_reason')}: ${reason}` : '',
+      formattedResults,
+    ].filter(Boolean).join('\n\n');
+  }
+
+  handleProgress(data) {
+    if (data?.id) {
+      this.updateTaskIds(data.id);
+    }
+    this.updateSnapshot(data, { persist: true });
+
+    if (!this.shouldLogProgress(data?.status)) {
+      return;
+    }
+
+    if (data?.status === 'analyzing') {
+      this.addLog('analyzing', t('scanner.log_ai_analyzing', { path: data.currentPath || '-' }));
+    } else if (data?.status === 'scanning') {
+      this.addLog('scanning', t('scanner.log_scanning_path', { path: data.currentPath || '-' }));
+    }
+  }
+
+  handleFound(item) {
+    this.addLog('found', t('scanner.log_found_item', {
+      name: item?.name || '-',
+      size: formatSize(item?.size || 0),
+      reason: item?.reason || '-',
+    }));
+  }
+
+  handleCache(info) {
+    if (!info || typeof info !== 'object') return;
+    const action = String(info.action || '').trim();
+    if (action === 'prepare_incremental_reuse_tree') {
+      this.addLog('analyzing', t('scanner.cache_prepare_reuse_tree', { count: info.count || 0 }));
+      return;
+    }
+    if (action === 'prepare_incremental_prune') {
+      this.addLog('analyzing', t('scanner.cache_prepare_prune', { count: info.count || 0 }));
+      return;
+    }
+    if (action === 'prepare_incremental_ready') {
+      this.addLog('analyzing', t('scanner.cache_prepare_ready'));
+      return;
+    }
+    if (action === 'reuse') {
+      this.addLog('analyzing', t('scanner.cache_reuse_detail', { path: info.path || info.name || '-' }));
+      return;
+    }
+    if (action === 'rescan_changed') {
+      this.addLog('analyzing', t('scanner.cache_rescan_detail', { path: info.path || info.name || '-' }));
+      return;
+    }
+    if (action === 'skip_deleted') {
+      this.addLog('analyzing', t('scanner.cache_deleted', { count: info.count || 0 }));
+    }
+  }
+
+  handleAgentCall(data) {
+    const nodeTypeLabel = this.getNodeTypeLabel(data?.nodeType);
+    const childDirList = (data?.childDirectories || [])
+      .map((entry) => `- ${entry.name} (${formatSize(entry.size)})`)
+      .join('\n');
+
+    let detailHtml = `
+      <div style="margin-bottom: 8px;"><strong>${this.escHtml(t('scanner.log_detail_type'))}:</strong> ${this.escHtml(nodeTypeLabel)}</div>
+      <div style="margin-bottom: 8px;"><strong>${this.escHtml(t('scanner.log_detail_path'))}:</strong> ${this.escHtml(data?.nodePath)}</div>
+      <div style="margin-bottom: 8px;"><strong>${this.escHtml(t('scanner.log_detail_name'))}:</strong> ${this.escHtml(data?.nodeName)}</div>
+      <div style="margin-bottom: 8px;"><strong>${this.escHtml(t('scanner.log_detail_size'))}:</strong> ${this.escHtml(formatSize(data?.nodeSize || 0))}</div>
+    `;
+
+    if (data?.nodeType === 'directory') {
+      detailHtml += `
+        <div style="margin-bottom: 4px;"><strong>${this.escHtml(t('scanner.log_detail_children'))}</strong></div>
+        <div style="padding-left: 8px; border-left: 2px solid rgba(6, 182, 212, 0.3);">${this.escHtml(childDirList || '(none)')}</div>
+      `;
+    }
+
+    this.addDetailLog(
+      'agent_call',
+      t('scanner.log_llm_call_summary', {
+        type: nodeTypeLabel,
+        name: data?.nodeName || '-',
+      }),
+      detailHtml,
+    );
+  }
+
+  handleAgentResponse(data) {
+    const nodeTypeLabel = this.getNodeTypeLabel(data?.nodeType);
+    const classificationLabel = this.getClassificationLabel(data?.classification);
+    const riskLabel = this.getRiskLabel(data?.risk);
+    const elapsedMs = Number(data?.elapsed || 0);
+    const elapsedText = `${(elapsedMs > 0 ? elapsedMs / 1000 : 0).toFixed(1)}s`;
+    const shouldExpandLabel = data?.nodeType === 'directory'
+      ? (data?.shouldExpand ? t('scanner.log_expand_yes') : t('scanner.log_expand_no'))
+      : t('scanner.log_expand_na');
+
+    let detailSections = `
+      <div style="margin-bottom: 10px;">
+        <strong>${this.escHtml(t('scanner.log_detail_model'))}:</strong> ${this.escHtml(data?.model)} &nbsp;|&nbsp;
+        <strong>${this.escHtml(t('scanner.log_detail_elapsed'))}:</strong> ${this.escHtml(elapsedText)} &nbsp;|&nbsp;
+        <strong>${this.escHtml(t('scanner.log_detail_token'))}:</strong> ${(data?.tokenUsage?.total || 0).toLocaleString()}
+      </div>
+      <div style="margin-bottom: 10px;">
+        <strong>${this.escHtml(t('scanner.log_detail_classification'))}:</strong> ${this.escHtml(classificationLabel)} &nbsp;|&nbsp;
+        <strong>${this.escHtml(t('scanner.log_detail_risk'))}:</strong> ${this.escHtml(riskLabel)} &nbsp;|&nbsp;
+        <strong>${this.escHtml(t('scanner.log_detail_expand'))}:</strong> ${this.escHtml(shouldExpandLabel)}
+      </div>
+      <div style="margin-bottom: 10px;"><strong>${this.escHtml(t('scanner.log_detail_type'))}:</strong> ${this.escHtml(nodeTypeLabel)}</div>
+      <div style="margin-bottom: 10px;"><strong>${this.escHtml(t('scanner.log_detail_path'))}:</strong> ${this.escHtml(data?.nodePath)}</div>
+    `;
+
+    if (data?.error) {
+      detailSections += `<div style="margin-bottom: 10px; color: var(--accent-danger);"><strong>${this.escHtml(t('scanner.log_detail_error'))}:</strong> ${this.escHtml(data.error)}</div>`;
+    }
+
+    if (data?.userPrompt) {
+      detailSections += `<div style="margin-bottom: 10px;">
+        <strong>${this.escHtml(t('scanner.log_detail_prompt'))}:</strong>
+        <div style="margin-top: 4px; padding: 8px; background: rgba(0,0,0,0.3); border-radius: 4px; max-height: 300px; overflow-y: auto;">${this.escHtml(data.userPrompt)}</div>
+      </div>`;
+    }
+
+    if (data?.reasoning) {
+      detailSections += `<div style="margin-bottom: 10px;">
+        <strong>${this.escHtml(t('scanner.log_detail_reasoning'))}:</strong>
+        <div style="margin-top: 4px; padding: 8px; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.15); border-radius: 4px; max-height: 400px; overflow-y: auto;">${this.escHtml(data.reasoning)}</div>
+      </div>`;
+    }
+
+    const searchContext = this.formatSearchContext(data?.search);
+    if (searchContext) {
+      detailSections += `<div style="margin-bottom: 10px;">
+        <strong>${this.escHtml(t('scanner.log_detail_search'))}:</strong>
+        <div style="margin-top: 4px; padding: 8px; background: rgba(6, 182, 212, 0.08); border: 1px solid rgba(6, 182, 212, 0.15); border-radius: 4px; max-height: 400px; overflow-y: auto;">${this.escHtml(searchContext)}</div>
+      </div>`;
+    }
+
+    if (data?.rawContent) {
+      const raw = String(data.rawContent);
+      const truncated = raw.length > 2000 ? `${raw.slice(0, 2000)}\n...（已截断）` : raw;
+      detailSections += `<div>
+        <strong>${this.escHtml(t('scanner.log_detail_raw'))}:</strong>
+        <div style="margin-top: 4px; padding: 8px; background: rgba(0,0,0,0.3); border-radius: 4px; max-height: 400px; overflow-y: auto;">${this.escHtml(truncated)}</div>
+      </div>`;
+    }
+
+    const summaryParts = [
+      t('scanner.log_llm_response_summary', {
+        type: nodeTypeLabel,
+        name: data?.nodeName || '-',
+      }),
+      elapsedText,
+      classificationLabel,
+      riskLabel,
+    ];
+    if (data?.nodeType === 'directory') {
+      summaryParts.push(t('scanner.log_expand_summary', { value: shouldExpandLabel }));
+    }
+
+    this.addDetailLog(
+      'agent_response',
+      summaryParts.join(' · '),
+      detailSections,
+      { expandByDefault: !!(data?.reasoning || data?.error) },
     );
   }
 

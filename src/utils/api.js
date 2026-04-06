@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { logClientError } from './client-log.js';
+import { normalizeAppError, normalizeTaskErrorPayload } from './errors.js';
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -9,9 +11,15 @@ function requireTauri(command) {
   }
 }
 
-async function call(command, args = {}) {
+async function invokeSafe(command, args = {}) {
   requireTauri(command);
-  return invoke(command, args);
+  try {
+    return await invoke(command, args);
+  } catch (err) {
+    const normalized = normalizeAppError(err, { context: { operation: command } });
+    logClientError(`tauri:${command}`, normalized);
+    throw normalized;
+  }
 }
 
 function createStream(taskId, specs) {
@@ -28,10 +36,15 @@ function createStream(taskId, specs) {
       if (closed) return;
       const payload = event?.payload || {};
       if (!matchTask(payload)) return;
-      handler(payload);
+      const normalizedPayload = eventName.endsWith('_error')
+        ? normalizeTaskErrorPayload(payload, { context: { operation: eventName } })
+        : payload;
+      handler(normalizedPayload);
     }).then((unlisten) => {
       if (closed) unlisten();
       else cleanups.push(unlisten);
+    }).catch((err) => {
+      logClientError(`tauri-event:${eventName}`, err, { context: { operation: eventName } });
     });
   }
   return {
@@ -47,73 +60,73 @@ function createStream(taskId, specs) {
 }
 
 export async function getSettings() {
-  return call('settings_get');
+  return invokeSafe('settings_get');
 }
 
 export async function saveSettings(data) {
-  return call('settings_save', { data });
+  return invokeSafe('settings_save', { data });
 }
 
 export async function moveDataDir(path) {
-  return call('settings_move_data_dir', { data: { path } });
+  return invokeSafe('settings_move_data_dir', { data: { path } });
 }
 
 export async function getCredentials() {
-  return call('credentials_get');
+  return invokeSafe('credentials_get');
 }
 
 export async function saveCredentials(payload) {
-  return call('credentials_save', { data: payload });
+  return invokeSafe('credentials_save', { data: payload });
 }
 
 export async function browseFolder() {
-  return call('settings_browse_folder');
+  return invokeSafe('settings_browse_folder');
 }
 
 export async function getProviderModels(endpoint, apiKey = undefined) {
-  return call('settings_get_provider_models', {
+  return invokeSafe('settings_get_provider_models', {
     data: apiKey == null ? { endpoint } : { endpoint, apiKey },
   });
 }
 
 export async function getPrivilegeStatus() {
-  return call('system_get_privilege');
+  return invokeSafe('system_get_privilege');
 }
 
 export async function requestElevation() {
-  return call('system_request_elevation');
+  return invokeSafe('system_request_elevation');
 }
 
 export async function openExternalUrl(url) {
-  return call('system_open_external_url', { data: { url } });
+  return invokeSafe('system_open_external_url', { data: { url } });
 }
 
 export async function getActiveScan() {
-  return call('scan_get_active');
+  return invokeSafe('scan_get_active');
 }
 
 export async function listScanHistory(limit = 20) {
-  return call('scan_list_history', { limit });
+  return invokeSafe('scan_list_history', { limit });
 }
 
 export async function findLatestScanForPath(path) {
-  return call('scan_find_latest_for_path', { path });
+  return invokeSafe('scan_find_latest_for_path', { path });
 }
 
 export async function deleteScanHistory(taskId) {
-  return call('scan_delete_history', { taskId });
+  return invokeSafe('scan_delete_history', { taskId });
 }
 
 export async function startScan(params) {
-  return call('scan_start', { input: params });
+  return invokeSafe('scan_start', { input: params });
 }
 
 export async function stopScan(taskId) {
-  return call('scan_stop', { taskId });
+  return invokeSafe('scan_stop', { taskId });
 }
 
 export async function getScanResult(taskId) {
-  return call('scan_get_result', { taskId });
+  return invokeSafe('scan_get_result', { taskId });
 }
 
 export function connectScanStream(taskId, handlers) {
@@ -132,36 +145,36 @@ export function connectScanStream(taskId, handlers) {
 }
 
 export async function openFileLocation(path) {
-  return call('files_open_location', { data: { path } });
+  return invokeSafe('files_open_location', { data: { path } });
 }
 
 export async function cleanFiles(paths, scanTaskId = null) {
   const body = scanTaskId ? { paths, scanTaskId } : { paths };
-  return call('files_clean', { data: body });
+  return invokeSafe('files_clean', { data: body });
 }
 
 export async function getOrganizeCapability() {
-  return call('organize_get_capability');
+  return invokeSafe('organize_get_capability');
 }
 
 export async function startOrganize(params) {
-  return call('organize_start', { input: params });
+  return invokeSafe('organize_start', { input: params });
 }
 
 export async function stopOrganize(taskId) {
-  return call('organize_stop', { taskId });
+  return invokeSafe('organize_stop', { taskId });
 }
 
 export async function getOrganizeResult(taskId) {
-  return call('organize_get_result', { taskId });
+  return invokeSafe('organize_get_result', { taskId });
 }
 
 export async function applyOrganize(taskId) {
-  return call('organize_apply', { taskId });
+  return invokeSafe('organize_apply', { taskId });
 }
 
 export async function rollbackOrganize(jobId) {
-  return call('organize_rollback', { jobId });
+  return invokeSafe('organize_rollback', { jobId });
 }
 
 export function connectOrganizeStream(taskId, handlers) {
