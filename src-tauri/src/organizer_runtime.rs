@@ -231,6 +231,41 @@ fn system_time_to_iso(value: std::time::SystemTime) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn format_relative_age(duration: chrono::Duration) -> String {
+    let seconds = duration.num_seconds().max(0);
+    if seconds < 60 {
+        "lt1m".to_string()
+    } else if seconds < 60 * 60 {
+        format!("{}m", (seconds / 60).max(1))
+    } else if seconds < 60 * 60 * 24 {
+        format!("{}h", (seconds / (60 * 60)).max(1))
+    } else if seconds < 60 * 60 * 24 * 7 {
+        format!("{}d", (seconds / (60 * 60 * 24)).max(1))
+    } else if seconds < 60 * 60 * 24 * 30 {
+        format!("{}w", (seconds / (60 * 60 * 24 * 7)).max(1))
+    } else if seconds < 60 * 60 * 24 * 365 {
+        format!("{}mo", (seconds / (60 * 60 * 24 * 30)).max(1))
+    } else {
+        format!("{}y", (seconds / (60 * 60 * 24 * 365)).max(1))
+    }
+}
+
+fn compute_relative_age_at(
+    value: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let parsed = value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))?;
+    Some(format_relative_age(now.signed_duration_since(parsed)))
+}
+
+fn compute_relative_age(value: Option<&str>) -> Option<String> {
+    compute_relative_age_at(value, chrono::Utc::now())
+}
+
 fn is_zh_language(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized == "zh" || normalized.starts_with("zh-") || normalized.starts_with("zh_")
@@ -2698,12 +2733,16 @@ fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Value> {
     batch_rows
         .iter()
         .map(|row| {
+            let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
+            let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
             json!({
                 "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
                 "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
                 "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                "createdAge": created_age,
+                "modifiedAge": modified_age,
                 "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
                 "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
                 "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
@@ -2747,14 +2786,20 @@ async fn classify_organize_batch(
         let mut payload = json!({
             "maxClusterDepth": max_cluster_depth,
             "existingTree": category_tree_to_value(existing_tree),
-            "fileIndex": batch_rows.iter().map(|row| json!({
-                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
-            })).collect::<Vec<_>>(),
+            "fileIndex": batch_rows.iter().map(|row| {
+                let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
+                let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
+                json!({
+                    "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+                    "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+                    "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+                    "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                    "createdAge": created_age,
+                    "modifiedAge": modified_age,
+                    "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
+                })
+            }).collect::<Vec<_>>(),
             "items": classification_items.clone(),
             "useWebSearch": use_web_search,
         });
@@ -4178,6 +4223,36 @@ mod tests {
     }
 
     #[test]
+    fn relative_age_uses_compact_backend_format() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-06T12:00:00Z")
+            .expect("parse now")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            compute_relative_age_at(Some("2026-04-06T11:59:45Z"), now).as_deref(),
+            Some("lt1m")
+        );
+        assert_eq!(
+            compute_relative_age_at(Some("2026-04-06T09:00:00Z"), now).as_deref(),
+            Some("3h")
+        );
+        assert_eq!(
+            compute_relative_age_at(Some("2026-03-30T12:00:00Z"), now).as_deref(),
+            Some("1w")
+        );
+        assert_eq!(
+            compute_relative_age_at(Some("2025-12-06T12:00:00Z"), now).as_deref(),
+            Some("4mo")
+        );
+        assert_eq!(
+            compute_relative_age_at(Some("2024-04-06T12:00:00Z"), now).as_deref(),
+            Some("2y")
+        );
+        assert_eq!(compute_relative_age_at(Some("bad-date"), now), None);
+        assert_eq!(compute_relative_age_at(None, now), None);
+    }
+
+    #[test]
     fn local_summary_skips_large_plain_text_inputs() {
         let root = temp_dir("large-text-summary");
         let path = root.join("notes.txt");
@@ -4297,6 +4372,8 @@ mod tests {
             "path": "E:\\docs\\report.pdf",
             "relativePath": "docs\\report.pdf",
             "size": 1234,
+            "createdAt": "2026-04-01T00:00:00Z",
+            "modifiedAt": "2026-04-05T00:00:00Z",
             "itemType": "file",
             "modality": "text",
             "summary": "季度财务报告",
@@ -4322,9 +4399,13 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+        assert!(item.get("createdAge").is_some());
+        assert!(item.get("modifiedAge").is_some());
         assert!(item.get("localExtraction").is_none());
         assert!(item.get("path").is_none());
         assert!(item.get("size").is_none());
+        assert!(item.get("createdAt").is_none());
+        assert!(item.get("modifiedAt").is_none());
     }
 
     #[test]

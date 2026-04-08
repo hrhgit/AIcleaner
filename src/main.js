@@ -3,17 +3,14 @@
  * 应用入口 — 路由管理与页面切换
  */
 import { renderScanner } from './pages/scanner.js';
-import { renderResults } from './pages/results.js';
-import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
+import { renderAdvisor } from './pages/advisor.js';
 import { browseFolder, getSettings, moveDataDir, openExternalUrl } from './utils/api.js';
 import { emitLangChange, registerLangChangeHandler, setLang, getLang, t } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
 
 const pages = {
     scanner: renderScanner,
-    results: renderResults,
-    organizer: renderOrganizer,
-    'organizer-results': renderOrganizerResults,
+    advisor: renderAdvisor,
 };
 
 let currentPage = null;
@@ -25,28 +22,36 @@ function hideBootSplash() {
     window.setTimeout(() => splash.remove(), 220);
 }
 
+function normalizePageName(pageName) {
+    if (pageName === 'organizer' || pageName === 'organizer-results') {
+        return 'advisor';
+    }
+    return pageName;
+}
+
 function navigate(pageName) {
+    const normalizedPage = normalizePageName(pageName);
     const container = document.getElementById('page-container');
     if (!container) return;
 
     // Update active nav
     document.querySelectorAll('.nav-link').forEach(link => {
-        link.classList.toggle('active', link.dataset.page === pageName);
+        link.classList.toggle('active', link.dataset.page === normalizedPage);
     });
 
     // Render page
-    currentPage = pageName;
+    currentPage = normalizedPage;
     container.innerHTML = '';
     container.style.animation = 'none';
     // Trigger reflow to restart animation
     void container.offsetHeight;
     container.style.animation = '';
 
-    const renderer = pages[pageName];
+    const renderer = pages[normalizedPage];
     if (renderer) {
         // Re-render immediately when language changes
         registerLangChangeHandler(() => {
-            if (currentPage === pageName) renderer(container); // Refresh active page
+            if (currentPage === normalizedPage) renderer(container); // Refresh active page
         });
         renderer(container);
     } else {
@@ -60,8 +65,22 @@ function navigate(pageName) {
 }
 
 function getPageFromHash() {
-    const hash = window.location.hash.replace('#/', '');
+    const hash = normalizePageName(window.location.hash.replace('#/', ''));
     return pages[hash] ? hash : 'scanner';
+}
+
+function updateShellCopy() {
+    const currentLang = getLang();
+    const scannerLabel = document.getElementById('nav-scanner-label');
+    const advisorLabel = document.getElementById('nav-advisor-label');
+    const bootSubtitle = document.getElementById('boot-subtitle');
+    const bootHint = document.getElementById('boot-hint');
+    if (scannerLabel) scannerLabel.textContent = currentLang === 'en' ? 'Inventory' : '盘点';
+    if (advisorLabel) advisorLabel.textContent = currentLang === 'en' ? 'Advisor' : '顾问';
+    if (bootSubtitle) bootSubtitle.textContent = currentLang === 'en' ? 'Loading workspace...' : '正在加载工作台...';
+    if (bootHint) bootHint.textContent = currentLang === 'en'
+        ? 'The first dev-mode load may be slower while frontend assets connect.'
+        : '开发模式下首次连接前端资源会稍慢一些，但不应再出现空白窗口。';
 }
 
 async function handleExternalLinkClick(event) {
@@ -148,6 +167,7 @@ document.addEventListener('DOMContentLoaded', () => {
         document.querySelectorAll('.lang-opt').forEach(opt => {
             opt.classList.toggle('active', opt.dataset.lang === currentLang);
         });
+        updateShellCopy();
     }
 
     document.querySelectorAll('.lang-opt').forEach(opt => {

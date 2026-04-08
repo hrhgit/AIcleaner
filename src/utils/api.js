@@ -96,10 +96,6 @@ export async function listScanHistory(limit = 20) {
   return call('scan_list_history', { limit });
 }
 
-export async function findLatestScanForPath(path) {
-  return call('scan_find_latest_for_path', { path });
-}
-
 export async function deleteScanHistory(taskId) {
   return call('scan_delete_history', { taskId });
 }
@@ -119,25 +115,12 @@ export async function getScanResult(taskId) {
 export function connectScanStream(taskId, handlers) {
   const stream = createStream(taskId, [
     ['scan_progress', (p) => handlers.onProgress?.(p)],
-    ['scan_found', (p) => handlers.onFound?.(p)],
-    ['scan_agent_call', (p) => handlers.onAgentCall?.(p)],
-    ['scan_agent_response', (p) => handlers.onAgentResponse?.(p)],
-    ['scan_cache', (p) => handlers.onCache?.(p)],
     ['scan_warning', (p) => handlers.onWarning?.(p)],
     ['scan_done', (p) => { handlers.onDone?.(p); stream.close(); }],
     ['scan_error', (p) => { handlers.onError?.(p); stream.close(); }],
     ['scan_stopped', (p) => { handlers.onStopped?.(p); stream.close(); }],
   ]);
   return stream;
-}
-
-export async function openFileLocation(path) {
-  return call('files_open_location', { data: { path } });
-}
-
-export async function cleanFiles(paths, scanTaskId = null) {
-  const body = scanTaskId ? { paths, scanTaskId } : { paths };
-  return call('files_clean', { data: body });
 }
 
 export async function getOrganizeCapability() {
@@ -174,4 +157,40 @@ export function connectOrganizeStream(taskId, handlers) {
     ['organize_stopped', (p) => { handlers.onStopped?.(p); stream.close(); }],
   ]);
   return stream;
+}
+
+export async function advisorSessionStart(params) {
+  return call('advisor_session_start', { input: params });
+}
+
+export async function advisorSessionGet(sessionId) {
+  return call('advisor_session_get', { sessionId });
+}
+
+export async function advisorMessageSend(params) {
+  return call('advisor_message_send', { input: params });
+}
+
+export async function advisorPreferenceApply(params) {
+  return call('advisor_preference_apply', { input: params });
+}
+
+export async function advisorSuggestionUpdate(params) {
+  return call('advisor_suggestion_update', { input: params });
+}
+
+export async function advisorExecutePreview(params) {
+  return call('advisor_execute_preview', { input: params });
+}
+
+export async function advisorExecuteConfirm(params) {
+  return call('advisor_execute_confirm', { input: params });
+}
+
+export async function advisorExecutionGet(jobId) {
+  return call('advisor_execution_get', { jobId });
+}
+
+export async function advisorExecutionRollback(jobId) {
+  return call('advisor_execution_rollback', { jobId });
 }

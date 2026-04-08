@@ -1,3 +1,4 @@
+use super::advisor::{advisor_tables_exist, create_advisor_tables, drop_advisor_tables};
 use super::organize::{create_organizer_tables, drop_organizer_tables, organizer_tables_exist};
 use super::scan::{
     cleanup_scan_drafts, normalize_existing_root_path_keys, run_scan_cache_maintenance,
@@ -241,6 +242,28 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         "INSERT INTO app_meta(key, value) VALUES('organizer_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![ORGANIZER_SCHEMA_VERSION],
+    )
+    .map_err(|e| e.to_string())?;
+    let current_advisor_schema = conn
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'advisor_schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let advisor_needs_reset = current_advisor_schema
+        .as_deref()
+        .map(|value| value != "advisor_v1")
+        .unwrap_or_else(|| advisor_tables_exist(&conn).unwrap_or(false));
+    if advisor_needs_reset {
+        drop_advisor_tables(&conn)?;
+    }
+    create_advisor_tables(&conn)?;
+    conn.execute(
+        "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params!["advisor_v1"],
     )
     .map_err(|e| e.to_string())?;
     normalize_existing_root_path_keys(&conn)?;

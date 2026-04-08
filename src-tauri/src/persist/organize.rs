@@ -280,6 +280,24 @@ pub fn load_latest_organize_tree(
     )))
 }
 
+pub fn find_latest_organize_task_id_for_root(
+    db_path: &Path,
+    root_path: &str,
+) -> Result<Option<String>, String> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        "SELECT task_id
+         FROM organize_tasks
+         WHERE root_path_key = ?1
+         ORDER BY datetime(created_at) DESC, task_id DESC
+         LIMIT 1",
+        params![create_root_path_key(root_path)],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 pub fn save_organize_manifest(db_path: &Path, manifest: &Value) -> Result<(), String> {
     let mut conn = open_db(db_path)?;
     let job_id = manifest

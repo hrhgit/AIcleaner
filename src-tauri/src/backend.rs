@@ -499,20 +499,15 @@ fn default_settings() -> Value {
             "https://api.moonshot.cn/v1": { "name": "Moonshot", "endpoint": "https://api.moonshot.cn/v1", "apiKey": "", "model": "moonshot-v1-8k" }
         },
         "scanPath": "",
-        "targetSizeGB": 1,
         "maxDepth": 5,
         "maxDepthUnlimited": false,
         "scanIgnorePaths": [],
-        "scanPersistentRules": {
-            "keepExact": [],
-            "safeDeleteExact": []
-        },
         "lastScanTime": null,
         "searchApi": {
             "provider": "tavily",
             "enabled": false,
             "apiKey": "",
-            "scopes": { "scan": false, "classify": false, "organizer": false }
+            "scopes": { "classify": false, "organizer": false }
         },
         "contentExtraction": {
             "tika": {
@@ -751,10 +746,6 @@ fn normalize_settings_shape(value: &mut Value) {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let scan_enabled = search_scopes
-        .get("scan")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let classify_enabled = search_scopes
         .get("classify")
         .and_then(Value::as_bool)
@@ -766,7 +757,7 @@ fn normalize_settings_shape(value: &mut Value) {
     let search_enabled = search_api
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(scan_enabled || classify_enabled || organizer_enabled);
+        .unwrap_or(classify_enabled || organizer_enabled);
     obj.insert(
         "searchApi".to_string(),
         json!({
@@ -777,22 +768,12 @@ fn normalize_settings_shape(value: &mut Value) {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "scopes": {
-                "scan": scan_enabled,
                 "classify": classify_enabled,
                 "organizer": organizer_enabled
             }
         }),
     );
-    let persistent_rules = normalize_scan_persistent_rules(obj.get("scanPersistentRules"));
-    obj.insert(
-        "scanPersistentRules".to_string(),
-        serde_json::to_value(&persistent_rules).unwrap_or_else(|_| {
-            json!({
-                "keepExact": [],
-                "safeDeleteExact": []
-            })
-        }),
-    );
+    obj.remove("scanPersistentRules");
     let tika = obj
         .get("contentExtraction")
         .and_then(|value| value.get("tika"))
@@ -1640,111 +1621,13 @@ pub async fn system_open_external_url(data: OpenExternalUrlInput) -> Result<Valu
     Ok(json!({ "success": true, "url": parsed.as_str() }))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenLocationInput {
-    path: String,
-}
-
-#[tauri::command]
-pub async fn files_open_location(data: OpenLocationInput) -> Result<Value, String> {
-    let path = PathBuf::from(data.path);
-    if !path.exists() {
-        return Err("File or directory does not exist".to_string());
-    }
-    if cfg!(windows) {
-        let _ = Command::new("explorer.exe")
-            .arg(format!("/select,{}", path.to_string_lossy()))
-            .spawn();
-    }
-    Ok(json!({ "success": true }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CleanFilesInput {
-    paths: Vec<String>,
-    scan_task_id: Option<String>,
-}
-
-fn clean_one_target(path: &Path) -> Result<(bool, bool), String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if meta.is_dir() && !meta.file_type().is_symlink() {
-        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-            let child = entry.map_err(|e| e.to_string())?.path();
-            let _ = clean_one_target(&child)?;
-        }
-        Ok((true, false))
-    } else {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-        Ok((true, true))
-    }
-}
-
-#[tauri::command]
-pub async fn files_clean(
-    state: State<'_, AppState>,
-    data: CleanFilesInput,
-) -> Result<Value, String> {
-    if data.paths.is_empty() {
-        return Err("Paths array is required".to_string());
-    }
-    let mut cleaned = Vec::new();
-    let mut removed = Vec::new();
-    let mut failed = Vec::new();
-    for raw in &data.paths {
-        let path = PathBuf::from(raw);
-        if !path.exists() {
-            failed.push(json!({"path": raw, "error": "Not found", "code": "ENOENT", "skipped": false, "permissionDenied": false, "requiresElevation": false}));
-            continue;
-        }
-        match clean_one_target(&path) {
-            Ok((ok, removed_self)) => {
-                if ok {
-                    cleaned.push(path.to_string_lossy().to_string());
-                }
-                if removed_self {
-                    removed.push(path.to_string_lossy().to_string());
-                }
-            }
-            Err(err) => failed.push(json!({
-                "path": path.to_string_lossy().to_string(),
-                "error": err,
-                "code": "UNKNOWN",
-                "skipped": false,
-                "permissionDenied": true,
-                "requiresElevation": cfg!(windows) && !check_elevation::is_elevated().unwrap_or(false)
-            })),
-        }
-    }
-    let mut scan_snapshot = Value::Null;
-    if let Some(task_id) = data.scan_task_id.as_deref() {
-        let db_path = state.db_path();
-        let _ = crate::persist::delete_scan_data_for_paths(&db_path, task_id, &cleaned);
-        if let Ok(Some(snapshot)) = crate::persist::load_scan_snapshot(&db_path, task_id) {
-            scan_snapshot = serde_json::to_value(snapshot).unwrap_or(Value::Null);
-        }
-    }
-    Ok(
-        json!({ "success": true, "results": { "cleaned": cleaned, "removed": removed, "failed": failed }, "scanSnapshot": scan_snapshot }),
-    )
-}
-
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanStartInput {
     pub target_path: String,
-    pub target_size_gb: Option<f64>,
     pub max_depth: Option<u32>,
     pub baseline_task_id: Option<String>,
     pub scan_mode: Option<String>,
-    pub auto_analyze: Option<bool>,
-    pub api_endpoint: Option<String>,
-    pub api_key: Option<String>,
-    pub model: Option<String>,
-    pub use_web_search: Option<bool>,
-    pub search_api_key: Option<String>,
-    pub response_language: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1760,6 +1643,11 @@ pub struct OrganizeStartInput {
     pub search_api_key: Option<String>,
     pub response_language: Option<String>,
 }
+
+pub use crate::advisor_runtime::{
+    AdvisorExecuteConfirmInput, AdvisorExecutePreviewInput, AdvisorMessageSendInput,
+    AdvisorPreferenceApplyInput, AdvisorSessionStartInput, AdvisorSuggestionUpdateInput,
+};
 
 fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -> Option<Value> {
     let mut routing = input.clone().unwrap_or_else(|| json!({}));
@@ -1798,35 +1686,8 @@ fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -
 pub async fn scan_start<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
-    mut input: ScanStartInput,
+    input: ScanStartInput,
 ) -> Result<Value, String> {
-    let (endpoint, model) = resolve_provider_endpoint_and_model(
-        state.inner(),
-        input.api_endpoint.as_deref(),
-        input.model.as_deref(),
-    );
-    input.api_endpoint = Some(endpoint.clone());
-    input.model = Some(model);
-    if input.auto_analyze.unwrap_or(true) {
-        input.api_key = Some(resolve_provider_api_key(state.inner(), &endpoint)?);
-    } else if input.api_key.is_none() {
-        input.api_key = Some(String::new());
-    }
-    if input.use_web_search.is_none() {
-        let settings = read_settings(&state.settings_path());
-        let scan_enabled = settings
-            .pointer("/searchApi/scopes/scan")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let classify_enabled = settings
-            .pointer("/searchApi/scopes/classify")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        input.use_web_search = Some(scan_enabled || classify_enabled);
-    }
-    if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
-        input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
-    }
     crate::scan_runtime::scan_start(app, state, input).await
 }
 
@@ -1841,14 +1702,6 @@ pub async fn scan_list_history(
     limit: Option<u32>,
 ) -> Result<Vec<Value>, String> {
     crate::scan_runtime::scan_list_history(state, limit).await
-}
-
-#[tauri::command]
-pub async fn scan_find_latest_for_path(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<Value, String> {
-    crate::scan_runtime::scan_find_latest_for_path(state, path).await
 }
 
 #[tauri::command]
@@ -1915,6 +1768,78 @@ pub async fn organize_rollback(
     job_id: String,
 ) -> Result<Value, String> {
     crate::organizer_runtime::organize_rollback(state, job_id).await
+}
+
+#[tauri::command]
+pub async fn advisor_session_start(
+    state: State<'_, AppState>,
+    input: AdvisorSessionStartInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_session_start(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_session_get(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_session_get(state, session_id).await
+}
+
+#[tauri::command]
+pub async fn advisor_message_send(
+    state: State<'_, AppState>,
+    input: AdvisorMessageSendInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_message_send(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_preference_apply(
+    state: State<'_, AppState>,
+    input: AdvisorPreferenceApplyInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_preference_apply(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_suggestion_update(
+    state: State<'_, AppState>,
+    input: AdvisorSuggestionUpdateInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_suggestion_update(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_execute_preview(
+    state: State<'_, AppState>,
+    input: AdvisorExecutePreviewInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_execute_preview(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_execute_confirm(
+    state: State<'_, AppState>,
+    input: AdvisorExecuteConfirmInput,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_execute_confirm(state, input).await
+}
+
+#[tauri::command]
+pub async fn advisor_execution_get(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_execution_get(state, job_id).await
+}
+
+#[tauri::command]
+pub async fn advisor_execution_rollback(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Value, String> {
+    crate::advisor_runtime::advisor_execution_rollback(state, job_id).await
 }
 
 #[cfg(test)]

@@ -61,9 +61,11 @@ fn bool_to_i64(value: bool) -> i64 {
 }
 
 mod organize;
+mod advisor;
 mod scan;
 mod schema;
 
+pub use advisor::*;
 pub use organize::*;
 pub use scan::*;
 pub use schema::*;

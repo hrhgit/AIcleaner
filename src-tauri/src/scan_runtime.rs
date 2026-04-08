@@ -2281,9 +2281,6 @@ async fn run_scan_task<R: Runtime>(
     if task.stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    if task.snapshot.lock().auto_analyze {
-        run_auto_analyze(app, state, task).await?;
-    }
     if !task.stop.load(Ordering::Relaxed) {
         let mut snap = task.snapshot.lock();
         if task.scan_mode == ScanMode::FullRescanIncremental {
@@ -2378,11 +2375,6 @@ pub async fn scan_start<R: Runtime>(
     if input.target_path.trim().is_empty() {
         return Err("targetPath is required".to_string());
     }
-    if input.auto_analyze.unwrap_or(true)
-        && input.api_key.as_deref().unwrap_or("").trim().is_empty()
-    {
-        return Err("API key is required for scan analysis".to_string());
-    }
     let target_path = PathBuf::from(&input.target_path)
         .to_string_lossy()
         .to_string();
@@ -2444,22 +2436,6 @@ pub async fn scan_start<R: Runtime>(
         None
     };
     let max_depth = input.max_depth.map(|value| value.clamp(1, 16));
-    let min_target_size_gb = if matches!(scan_mode, ScanMode::DeepenIncremental) {
-        baseline_snapshot
-            .as_ref()
-            .map(|snapshot| {
-                round_up_to_tenth(snapshot.total_cleanable as f64 / 1024.0 / 1024.0 / 1024.0)
-            })
-            .unwrap_or(TARGET_SIZE_MIN_GB)
-            .max(TARGET_SIZE_MIN_GB)
-    } else {
-        TARGET_SIZE_MIN_GB
-    };
-    let max_target_size_gb = TARGET_SIZE_DEFAULT_MAX_GB.max(min_target_size_gb);
-    let target_size_gb = input
-        .target_size_gb
-        .unwrap_or(1.0)
-        .clamp(min_target_size_gb, max_target_size_gb);
     let mut snapshot = if matches!(scan_mode, ScanMode::DeepenIncremental) {
         let mut existing = baseline_snapshot
             .clone()
@@ -2470,7 +2446,7 @@ pub async fn scan_start<R: Runtime>(
         existing.visible_latest = true;
         existing.root_path_key = persist::create_root_path_key(&target_path);
         existing.target_path = target_path.clone();
-        existing.auto_analyze = input.auto_analyze.unwrap_or(true);
+        existing.auto_analyze = false;
         existing.root_node_id = persist::create_node_id(&target_path);
         existing.configured_max_depth = max_depth;
         existing.current_path = target_path.clone();
@@ -2478,7 +2454,11 @@ pub async fn scan_start<R: Runtime>(
         existing.scanned_count = 0;
         existing.total_entries = 0;
         existing.processed_entries = 0;
-        existing.target_size = (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        existing.deletable_count = 0;
+        existing.total_cleanable = 0;
+        existing.target_size = 0;
+        existing.token_usage = TokenUsage::default();
+        existing.deletable.clear();
         existing.error_message.clear();
         existing.id = task_id.clone();
         existing
@@ -2487,9 +2467,9 @@ pub async fn scan_start<R: Runtime>(
             &state.db_path(),
             &task_id,
             &target_path,
-            (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            0,
             max_depth,
-            input.auto_analyze.unwrap_or(true),
+            false,
             baseline_task_id.as_deref(),
         )?;
         ScanSnapshot {
@@ -2500,7 +2480,7 @@ pub async fn scan_start<R: Runtime>(
             visible_latest: false,
             root_path_key: persist::create_root_path_key(&target_path),
             target_path: target_path.clone(),
-            auto_analyze: input.auto_analyze.unwrap_or(true),
+            auto_analyze: false,
             root_node_id: persist::create_node_id(&target_path),
             configured_max_depth: max_depth,
             max_scanned_depth: baseline_snapshot
@@ -2514,7 +2494,7 @@ pub async fn scan_start<R: Runtime>(
             processed_entries: 0,
             deletable_count: 0,
             total_cleanable: 0,
-            target_size: (target_size_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            target_size: 0,
             token_usage: TokenUsage::default(),
             deletable: Vec::new(),
             permission_denied_count: 0,
@@ -2546,12 +2526,6 @@ pub async fn scan_start<R: Runtime>(
             .collect();
     }
     persist::save_scan_snapshot(&state.db_path(), &snapshot)?;
-    let (persistent_rules, persistent_rules_cleaned) =
-        crate::backend::read_scan_persistent_rules_with_cleanup(&state.settings_path());
-    if persistent_rules_cleaned {
-        let _ =
-            crate::backend::save_scan_persistent_rules(&state.settings_path(), &persistent_rules)?;
-    }
     let task = Arc::new(ScanTaskRuntime {
         stop: AtomicBool::new(false),
         child_pid: Mutex::new(None),
@@ -2563,17 +2537,15 @@ pub async fn scan_start<R: Runtime>(
         ignored_paths,
         prune_rules,
         in_place_baseline,
-        persistent_rules: Mutex::new(persistent_rules),
+        persistent_rules: Mutex::new(ScanPersistentRules::default()),
         last_progress_persist_at: Mutex::new(None),
         ai: ScanAiConfig {
-            endpoint: input
-                .api_endpoint
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            api_key: input.api_key.unwrap_or_default(),
-            model: input.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
-            use_web_search: input.use_web_search.unwrap_or(false),
-            search_api_key: input.search_api_key.unwrap_or_default(),
-            response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            use_web_search: false,
+            search_api_key: String::new(),
+            response_language: "zh".to_string(),
         },
         job: Mutex::new(None),
     });
@@ -2680,20 +2652,6 @@ pub async fn scan_list_history(
     limit: Option<u32>,
 ) -> Result<Vec<Value>, String> {
     persist::list_scan_history(&state.db_path(), limit.unwrap_or(20).clamp(1, 200))
-}
-
-pub async fn scan_find_latest_for_path(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<Value, String> {
-    let Some(task_id) =
-        persist::find_latest_visible_scan_task_id_for_path(&state.db_path(), &path)?
-    else {
-        return Ok(Value::Null);
-    };
-    let snapshot = persist::load_scan_snapshot_summary(&state.db_path(), &task_id)?
-        .ok_or_else(|| "Task not found".to_string())?;
-    serde_json::to_value(snapshot).map_err(|e| e.to_string())
 }
 
 pub async fn scan_delete_history(

@@ -3,6 +3,7 @@
 ## Overview / 概览
 
 中文：
+- 以代码为准，本文仅作为当前 prompt 与摘要模板的索引说明。
 - 这个文档整理了当前项目里仍在使用的 AI 提示词与摘要模板。
 - 扫描和 organizer 都已经支持中英双模板。
 - organizer 默认每批 20 个条目。
@@ -12,6 +13,7 @@
 - organizer 里不仅 `system prompt` 会切语言，摘要标签和原目录结构上下文也会一起切语言。
 
 English:
+- The code is the source of truth; this document is only an index of the current prompts and summary templates.
 - This document lists the AI prompts and summary templates that are still in active use.
 - Both scan and organizer now support bilingual prompt templates.
 - Organizer now uses a default batch size of 20 items.
@@ -26,6 +28,10 @@ English:
 
 Code / 代码位置:
 - `src-tauri/src/scan_runtime.rs`
+- `build_scan_system_prompt`: 构造扫描阶段的 `system prompt`
+- `scan_prompt_classification_tokens`: 提供目录/文件分类 token 与中英模板
+- `analyze_scan_node`: 根据节点类型拼接目录或文件的 `user prompt`
+- `chat_completion`: 实际把 `system` / `user` message 发给模型
 
 #### Directory System Prompt / 目录 system prompt
 
@@ -147,6 +153,11 @@ If unsure, prefer expand_analysis over delete_all.
 
 Code / 代码位置:
 - `src-tauri/src/organizer_runtime.rs`
+- `build_summary_agent_system_prompt`: 文件摘要阶段的 `system prompt`
+- `build_organize_system_prompt`: 树状聚类阶段的 `system prompt`
+- `summarize_directory_for_prompt`: 目录摘要本地模板
+- `summarize_batch_with_agent`: 批量摘要时实际发送 `system prompt` 与 JSON `user prompt`
+- `classify_organize_batch`: 聚类时实际发送 `system prompt` 与 JSON `user prompt`
 
 #### Clustering System Prompt / 聚类 system prompt
 
@@ -207,6 +218,10 @@ English:
 - The directory summary is not a standalone model prompt.
 - It is generated locally first, then inserted into `items[].summary` before tree clustering.
 
+Code / 代码位置:
+- `src-tauri/src/organizer_runtime.rs`
+- `summarize_directory_for_prompt`
+
 中文模板：
 
 ```text
@@ -244,6 +259,12 @@ dominantExtensions={dominant_extensions}
 
 English:
 - These templates are used when text content cannot be read or when the item can only be summarized from metadata.
+
+Code / 代码位置:
+- `src-tauri/src/organizer_runtime.rs`
+- `extract_plain_text_summary`
+- `build_empty_extraction`
+- `build_local_summary`
 
 #### Text File Fallback / 文本文件降级摘要
 
@@ -289,6 +310,122 @@ modality={modality}
 size={size}
 createdAt={created_at}
 modifiedAt={modified_at}
+```
+
+### 5. Advisor Suggestion Flow / 顾问页建议流
+
+中文：
+- 顾问页当前使用的 prompt 不在旧文档版本里，实际以 `src-tauri/src/advisor_runtime.rs` 为准。
+- 顾问会话启动时，如果本地已有扫描/整理结果，会优先复用本地建议；只有本地建议不足时，才会调用 AI 生成建议。
+- 顾问页发给 AI 的 `user prompt` 主要是 JSON payload，不是固定自然语言长提示词。
+
+English:
+- The advisor prompts were missing from older versions of this document; the source of truth is `src-tauri/src/advisor_runtime.rs`.
+- On session start, the advisor prefers existing local scan/organize suggestions and only calls the model when those are insufficient.
+- The advisor mostly sends a JSON payload as the `user prompt` rather than a long natural-language wrapper.
+
+Code / 代码位置:
+- `src-tauri/src/advisor_runtime.rs`
+- `build_preference_extraction_system_prompt`: 从用户消息提取偏好的 `system prompt`
+- `build_suggestion_generation_system_prompt`: 生成建议列表的 `system prompt`
+- `build_suggestion_revision_system_prompt`: 根据后续反馈修订建议的 `system prompt`
+- `generate_suggestions_from_context`: 组装顾问初始化 `user prompt` JSON
+- `advisor_session_start`: 启动顾问会话，并在本地建议不足时触发建议生成
+- `advisor_message_send`: 发送顾问页消息，触发偏好提取与建议修订
+- `chat_completion`: 实际把 `system` / `user` message 发给模型
+
+#### Suggestion Generation System Prompt / 初始建议 system prompt
+
+中文说明：
+- 当前代码中该 prompt 直接写成英文字符串，再通过 `response_language` 约束输出字段语言。
+
+English template:
+
+```text
+You are an AI file cleanup and organization advisor.
+Return JSON only.
+Schema: {"suggestions":[{"suggestionId":"...","kind":"move|archive|delete|keep|review","path":"...","targetPath":"... optional","title":"...","summary":"...","risk":"low|medium|high","confidence":"high|medium|low","why":["..."],"triggeredPreferences":["..."],"requiresConfirmation":true,"executable":true}],"reply":"..."}
+Follow the current advisor mode exactly: {mode}.
+Prefer using structured local context first.
+Never recommend direct deletion for uncertain items.
+Use kind=review for ambiguous or risky items.
+Use kind=keep when the item is likely important or protected by user preference.
+Use kind=delete only for low-risk items.
+Use targetPath only for move or archive suggestions.
+Keep suggestions practical and non-overlapping.
+The reply, title, summary, why, and triggeredPreferences fields must be written in {output_language} only.
+```
+
+#### Suggestion Generation User Payload / 初始建议 user payload
+
+中文：
+- 顾问初始化建议时，直接把下面结构的 JSON 序列化后作为 `user prompt` 发送。
+
+English:
+- During initial advisor suggestion generation, the app serializes the following JSON structure and sends it as the `user prompt`.
+
+```json
+{
+  "mode": "{mode}",
+  "rootPath": "{root_path}",
+  "scanSummary": "{context_summary.scanSummary}",
+  "fileCandidates": [
+    {
+      "path": "{path}",
+      "name": "{name}",
+      "categoryPath": ["... optional"],
+      "summary": "{summary_or_null}",
+      "reason": "{scan_reason_optional}",
+      "risk": "low|medium|high",
+      "kindHint": "move|delete"
+    }
+  ],
+  "existingTree": "{latest_tree_or_null}",
+  "preferences": [],
+  "recentConversationSummary": []
+}
+```
+
+#### Preference Extraction Prompt / 偏好提取 prompt
+
+Code / 代码位置:
+- `src-tauri/src/advisor_runtime.rs`
+- `build_preference_extraction_system_prompt`
+- `advisor_message_send` 中的 `preference_prompt`
+
+中文：
+- 当用户在顾问页输入一句话后，系统会先发送一轮偏好提取请求。
+
+English user payload:
+
+```json
+{
+  "message": "{user_message}",
+  "mode": "{mode}",
+  "preferences": "{current_preferences}",
+  "outputLanguage": "{localized_output_language_name}"
+}
+```
+
+#### Suggestion Revision Prompt / 建议修订 prompt
+
+Code / 代码位置:
+- `src-tauri/src/advisor_runtime.rs`
+- `build_suggestion_revision_system_prompt`
+- `advisor_message_send` 中的 revision payload
+
+中文：
+- 如果当前会话里已经有建议，顾问页不会重新整包生成，而是发送“修订建议”请求。
+
+English user payload:
+
+```json
+{
+  "message": "{user_message}",
+  "suggestions": "{current_suggestions}",
+  "preferences": "{current_preferences}",
+  "mode": "{mode}"
+}
 ```
 
 ## Notes / 备注

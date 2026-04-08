@@ -76,7 +76,6 @@ const state = {
     enabled: false,
     apiKey: '',
     scopes: {
-      scan: false,
       classify: false,
       organizer: false,
     },
@@ -195,7 +194,6 @@ function normalizeSearchApi(settings) {
     enabled: !!source?.enabled,
     apiKey: '',
     scopes: {
-      scan: !!scopesSource.scan,
       classify: !!scopesSource.classify,
       organizer: !!scopesSource.organizer,
     },
@@ -541,12 +539,10 @@ function buildModalSnapshot() {
       provider: 'tavily',
       enabled: !!(
         state.searchApi?.enabled
-        || state.searchApi?.scopes?.scan
         || state.searchApi?.scopes?.classify
         || state.searchApi?.scopes?.organizer
       ),
       scopes: {
-        scan: !!state.searchApi?.scopes?.scan,
         classify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
         organizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
       },
@@ -614,12 +610,10 @@ function collectPayloadFromDOM() {
     provider: 'tavily',
     enabled: !!(
       state.searchApi?.enabled
-      || state.searchApi?.scopes?.scan
       || state.searchApi?.scopes?.classify
       || state.searchApi?.scopes?.organizer
     ),
     scopes: {
-      scan: !!state.searchApi?.scopes?.scan,
       classify: !!(state.searchApi?.scopes?.classify || state.searchApi?.scopes?.organizer),
       organizer: !!(state.searchApi?.scopes?.organizer || state.searchApi?.scopes?.classify),
     },

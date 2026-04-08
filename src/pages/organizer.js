@@ -411,7 +411,6 @@ function resolveSearchApi(settings) {
     enabled: !!source.enabled,
     apiKey: String(source.apiKey || '').trim(),
     scopes: {
-      scan: !!scopes.scan,
       classify: !!scopes.classify,
       organizer: !!scopes.organizer,
     },
@@ -423,9 +422,8 @@ async function syncClassifyWebSearchToSettings(isEnabled) {
   const currentSearchApi = resolveSearchApi(settings);
   const nextSearchApi = {
     provider: 'tavily',
-    enabled: !!(currentSearchApi.scopes.scan || isEnabled),
+    enabled: !!isEnabled,
     scopes: {
-      scan: !!currentSearchApi.scopes.scan,
       classify: !!isEnabled,
       organizer: !!isEnabled,
     },

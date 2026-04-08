@@ -1,7 +1,9 @@
+mod advisor_runtime;
 mod backend;
 mod organizer_runtime;
 mod persist;
 mod scan_runtime;
+mod system_ops;
 mod web_search;
 
 use backend::AppState;
@@ -29,11 +31,8 @@ pub fn run() {
             backend::system_get_privilege,
             backend::system_request_elevation,
             backend::system_open_external_url,
-            backend::files_open_location,
-            backend::files_clean,
             backend::scan_get_active,
             backend::scan_list_history,
-            backend::scan_find_latest_for_path,
             backend::scan_delete_history,
             backend::scan_start,
             backend::scan_stop,
@@ -43,7 +42,16 @@ pub fn run() {
             backend::organize_stop,
             backend::organize_get_result,
             backend::organize_apply,
-            backend::organize_rollback
+            backend::organize_rollback,
+            backend::advisor_session_start,
+            backend::advisor_session_get,
+            backend::advisor_message_send,
+            backend::advisor_preference_apply,
+            backend::advisor_suggestion_update,
+            backend::advisor_execute_preview,
+            backend::advisor_execute_confirm,
+            backend::advisor_execution_get,
+            backend::advisor_execution_rollback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
