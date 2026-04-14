@@ -507,7 +507,11 @@ fn default_settings() -> Value {
             "provider": "tavily",
             "enabled": false,
             "apiKey": "",
-            "scopes": { "classify": false, "organizer": false }
+            "scopes": { "scan": false, "classify": false, "organizer": false }
+        },
+        "scanPersistentRules": {
+            "keepExact": [],
+            "safeDeleteExact": []
         },
         "contentExtraction": {
             "tika": {
@@ -746,10 +750,19 @@ fn normalize_settings_shape(value: &mut Value) {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let scan_enabled = search_scopes
+        .get("scan")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            search_api
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
     let classify_enabled = search_scopes
         .get("classify")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(scan_enabled);
     let organizer_enabled = search_scopes
         .get("organizer")
         .and_then(Value::as_bool)
@@ -757,7 +770,7 @@ fn normalize_settings_shape(value: &mut Value) {
     let search_enabled = search_api
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(classify_enabled || organizer_enabled);
+        .unwrap_or(scan_enabled || classify_enabled || organizer_enabled);
     obj.insert(
         "searchApi".to_string(),
         json!({
@@ -768,12 +781,20 @@ fn normalize_settings_shape(value: &mut Value) {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "scopes": {
+                "scan": scan_enabled,
                 "classify": classify_enabled,
                 "organizer": organizer_enabled
             }
         }),
     );
-    obj.remove("scanPersistentRules");
+    obj.insert(
+        "scanPersistentRules".to_string(),
+        serde_json::to_value(normalize_scan_persistent_rules(obj.get("scanPersistentRules")))
+            .unwrap_or_else(|_| json!({
+                "keepExact": [],
+                "safeDeleteExact": []
+            })),
+    );
     let tika = obj
         .get("contentExtraction")
         .and_then(|value| value.get("tika"))
@@ -1645,8 +1666,7 @@ pub struct OrganizeStartInput {
 }
 
 pub use crate::advisor_runtime::{
-    AdvisorExecuteConfirmInput, AdvisorExecutePreviewInput, AdvisorMessageSendInput,
-    AdvisorPreferenceApplyInput, AdvisorSessionStartInput, AdvisorSuggestionUpdateInput,
+    AdvisorCardActionInput, AdvisorMessageSendInput, AdvisorSessionStartInput,
 };
 
 fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -> Option<Value> {
@@ -1795,51 +1815,11 @@ pub async fn advisor_message_send(
 }
 
 #[tauri::command]
-pub async fn advisor_preference_apply(
+pub async fn advisor_card_action(
     state: State<'_, AppState>,
-    input: AdvisorPreferenceApplyInput,
+    input: AdvisorCardActionInput,
 ) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_preference_apply(state, input).await
-}
-
-#[tauri::command]
-pub async fn advisor_suggestion_update(
-    state: State<'_, AppState>,
-    input: AdvisorSuggestionUpdateInput,
-) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_suggestion_update(state, input).await
-}
-
-#[tauri::command]
-pub async fn advisor_execute_preview(
-    state: State<'_, AppState>,
-    input: AdvisorExecutePreviewInput,
-) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_execute_preview(state, input).await
-}
-
-#[tauri::command]
-pub async fn advisor_execute_confirm(
-    state: State<'_, AppState>,
-    input: AdvisorExecuteConfirmInput,
-) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_execute_confirm(state, input).await
-}
-
-#[tauri::command]
-pub async fn advisor_execution_get(
-    state: State<'_, AppState>,
-    job_id: String,
-) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_execution_get(state, job_id).await
-}
-
-#[tauri::command]
-pub async fn advisor_execution_rollback(
-    state: State<'_, AppState>,
-    job_id: String,
-) -> Result<Value, String> {
-    crate::advisor_runtime::advisor_execution_rollback(state, job_id).await
+    crate::advisor_runtime::advisor_card_action(state, input).await
 }
 
 #[cfg(test)]

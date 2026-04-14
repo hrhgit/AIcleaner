@@ -14,6 +14,11 @@
 8. AI 在用户意图明确后通过 tool use 生成执行计划和预览。
 9. 程序负责校验、执行和回滚。
 
+说明：
+
+1. 不再要求用户在会话开始前先选择“清理优先”或“整理优先”。
+2. 这类处理倾向由用户在对话中直接表达，或以后作为可选快捷入口存在。
+
 ## 2. 各阶段职责
 
 ### 2.1 扫描
@@ -89,10 +94,11 @@
 
 要做的事：
 
-1. 用自然语言保存长期偏好。
-2. 用自然语言保存当前会话目标。
-3. 在顾问阶段把偏好作为 AI 上下文使用。
-4. 保留少量结构化规则用于程序安全校验。
+1. 用自然语言保存长期处理偏好。
+2. 用自然语言保存长期归类偏好。
+3. 用自然语言保存当前会话目标。
+4. 在顾问阶段把偏好作为 AI 上下文使用。
+5. 保留少量结构化规则用于程序安全校验。
 
 偏好记录结构：
 
@@ -114,6 +120,15 @@
 3. `session` 表示当前会话内需要持续记住的内容。
 4. 不再单独区分“本次目标”和“特殊例外”。
 5. 当 `session` 和 `global` 冲突时，以 `session` 为准。
+6. 偏好既可以描述处理方式，也可以描述归类方式。
+7. 当用户对建议、执行方式或归类结果提出反对、修正或补充时，默认优先记为偏好候选。
+
+归类偏好示例：
+
+1. “安装包和压缩包不要放在同一类。”
+2. “截图和聊天图片分开。”
+3. “财务表格优先归到文档资料下。”
+4. “项目源码压缩包单独成类。”
 
 ## 4. 首轮展示
 
@@ -136,7 +151,7 @@
 
 建议要做的工具：
 
-### 6.1 `advisor_get_directory_overview`
+### 6.1 `get_directory_overview`
 
 作用：
 
@@ -168,7 +183,7 @@
 2. `treeText`
 3. `viewType`
 
-### 6.2 `advisor_find_files`
+### 6.2 `find_files`
 
 作用：
 
@@ -228,7 +243,7 @@
 2. 后续计划、预览和执行都基于 `selectionId`，不直接基于类别执行。
 3. `querySummary` 用于帮助模型识别这次筛选到底是哪一批结果。
 
-### 6.3 `advisor_summarize_files`
+### 6.3 `summarize_files`
 
 作用：
 
@@ -285,7 +300,7 @@
 4. 如果因为批量限制、限流、超时或网络不稳定而最终无法完成，就返回 `status=error`。
 5. 不自动退回到 `metadata_summary`。
 
-### 6.4 `advisor_read_only_file_summaries`
+### 6.4 `read_only_file_summaries`
 
 作用：
 
@@ -319,7 +334,7 @@
    - `summaryShort`
    - `summaryNormal`
 
-### 6.5 `advisor_capture_preference`
+### 6.5 `capture_preference`
 
 作用：
 
@@ -331,7 +346,8 @@
 
 1. 用户明确表达长期习惯时。
 2. 用户说明这次任务目标时。
-3. AI 判断这句话值得记忆时。
+3. 用户对建议、执行方式或归类结果提出反对、修正或补充时。
+4. AI 判断这句话值得记忆时。
 
 输入：
 
@@ -349,7 +365,7 @@
 3. `text`
 4. `createdAt`
 
-### 6.6 `advisor_list_preferences`
+### 6.6 `list_preferences`
 
 作用：
 
@@ -372,7 +388,7 @@
 1. `sessionPreferences`
 2. `globalPreferences`
 
-### 6.7 `advisor_preview_plan`
+### 6.7 `preview_plan`
 
 作用：
 
@@ -447,10 +463,10 @@
 
 1. 如果 `plan` 中没有 `selectionId`，返回错误。
 2. 如果 `selectionId` 无效、过期或不存在，返回错误。
-3. 错误信息要明确提示模型先调用 `advisor_find_files` 生成筛选结果。
+3. 错误信息要明确提示模型先调用 `find_files` 生成筛选结果。
 4. preview 阶段只做程序化一致性校验，避免把旧的筛选结果误用于当前意图。
 
-### 6.8 `advisor_execute_plan`
+### 6.8 `execute_plan`
 
 作用：
 
@@ -484,7 +500,7 @@
    - `failed`
 3. `entries`
 
-### 6.9 `advisor_rollback_plan`
+### 6.9 `rollback_plan`
 
 作用：
 
@@ -511,17 +527,402 @@
    - `failed`
 3. `entries`
 
-## 7. 页面结构
+### 6.10 `apply_reclassification`
 
-顾问页要做的区域：
+作用：
 
-1. 归类结果树区域。
-2. 首轮建议区域。
-3. 对话输入区域。
-4. 执行预览区域。
-5. 执行与回滚区域。
+1. 接收模型直接输出的固定 `reclassificationRequest JSON`。
+2. 支持局部修订，不要求整棵树重跑。
+3. 直接应用归类修订。
+4. 让后续顾问和筛选基于新的分类继续工作。
 
-## 8. 上下文组装规范
+什么时候调：
+
+1. 用户明确表示当前分类不满意时。
+2. 用户已经说明希望怎么改分类时。
+3. AI 已经把用户意图整理成固定格式的归类修订请求时。
+
+输入：
+
+1. `sessionId`
+2. `request`
+   - `intentSummary`
+   - `change`
+     - `type`
+     - `selectionId`
+     - `sourceCategoryId`
+     - `targetCategoryId`
+     - `newCategoryName`
+3. `applyPreferenceCapture`
+
+输出：
+
+1. `reclassificationJobId`
+2. `message`
+3. `changeSummary`
+4. `updatedTreeText`
+5. `change`
+   - `type`
+   - `sourceCategoryId`
+   - `targetCategoryId`
+   - `newCategoryName`
+   - `selectionId`
+   - `fileCount`
+6. `invalidated`
+   - `selection`
+   - `preview`
+
+说明：
+
+1. `change` 是统一入口，内部通过 `change.type` 分派到不同修改模板。
+2. 这个工具优先做局部归类修订，不默认全量重跑。
+3. 模型不直接提交整棵新树，而是提交结构化归类修订请求。
+4. 这个工具不负责再做一次自然语言理解，不要求在 tool 内再调用模型。
+5. 这个工具直接应用归类 patch，不要求先 preview。
+6. 应用成功后当前活跃的 `selection` 和 `preview` 都要失效。
+
+支持的 `change.type`：
+
+1. `rename_category`
+   - 必填：`sourceCategoryId`、`newCategoryName`
+2. `move_selection_to_category`
+   - 必填：`selectionId`、`targetCategoryId`
+3. `split_selection_to_new_category`
+   - 必填：`selectionId`、`sourceCategoryId`、`newCategoryName`
+4. `merge_category_into_category`
+   - 必填：`sourceCategoryId`、`targetCategoryId`
+5. `delete_empty_category`
+   - 必填：`sourceCategoryId`
+
+模型输出的 `reclassificationRequest JSON` 结构：
+
+```json
+{
+  "intentSummary": "把安装包和压缩包分开，当前这一批压缩文件不要放在安装包里。",
+  "change": {
+    "type": "split_selection_to_new_category",
+    "selectionId": "selection_003",
+    "sourceCategoryId": "installers",
+    "newCategoryName": "压缩包"
+  }
+}
+```
+
+典型工具输入示例：
+
+```json
+{
+  "sessionId": "session_001",
+  "request": {
+    "intentSummary": "把安装包和压缩包分开，当前这一批压缩文件不要放在安装包里。",
+    "change": {
+      "type": "split_selection_to_new_category",
+      "selectionId": "selection_003",
+      "sourceCategoryId": "installers",
+      "newCategoryName": "压缩包"
+    }
+  },
+  "applyPreferenceCapture": true
+}
+```
+
+典型输出示例：
+
+```json
+{
+  "reclassificationJobId": "reclass_job_001",
+  "message": "已应用归类修订。",
+  "changeSummary": "已把 12 个压缩文件从“安装包”中拆出，形成新分类“压缩包”。",
+  "updatedTreeText": "安装包 (42 -> 30)\\n新增: 压缩包 (12)",
+  "change": {
+    "type": "split_selection_to_new_category",
+    "sourceCategoryId": "installers",
+    "targetCategoryId": "archives",
+    "newCategoryName": "压缩包",
+    "selectionId": "selection_003",
+    "fileCount": 12
+  },
+  "invalidated": ["selection", "preview"]
+}
+```
+
+### 6.11 `rollback_reclassification`
+
+作用：
+
+1. 回滚最近一次可回滚的归类修订。
+2. 恢复归类主结果和树视图。
+3. 让用户可以在直接应用后撤回归类修改。
+
+什么时候调：
+
+1. 用户要求撤回最近一次归类修改时。
+2. 已有有效 `reclassificationJobId` 且该修改可回滚时。
+
+输入：
+
+1. `sessionId`
+2. `reclassificationJobId`
+
+输出：
+
+1. `message`
+2. `updatedTreeText`
+3. `rolledBack`
+4. `invalidated`
+   - `selection`
+   - `preview`
+
+说明：
+
+1. 归类修订回滚不影响执行类回滚。
+2. 回滚成功后当前活跃的 `selection` 和 `preview` 都要失效。
+
+## 7. Tool 错误返回
+
+错误返回原则：
+
+1. 给模型的错误返回优先使用一句话文本。
+2. 这句话同时包含错误信息和下一步建议。
+3. 不默认要求向模型返回 JSON 错误对象。
+4. 如果内部需要错误码，可在程序内部保留，不必直接暴露给模型。
+
+建议格式：
+
+```text
+当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续生成预览。
+```
+
+示例：
+
+1. `preview_plan`
+   - `当前计划缺少 selectionId，请先调用 find_files 生成筛选结果，再继续生成预览。`
+2. `execute_plan`
+   - `当前预览不存在或已过期，请先重新生成 preview，再执行。`
+3. `apply_reclassification`
+   - `当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。`
+4. `rollback_plan`
+   - `当前执行记录不可回滚，请不要继续尝试回滚这个任务。`
+5. `rollback_reclassification`
+   - `当前归类修改记录不存在或不可回滚，请先确认最近一次归类修改是否成功。`
+
+## 8. 页面结构
+
+顾问页采用单列对话式 AI 工作台布局。
+
+普通建议保持自然语言回复，只有结构化结果才卡片化。
+
+页面从上到下分为：
+
+1. 顶部会话初始化区 / 上下文条。
+2. 主消息流。
+3. 结果型卡片插入位。
+4. 底部固定输入区。
+
+### 8.1 页面主骨架
+
+顾问页不再以左右双栏作为核心结构，而是以单列消息流为主。
+
+页面骨架规则：
+
+1. 主视线永远落在消息流。
+2. 树结果、分类修改、偏好、预览、执行结果都挂在消息流中。
+3. 不再把建议区、预览区、执行区做成并列后台面板。
+4. 输入区固定在页面底部，消息流独立滚动。
+5. 页面以桌面端优先，但窄屏下仍保持单列结构。
+
+### 8.2 顶部会话初始化区与上下文条
+
+首次进入顾问页时，页面顶部展示会话初始化区。
+
+初始化区要包含：
+
+1. 当前工作目录。
+2. 顾问模式。
+3. 最近可复用的盘点来源。
+4. 启动会话入口。
+
+初始化区行为：
+
+1. 用户首次进入时默认展开。
+2. 用户启动会话后，初始化区自动折叠为上下文条。
+3. 折叠后的上下文条持续显示：
+   - 当前目录
+   - 当前模式
+   - 当前盘点来源
+   - 展开入口
+4. 用户可以再次展开上下文条，重新选择目录、切换模式或重建会话。
+
+这样做的目的：
+
+1. 会话开始前保证用户知道 AI 基于什么上下文工作。
+2. 会话开始后减少顶部占高，把注意力还给消息流。
+
+### 8.3 主消息流
+
+消息流是顾问页的主舞台。
+
+消息流按时间顺序展示每一轮内容：
+
+1. 用户消息。
+2. AI 自然语言回复。
+3. 该轮附着的结构化结果卡片。
+
+消息流规则：
+
+1. 普通 AI 建议只用自然语言表达，不单独生成建议卡。
+2. 一轮对话可以只包含文本，也可以包含文本加结果卡。
+3. 结果卡是某一轮消息的附着物，不是独立常驻区域。
+4. 新内容插入后，页面自动定位到最新一轮。
+5. 会话开始后，首批消息应优先建立目录认知，而不是直接进入执行。
+
+### 8.4 结果型卡片
+
+顾问页只保留以下 5 类结果型卡片，卡片样式统一。
+
+#### 8.4.1 树结果卡
+
+作用：
+
+1. 展示当前分类状态。
+2. 可以是全量树，也可以是局部树。
+
+规则：
+
+1. 只读。
+2. 不承担计划确认或执行操作。
+3. 用于帮助用户和模型理解当前目录结构。
+4. 全量树用于建立整体认知，局部树用于追问某一路径或某一类时补充展示。
+
+#### 8.4.2 分类修改结果卡
+
+作用：
+
+1. 说明这一轮对话让哪些分类结果发生了变化。
+
+规则：
+
+1. 只读。
+2. 要说明从什么分类改成什么分类。
+3. 要说明影响了哪些对象。
+4. 要说明这次修改是否会影响后续建议或计划。
+
+#### 8.4.3 偏好提炼卡
+
+作用：
+
+1. 展示 AI 从用户话里提炼出的明确偏好。
+
+规则：
+
+1. 不做常驻区域。
+2. 只在本轮确实提炼出偏好时出现。
+3. 带操作按钮：
+   - `应用 / 保存`
+   - `撤销`
+4. 用户处理完后，页面继续回到普通消息流。
+
+#### 8.4.4 计划预览卡
+
+作用：
+
+1. 展示已经收敛成确定计划的结构化预览结果。
+
+规则：
+
+1. 只在用户意图足够明确且系统已生成有效预览时出现。
+2. 必须明确这是“预览”，不是已执行结果。
+3. 带操作按钮：
+   - `执行`
+4. 计划预览卡是从理解阶段进入落地阶段的关键分界点。
+
+#### 8.4.5 执行结果卡
+
+作用：
+
+1. 展示执行后的程序结果。
+2. 也可承载最近一次回滚结果摘要。
+
+规则：
+
+1. 带操作按钮：
+   - `撤销`
+2. 只有 `rollbackAvailable=true` 时，撤销入口才允许可用。
+3. 执行结果卡用于形成“预览 -> 执行 -> 回滚”的闭环反馈。
+
+#### 8.4.6 卡片总规则
+
+1. 普通 AI 建议不做结果卡，只保留自然语言回复。
+2. 只有程序状态已经形成结构化结果时，才使用卡片。
+3. 所有卡片使用统一骨架，不为不同卡片设计完全不同的视觉语言。
+
+### 8.5 底部固定输入区
+
+页面底部固定一个持续可用的对话输入区。
+
+输入区要包含：
+
+1. 多行输入框。
+2. 发送按钮。
+3. 当前会话状态提示。
+4. 必要时的轻量输入引导。
+
+输入区规则：
+
+1. 始终可见，不随消息流滚走。
+2. 支持连续多轮输入。
+3. 发送后自动滚动到最新一轮内容。
+4. 输入区是整个顾问页最稳定的交互锚点。
+
+### 8.6 页面状态
+
+顾问页需要在页面结构中显式定义状态，而不是临时拼 UI。
+
+#### 8.6.1 空状态
+
+1. 未开始会话时，展示初始化引导。
+2. 无树结果时，提示需要先初始化或先让 AI 理解目录。
+3. 无计划时，不显示计划预览卡。
+4. 无执行记录时，不显示执行结果卡。
+
+#### 8.6.2 加载状态
+
+1. AI 回复中要有统一的处理中表现。
+2. 生成预览中要有统一的处理中表现。
+3. 执行中要有统一的处理中表现。
+4. 回滚中要有统一的处理中表现。
+
+#### 8.6.3 定位与滚动
+
+1. 页面滚动主体是消息流。
+2. 顶部上下文条固定在页面上部。
+3. 底部输入区固定在页面下部。
+4. 新卡片插入后自动定位到最新一轮。
+
+### 8.7 统一交互与样式规则
+
+所有结果卡采用统一样式骨架。
+
+统一结构：
+
+1. 卡片头部。
+   - 类型标签
+   - 标题
+   - 时间或状态信息
+2. 卡片正文。
+   - 承载该类结果的核心内容
+3. 卡片底部操作区。
+   - 只在可操作卡片中出现
+
+统一规则：
+
+1. 只读卡没有底部操作区。
+2. 可操作卡的按钮位置保持一致。
+3. `树结果卡` 与 `分类修改结果卡` 为只读卡。
+4. `偏好提炼卡`、`计划预览卡`、`执行结果卡` 为可操作卡。
+5. 卡片之间通过内容和状态区分，不通过完全不同的样式语言区分。
+
+## 9. 上下文组装规范
 
 上下文组装不是模型工具，而是后台自动完成的工作。
 
@@ -532,7 +933,7 @@
 3. 当前轮用户消息
 4. 最近必要的工具结果
 
-### 8.1 `system`
+### 9.1 `system`
 
 `system` 只放稳定规则，不放当前目录事实，不放大段业务数据。
 
@@ -573,7 +974,7 @@
 5. 最近一次预览明细。
 6. 最近一次执行明细。
 
-### 8.2 `context payload`
+### 9.2 `context payload`
 
 `context payload` 放当前轮真正需要的事实数据，推荐用 JSON。
 
@@ -583,7 +984,6 @@
 {
   "session": {
     "sessionId": "session_001",
-    "mode": "balanced",
     "workflowStage": "understand",
     "rollbackAvailable": false
   },
@@ -653,16 +1053,15 @@
 `context payload` 中要放的内容：
 
 1. 当前会话标识。
-2. 当前模式。
-3. 当前主流程阶段。
-4. 当前是否可回滚。
-5. 当前根目录。
-6. `session` 记忆文本列表。
-7. `global` 记忆文本列表。
-8. 当前默认树视图文本。
-9. 当前活跃的筛选卡片。
-10. 当前活跃的预览卡片。
-11. 当前会话内最近一次执行卡片。
+2. 当前主流程阶段。
+3. 当前是否可回滚。
+4. 当前根目录。
+5. `session` 记忆文本列表。
+6. `global` 记忆文本列表。
+7. 当前默认树视图文本。
+8. 当前活跃的筛选卡片。
+9. 当前活跃的预览卡片。
+10. 当前会话内最近一次执行卡片。
 
 `context payload` 中不要默认放的内容：
 
@@ -672,7 +1071,7 @@
 4. 预览逐项明细。
 5. 执行逐项明细。
 
-### 8.3 当前轮用户消息
+### 9.3 当前轮用户消息
 
 当前轮用户输入不要并进 `context payload`，而是单独作为普通用户消息传入。
 
@@ -692,14 +1091,14 @@
 2. 上下文 JSON。
 3. 工具结果拼接文本。
 
-### 8.4 工具结果
+### 9.4 工具结果
 
 工具结果不预先全部注入，只在需要时按轮次补充。
 
 建议格式：
 
 ```text
-[advisor_find_files]
+[find_files]
 找到 12 个文件，已按大小从大到小排序。
 1. Screenshot-001.png | 截图 | 24 MB | 3 天前
 2. Screenshot-002.png | 截图 | 18 MB | 7 天前
@@ -718,7 +1117,7 @@
 2. 重复的大段树文本。
 3. 完整归类主结果全文。
 
-### 8.5 组装规则
+### 9.5 组装规则
 
 1. `system` 只放稳定规则。
 2. 目录事实、记忆和最近状态放进 `context payload`。
@@ -730,7 +1129,7 @@
 8. 预览卡片和执行卡片可以出现在多轮对话中，但不能只依赖聊天历史。
 9. 当前活跃的预览卡片和当前会话内最近一次执行卡片仍要显式放进 `context payload`。
 
-### 8.6 阶段化 Tool Policy
+### 9.6 阶段化 Tool Policy
 
 阶段状态：
 
@@ -744,48 +1143,57 @@
 
 规则：
 
-1. `advisor_find_files` 是进入主流程的起点。
-2. 只有拿到有效 `selectionId` 后，才允许 `advisor_preview_plan`。
-3. 只有拿到有效 `previewId` 后，才允许 `advisor_execute_plan`。
-4. `advisor_execute_plan` 成功后：
+1. `find_files` 是进入主流程的起点。
+2. 只有拿到有效 `selectionId` 后，才允许 `preview_plan`。
+3. 只有拿到有效 `previewId` 后，才允许 `execute_plan`。
+4. `execute_plan` 成功后：
    - `workflowStage` 回到 `understand`
    - `activeSelectionCard` 失效
    - `activePreviewCard` 失效
    - `latestExecutionCard` 更新
    - `rollbackAvailable=true`
-5. `advisor_rollback_plan` 不属于主流程阶段切换条件。
-6. `advisor_rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
+5. `apply_reclassification` 成功后：
+   - `workflowStage` 回到 `understand`
+   - `activeSelectionCard` 失效
+   - `activePreviewCard` 失效
+   - 后续筛选和预览必须基于新的分类结果重新生成
+6. `rollback_plan` 不属于主流程阶段切换条件。
+7. `rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
+8. `rollback_reclassification` 不属于主流程阶段切换条件。
+9. `rollback_reclassification` 默认可用，但只有存在可回滚的归类修改记录时才允许真正调用成功。
 
 工具暴露规则：
 
 1. 严格受阶段限制的工具只有三个：
-   - `advisor_find_files`
-   - `advisor_preview_plan`
-   - `advisor_execute_plan`
+   - `find_files`
+   - `preview_plan`
+   - `execute_plan`
 2. 其它工具默认可用：
-   - `advisor_get_directory_overview`
-   - `advisor_summarize_files`
-   - `advisor_read_only_file_summaries`
-   - `advisor_capture_preference`
-   - `advisor_list_preferences`
-   - `advisor_rollback_plan`
-3. `advisor_rollback_plan` 默认可见，但只有 `rollbackAvailable=true` 时才允许真正调用成功。
+   - `get_directory_overview`
+   - `summarize_files`
+   - `read_only_file_summaries`
+   - `capture_preference`
+   - `list_preferences`
+   - `apply_reclassification`
+   - `rollback_reclassification`
+   - `rollback_plan`
+3. `rollback_plan` 默认可见，但只有 `rollbackAvailable=true` 时才允许真正调用成功。
 
 优先级：
 
 1. `understand`
-   - 优先：`advisor_get_directory_overview`、`advisor_find_files`
-   - 其次：`advisor_summarize_files`、`advisor_list_preferences`
+   - 优先：`get_directory_overview`、`find_files`
+   - 其次：`summarize_files`、`list_preferences`
 2. `preview_ready`
-   - 优先：`advisor_preview_plan`
-   - 其次：`advisor_find_files`、`advisor_summarize_files`
+   - 优先：`preview_plan`
+   - 其次：`find_files`、`summarize_files`
 3. `execute_ready`
-   - 优先：`advisor_execute_plan`
-   - 其次：`advisor_preview_plan`
+   - 优先：`execute_plan`
+   - 其次：`preview_plan`
 4. 任意阶段
-   - 若 `rollbackAvailable=true`，则 `advisor_rollback_plan` 可作为侧边能力保留
+   - 若 `rollbackAvailable=true`，则 `rollback_plan` 可作为侧边能力保留
 
-## 9. 归类主结果
+## 10. 归类主结果
 
 归类阶段要保存完整结果数据，不只保存一棵展示树。
 
@@ -819,7 +1227,7 @@
    - `risk`
    - `suggestedAction`
 
-## 10. 树视图
+## 11. 树视图
 
 树视图不是唯一主数据，而是完整归类结果的派生视图。
 
@@ -831,7 +1239,7 @@
 4. `executionTree`
 5. `partialTree`
 
-## 11. 目标流程
+## 12. 目标流程
 
 1. 扫描基础信息。
 2. 生成摘要。
@@ -846,7 +1254,7 @@
 11. 用户确认执行。
 12. 程序执行和回滚。
 
-## 12. 分类树结构
+## 13. 分类树结构
 
 分类树是完整归类结果的一种视图。
 
@@ -914,7 +1322,7 @@
 }
 ```
 
-## 13. 数值字段表示
+## 14. 数值字段表示
 
 完整归类结果保留机器值。
 
@@ -945,7 +1353,7 @@
 2. 不返回 `createdAt`
 3. 不返回 `modifiedAt`
 
-## 14. 后续继续讨论
+## 15. 后续继续讨论
 
 1. 首轮建议的长度和口吻。
 2. 完整归类结果还需要哪些字段。

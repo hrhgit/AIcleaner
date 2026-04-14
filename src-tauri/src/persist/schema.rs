@@ -254,7 +254,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let advisor_needs_reset = current_advisor_schema
         .as_deref()
-        .map(|value| value != "advisor_v1")
+        .map(|value| value != "advisor_v3")
         .unwrap_or_else(|| advisor_tables_exist(&conn).unwrap_or(false));
     if advisor_needs_reset {
         drop_advisor_tables(&conn)?;
@@ -263,7 +263,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
     conn.execute(
         "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params!["advisor_v1"],
+        params!["advisor_v3"],
     )
     .map_err(|e| e.to_string())?;
     normalize_existing_root_path_keys(&conn)?;

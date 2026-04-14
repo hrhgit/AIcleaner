@@ -60,8 +60,8 @@ fn bool_to_i64(value: bool) -> i64 {
     }
 }
 
-mod organize;
 mod advisor;
+mod organize;
 mod scan;
 mod schema;
 

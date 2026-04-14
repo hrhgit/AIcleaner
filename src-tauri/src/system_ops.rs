@@ -62,7 +62,8 @@ pub fn move_to_recycle_bin(path: &Path) -> Result<(), String> {
 }
 
 pub fn recycle_many(paths: &[String]) -> Vec<Value> {
-    paths.iter()
+    paths
+        .iter()
         .map(|raw| {
             let path = Path::new(raw);
             if !path.exists() {

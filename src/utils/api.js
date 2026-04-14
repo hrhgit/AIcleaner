@@ -171,26 +171,6 @@ export async function advisorMessageSend(params) {
   return call('advisor_message_send', { input: params });
 }
 
-export async function advisorPreferenceApply(params) {
-  return call('advisor_preference_apply', { input: params });
-}
-
-export async function advisorSuggestionUpdate(params) {
-  return call('advisor_suggestion_update', { input: params });
-}
-
-export async function advisorExecutePreview(params) {
-  return call('advisor_execute_preview', { input: params });
-}
-
-export async function advisorExecuteConfirm(params) {
-  return call('advisor_execute_confirm', { input: params });
-}
-
-export async function advisorExecutionGet(jobId) {
-  return call('advisor_execution_get', { jobId });
-}
-
-export async function advisorExecutionRollback(jobId) {
-  return call('advisor_execution_rollback', { jobId });
+export async function advisorCardAction(params) {
+  return call('advisor_card_action', { input: params });
 }

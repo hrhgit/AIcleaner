@@ -46,12 +46,7 @@ pub fn run() {
             backend::advisor_session_start,
             backend::advisor_session_get,
             backend::advisor_message_send,
-            backend::advisor_preference_apply,
-            backend::advisor_suggestion_update,
-            backend::advisor_execute_preview,
-            backend::advisor_execute_confirm,
-            backend::advisor_execution_get,
-            backend::advisor_execution_rollback
+            backend::advisor_card_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
