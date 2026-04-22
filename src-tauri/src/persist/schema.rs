@@ -5,8 +5,21 @@ use super::scan::{
 };
 use super::*;
 
-pub fn init_db(db_path: &Path) -> Result<(), String> {
-    let mut conn = open_db(db_path)?;
+const ADVISOR_SCHEMA_VERSION: &str = "advisor_v3";
+
+fn ensure_app_meta_table(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn ensure_scan_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS scan_tasks (
@@ -151,14 +164,7 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         "#,
     )
     .map_err(|e| e.to_string())?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS app_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
+    ensure_app_meta_table(conn)?;
     let scan_task_columns = conn
         .prepare("PRAGMA table_info(scan_tasks)")
         .and_then(|mut stmt| {
@@ -221,7 +227,56 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     conn.execute("DROP INDEX IF EXISTS idx_scan_nodes_path", [])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
+pub(crate) fn ensure_organizer_read_schema(conn: &Connection) -> Result<(), String> {
+    ensure_app_meta_table(conn)?;
+    let had_schema_version = conn
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'organizer_schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    create_organizer_tables(conn)?;
+    if !had_schema_version {
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('organizer_schema_version', ?1)
+             ON CONFLICT(key) DO NOTHING",
+            params![ORGANIZER_SCHEMA_VERSION],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_advisor_read_schema(conn: &Connection) -> Result<(), String> {
+    ensure_app_meta_table(conn)?;
+    let had_schema_version = conn
+        .query_row(
+            "SELECT value FROM app_meta WHERE key = 'advisor_schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    create_advisor_tables(conn)?;
+    if !had_schema_version {
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
+             ON CONFLICT(key) DO NOTHING",
+            params![ADVISOR_SCHEMA_VERSION],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn ensure_organizer_schema_full(conn: &Connection) -> Result<(), String> {
     let current_organizer_schema = conn
         .query_row(
             "SELECT value FROM app_meta WHERE key = 'organizer_schema_version'",
@@ -244,6 +299,10 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
         params![ORGANIZER_SCHEMA_VERSION],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn ensure_advisor_schema_full(conn: &Connection) -> Result<(), String> {
     let current_advisor_schema = conn
         .query_row(
             "SELECT value FROM app_meta WHERE key = 'advisor_schema_version'",
@@ -263,25 +322,38 @@ pub fn init_db(db_path: &Path) -> Result<(), String> {
     conn.execute(
         "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params!["advisor_v3"],
+        params![ADVISOR_SCHEMA_VERSION],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn init_db(db_path: &Path) -> Result<(), String> {
+    let mut conn = open_db_raw(db_path)?;
+    ensure_scan_schema(&conn)?;
+    ensure_organizer_schema_full(&conn)?;
+    ensure_advisor_schema_full(&conn)?;
     normalize_existing_root_path_keys(&conn)?;
     cleanup_scan_drafts(&conn)?;
     run_scan_cache_maintenance(db_path, &mut conn)?;
     Ok(())
 }
 
-pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
-    let conn = open_db(db_path)?;
+pub fn mark_stale_scan_tasks(db_path: &Path) -> Result<(), String> {
+    let conn = open_db_raw(db_path)?;
     let now = now_iso();
     conn.execute(
         "UPDATE scan_tasks
          SET status='stopped', updated_at=?1, finished_at=COALESCE(finished_at, ?1)
-         WHERE status IN ('idle', 'scanning', 'analyzing')",
+        WHERE status IN ('idle', 'scanning', 'analyzing')",
         params![now],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn mark_stale_organize_tasks(db_path: &Path) -> Result<(), String> {
+    let conn = open_db_raw(db_path)?;
     let now = now_iso();
     let mut stmt = conn
         .prepare(
@@ -319,4 +391,9 @@ pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+pub fn mark_stale_tasks(db_path: &Path) -> Result<(), String> {
+    mark_stale_scan_tasks(db_path)?;
+    mark_stale_organize_tasks(db_path)
 }

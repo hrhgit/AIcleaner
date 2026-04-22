@@ -4,16 +4,21 @@
  */
 import { renderScanner } from './pages/scanner.js';
 import { renderAdvisor } from './pages/advisor.js';
+import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
 import { browseFolder, getSettings, moveDataDir, openExternalUrl } from './utils/api.js';
 import { emitLangChange, registerLangChangeHandler, setLang, getLang, t } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
+import { showToast } from './utils/toast.js';
 
 const pages = {
     scanner: renderScanner,
+    organizer: renderOrganizer,
+    'organizer-results': renderOrganizerResults,
     advisor: renderAdvisor,
 };
 
 let currentPage = null;
+let pageLangChangeUnsubscribe = null;
 
 function hideBootSplash() {
     const splash = document.getElementById('boot-splash');
@@ -23,9 +28,6 @@ function hideBootSplash() {
 }
 
 function normalizePageName(pageName) {
-    if (pageName === 'organizer' || pageName === 'organizer-results') {
-        return 'advisor';
-    }
     return pageName;
 }
 
@@ -49,8 +51,8 @@ function navigate(pageName) {
 
     const renderer = pages[normalizedPage];
     if (renderer) {
-        // Re-render immediately when language changes
-        registerLangChangeHandler(() => {
+        pageLangChangeUnsubscribe?.();
+        pageLangChangeUnsubscribe = registerLangChangeHandler(() => {
             if (currentPage === normalizedPage) renderer(container); // Refresh active page
         });
         renderer(container);
@@ -72,10 +74,12 @@ function getPageFromHash() {
 function updateShellCopy() {
     const currentLang = getLang();
     const scannerLabel = document.getElementById('nav-scanner-label');
+    const organizerLabel = document.getElementById('nav-organizer-label');
     const advisorLabel = document.getElementById('nav-advisor-label');
     const bootSubtitle = document.getElementById('boot-subtitle');
     const bootHint = document.getElementById('boot-hint');
     if (scannerLabel) scannerLabel.textContent = currentLang === 'en' ? 'Inventory' : '盘点';
+    if (organizerLabel) organizerLabel.textContent = currentLang === 'en' ? 'Organizer' : '归类';
     if (advisorLabel) advisorLabel.textContent = currentLang === 'en' ? 'Advisor' : '顾问';
     if (bootSubtitle) bootSubtitle.textContent = currentLang === 'en' ? 'Loading workspace...' : '正在加载工作台...';
     if (bootHint) bootHint.textContent = currentLang === 'en'
@@ -184,25 +188,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initial page
     navigate(getPageFromHash());
-    hideBootSplash();
+    window.requestAnimationFrame(() => {
+        hideBootSplash();
+    });
 });
 
-// Toast utility
-export function showToast(message, type = 'success') {
-    const existing = document.querySelector('.toast');
-    if (existing) existing.remove();
-
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.innerHTML = `
-    <span>${type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ'}</span>
-    <span>${message}</span>
-  `;
-    document.body.appendChild(toast);
-
-    setTimeout(() => {
-        toast.style.opacity = '0';
-        toast.style.transform = 'translateY(8px)';
-        setTimeout(() => toast.remove(), 300);
-    }, 3000);
-}

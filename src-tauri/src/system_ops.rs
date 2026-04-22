@@ -1,5 +1,4 @@
 use base64::Engine;
-use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 
@@ -59,32 +58,4 @@ pub fn move_to_recycle_bin(path: &Path) -> Result<(), String> {
         };
         Err(detail)
     }
-}
-
-pub fn recycle_many(paths: &[String]) -> Vec<Value> {
-    paths
-        .iter()
-        .map(|raw| {
-            let path = Path::new(raw);
-            if !path.exists() {
-                return json!({
-                    "path": raw,
-                    "status": "failed",
-                    "error": "path_not_found"
-                });
-            }
-            match move_to_recycle_bin(path) {
-                Ok(()) => json!({
-                    "path": raw,
-                    "status": "recycled",
-                    "error": Value::Null
-                }),
-                Err(err) => json!({
-                    "path": raw,
-                    "status": "failed",
-                    "error": err
-                }),
-            }
-        })
-        .collect()
 }

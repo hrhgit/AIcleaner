@@ -718,6 +718,7 @@ setTimeout(applyTranslationsToDOM, 0);
 
 export function registerLangChangeHandler(handler) {
   window.addEventListener('languageChanged', handler);
+  return () => window.removeEventListener('languageChanged', handler);
 }
 
 export function emitLangChange() {

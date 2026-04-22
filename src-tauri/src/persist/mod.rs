@@ -5,11 +5,13 @@ use serde_json::{json, Value};
 use sha1::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 const ORGANIZER_SCHEMA_VERSION: &str = "tree_v2";
 const SCAN_CACHE_MAINTENANCE_VERSION: &str = "scan_cache_v2";
 const SCAN_DRAFT_SCHEMA_VERSION: &str = "scan_draft_v1";
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ScanNode {
     pub id: String,
@@ -24,13 +26,21 @@ pub struct ScanNode {
     pub mtime_ms: Option<i64>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ScanFindingRecord {
     pub item: ScanResultItem,
     pub should_expand: bool,
 }
 
-fn open_db(db_path: &Path) -> Result<Connection, String> {
+static FULL_DB_BOOTSTRAP_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SCAN_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ORGANIZER_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ADVISOR_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SCAN_MODULE_PREPARED_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ORGANIZER_MODULE_PREPARED_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn open_db_raw(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
@@ -41,6 +51,78 @@ fn open_db(db_path: &Path) -> Result<Connection, String> {
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|e| e.to_string())?;
     Ok(conn)
+}
+
+fn db_cache(cache: &'static OnceLock<Mutex<HashSet<String>>>) -> &'static Mutex<HashSet<String>> {
+    cache.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn db_bootstrap_key(db_path: &Path) -> String {
+    normalize_root_path(&db_path.to_string_lossy())
+}
+
+fn run_cached_db_action(
+    cache: &'static OnceLock<Mutex<HashSet<String>>>,
+    db_path: &Path,
+    action: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let key = db_bootstrap_key(db_path);
+    let mut cache = db_cache(cache)
+        .lock()
+        .map_err(|_| "failed to lock db bootstrap cache".to_string())?;
+    if cache.contains(&key) {
+        return Ok(());
+    }
+    action()?;
+    cache.insert(key);
+    Ok(())
+}
+
+fn ensure_db_bootstrapped(db_path: &Path) -> Result<(), String> {
+    run_cached_db_action(&FULL_DB_BOOTSTRAP_CACHE, db_path, || {
+        init_db(db_path)?;
+        mark_stale_tasks(db_path)
+    })
+}
+
+pub(crate) fn ensure_scan_read_ready(db_path: &Path) -> Result<(), String> {
+    run_cached_db_action(&SCAN_READ_READY_CACHE, db_path, || {
+        let conn = open_db_raw(db_path)?;
+        ensure_scan_schema(&conn)
+    })
+}
+
+pub(crate) fn ensure_organizer_read_ready(db_path: &Path) -> Result<(), String> {
+    run_cached_db_action(&ORGANIZER_READ_READY_CACHE, db_path, || {
+        let conn = open_db_raw(db_path)?;
+        ensure_organizer_read_schema(&conn)
+    })
+}
+
+pub(crate) fn ensure_advisor_read_ready(db_path: &Path) -> Result<(), String> {
+    run_cached_db_action(&ADVISOR_READ_READY_CACHE, db_path, || {
+        let conn = open_db_raw(db_path)?;
+        ensure_advisor_read_schema(&conn)
+    })
+}
+
+pub(crate) fn prepare_scan_module_access(db_path: &Path) -> Result<(), String> {
+    ensure_scan_read_ready(db_path)?;
+    run_cached_db_action(&SCAN_MODULE_PREPARED_CACHE, db_path, || {
+        mark_stale_scan_tasks(db_path)
+    })
+}
+
+pub(crate) fn prepare_organizer_module_access(db_path: &Path) -> Result<(), String> {
+    ensure_organizer_read_ready(db_path)?;
+    run_cached_db_action(&ORGANIZER_MODULE_PREPARED_CACHE, db_path, || {
+        mark_stale_organize_tasks(db_path)
+    })
+}
+
+fn open_db(db_path: &Path) -> Result<Connection, String> {
+    ensure_db_bootstrapped(db_path)?;
+    open_db_raw(db_path)
 }
 
 fn now_iso() -> String {
@@ -160,6 +242,17 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("wipeout-{name}-{}.sqlite", Uuid::new_v4()))
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            params![table_name],
+            |_row| Ok(()),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some()
     }
 
     fn make_scan_snapshot(task_id: &str, root_path: &str) -> ScanSnapshot {
@@ -359,6 +452,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_read_ready_does_not_initialize_advisor_or_organizer_tables() {
+        let db_path = temp_db_path("scan-read-ready");
+        ensure_scan_read_ready(&db_path).expect("ensure scan read ready");
+
+        let conn = open_db_raw(&db_path).expect("open raw db");
+        assert!(table_exists(&conn, "scan_tasks"));
+        assert!(table_exists(&conn, "scan_nodes"));
+        assert!(table_exists(&conn, "scan_findings"));
+        assert!(!table_exists(&conn, "organize_tasks"));
+        assert!(!table_exists(&conn, "advisor_sessions"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn advisor_read_ready_does_not_initialize_scan_or_organizer_tables() {
+        let db_path = temp_db_path("advisor-read-ready");
+        ensure_advisor_read_ready(&db_path).expect("ensure advisor read ready");
+
+        let conn = open_db_raw(&db_path).expect("open raw db");
+        assert!(table_exists(&conn, "advisor_sessions"));
+        assert!(table_exists(&conn, "advisor_turns"));
+        assert!(table_exists(&conn, "advisor_cards"));
+        assert!(!table_exists(&conn, "scan_tasks"));
+        assert!(!table_exists(&conn, "organize_tasks"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
     fn scan_finding_write_skips_immediate_stat_refresh_but_delete_paths_recomputes_stats() {
         let db_path = temp_db_path("scan-finding-stats");
         init_db(&db_path).expect("init db");
@@ -487,6 +610,61 @@ mod tests {
         let after_cleanup =
             load_full_scan_draft_snapshot(&db_path, task_id).expect("load draft after cleanup");
         assert!(after_cleanup.is_none());
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn prepare_scan_module_access_marks_stale_scan_tasks() {
+        let db_path = temp_db_path("scan-module-prepare");
+        init_db(&db_path).expect("init db");
+
+        let task_id = "scan_stale_task";
+        let root_path = r"C:\scan-root";
+        init_scan_task(
+            &db_path,
+            task_id,
+            root_path,
+            0,
+            Some(2),
+            true,
+            None,
+            "full_rescan_incremental",
+            true,
+        )
+        .expect("init scan task");
+        let mut snapshot = make_scan_snapshot(task_id, root_path);
+        snapshot.status = "scanning".to_string();
+        save_scan_snapshot(&db_path, &snapshot).expect("save stale scan snapshot");
+
+        prepare_scan_module_access(&db_path).expect("prepare scan module access");
+
+        let prepared = load_scan_snapshot(&db_path, task_id)
+            .expect("load prepared snapshot")
+            .expect("snapshot exists");
+        assert_eq!(prepared.status, "stopped");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn prepare_organizer_module_access_marks_stale_organize_tasks() {
+        let db_path = temp_db_path("organizer-module-prepare");
+        init_db(&db_path).expect("init db");
+
+        let mut snapshot = make_organize_snapshot("organize_stale_task", r"C:\root");
+        snapshot.status = "classifying".to_string();
+        snapshot.completed_at = None;
+        init_organize_task(&db_path, &snapshot).expect("init organize task");
+        save_organize_snapshot(&db_path, &snapshot).expect("save organize snapshot");
+
+        prepare_organizer_module_access(&db_path).expect("prepare organizer module access");
+
+        let prepared = load_organize_snapshot(&db_path, &snapshot.id)
+            .expect("load prepared organize snapshot")
+            .expect("snapshot exists");
+        assert_eq!(prepared.status, "stopped");
+        assert!(prepared.completed_at.is_some());
 
         let _ = fs::remove_file(db_path);
     }

@@ -2,6 +2,11 @@ use super::*;
 
 const DEFAULT_SESSION_STATUS: &str = "active";
 
+fn open_advisor_db_for_read(db_path: &Path) -> Result<Connection, String> {
+    ensure_advisor_read_ready(db_path)?;
+    open_db_raw(db_path)
+}
+
 pub(crate) fn advisor_tables_exist(conn: &Connection) -> Result<bool, String> {
     let count = conn
         .query_row(
@@ -262,7 +267,7 @@ pub fn save_advisor_session(db_path: &Path, session: &Value) -> Result<(), Strin
 }
 
 pub fn load_advisor_session(db_path: &Path, session_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let raw = conn
         .query_row(
             "SELECT session_json FROM advisor_sessions WHERE session_id = ?1",
@@ -315,7 +320,7 @@ pub fn create_advisor_turn(
 }
 
 pub fn load_advisor_turns(db_path: &Path, session_id: &str) -> Result<Vec<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT turn_json
@@ -385,7 +390,7 @@ pub fn save_advisor_card(db_path: &Path, card: &Value) -> Result<(), String> {
 }
 
 pub fn load_advisor_cards(db_path: &Path, session_id: &str) -> Result<Vec<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT card_json
@@ -402,7 +407,7 @@ pub fn load_advisor_cards(db_path: &Path, session_id: &str) -> Result<Vec<Value>
 }
 
 pub fn load_advisor_card(db_path: &Path, card_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let raw = conn
         .query_row(
             "SELECT card_json FROM advisor_cards WHERE card_id = ?1",
@@ -463,7 +468,7 @@ pub fn load_advisor_memories(
     db_path: &Path,
     session_id: Option<&str>,
 ) -> Result<Vec<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT memory_json
@@ -526,7 +531,7 @@ pub fn load_advisor_file_summary(
     root_path_key: &str,
     path_key: &str,
 ) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let raw = conn
         .query_row(
             "SELECT summary_json FROM advisor_file_summaries WHERE root_path_key = ?1 AND path_key = ?2",
@@ -582,7 +587,7 @@ pub fn save_advisor_selection(db_path: &Path, row: &Value) -> Result<(), String>
 }
 
 pub fn load_advisor_selection(db_path: &Path, selection_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let raw = conn
         .query_row(
             "SELECT selection_json FROM advisor_selections WHERE selection_id = ?1",
@@ -652,7 +657,7 @@ pub fn save_advisor_plan_job(db_path: &Path, row: &Value) -> Result<(), String> 
 }
 
 pub fn load_advisor_plan_job(db_path: &Path, job_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let row = conn
         .query_row(
             "SELECT session_id, selection_id, preview_card_id, status, preview_json, result_json, rollback_json, created_at, updated_at
@@ -750,7 +755,7 @@ pub fn save_advisor_reclass_job(db_path: &Path, row: &Value) -> Result<(), Strin
 }
 
 pub fn load_advisor_reclass_job(db_path: &Path, job_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_advisor_db_for_read(db_path)?;
     let row = conn
         .query_row(
             "SELECT session_id, status, request_json, result_json, rollback_json, created_at, updated_at

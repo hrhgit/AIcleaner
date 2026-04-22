@@ -1,6 +1,13 @@
+mod planner;
+mod summary;
+
 use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
+use crate::llm_protocol::{
+    apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
+    parse_completion_response, ParsedToolCall, DEFAULT_MAX_TOKENS,
+};
 use crate::persist;
-use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
+use crate::web_search::{format_web_search_context, tavily_search, WebSearchRequest};
 use parking_lot::Mutex;
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -28,6 +35,7 @@ const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
+const ORGANIZER_WEB_SEARCH_BUDGET: usize = 8;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_TIKA_URL: &str = "http://127.0.0.1:9998";
@@ -66,6 +74,8 @@ struct RouteConfig {
 struct ChatCompletionOutput {
     raw_body: String,
     content: String,
+    raw_message: Value,
+    tool_calls: Vec<ParsedToolCall>,
     usage: TokenUsage,
 }
 
@@ -2109,1030 +2119,6 @@ fn normalize_multiline_text(value: &str, max_chars: usize) -> String {
     trim_to_chars(out.trim(), max_chars)
 }
 
-fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    let stem = Path::new(&unit.name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(&unit.name);
-    for token in stem
-        .split(|ch: char| !ch.is_alphanumeric() && !('\u{4e00}'..='\u{9fff}').contains(&ch))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let normalized = token.to_ascii_lowercase();
-        if seen.insert(normalized) {
-            out.push(token.to_string());
-        }
-        if out.len() >= limit {
-            break;
-        }
-    }
-    if out.is_empty() {
-        out.push(unit.name.clone());
-    }
-    out
-}
-
-fn build_empty_extraction(unit: &OrganizeUnit, warning: &str) -> SummaryExtraction {
-    build_empty_extraction_with_warnings(unit, vec![warning.to_string()])
-}
-
-fn build_empty_extraction_with_warnings(
-    unit: &OrganizeUnit,
-    warnings: Vec<String>,
-) -> SummaryExtraction {
-    SummaryExtraction {
-        parser: "unavailable".to_string(),
-        title: None,
-        excerpt: String::new(),
-        keywords: collect_name_keywords(unit, 6),
-        metadata_lines: Vec::new(),
-        warnings,
-    }
-}
-
-fn extract_plain_text_summary(unit: &OrganizeUnit) -> SummaryExtraction {
-    if unit.size > LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES {
-        return build_empty_extraction_with_warnings(
-            unit,
-            vec![format!(
-                "summary_input_too_large:{}>{}",
-                unit.size, LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES
-            )],
-        );
-    }
-    match fs::read(&unit.path) {
-        Ok(bytes) => {
-            let text = normalize_multiline_text(
-                &String::from_utf8_lossy(&bytes),
-                LOCAL_TEXT_EXCERPT_CHARS,
-            );
-            if text.trim().is_empty() {
-                return build_empty_extraction(unit, "text_summary_fallback");
-            }
-            SummaryExtraction {
-                parser: "plain_text".to_string(),
-                title: Some(unit.name.clone()),
-                excerpt: text,
-                keywords: collect_name_keywords(unit, 6),
-                metadata_lines: vec![
-                    format!("name={}", unit.name),
-                    format!("relativePath={}", unit.relative_path),
-                    format!("size={}", unit.size),
-                ],
-                warnings: Vec::new(),
-            }
-        }
-        Err(_) => build_empty_extraction(unit, "text_summary_fallback"),
-    }
-}
-
-fn extract_unit_content_for_summary(
-    unit: &OrganizeUnit,
-    response_language: &str,
-    stop: &AtomicBool,
-) -> SummaryExtraction {
-    if stop.load(Ordering::Relaxed) {
-        return build_empty_extraction(unit, "stop_requested");
-    }
-    if unit.item_type == "directory" {
-        return SummaryExtraction {
-            parser: "directory_assessment".to_string(),
-            title: Some(unit.name.clone()),
-            excerpt: summarize_directory_for_prompt(unit, response_language),
-            keywords: collect_name_keywords(unit, 6),
-            metadata_lines: vec![
-                format!("name={}", unit.name),
-                format!("relativePath={}", unit.relative_path),
-                "itemType=directory".to_string(),
-            ],
-            warnings: unit
-                .directory_assessment
-                .as_ref()
-                .map(|assessment| assessment.fragmentation_warnings.clone())
-                .unwrap_or_default(),
-        };
-    }
-
-    let ext = extension_key(Path::new(&unit.path));
-    match ext.as_str() {
-        ".txt" | ".md" | ".csv" | ".json" | ".yaml" | ".yml" | ".toml" | ".xml" | ".log"
-        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py" | ".java"
-        | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql" | ".sh" | ".bat"
-        | ".ps1" => extract_plain_text_summary(unit),
-        _ if unit.modality == "text" && !supports_tika_extraction(unit) => {
-            extract_plain_text_summary(unit)
-        }
-        _ => build_empty_extraction(unit, "filename_only_fallback"),
-    }
-}
-
-fn supports_tika_extraction(unit: &OrganizeUnit) -> bool {
-    if unit.item_type != "file" {
-        return false;
-    }
-    let ext = extension_key(Path::new(&unit.path));
-    matches!(
-        ext.as_str(),
-        ".pdf"
-            | ".doc"
-            | ".docx"
-            | ".xls"
-            | ".xlsx"
-            | ".ppt"
-            | ".pptx"
-            | ".rtf"
-            | ".odt"
-            | ".ods"
-            | ".odp"
-            | ".epub"
-    )
-}
-
-async fn tika_extract_text(
-    config: &ExtractionToolConfig,
-    unit: &OrganizeUnit,
-    stop: &AtomicBool,
-) -> Result<String, String> {
-    if !config.tika_enabled || !supports_tika_extraction(unit) {
-        return Err("tika_not_enabled".to_string());
-    }
-    if unit.size > TIKA_MAX_UPLOAD_BYTES {
-        return Err(format!(
-            "tika_input_too_large:{}>{}",
-            unit.size, TIKA_MAX_UPLOAD_BYTES
-        ));
-    }
-    if stop.load(Ordering::Relaxed) {
-        return Err("stop_requested".to_string());
-    }
-
-    let body = fs::read(&unit.path).map_err(|e| format!("tika_read_failed:{e}"))?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(TIKA_EXTRACT_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("tika_client_failed:{e}"))?;
-    let request = client
-        .put(format!("{}/tika", config.tika_url))
-        .header("Accept", "text/plain")
-        .header("Content-Type", "application/octet-stream")
-        .body(body);
-    let request_future = async move {
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("tika_request_failed:{e}"))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| format!("tika_body_failed:{e}"))?;
-        if !status.is_success() {
-            return Err(format!("tika_http_{}:{}", status.as_u16(), text));
-        }
-        Ok(text)
-    };
-    tokio::pin!(request_future);
-
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Err("stop_requested".to_string());
-        }
-        tokio::select! {
-            result = &mut request_future => return result,
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-        }
-    }
-}
-
-async fn extract_unit_content_for_summary_with_tools(
-    unit: &OrganizeUnit,
-    response_language: &str,
-    stop: &AtomicBool,
-    extraction_tool: &ExtractionToolConfig,
-) -> SummaryExtraction {
-    if extraction_tool.tika_ready && supports_tika_extraction(unit) {
-        match tika_extract_text(extraction_tool, unit, stop).await {
-            Ok(text) => {
-                let excerpt = normalize_multiline_text(&text, LOCAL_TEXT_EXCERPT_CHARS);
-                if !excerpt.trim().is_empty() {
-                    return SummaryExtraction {
-                        parser: "tika".to_string(),
-                        title: Some(unit.name.clone()),
-                        excerpt,
-                        keywords: collect_name_keywords(unit, 6),
-                        metadata_lines: vec![
-                            format!("name={}", unit.name),
-                            format!("relativePath={}", unit.relative_path),
-                            format!("itemType={}", unit.item_type),
-                            format!("modality={}", unit.modality),
-                            "externalExtractor=tika".to_string(),
-                        ],
-                        warnings: Vec::new(),
-                    };
-                }
-                return build_empty_extraction_with_warnings(
-                    unit,
-                    vec![
-                        "tika_empty_text".to_string(),
-                        "filename_only_fallback".to_string(),
-                    ],
-                );
-            }
-            Err(err) if err == "stop_requested" => {
-                return build_empty_extraction(unit, "stop_requested");
-            }
-            Err(err) => {
-                let mut fallback = extract_unit_content_for_summary(unit, response_language, stop);
-                fallback.warnings.push(err);
-                return fallback;
-            }
-        }
-    }
-    extract_unit_content_for_summary(unit, response_language, stop)
-}
-
-fn build_local_summary(unit: &OrganizeUnit, extracted: &SummaryExtraction) -> SummaryBuildResult {
-    if unit.item_type != "directory" && extracted.excerpt.trim().is_empty() {
-        return SummaryBuildResult {
-            summary: String::new(),
-            source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
-            degraded: true,
-            warnings: extracted.warnings.clone(),
-            confidence: None,
-        };
-    }
-
-    let mut lines = vec![
-        format!("name={}", unit.name),
-        format!("relativePath={}", unit.relative_path),
-        format!("itemType={}", unit.item_type),
-        format!("modality={}", unit.modality),
-        format!("parser={}", extracted.parser),
-    ];
-    if let Some(title) = extracted
-        .title
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(format!(
-            "title={}",
-            trim_to_chars(title, LOCAL_SUMMARY_EXCERPT_CHARS)
-        ));
-    }
-    if !extracted.keywords.is_empty() {
-        lines.push(format!(
-            "keywords={}",
-            trim_to_chars(&extracted.keywords.join(", "), LOCAL_SUMMARY_EXCERPT_CHARS)
-        ));
-    }
-    lines.extend(extracted.metadata_lines.iter().cloned());
-    if !extracted.excerpt.trim().is_empty() {
-        lines.push(format!(
-            "excerpt={}",
-            trim_to_chars(
-                &normalize_multiline_text(&extracted.excerpt, LOCAL_TEXT_EXCERPT_CHARS),
-                LOCAL_SUMMARY_EXCERPT_CHARS
-            )
-        ));
-    }
-
-    SummaryBuildResult {
-        summary: lines.join("\n"),
-        source: SUMMARY_SOURCE_LOCAL_SUMMARY.to_string(),
-        degraded: false,
-        warnings: extracted.warnings.clone(),
-        confidence: None,
-    }
-}
-
-fn sanitize_json_block(content: &str) -> String {
-    content
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim()
-        .to_string()
-}
-
-fn append_batch_trace(
-    trace: &mut Vec<String>,
-    round: usize,
-    route: &RouteConfig,
-    outcome: &str,
-    raw_body: &str,
-    message_content: Option<&str>,
-    error_message: Option<&str>,
-) {
-    let mut sections = vec![
-        format!("Round: {}", round),
-        format!("Model: {}/{}", route.endpoint, route.model),
-        format!("Outcome: {}", outcome),
-    ];
-    if let Some(error_message) = error_message.filter(|value| !value.trim().is_empty()) {
-        sections.push(format!("Error: {}", error_message));
-    }
-    if let Some(message_content) = message_content.filter(|value| !value.trim().is_empty()) {
-        sections.push("Message Content:".to_string());
-        sections.push(message_content.to_string());
-    }
-    sections.push("HTTP Raw Response Body:".to_string());
-    sections.push(if raw_body.trim().is_empty() {
-        "(unavailable)".to_string()
-    } else {
-        raw_body.to_string()
-    });
-    trace.push(sections.join("\n"));
-}
-
-fn summarize_response_body_for_error(raw_body: &str) -> String {
-    let trimmed = raw_body.trim();
-    if trimmed.is_empty() {
-        return "empty body".to_string();
-    }
-    let snippet: String = trimmed.chars().take(RESPONSE_ERROR_SNIPPET_CHARS).collect();
-    if trimmed.chars().count() > RESPONSE_ERROR_SNIPPET_CHARS {
-        format!("{snippet}...")
-    } else {
-        snippet
-    }
-}
-
-fn parse_chat_completion_http_body(
-    status: StatusCode,
-    raw_body: &str,
-) -> Result<ChatCompletionOutput, ChatCompletionError> {
-    let body: Value = serde_json::from_str(raw_body).map_err(|e| ChatCompletionError {
-        message: format!(
-            "error decoding response body: {} | body: {}",
-            e,
-            summarize_response_body_for_error(raw_body)
-        ),
-        raw_body: raw_body.to_string(),
-    })?;
-    if !status.is_success() {
-        let api_message = body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("classification request failed");
-        return Err(ChatCompletionError {
-            message: format!("{} (HTTP {})", api_message, status.as_u16()),
-            raw_body: raw_body.to_string(),
-        });
-    }
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if content.trim().is_empty() {
-        return Err(ChatCompletionError {
-            message: format!(
-                "classification response missing choices[0].message.content | body: {}",
-                summarize_response_body_for_error(raw_body)
-            ),
-            raw_body: raw_body.to_string(),
-        });
-    }
-    let usage = TokenUsage {
-        prompt: body
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        completion: body
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        total: body
-            .pointer("/usage/total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    };
-    Ok(ChatCompletionOutput {
-        raw_body: raw_body.to_string(),
-        content,
-        usage,
-    })
-}
-
-async fn chat_completion(
-    route: &RouteConfig,
-    system_prompt: &str,
-    user_prompt: &str,
-    stop: &AtomicBool,
-) -> Result<ChatCompletionOutput, ChatCompletionError> {
-    let url = format!("{}/chat/completions", route.endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(CHAT_COMPLETION_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| ChatCompletionError {
-            message: e.to_string(),
-            raw_body: String::new(),
-        })?;
-    let mut req = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&json!({
-            "model": route.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_prompt }
-            ],
-            "temperature": 0
-        }));
-    if !route.api_key.is_empty() {
-        req = req
-            .header("Authorization", format!("Bearer {}", route.api_key))
-            .header("x-api-key", route.api_key.clone())
-            .header("api-key", route.api_key.clone());
-    }
-    let request_future = async move {
-        let resp = req.send().await.map_err(|e| ChatCompletionError {
-            message: e.to_string(),
-            raw_body: String::new(),
-        })?;
-        let status = resp.status();
-        let raw_body = resp.text().await.map_err(|e| ChatCompletionError {
-            message: format!("error reading response body: {}", e),
-            raw_body: String::new(),
-        })?;
-        parse_chat_completion_http_body(status, &raw_body)
-    };
-    tokio::pin!(request_future);
-
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Err(ChatCompletionError {
-                message: "stop_requested".to_string(),
-                raw_body: String::new(),
-            });
-        }
-        tokio::select! {
-            result = &mut request_future => return result,
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-        }
-    }
-}
-
-fn build_summary_agent_system_prompt(response_language: &str) -> String {
-    let output_language = localized_language_name(response_language, response_language);
-    [
-        "You prepare short standardized summaries for a later file classification step."
-            .to_string(),
-        "Return JSON only.".to_string(),
-        "Schema: {\"items\":[{\"itemId\":\"...\",\"summary\":\"...\",\"keywords\":[\"...\"],\"confidence\":\"high|medium|low\",\"warnings\":[\"...\"]}]}".to_string(),
-        "Cover every input item exactly once and preserve itemId verbatim.".to_string(),
-        "Do not classify, rename, or omit items.".to_string(),
-        format!(
-            "Write summary and warnings in {output_language} only. Keep each summary under about {SUMMARY_AGENT_SUMMARY_CHARS} characters."
-        ),
-        "Use the provided local extraction material first. If content is sparse, say so briefly instead of inventing details.".to_string(),
-    ]
-    .join("\n")
-}
-
-fn parse_summary_agent_output(content: &str) -> Result<HashMap<String, SummaryAgentItem>, String> {
-    let parsed: Value =
-        serde_json::from_str(&sanitize_json_block(content)).map_err(|e| e.to_string())?;
-    let items = parsed
-        .get("items")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "summary agent response missing items".to_string())?;
-    let mut out = HashMap::new();
-    for item in items {
-        let Some(item_id) = item.get("itemId").and_then(Value::as_str) else {
-            continue;
-        };
-        let summary = item
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
-        let keywords = item
-            .get("keywords")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
-            .filter(|value| !value.is_empty())
-            .take(8)
-            .collect::<Vec<_>>();
-        let warnings = item
-            .get("warnings")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
-            .filter(|value| !value.is_empty())
-            .take(8)
-            .collect::<Vec<_>>();
-        out.insert(
-            item_id.to_string(),
-            SummaryAgentItem {
-                summary,
-                keywords,
-                confidence: sanitize_summary_confidence(
-                    item.get("confidence").and_then(Value::as_str),
-                ),
-                warnings,
-            },
-        );
-    }
-    Ok(out)
-}
-
-async fn summarize_batch_with_agent(
-    text_route: &RouteConfig,
-    response_language: &str,
-    stop: &AtomicBool,
-    batch_rows: &[Value],
-) -> SummaryAgentBatchOutput {
-    if text_route.api_key.trim().is_empty() {
-        return SummaryAgentBatchOutput {
-            items: HashMap::new(),
-            usage: TokenUsage::default(),
-            error: Some("summary_agent_missing_api_key".to_string()),
-        };
-    }
-
-    let system_prompt = build_summary_agent_system_prompt(response_language);
-    let payload = json!({
-        "mode": SUMMARY_MODE_AGENT_SUMMARY,
-        "outputLanguage": localized_language_name(response_language, response_language),
-        "fileIndex": batch_rows.iter().map(|row| json!({
-            "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-            "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-            "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-            "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-        })).collect::<Vec<_>>(),
-        "items": batch_rows.iter().map(|row| json!({
-            "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-            "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-            "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-            "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-            "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
-        })).collect::<Vec<_>>(),
-    });
-
-    match chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await {
-        Ok(output) => match parse_summary_agent_output(&output.content) {
-            Ok(items) => SummaryAgentBatchOutput {
-                items,
-                usage: output.usage,
-                error: None,
-            },
-            Err(err) => SummaryAgentBatchOutput {
-                items: HashMap::new(),
-                usage: output.usage,
-                error: Some(format!("summary_agent_parse_failed:{err}")),
-            },
-        },
-        Err(err) => SummaryAgentBatchOutput {
-            items: HashMap::new(),
-            usage: TokenUsage::default(),
-            error: Some(err.message),
-        },
-    }
-}
-
-fn build_organize_system_prompt(response_language: &str, allow_web_search: bool) -> String {
-    let output_language = localized_language_name(response_language, response_language);
-    let mut lines = vec![
-        "You cluster file summaries into a hierarchical category tree.".to_string(),
-        "Return JSON only.".to_string(),
-        "Final schema: {\"tree\":{...},\"assignments\":[{\"itemId\":\"...\",\"leafNodeId\":\"... optional\",\"categoryPath\":[\"...\"],\"reason\":\"...\"}]}".to_string(),
-        "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
-        "When an item summary includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the summary clearly shows unrelated mixed content.".to_string(),
-        "Some items may have an empty summary and only provide file name, path, type, or modality. In that case, classify using those fields instead of assuming missing content.".to_string(),
-        "The classification payload only includes normalized summaries and lightweight metadata, not raw extraction text.".to_string(),
-        "Prefer using summary first when it exists; otherwise fall back to name, relativePath, itemType, and modality.".to_string(),
-        format!("Use {output_language} names and keep labels short."),
-        format!("The assignment \"reason\" field must be written in {output_language} only."),
-    ];
-    if allow_web_search {
-        lines.push(
-            "If local metadata is insufficient and external context is necessary, you may return {\"action\":\"web_search\",\"query\":\"...\",\"reason\":\"...\"} instead of the final schema. Use one concise query only."
-                .to_string(),
-        );
-    }
-    lines.join("\n")
-}
-
-fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Value> {
-    batch_rows
-        .iter()
-        .map(|row| {
-            let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
-            let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
-            json!({
-                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-                "createdAge": created_age,
-                "modifiedAge": modified_age,
-                "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
-                "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
-                "summaryKeywords": row
-                    .get("summaryKeywords")
-                    .cloned()
-                    .unwrap_or(Value::Array(Vec::new())),
-                "summaryWarnings": row
-                    .get("summaryWarnings")
-                    .cloned()
-                    .unwrap_or(Value::Array(Vec::new())),
-            })
-        })
-        .collect()
-}
-
-async fn classify_organize_batch(
-    text_route: &RouteConfig,
-    response_language: &str,
-    stop: &AtomicBool,
-    existing_tree: &CategoryTreeNode,
-    batch_rows: &[Value],
-    max_cluster_depth: Option<u32>,
-    reference_structure: Option<&String>,
-    use_web_search: bool,
-    search_api_key: &str,
-) -> Result<ClassifyOrganizeBatchOutput, String> {
-    let search_allowed = use_web_search && !search_api_key.trim().is_empty();
-    let mut total_usage = TokenUsage::default();
-    let mut search_context = None::<String>;
-    let mut round_trace = Vec::new();
-    let max_rounds = if search_allowed { 2 } else { 1 };
-    let classification_items = build_classification_batch_items(batch_rows);
-
-    for round_idx in 0..max_rounds {
-        let round = round_idx + 1;
-        let system_prompt = build_organize_system_prompt(
-            response_language,
-            search_allowed && search_context.is_none(),
-        );
-        let mut payload = json!({
-            "maxClusterDepth": max_cluster_depth,
-            "existingTree": category_tree_to_value(existing_tree),
-            "fileIndex": batch_rows.iter().map(|row| {
-                let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
-                let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
-                json!({
-                    "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-                    "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-                    "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-                    "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-                    "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-                    "createdAge": created_age,
-                    "modifiedAge": modified_age,
-                    "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
-                })
-            }).collect::<Vec<_>>(),
-            "items": classification_items.clone(),
-            "useWebSearch": use_web_search,
-        });
-        if let Some(structure) = reference_structure {
-            payload["referenceStructure"] = Value::String(structure.clone());
-        }
-        if let Some(context) = search_context.as_ref() {
-            payload["webSearchContext"] = Value::String(context.clone());
-            payload["webSearchFollowup"] =
-                Value::String("Return the final tree and assignments JSON only.".to_string());
-        }
-
-        let completion =
-            match chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await {
-                Ok(output) => output,
-                Err(err) => {
-                    append_batch_trace(
-                        &mut round_trace,
-                        round,
-                        text_route,
-                        "http_error",
-                        &err.raw_body,
-                        None,
-                        Some(&err.message),
-                    );
-                    return Ok(ClassifyOrganizeBatchOutput {
-                        parsed: None,
-                        usage: total_usage,
-                        raw_output: round_trace.join("\n\n====================\n\n"),
-                        error: Some(err.message),
-                    });
-                }
-            };
-        total_usage.prompt = total_usage.prompt.saturating_add(completion.usage.prompt);
-        total_usage.completion = total_usage
-            .completion
-            .saturating_add(completion.usage.completion);
-        total_usage.total = total_usage.total.saturating_add(completion.usage.total);
-        append_batch_trace(
-            &mut round_trace,
-            round,
-            text_route,
-            "http_ok",
-            &completion.raw_body,
-            Some(&completion.content),
-            None,
-        );
-
-        let parsed = serde_json::from_str::<Value>(&sanitize_json_block(&completion.content))
-            .unwrap_or_else(|_| json!({}));
-        if search_allowed && search_context.is_none() {
-            if let Some(request) = parse_web_search_request(&parsed) {
-                let trace = tavily_search(search_api_key, &request).await?;
-                search_context = Some(format_web_search_context(&trace, response_language));
-                continue;
-            }
-        }
-
-        if parsed.get("tree").is_some() || parsed.get("assignments").is_some() {
-            return Ok(ClassifyOrganizeBatchOutput {
-                parsed: Some(parsed),
-                usage: total_usage,
-                raw_output: round_trace.join("\n\n====================\n\n"),
-                error: None,
-            });
-        }
-
-        return Ok(ClassifyOrganizeBatchOutput {
-            parsed: None,
-            usage: total_usage,
-            raw_output: round_trace.join("\n\n====================\n\n"),
-            error: Some("classification response is not valid JSON schema".to_string()),
-        });
-    }
-
-    Ok(ClassifyOrganizeBatchOutput {
-        parsed: None,
-        usage: total_usage,
-        raw_output: round_trace.join("\n\n====================\n\n"),
-        error: Some(
-            "model requested web search but did not return final batch assignments".to_string(),
-        ),
-    })
-}
-
-fn emit_organize_summary_ready<R: Runtime>(
-    app: &AppHandle<R>,
-    task_id: &str,
-    batch_index: u64,
-    row: &Value,
-) {
-    let payload = json!({
-        "taskId": task_id,
-        "batchIndex": batch_index,
-        "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-        "path": row.get("path").and_then(Value::as_str).unwrap_or(""),
-        "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-        "size": row.get("size").and_then(Value::as_u64).unwrap_or(0),
-        "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-        "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-        "summaryMode": row
-            .get("summaryMode")
-            .cloned()
-            .unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
-        "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-        "summarySource": row
-            .get("summarySource")
-            .and_then(Value::as_str)
-            .unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
-        "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
-        "summaryKeywords": row
-            .get("summaryKeywords")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
-        "summaryWarnings": row
-            .get("summaryWarnings")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
-        "warnings": row
-            .get("summaryWarnings")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
-        "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
-        "provider": row.get("provider").and_then(Value::as_str).unwrap_or(""),
-        "model": row.get("model").and_then(Value::as_str).unwrap_or(""),
-    });
-    if let Err(err) = app.emit("organize_summary_ready", payload) {
-        log::warn!("failed to emit organize_summary_ready for task {task_id}: {err}");
-    }
-}
-
-fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
-    let mut used = HashSet::new();
-    let mut out = Vec::new();
-    for row in results {
-        if row_has_classification_error(row) {
-            continue;
-        }
-        let category_path = category_path_from_value(row.get("categoryPath"));
-        let mut target_dir = PathBuf::from(root_path);
-        for segment in if category_path.is_empty() {
-            vec![UNCATEGORIZED_NODE_NAME.to_string()]
-        } else {
-            category_path.clone()
-        } {
-            target_dir = target_dir.join(sanitize_node_name(&segment));
-        }
-        let mut target = target_dir.join(row.get("name").and_then(Value::as_str).unwrap_or(""));
-        let mut suffix = 1_u32;
-        while used.contains(&target.to_string_lossy().to_lowercase()) {
-            let name = target
-                .file_stem()
-                .and_then(|x| x.to_str())
-                .unwrap_or("file");
-            let ext = target.extension().and_then(|x| x.to_str()).unwrap_or("");
-            let next_name = if ext.is_empty() {
-                format!("{name} ({suffix})")
-            } else {
-                format!("{name} ({suffix}).{ext}")
-            };
-            target = target_dir.join(next_name);
-            suffix += 1;
-        }
-        used.insert(target.to_string_lossy().to_lowercase());
-        out.push(json!({
-            "sourcePath": row.get("path").and_then(Value::as_str).unwrap_or(""),
-            "category": category_path_display(&category_path),
-            "categoryPath": category_path,
-            "leafNodeId": row.get("leafNodeId").and_then(Value::as_str).unwrap_or(""),
-            "targetPath": target.to_string_lossy().to_string(),
-            "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file")
-        }));
-    }
-    out
-}
-
-fn hydrate_loaded_snapshot(mut snapshot: OrganizeSnapshot) -> OrganizeSnapshot {
-    snapshot.preview = build_preview(&snapshot.root_path, &snapshot.results);
-    snapshot
-}
-
-fn normalize_path_key(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "\\").to_lowercase()
-}
-
-fn path_depth(path: &Path) -> usize {
-    path.components().count()
-}
-
-fn next_conflict_target_path(target: &Path, target_dir: &Path, suffix: u32) -> PathBuf {
-    let stem = target
-        .file_stem()
-        .and_then(|x| x.to_str())
-        .unwrap_or("file");
-    let ext = target.extension().and_then(|x| x.to_str()).unwrap_or("");
-    let next_name = if ext.is_empty() {
-        format!("{stem} ({suffix})")
-    } else {
-        format!("{stem} ({suffix}).{ext}")
-    };
-    target_dir.join(next_name)
-}
-
-fn resolve_apply_target_path(source: &Path, planned_target: &Path) -> PathBuf {
-    if normalize_path_key(source) == normalize_path_key(planned_target) {
-        return planned_target.to_path_buf();
-    }
-
-    let target_dir = planned_target
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let mut resolved = planned_target.to_path_buf();
-    let mut suffix = 1_u32;
-    while resolved.exists() {
-        if normalize_path_key(source) == normalize_path_key(&resolved) {
-            return resolved;
-        }
-        resolved = next_conflict_target_path(planned_target, &target_dir, suffix);
-        suffix = suffix.saturating_add(1);
-    }
-    resolved
-}
-
-fn prune_empty_dirs_upward(start_dir: &Path, stop_dir: &Path) {
-    let stop_key = normalize_path_key(stop_dir);
-    let mut current = start_dir.to_path_buf();
-
-    loop {
-        if normalize_path_key(&current) == stop_key {
-            break;
-        }
-
-        let Some(parent) = current.parent().map(Path::to_path_buf) else {
-            break;
-        };
-
-        match fs::remove_dir(&current) {
-            Ok(_) => {
-                current = parent;
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
-                ) =>
-            {
-                current = parent;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                break;
-            }
-            Err(_) => {
-                break;
-            }
-        }
-    }
-}
-
-fn build_apply_plan(snapshot: &OrganizeSnapshot) -> Vec<Value> {
-    let preview_rows = build_preview(&snapshot.root_path, &snapshot.results);
-
-    let mut plan = preview_rows
-        .into_iter()
-        .map(|entry| {
-            let source_path = entry
-                .get("sourcePath")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let item_type = entry
-                .get("itemType")
-                .and_then(Value::as_str)
-                .unwrap_or("file")
-                .to_string();
-            let category = sanitize_category_name(
-                entry
-                    .get("category")
-                    .and_then(Value::as_str)
-                    .unwrap_or(CATEGORY_OTHER_PENDING),
-            );
-            let fallback_name = Path::new(&source_path)
-                .file_name()
-                .and_then(|x| x.to_str())
-                .unwrap_or("item")
-                .to_string();
-            let fallback_target = PathBuf::from(&snapshot.root_path)
-                .join(&category)
-                .join(&fallback_name);
-            let planned_target = entry
-                .get("targetPath")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or(fallback_target);
-
-            json!({
-                "sourcePath": source_path,
-                "targetPath": planned_target.to_string_lossy().to_string(),
-                "itemType": item_type,
-                "category": category,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Move deeper children first so parent-directory moves do not invalidate nested source paths.
-    plan.sort_by(|left, right| {
-        let left_source = Path::new(left.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
-        let right_source = Path::new(
-            right
-                .get("sourcePath")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        );
-        path_depth(right_source)
-            .cmp(&path_depth(left_source))
-            .then_with(|| {
-                let left_type = left
-                    .get("itemType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("file");
-                let right_type = right
-                    .get("itemType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("file");
-                left_type.cmp(right_type)
-            })
-            .then_with(|| normalize_path_key(left_source).cmp(&normalize_path_key(right_source)))
-    });
-
-    plan
-}
-
 async fn emit_snapshot<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -3244,7 +2230,7 @@ async fn run_organize_task<R: Runtime>(
             let extracted = match summary_mode.as_str() {
                 SUMMARY_MODE_FILENAME_ONLY => None,
                 _ => Some(
-                    extract_unit_content_for_summary_with_tools(
+                    summary::extract_unit_content_for_summary_with_tools(
                         unit,
                         &task.response_language,
                         &task.stop,
@@ -3261,7 +2247,7 @@ async fn run_organize_task<R: Runtime>(
                     warnings: Vec::new(),
                     confidence: None,
                 },
-                _ => build_local_summary(
+                _ => summary::build_local_summary(
                     unit,
                     extracted.as_ref().unwrap_or(&SummaryExtraction::default()),
                 ),
@@ -3305,7 +2291,7 @@ async fn run_organize_task<R: Runtime>(
             }));
             if summary_mode == SUMMARY_MODE_LOCAL_SUMMARY {
                 if let Some(row) = batch_rows.last() {
-                    emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
+                    summary::emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
                 }
             }
             local_results.push(local_result);
@@ -3313,7 +2299,7 @@ async fn run_organize_task<R: Runtime>(
 
         let mut summary_usage = TokenUsage::default();
         if summary_mode == SUMMARY_MODE_AGENT_SUMMARY {
-            let output = summarize_batch_with_agent(
+            let output = summary::summarize_batch_with_agent(
                 &text_route,
                 &task.response_language,
                 &task.stop,
@@ -3383,7 +2369,7 @@ async fn run_organize_task<R: Runtime>(
                 }
             }
             for row in &batch_rows {
-                emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
+                summary::emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
             }
         }
 
@@ -3394,7 +2380,7 @@ async fn run_organize_task<R: Runtime>(
         let mut assignment_map: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
 
         if !text_route.api_key.trim().is_empty() {
-            match classify_organize_batch(
+            match summary::classify_organize_batch(
                 &text_route,
                 &task.response_language,
                 &task.stop,
@@ -3594,7 +2580,7 @@ async fn run_organize_task<R: Runtime>(
         let mut snap = task.snapshot.lock();
         snap.results
             .sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
-        snap.preview = build_preview(&snap.root_path, &snap.results);
+        snap.preview = planner::build_preview(&snap.root_path, &snap.results);
         snap.tree = category_tree_to_value(&tree);
         snap.status = "completed".to_string();
         snap.completed_at = Some(now_iso());
@@ -3775,13 +2761,14 @@ pub async fn organize_get_result(
         let snap = task.snapshot.lock().clone();
         return serde_json::to_value(snap).map_err(|e| e.to_string());
     }
+    persist::prepare_organizer_module_access(&state.db_path())?;
     let snapshot = persist::load_organize_snapshot(&state.db_path(), &task_id)?
         .ok_or_else(|| "Task not found".to_string())?;
-    serde_json::to_value(hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
+    serde_json::to_value(planner::hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
 }
 
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
-    let mut snapshot = hydrate_loaded_snapshot(
+    let mut snapshot = planner::hydrate_loaded_snapshot(
         persist::load_organize_snapshot(&state.db_path(), &task_id)?
             .ok_or_else(|| "Task not found".to_string())?,
     );
@@ -3794,7 +2781,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
     snapshot.status = "moving".to_string();
     persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
 
-    let plan = build_apply_plan(&snapshot);
+    let plan = planner::build_apply_plan(&snapshot);
     let mut entries = Vec::new();
     for row in &plan {
         let source = PathBuf::from(row.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
@@ -3847,8 +2834,8 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             }));
             continue;
         }
-        let target = resolve_apply_target_path(&source, &target_base);
-        if normalize_path_key(&source) == normalize_path_key(&target) {
+        let target = planner::resolve_apply_target_path(&source, &target_base);
+        if planner::normalize_path_key(&source) == planner::normalize_path_key(&target) {
             entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target.to_string_lossy().to_string(),
@@ -3993,7 +2980,7 @@ pub async fn organize_rollback(
         match fs::rename(&target, &source) {
             Ok(_) => {
                 if let Some(target_parent) = target.parent() {
-                    prune_empty_dirs_upward(target_parent, &root_path);
+                    planner::prune_empty_dirs_upward(target_parent, &root_path);
                 }
                 rollback_entries.push(json!({
                     "sourcePath": source.to_string_lossy().to_string(),
@@ -4033,7 +3020,7 @@ pub async fn organize_rollback(
         if let Some(task_id) = task_id {
             if let Some(mut snapshot) = persist::load_organize_snapshot(&state.db_path(), &task_id)?
             {
-                snapshot = hydrate_loaded_snapshot(snapshot);
+                snapshot = planner::hydrate_loaded_snapshot(snapshot);
                 snapshot.status = "completed".to_string();
                 snapshot.job_id = None;
                 persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
@@ -4110,7 +3097,7 @@ mod tests {
 
     #[test]
     fn build_preview_uses_nested_category_path() {
-        let preview = build_preview(
+        let preview = planner::build_preview(
             r"C:\root",
             &[json!({
                 "name": "foo.txt",
@@ -4128,7 +3115,7 @@ mod tests {
 
     #[test]
     fn build_preview_skips_classification_error_rows() {
-        let preview = build_preview(
+        let preview = planner::build_preview(
             r"C:\root",
             &[
                 json!({
@@ -4198,7 +3185,7 @@ mod tests {
             completed_at: None,
             job_id: None,
         };
-        let plan = build_apply_plan(&snapshot);
+        let plan = planner::build_apply_plan(&snapshot);
         assert!(plan.is_empty());
     }
 
@@ -4259,7 +3246,7 @@ mod tests {
         write_text_file(&path, "small content");
         let mut unit = make_test_unit(&path);
         unit.size = LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES + 1;
-        let extracted = extract_plain_text_summary(&unit);
+        let extracted = summary::extract_plain_text_summary(&unit);
         assert!(extracted.excerpt.is_empty());
         assert!(extracted
             .warnings
@@ -4277,8 +3264,8 @@ mod tests {
         let mut unit = make_test_unit(&path);
         unit.modality = "binary".to_string();
         let stop = AtomicBool::new(false);
-        let extracted = extract_unit_content_for_summary(&unit, "zh-CN", &stop);
-        let summary = build_local_summary(&unit, &extracted);
+        let extracted = summary::extract_unit_content_for_summary(&unit, "zh-CN", &stop);
+        let summary = summary::build_local_summary(&unit, &extracted);
         assert!(extracted.excerpt.is_empty());
         assert_eq!(summary.source, SUMMARY_SOURCE_FILENAME_ONLY);
         assert!(summary.degraded);
@@ -4330,7 +3317,7 @@ mod tests {
         unit.modality = "text".to_string();
         let stop = AtomicBool::new(false);
 
-        let extracted = extract_unit_content_for_summary(&unit, "zh-CN", &stop);
+        let extracted = summary::extract_unit_content_for_summary(&unit, "zh-CN", &stop);
         assert_eq!(extracted.parser, "unavailable");
         assert!(extracted.excerpt.is_empty());
         assert!(extracted
@@ -4343,7 +3330,7 @@ mod tests {
 
     #[test]
     fn parse_summary_agent_output_reads_items() {
-        let parsed = parse_summary_agent_output(
+        let parsed = summary::parse_summary_agent_output(
             r#"{
                 "items": [
                     {
@@ -4366,7 +3353,7 @@ mod tests {
 
     #[test]
     fn classification_batch_items_exclude_raw_extraction_fields() {
-        let items = build_classification_batch_items(&[json!({
+        let items = summary::build_classification_batch_items(&[json!({
             "itemId": "batch1_1",
             "name": "report.pdf",
             "path": "E:\\docs\\report.pdf",
@@ -4735,8 +3722,12 @@ mod tests {
             "total_tokens": 46
           }
         }"#;
-        let parsed =
-            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect("parse success");
+        let parsed = summary::parse_chat_completion_http_body(
+            "https://api.openai.com/v1",
+            StatusCode::OK,
+            raw_body,
+        )
+        .expect("parse success");
         assert!(parsed.content.contains("\"assignments\":[]"));
         assert_eq!(parsed.usage.prompt, 12);
         assert_eq!(parsed.usage.completion, 34);
@@ -4746,10 +3737,51 @@ mod tests {
     #[test]
     fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
         let raw_body = "<html>upstream gateway error</html>";
-        let err =
-            parse_chat_completion_http_body(StatusCode::OK, raw_body).expect_err("decode error");
+        let err = summary::parse_chat_completion_http_body(
+            "https://api.openai.com/v1",
+            StatusCode::OK,
+            raw_body,
+        )
+        .expect_err("decode error");
         assert!(err.message.contains("error decoding response body"));
         assert!(err.message.contains("upstream gateway error"));
         assert_eq!(err.raw_body, raw_body);
+    }
+
+    #[test]
+    fn parse_chat_completion_http_body_accepts_tool_calls_without_text() {
+        let raw_body = r#"{
+          "choices": [
+            {
+              "message": {
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                      "name": "submit_organize_result",
+                      "arguments": "{\"tree\":{\"nodeId\":\"root\",\"name\":\"\",\"children\":[]},\"assignments\":[]}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 5,
+            "total_tokens": 8
+          }
+        }"#;
+        let parsed = summary::parse_chat_completion_http_body(
+            "https://api.openai.com/v1",
+            StatusCode::OK,
+            raw_body,
+        )
+        .expect("parse success");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "submit_organize_result");
+        assert_eq!(parsed.usage.total, 8);
     }
 }

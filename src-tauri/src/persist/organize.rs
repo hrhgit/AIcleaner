@@ -7,6 +7,11 @@ fn compact_organize_snapshot(snapshot: &OrganizeSnapshot) -> OrganizeSnapshot {
     compact
 }
 
+fn open_organizer_db_for_read(db_path: &Path) -> Result<Connection, String> {
+    ensure_organizer_read_ready(db_path)?;
+    open_db_raw(db_path)
+}
+
 pub(crate) fn organizer_tables_exist(conn: &Connection) -> Result<bool, String> {
     let count = conn
         .query_row(
@@ -191,7 +196,7 @@ pub fn load_organize_snapshot(
     db_path: &Path,
     task_id: &str,
 ) -> Result<Option<OrganizeSnapshot>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_organizer_db_for_read(db_path)?;
     let snapshot_json = conn
         .query_row(
             "SELECT snapshot_json FROM organize_tasks WHERE task_id = ?1",
@@ -260,7 +265,7 @@ pub fn load_latest_organize_tree(
     db_path: &Path,
     root_path: &str,
 ) -> Result<Option<(Value, u64)>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_organizer_db_for_read(db_path)?;
     let row = conn
         .query_row(
             "SELECT tree_json, tree_version
@@ -284,7 +289,7 @@ pub fn find_latest_organize_task_id_for_root(
     db_path: &Path,
     root_path: &str,
 ) -> Result<Option<String>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_organizer_db_for_read(db_path)?;
     conn.query_row(
         "SELECT task_id
          FROM organize_tasks
@@ -355,7 +360,7 @@ pub fn save_organize_manifest(db_path: &Path, manifest: &Value) -> Result<(), St
 }
 
 pub fn load_organize_job(db_path: &Path, job_id: &str) -> Result<Option<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_organizer_db_for_read(db_path)?;
     let row = conn
         .query_row(
             "SELECT manifest_json, rollback_json FROM organize_jobs WHERE job_id = ?1",
@@ -377,7 +382,7 @@ pub fn load_organize_job(db_path: &Path, job_id: &str) -> Result<Option<Value>, 
 }
 
 pub fn load_organize_job_entries(db_path: &Path, job_id: &str) -> Result<Vec<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_organizer_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT idx, source_path, target_path, entry_type, category, status, error

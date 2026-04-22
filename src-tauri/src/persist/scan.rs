@@ -9,6 +9,11 @@ struct ScanTaskMeta {
     updated_at: String,
 }
 
+fn open_scan_db_for_read(db_path: &Path) -> Result<Connection, String> {
+    ensure_scan_read_ready(db_path)?;
+    open_db_raw(db_path)
+}
+
 pub(crate) fn normalize_existing_root_path_keys(conn: &Connection) -> Result<(), String> {
     let scan_rows = conn
         .prepare("SELECT task_id, root_path FROM scan_tasks")
@@ -456,6 +461,7 @@ pub fn save_full_scan_draft_snapshot(
     save_scan_snapshot_in_storage(&conn, ScanStorage::Draft, snapshot)
 }
 
+#[cfg(test)]
 fn upsert_scan_finding_in_storage(
     conn: &Connection,
     storage: ScanStorage,
@@ -500,6 +506,7 @@ fn upsert_scan_finding_in_storage(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn upsert_scan_finding(
     db_path: &Path,
     task_id: &str,
@@ -621,54 +628,9 @@ pub fn load_scan_findings_map(
     db_path: &Path,
     task_id: &str,
 ) -> Result<HashMap<String, ScanFindingRecord>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     load_scan_findings_map_exact_in_storage(&conn, storage, task_id)
-}
-
-fn load_scan_task_root_path(conn: &Connection, task_id: &str) -> Result<Option<String>, String> {
-    conn.query_row(
-        "SELECT root_path FROM scan_tasks WHERE task_id = ?1",
-        params![task_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(|e| e.to_string())
-}
-
-fn merge_effective_scan_findings_map(
-    conn: &Connection,
-    task_id: &str,
-    out: &mut HashMap<String, ScanFindingRecord>,
-    visited: &mut HashSet<String>,
-) -> Result<(), String> {
-    if !visited.insert(task_id.to_string()) {
-        return Ok(());
-    }
-    out.extend(load_scan_findings_map_exact_in_storage(
-        conn,
-        ScanStorage::Committed,
-        task_id,
-    )?);
-    let Some(root_path) = load_scan_task_root_path(conn, task_id)? else {
-        return Ok(());
-    };
-    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)?
-    {
-        merge_effective_scan_findings_map(conn, &descendant_task_id, out, visited)?;
-    }
-    Ok(())
-}
-
-pub fn load_effective_scan_findings_map(
-    db_path: &Path,
-    task_id: &str,
-) -> Result<HashMap<String, ScanFindingRecord>, String> {
-    let conn = open_db(db_path)?;
-    let mut out = HashMap::new();
-    let mut visited = HashSet::new();
-    merge_effective_scan_findings_map(&conn, task_id, &mut out, &mut visited)?;
-    Ok(out)
 }
 
 fn load_scan_snapshot_from_conn(
@@ -774,7 +736,7 @@ fn load_scan_snapshot_internal(
     task_id: &str,
     include_findings: bool,
 ) -> Result<Option<ScanSnapshot>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     load_scan_snapshot_from_conn(&conn, storage, task_id, include_findings)
 }
@@ -783,24 +745,17 @@ pub fn load_scan_snapshot(db_path: &Path, task_id: &str) -> Result<Option<ScanSn
     load_scan_snapshot_internal(db_path, task_id, true)
 }
 
-pub fn load_scan_snapshot_summary(
-    db_path: &Path,
-    task_id: &str,
-) -> Result<Option<ScanSnapshot>, String> {
-    load_scan_snapshot_internal(db_path, task_id, false)
-}
-
 #[cfg(test)]
 pub fn load_full_scan_draft_snapshot(
     db_path: &Path,
     task_id: &str,
 ) -> Result<Option<ScanSnapshot>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     load_scan_snapshot_from_conn(&conn, ScanStorage::Draft, task_id, true)
 }
 
 pub fn list_scan_history(db_path: &Path, limit: u32) -> Result<Vec<Value>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT task_id, root_path, root_path_key, status, scan_mode, baseline_task_id, target_size, max_depth, auto_analyze, current_path,
@@ -1174,6 +1129,7 @@ fn load_scan_children_exact_in_storage(
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+#[cfg(test)]
 fn load_scan_node_map_exact_in_storage(
     conn: &Connection,
     storage: ScanStorage,
@@ -1242,41 +1198,6 @@ fn load_scan_node_exact_in_storage(
     .map_err(|e| e.to_string())
 }
 
-fn merge_effective_scan_node_map(
-    conn: &Connection,
-    task_id: &str,
-    out: &mut HashMap<String, ScanNode>,
-    visited: &mut HashSet<String>,
-) -> Result<(), String> {
-    if !visited.insert(task_id.to_string()) {
-        return Ok(());
-    }
-    out.extend(load_scan_node_map_exact_in_storage(
-        conn,
-        ScanStorage::Committed,
-        task_id,
-    )?);
-    let Some(root_path) = load_scan_task_root_path(conn, task_id)? else {
-        return Ok(());
-    };
-    for descendant_task_id in list_visible_descendant_scan_task_ids_for_root_path(conn, &root_path)?
-    {
-        merge_effective_scan_node_map(conn, &descendant_task_id, out, visited)?;
-    }
-    Ok(())
-}
-
-pub fn load_effective_scan_node_map(
-    db_path: &Path,
-    task_id: &str,
-) -> Result<HashMap<String, ScanNode>, String> {
-    let conn = open_db(db_path)?;
-    let mut out = HashMap::new();
-    let mut visited = HashSet::new();
-    merge_effective_scan_node_map(&conn, task_id, &mut out, &mut visited)?;
-    Ok(out)
-}
-
 #[allow(dead_code)]
 pub fn load_scan_children(
     db_path: &Path,
@@ -1284,7 +1205,7 @@ pub fn load_scan_children(
     node_id: &str,
     dirs_only: bool,
 ) -> Result<Vec<ScanNode>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     let local = load_scan_children_exact_in_storage(&conn, storage, task_id, node_id, dirs_only)?;
     if !local.is_empty() {
@@ -1315,22 +1236,12 @@ pub fn load_scan_children(
     )
 }
 
-pub fn load_scan_children_exact_for_task(
-    db_path: &Path,
-    task_id: &str,
-    node_id: &str,
-    dirs_only: bool,
-) -> Result<Vec<ScanNode>, String> {
-    let conn = open_db(db_path)?;
-    let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
-    load_scan_children_exact_in_storage(&conn, storage, task_id, node_id, dirs_only)
-}
-
+#[cfg(test)]
 pub fn load_scan_node_map(
     db_path: &Path,
     task_id: &str,
 ) -> Result<HashMap<String, ScanNode>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let storage = resolve_scan_storage_by_task_id(&conn, task_id)?;
     load_scan_node_map_exact_in_storage(&conn, storage, task_id)
 }
@@ -1509,7 +1420,7 @@ pub fn find_latest_visible_scan_task_id_for_path(
     db_path: &Path,
     path: &str,
 ) -> Result<Option<String>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     conn.query_row(
         "SELECT task_id
          FROM scan_tasks
@@ -1528,27 +1439,6 @@ fn load_visible_scan_tasks(conn: &Connection) -> Result<Vec<ScanTaskMeta>, Strin
         .into_iter()
         .filter(|task| task.visible_latest)
         .collect())
-}
-
-fn list_visible_descendant_scan_task_ids_for_root_path(
-    conn: &Connection,
-    root_path: &str,
-) -> Result<Vec<String>, String> {
-    let root_key = create_root_path_key(root_path);
-    let mut tasks = load_visible_scan_tasks(conn)?
-        .into_iter()
-        .filter(|task| {
-            task.root_path_key != root_key
-                && is_same_or_descendant_path(&task.root_path_key, &root_key)
-        })
-        .collect::<Vec<_>>();
-    tasks.sort_by(|left, right| {
-        path_depth(&right.root_path)
-            .cmp(&path_depth(&left.root_path))
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
-            .then_with(|| right.task_id.cmp(&left.task_id))
-    });
-    Ok(tasks.into_iter().map(|task| task.task_id).collect())
 }
 
 fn list_visible_descendant_scan_root_paths(
@@ -1577,7 +1467,7 @@ pub fn find_owner_visible_scan_task_for_path(
     db_path: &Path,
     path: &str,
 ) -> Result<Option<(String, String)>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let normalized_path = create_root_path_key(path);
     let mut tasks = load_visible_scan_tasks(&conn)?
         .into_iter()
@@ -1783,7 +1673,7 @@ pub fn list_boundary_scan_nodes(
     task_id: &str,
     depth: u32,
 ) -> Result<Vec<ScanNode>, String> {
-    let conn = open_db(db_path)?;
+    let conn = open_scan_db_for_read(db_path)?;
     let mut stmt = conn
         .prepare(
             "SELECT n.node_id, n.parent_id, n.path, n.name, n.type, n.depth, n.self_size, n.total_size, n.child_count, n.mtime_ms

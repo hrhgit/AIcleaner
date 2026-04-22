@@ -11,76 +11,43 @@
   startOrganize,
   stopOrganize,
 } from '../utils/api.js';
-import { showToast } from '../main.js';
 import { getLang, t } from '../utils/i18n.js';
 import {
   ensureRequiredCredentialsConfigured,
   getProviderCredentialPresence,
   getSearchCredentialPresence,
 } from '../utils/secret-ui.js';
-
-const PERSIST_KEYS = {
-  rootPath: 'wipeout.organizer.global.root_path.v2',
-  exclusions: 'wipeout.organizer.global.exclusions.v2',
-  batchSize: 'wipeout.organizer.global.batch_size.v2',
-  summaryMode: 'wipeout.organizer.global.summary_mode.v1',
-  maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v2',
-  useWebSearch: 'wipeout.organizer.global.use_web_search.v2',
-  modelRouting: 'wipeout.organizer.global.model_routing.v2',
-  lastJobId: 'wipeout.organizer.global.last_job_id.v2',
-  lastTaskId: 'wipeout.organizer.global.last_task_id.v2',
-  lastSnapshot: 'wipeout.organizer.global.last_snapshot.v2',
-  lastApplyManifest: 'wipeout.organizer.global.last_apply_manifest.v2',
-  logEntries: 'wipeout.organizer.global.log_entries.v1',
-  logCollapsed: 'wipeout.organizer.global.log_collapsed.v1',
-  logRecordGroupCollapsed: 'wipeout.organizer.global.log_record_group_collapsed.v1',
-  logTaskId: 'wipeout.organizer.global.log_task_id.v1',
-  runtimeCacheVersion: 'wipeout.organizer.global.runtime_cache_version.v1',
-};
-
-const ORGANIZER_RUNTIME_CACHE_VERSION = 2;
-const RUNTIME_CACHE_KEYS = [
-  PERSIST_KEYS.lastJobId,
-  PERSIST_KEYS.lastTaskId,
-  PERSIST_KEYS.lastSnapshot,
-  PERSIST_KEYS.lastApplyManifest,
-  PERSIST_KEYS.logEntries,
-  PERSIST_KEYS.logTaskId,
-];
-
-const LEGACY_PERSIST_KEYS = [
-  'wipeout.organizer.global.root_path.v1',
-  'wipeout.organizer.global.exclusions.v1',
-  'wipeout.organizer.global.batch_size.v1',
-  'wipeout.organizer.global.max_cluster_depth.v1',
-  'wipeout.organizer.global.use_web_search.v1',
-  'wipeout.organizer.global.model_routing.v1',
-  'wipeout.organizer.global.last_job_id.v1',
-  'wipeout.organizer.global.last_task_id.v1',
-  'wipeout.organizer.global.last_snapshot.v1',
-  'wipeout.organizer.global.last_apply_manifest.v1',
-  'wipeout.organizer.global.recursive.v1',
-  'wipeout.organizer.global.model_selection.v1',
-  'wipeout.organizer.global.mode.v1',
-  'wipeout.organizer.global.allow_new_categories.v1',
-  'wipeout.organizer.global.categories.v1',
-  'wipeout.organizer.global.parallelism.v1',
-];
-
-const DEFAULT_EXCLUSIONS = [
-  '.git',
-  'node_modules',
-  'dist',
-  'build',
-  'out',
-  'Windows',
-  'Program Files',
-  'Program Files (x86)',
-];
-
-const DEFAULT_BATCH_SIZE = 20;
-const DEFAULT_SUMMARY_MODE = 'filename_only';
-const SUMMARY_MODES = ['filename_only', 'local_summary', 'agent_summary'];
+import {
+  DEFAULT_PROVIDER_ENDPOINT,
+  defaultModelByEndpoint,
+  ensureProviderOptionExists,
+  getProviderLabel,
+  normalizeRemoteModels,
+  populateProviderOptions,
+  PROVIDER_MODELS,
+  PROVIDER_OPTIONS,
+} from '../utils/provider-registry.js';
+import { showToast } from '../utils/toast.js';
+import {
+  cleanupLegacyPersistedState,
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_EXCLUSIONS,
+  DEFAULT_SUMMARY_MODE,
+  getPersisted,
+  getPersistedApplyManifest,
+  invalidateOrganizerRuntimeCacheIfNeeded,
+  isOrganizerLogCollapsed,
+  isOrganizerRecordGroupCollapsed,
+  PERSIST_KEYS,
+  persistForm,
+  removePersisted,
+  restoreDefaults,
+  setOrganizerLogCollapsed,
+  setOrganizerRecordGroupCollapsed,
+  setPersisted,
+  setPersistedApplyManifest,
+  SUMMARY_MODES,
+} from './organizer-storage.js';
 
 const MOVE_RESULT_TEXT = {
   zh: {
@@ -131,45 +98,6 @@ const PROVIDER_SELECT_IDS = {
 
 const COPY_TEXT_ROUTE_BTN_ID = 'org-copy-text-route-btn';
 
-const PROVIDER_OPTIONS = [
-  { value: 'https://api.deepseek.com', label: 'DeepSeek' },
-  { value: 'https://api.openai.com/v1', label: 'OpenAI' },
-  { value: 'https://generativelanguage.googleapis.com/v1beta/openai/', label: 'Google Gemini' },
-  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: 'Qwen (DashScope)' },
-  { value: 'https://open.bigmodel.cn/api/paas/v4', label: 'GLM (BigModel)' },
-  { value: 'https://api.moonshot.cn/v1', label: 'Kimi (Moonshot)' },
-];
-
-const PROVIDER_MODELS = {
-  'https://api.openai.com/v1': [
-    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
-    { value: 'gpt-4o', label: 'gpt-4o' },
-    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
-  ],
-  'https://api.deepseek.com': [
-    { value: 'deepseek-chat', label: 'deepseek-chat' },
-    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
-  ],
-  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
-    { value: 'qwen-plus', label: 'qwen-plus' },
-    { value: 'qwen-turbo', label: 'qwen-turbo' },
-    { value: 'qwen-max', label: 'qwen-max' },
-  ],
-  'https://open.bigmodel.cn/api/paas/v4': [
-    { value: 'glm-4-flash', label: 'glm-4-flash' },
-    { value: 'glm-4', label: 'glm-4' },
-  ],
-  'https://api.moonshot.cn/v1': [
-    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
-    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
-  ],
-  'https://generativelanguage.googleapis.com/v1beta/openai/': [
-    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
-    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
-    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
-  ],
-};
 
 let activeTaskId = null;
 let activeEventSource = null;
@@ -186,49 +114,6 @@ const loggedOrganizerRawBatchKeys = new Set();
 const loggedOrganizerSummaryKeys = new Set();
 let organizerLogTaskId = null;
 let organizerLogProgressBaseline = null;
-
-function getPersisted(key, fallback) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
-  }
-}
-
-function setPersisted(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // ignore quota errors
-  }
-}
-
-function removePersisted(key) {
-  try {
-    localStorage.removeItem(key);
-  } catch {
-    // ignore storage errors
-  }
-}
-
-function cleanupLegacyPersistedState() {
-  for (const key of LEGACY_PERSIST_KEYS) {
-    removePersisted(key);
-  }
-}
-
-function invalidateOrganizerRuntimeCacheIfNeeded() {
-  const currentVersion = Number(getPersisted(PERSIST_KEYS.runtimeCacheVersion, 0) || 0);
-  if (currentVersion === ORGANIZER_RUNTIME_CACHE_VERSION) {
-    return;
-  }
-  for (const key of RUNTIME_CACHE_KEYS) {
-    removePersisted(key);
-  }
-  setPersisted(PERSIST_KEYS.runtimeCacheVersion, ORGANIZER_RUNTIME_CACHE_VERSION);
-}
 
 function getErrorMessage(err) {
   if (typeof err === 'string' && err.trim()) {
@@ -251,46 +136,12 @@ function getMoveResultText(key) {
   return MOVE_RESULT_TEXT[lang]?.[key] || MOVE_RESULT_TEXT.zh[key] || key;
 }
 
-function setPersistedApplyManifest(manifest) {
-  if (manifest && typeof manifest === 'object') {
-    setPersisted(PERSIST_KEYS.lastApplyManifest, manifest);
-    return;
-  }
-  removePersisted(PERSIST_KEYS.lastApplyManifest);
-}
-
-function getPersistedApplyManifest() {
-  const manifest = getPersisted(PERSIST_KEYS.lastApplyManifest, null);
-  return manifest && typeof manifest === 'object' ? manifest : null;
-}
-
 function parseListInput(text) {
   return String(text || '')
     .split(/[\n,]/)
     .map((x) => x.trim())
     .filter(Boolean)
     .filter((x, idx, arr) => arr.indexOf(x) === idx);
-}
-
-function normalizeRemoteModels(models) {
-  const seen = new Set();
-  const normalized = [];
-  for (const item of models || []) {
-    if (!item?.value) continue;
-    const value = String(item.value).trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    normalized.push({ value, label: String(item.label || value) });
-  }
-  return normalized;
-}
-
-function ensureProviderOptionExists(select, endpoint) {
-  if (!select || !endpoint) return;
-  const exists = Array.from(select.options).some((opt) => opt.value === endpoint);
-  if (!exists) {
-    select.add(new Option(endpoint, endpoint));
-  }
 }
 
 function getApiKeyForEndpoint(endpoint) {
@@ -375,29 +226,6 @@ function collectForm() {
   };
 }
 
-function persistForm(data) {
-  setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
-  setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
-  setPersisted(PERSIST_KEYS.batchSize, data.batchSize);
-  setPersisted(PERSIST_KEYS.summaryMode, data.summaryMode || DEFAULT_SUMMARY_MODE);
-  setPersisted(PERSIST_KEYS.maxClusterDepth, data.maxClusterDepth);
-  setPersisted(PERSIST_KEYS.useWebSearch, data.useWebSearch);
-  setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
-}
-
-function restoreDefaults() {
-  const modelRouting = getPersisted(PERSIST_KEYS.modelRouting, null);
-  return {
-    rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
-    excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
-    batchSize: getPersisted(PERSIST_KEYS.batchSize, DEFAULT_BATCH_SIZE),
-    summaryMode: getPersisted(PERSIST_KEYS.summaryMode, DEFAULT_SUMMARY_MODE),
-    maxClusterDepth: getPersisted(PERSIST_KEYS.maxClusterDepth, null),
-    useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
-    modelRouting: modelRouting || {},
-  };
-}
-
 function resolveSearchApi(settings) {
   const source = settings?.searchApi && typeof settings.searchApi === 'object'
     ? settings.searchApi
@@ -475,10 +303,6 @@ function escapeHtml(value) {
 
 function organizerText(zh, en) {
   return getLang() === 'en' ? en : zh;
-}
-
-function getProviderLabel(endpoint) {
-  return PROVIDER_OPTIONS.find((item) => item.value === endpoint)?.label || String(endpoint || '').trim() || 'N/A';
 }
 
 function getOrganizerCategoryLabel(data = {}) {
@@ -643,22 +467,6 @@ function setOrganizerDetailLogExpanded(entryId, expanded) {
 function isOrganizerLogPinnedToBottom(log) {
   if (!log) return true;
   return (log.scrollHeight - log.scrollTop - log.clientHeight) <= 24;
-}
-
-function isOrganizerLogCollapsed() {
-  return !!getPersisted(PERSIST_KEYS.logCollapsed, true);
-}
-
-function setOrganizerLogCollapsed(collapsed) {
-  setPersisted(PERSIST_KEYS.logCollapsed, !!collapsed);
-}
-
-function isOrganizerRecordGroupCollapsed() {
-  return !!getPersisted(PERSIST_KEYS.logRecordGroupCollapsed, true);
-}
-
-function setOrganizerRecordGroupCollapsed(collapsed) {
-  setPersisted(PERSIST_KEYS.logRecordGroupCollapsed, !!collapsed);
 }
 
 function refreshOrganizerLogPanel() {
@@ -1367,20 +1175,15 @@ async function initModelRoutingFields(defaultRouting = {}) {
 
   syncProviderApiKeys(settings);
 
-  const baseEndpoint = String(settings?.defaultProviderEndpoint || 'https://api.deepseek.com').trim();
+  const baseEndpoint = String(settings?.defaultProviderEndpoint || DEFAULT_PROVIDER_ENDPOINT).trim();
   const baseModel = String(
     settings?.providerConfigs?.[baseEndpoint]?.model
-    || PROVIDER_MODELS[baseEndpoint]?.[0]?.value
-    || 'deepseek-chat'
+    || defaultModelByEndpoint(baseEndpoint)
+    || defaultModelByEndpoint(DEFAULT_PROVIDER_ENDPOINT)
   ).trim();
 
-  for (const option of PROVIDER_OPTIONS) {
-    for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
-      const select = document.getElementById(PROVIDER_SELECT_IDS[modality]);
-      if (!select) continue;
-      const exists = Array.from(select.options).some((x) => x.value === option.value);
-      if (!exists) select.add(new Option(option.label, option.value));
-    }
+  for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {
+    populateProviderOptions(document.getElementById(PROVIDER_SELECT_IDS[modality]));
   }
 
   for (const modality of Object.keys(PROVIDER_SELECT_IDS)) {

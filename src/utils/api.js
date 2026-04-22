@@ -14,6 +14,8 @@ async function call(command, args = {}) {
   return invoke(command, args);
 }
 
+let inflightSettingsRequest = null;
+
 function createStream(taskId, specs) {
   requireTauri('event_stream');
   const cleanups = [];
@@ -46,8 +48,22 @@ function createStream(taskId, specs) {
   };
 }
 
-export async function getSettings() {
-  return call('settings_get');
+export async function getSettings(options = {}) {
+  const { force = false } = options || {};
+  if (!force && inflightSettingsRequest) {
+    return inflightSettingsRequest;
+  }
+  const request = call('settings_get');
+  if (force) {
+    return request;
+  }
+  const wrappedRequest = request.finally(() => {
+    if (inflightSettingsRequest === wrappedRequest) {
+      inflightSettingsRequest = null;
+    }
+  });
+  inflightSettingsRequest = wrappedRequest;
+  return wrappedRequest;
 }
 
 export async function saveSettings(data) {

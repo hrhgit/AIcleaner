@@ -6,10 +6,10 @@ import {
   browseFolder,
   listScanHistory,
 } from '../utils/api.js';
-import { showToast } from '../main.js';
 import { getLang } from '../utils/i18n.js';
 import { formatSize } from '../utils/storage.js';
 import { scanTaskController } from '../utils/scan-task-controller.js';
+import { showToast } from '../utils/toast.js';
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.advisor.global.root_path.v2',
@@ -157,7 +157,7 @@ function renderTreeNode(node) {
 function renderPlanEntries(entries) {
   return entries.slice(0, 10).map((entry) => `
     <div class="advisor-entry-row">
-      <div>
+      <div class="advisor-entry-copy">
         <div>${escapeHtml(entry?.name || entry?.sourcePath || '-')}</div>
         <div class="form-hint">${escapeHtml(entry?.sourcePath || '-')}</div>
       </div>
@@ -172,7 +172,7 @@ function renderCard(card) {
   return `
     <article class="advisor-card advisor-card-${escapeHtml(card?.cardType || 'generic')}">
       <div class="advisor-card-head">
-        <div>
+        <div class="advisor-card-title-group">
           <div class="card-title">${escapeHtml(card?.title || '-')}</div>
           <div class="form-hint">${escapeHtml(formatDateTime(card?.createdAt))}</div>
         </div>
@@ -220,19 +220,36 @@ function renderTimeline() {
   const timeline = Array.isArray(state.sessionData?.timeline) ? state.sessionData.timeline : [];
   if (!timeline.length) {
     return `
-      <div class="empty-state advisor-empty-compact">
-        <div class="empty-state-text">${escapeHtml(text('启动会话后，消息流和结果卡会显示在这里。', 'The timeline and cards will appear here once the session starts.'))}</div>
+      <div class="card advisor-empty-panel">
+        <div class="empty-state advisor-empty-compact">
+          <div class="empty-state-text">${escapeHtml(text('启动会话后，消息流和结果卡会显示在这里。', 'The timeline and cards will appear here once the session starts.'))}</div>
+          <div class="empty-state-hint">${escapeHtml(text('先选择目录，再启动会话或从最近扫描直接接入。', 'Pick a folder, then start a session or jump in from a recent scan.'))}</div>
+        </div>
       </div>
     `;
   }
   return timeline.map((turn) => `
-    <section class="advisor-turn advisor-turn-${escapeHtml(turn?.role || 'assistant')}">
-      <div class="advisor-turn-head">
-        <span class="badge ${turn?.role === 'user' ? 'badge-info' : 'badge-success'}">${escapeHtml(turn?.role === 'user' ? text('你', 'You') : text('顾问', 'Advisor'))}</span>
-        <span class="form-hint">${escapeHtml(formatDateTime(turn?.createdAt))}</span>
+    <section class="advisor-message-section advisor-message-section-${escapeHtml(turn?.role || 'assistant')}">
+      <div class="advisor-message-rail" aria-hidden="true">
+        <span class="advisor-message-node"></span>
       </div>
-      ${(turn?.text || '').trim() ? `<div class="advisor-turn-text">${escapeHtml(turn?.text || '')}</div>` : ''}
-      <div class="advisor-turn-cards">${(Array.isArray(turn?.cards) ? turn.cards : []).map(renderCard).join('')}</div>
+      <div class="advisor-message-stack">
+        ${(turn?.text || '').trim() ? `
+          <article class="advisor-message-bubble">
+            <div class="advisor-message-meta">
+              <span class="advisor-message-role">${escapeHtml(turn?.role === 'user' ? text('你', 'You') : text('顾问', 'Advisor'))}</span>
+              <span class="advisor-message-time">${escapeHtml(formatDateTime(turn?.createdAt))}</span>
+            </div>
+            <div class="advisor-message-text">${escapeHtml(turn?.text || '')}</div>
+          </article>
+        ` : `
+          <div class="advisor-message-meta advisor-message-meta-inline">
+            <span class="advisor-message-role">${escapeHtml(turn?.role === 'user' ? text('你', 'You') : text('顾问', 'Advisor'))}</span>
+            <span class="advisor-message-time">${escapeHtml(formatDateTime(turn?.createdAt))}</span>
+          </div>
+        `}
+        <div class="advisor-turn-cards">${(Array.isArray(turn?.cards) ? turn.cards : []).map(renderCard).join('')}</div>
+      </div>
     </section>
   `).join('');
 }
@@ -253,62 +270,111 @@ function renderQuickScans() {
   }).join('');
 }
 
-function renderPage() {
-  if (!pageContainer) return;
+function renderContextSummary() {
+  if (!state.sessionData) return '';
   const contextBar = state.sessionData?.contextBar || {};
   const collapsed = !!contextBar?.collapsed;
-  const stageLabel = getStageLabel();
+  const rootPath = contextBar?.rootPath || state.rootPath || '-';
   const modeLabel = contextBar?.mode?.label || text('顾问模式：单智能体', 'Advisor Mode: Single Agent');
+  const stageLabel = getStageLabel();
+  return `
+    <section class="card advisor-context-summary ${collapsed ? 'collapsed' : ''}">
+      <div class="advisor-context-head">
+        <div>
+          <div class="workflow-kicker workflow-kicker-subtle">${escapeHtml(text('会话上下文', 'Session Context'))}</div>
+          <div class="card-title">${escapeHtml(rootPath)}</div>
+        </div>
+        <div class="advisor-context-actions">
+          <span class="advisor-stage-chip advisor-stage-chip-muted">${escapeHtml(stageLabel)}</span>
+          <button id="advisor-toggle-context" class="btn btn-ghost" type="button" ${state.acting ? 'disabled' : ''}>${escapeHtml(collapsed ? text('展开', 'Expand') : text('折叠', 'Collapse'))}</button>
+        </div>
+      </div>
+      ${collapsed ? `
+        <div class="form-hint">${escapeHtml(modeLabel)}</div>
+      ` : `
+        <div class="advisor-context-grid">
+          <div class="advisor-context-chip">${escapeHtml(modeLabel)}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('扫描记录', 'Scan'))}: ${escapeHtml(contextBar?.scanTaskId || '-')}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('分类记录', 'Organize'))}: ${escapeHtml(contextBar?.organizeTaskId || '-')}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('项目数', 'Items'))}: ${escapeHtml(contextBar?.inventorySummary?.itemCount || 0)}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('可复用树', 'Reusable Tree'))}: ${escapeHtml(contextBar?.inventorySummary?.treeAvailable ? text('是', 'Yes') : text('否', 'No'))}</div>
+        </div>
+        <div class="advisor-context-notes">
+          ${contextBar?.memorySummary?.message ? `<div class="form-hint">${escapeHtml(contextBar.memorySummary.message)}</div>` : ''}
+          ${contextBar?.inventorySummary?.message ? `<div class="form-hint">${escapeHtml(contextBar.inventorySummary.message)}</div>` : ''}
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function renderPage() {
+  if (!pageContainer) return;
+  const hasSession = !!state.sessionData;
+  const stageLabel = getStageLabel();
   pageContainer.innerHTML = `
-    <section class="advisor-v2-shell">
-      <section class="card advisor-v2-init">
-        <div class="advisor-v2-header">
-          <div>
-            <h1>${escapeHtml(text('顾问工作流', 'Advisor Workflow'))}</h1>
-            <p>${escapeHtml(text('扫描页继续作为入口，这里改成单列消息流、附着式结果卡和底部固定输入区。', 'Inventory stays as the entry. This page is now a single-column session flow with attached cards and a bottom composer.'))}</p>
+    <section class="workflow-shell advisor-workspace">
+      <section class="card workflow-hero-panel advisor-hero-panel">
+        <div class="workflow-hero-row">
+          <div class="workflow-hero-copy">
+            <div class="workflow-kicker">${escapeHtml(text('顾问工作流', 'Advisor Workflow'))}</div>
+            <h1>${escapeHtml(text('在一条会话流里完成理解、预览和执行。', 'Run understanding, preview, and execution in one conversation flow.'))}</h1>
+            <p>${escapeHtml(text('扫描页负责提供目录与历史记录；这里负责连续对话、附着式结果卡和最终动作确认。', 'The inventory page provides directories and reusable scans; this page handles conversation, attached result cards, and final actions.'))}</p>
           </div>
-          <button id="advisor-start-btn" class="btn btn-primary" type="button" ${state.loading ? 'disabled' : ''}>${escapeHtml(state.sessionId ? text('重建会话', 'Restart Session') : text('开始会话', 'Start Session'))}</button>
+          <div class="workflow-hero-actions advisor-hero-actions">
+            <span class="advisor-stage-chip">${escapeHtml(stageLabel)}</span>
+            <button id="advisor-start-btn" class="btn btn-primary" type="button" ${state.loading ? 'disabled' : ''}>${escapeHtml(state.sessionId ? text('重建会话', 'Restart Session') : text('开始会话', 'Start Session'))}</button>
+          </div>
         </div>
-        <div class="advisor-path-actions">
-          <input id="advisor-root-path" class="input" type="text" value="${escapeHtml(state.rootPath)}" placeholder="${escapeHtml(text('选择目录，或从扫描页带入目录', 'Choose a folder or hand off from the scanner'))}">
-          <button id="advisor-browse-btn" class="btn btn-secondary" type="button">${escapeHtml(text('浏览', 'Browse'))}</button>
-        </div>
-        <div class="advisor-quick-scan-grid">${renderQuickScans()}</div>
-      </section>
 
-      ${state.sessionData ? `
-        <section class="card advisor-v2-context ${collapsed ? 'collapsed' : ''}">
-          <div class="advisor-card-head">
+        <div class="advisor-source-grid">
+          <div class="advisor-source-field">
+            <label class="form-label" for="advisor-root-path">${escapeHtml(text('工作目录', 'Working Directory'))}</label>
+            <div class="advisor-path-actions">
+              <input id="advisor-root-path" class="form-input advisor-input-path" type="text" value="${escapeHtml(state.rootPath)}" placeholder="${escapeHtml(text('选择目录，或从扫描页带入目录', 'Choose a folder or hand off from the inventory page'))}">
+              <button id="advisor-browse-btn" class="btn btn-secondary" type="button">${escapeHtml(text('浏览', 'Browse'))}</button>
+            </div>
+          </div>
+          <div class="advisor-source-note">
+            <div class="advisor-hero-stat">
+              <span class="advisor-hero-stat-label">${escapeHtml(text('会话状态', 'Session Status'))}</span>
+              <strong>${escapeHtml(hasSession ? text('已连接顾问会话', 'Connected to advisor session') : text('等待启动会话', 'Waiting to start a session'))}</strong>
+            </div>
+            <div class="form-hint">${escapeHtml(text('支持从最近扫描直接启动，也支持手动切换目录后重建会话。', 'You can start directly from a recent scan or switch directories and rebuild the session.'))}</div>
+          </div>
+        </div>
+
+        <div class="advisor-quick-scan-shell">
+          <div class="advisor-section-head">
             <div>
-              <div class="card-title">${escapeHtml(text('上下文条', 'Context Bar'))}</div>
-              <div class="form-hint">${escapeHtml(contextBar?.rootPath || state.rootPath || '-')}</div>
+              <div class="card-title">${escapeHtml(text('最近扫描', 'Recent Scans'))}</div>
+              <div class="form-hint">${escapeHtml(text('点击一条记录可直接把目录和扫描上下文带入顾问。', 'Click a record to hand the directory and scan context to the advisor.'))}</div>
             </div>
-            <span class="badge badge-info">${escapeHtml(stageLabel)}</span>
-            <button id="advisor-toggle-context" class="btn btn-ghost" type="button" ${state.acting ? 'disabled' : ''}>${escapeHtml(collapsed ? text('展开', 'Expand') : text('折叠', 'Collapse'))}</button>
           </div>
-          ${collapsed ? '' : `
-            <div class="advisor-context-grid">
-              <div class="advisor-context-chip">${escapeHtml(modeLabel)}</div>
-              <div class="advisor-context-chip">${escapeHtml(text('扫描记录', 'Scan'))}: ${escapeHtml(contextBar?.scanTaskId || '-')}</div>
-              <div class="advisor-context-chip">${escapeHtml(text('分类记录', 'Organize'))}: ${escapeHtml(contextBar?.organizeTaskId || '-')}</div>
-              <div class="advisor-context-chip">${escapeHtml(text('项目数', 'Items'))}: ${escapeHtml(contextBar?.inventorySummary?.itemCount || 0)}</div>
-              <div class="advisor-context-chip">${escapeHtml(text('可复用树', 'Reusable Tree'))}: ${escapeHtml(contextBar?.inventorySummary?.treeAvailable ? text('是', 'Yes') : text('否', 'No'))}</div>
-            </div>
-            <div class="form-hint">${escapeHtml(contextBar?.memorySummary?.message || '')}</div>
-            <div class="form-hint">${escapeHtml(contextBar?.inventorySummary?.message || '')}</div>
-          `}
-        </section>
-      ` : ''}
-
-      <section class="advisor-v2-timeline-wrap">
-        <div class="advisor-v2-timeline">${renderTimeline()}</div>
+          <div class="advisor-quick-scan-grid">${renderQuickScans()}</div>
+        </div>
       </section>
 
-      <section class="card advisor-v2-composer">
-        <textarea id="advisor-message" class="textarea" rows="4" placeholder="${escapeHtml(state.sessionData?.composer?.placeholder || text('告诉我你想先处理哪些文件。', 'Tell me which files you want to handle first.'))}">${escapeHtml(state.messageDraft)}</textarea>
-        <div class="form-hint">${escapeHtml(text('当前阶段：', 'Current stage: '))}${escapeHtml(stageLabel)}</div>
-        <div class="advisor-inline-actions">
-          <button id="advisor-send-btn" class="btn btn-primary" type="button" ${state.sending || !state.sessionId ? 'disabled' : ''}>${escapeHtml(state.sessionData?.composer?.submitLabel || text('发送', 'Send'))}</button>
+      ${renderContextSummary()}
+
+      <section class="advisor-timeline-shell">
+        <div class="advisor-timeline">${renderTimeline()}</div>
+      </section>
+
+      <section class="card advisor-composer-panel">
+        <div class="advisor-composer-grid">
+          <div class="advisor-composer-main">
+            <label class="form-label" for="advisor-message">${escapeHtml(text('下一步指令', 'Next Instruction'))}</label>
+            <textarea id="advisor-message" class="form-input advisor-composer-input" rows="4" placeholder="${escapeHtml(state.sessionData?.composer?.placeholder || text('告诉我你想先处理哪些文件。', 'Tell me which files you want to handle first.'))}">${escapeHtml(state.messageDraft)}</textarea>
+          </div>
+          <div class="advisor-composer-side">
+            <div class="advisor-composer-stage">
+              <div class="workflow-kicker workflow-kicker-subtle">${escapeHtml(text('当前阶段', 'Current Stage'))}</div>
+              <div class="advisor-composer-stage-value">${escapeHtml(stageLabel)}</div>
+              <div class="form-hint">${escapeHtml(text('按 Ctrl/Cmd + Enter 快速发送。', 'Press Ctrl/Cmd + Enter to send quickly.'))}</div>
+            </div>
+            <button id="advisor-send-btn" class="btn btn-primary advisor-send-btn" type="button" ${state.sending || !state.sessionId ? 'disabled' : ''}>${escapeHtml(state.sessionData?.composer?.submitLabel || text('发送', 'Send'))}</button>
+          </div>
         </div>
       </section>
     </section>
@@ -422,7 +488,7 @@ async function handleCardAction(cardId, action) {
 
 function scrollComposerIntoView() {
   window.setTimeout(() => {
-    pageContainer?.querySelector('.advisor-v2-composer')?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
+    pageContainer?.querySelector('.advisor-composer-panel')?.scrollIntoView?.({ behavior: 'smooth', block: 'end' });
   }, 30);
 }
 
@@ -467,6 +533,7 @@ function bindEvents() {
 }
 
 async function bootstrap() {
+  renderPage();
   await refreshQuickScans();
   renderPage();
   const handoff = getPendingHandoff();

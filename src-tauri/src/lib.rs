@@ -1,5 +1,6 @@
 mod advisor_runtime;
 mod backend;
+mod llm_protocol;
 mod organizer_runtime;
 mod persist;
 mod scan_runtime;

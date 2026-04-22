@@ -4,6 +4,10 @@ use super::types::{
     set_inventory_override, ContextAssets, DirectoryOverview, InventoryItem,
 };
 use crate::backend::AppState;
+use crate::llm_protocol::{
+    apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
+    parse_completion_response, DEFAULT_MAX_TOKENS,
+};
 use crate::persist::{self, ScanFindingRecord};
 use crate::system_ops;
 use serde_json::{json, Value};
@@ -18,9 +22,6 @@ use uuid::Uuid;
 struct TreeDraftNode {
     name: String,
     item_count: u64,
-    total_size: u64,
-    latest_modified_at: Option<String>,
-    risk: String,
     children: BTreeMap<String, TreeDraftNode>,
 }
 
@@ -196,34 +197,7 @@ impl<'a> ToolService<'a> {
         session: &Value,
         args: &Value,
     ) -> Result<Value, String> {
-        return self.summarize_files_tool_impl(session, args).await;
-        let overview = self.get_directory_overview(
-            session
-                .get("rootPath")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
-            Some(session),
-            session
-                .get("responseLanguage")
-                .and_then(Value::as_str)
-                .unwrap_or("zh"),
-        )?;
-        let items = summarize_inventory_items(&overview.inventory, args, true);
-        Ok(json!({
-            "status": "ok",
-            "message": local_text(
-                session.get("responseLanguage").and_then(Value::as_str).unwrap_or("zh"),
-                &format!("已返回 {} 条文件摘要。", items.len()),
-                &format!("Returned {} file summaries.", items.len())
-            ),
-            "mode": args.get("mode").cloned().unwrap_or(Value::String("metadata_summary".to_string())),
-            "total": items.len(),
-            "completed": items.len(),
-            "failed": 0,
-            "items": items,
-            "errors": [],
-        }))
+        self.summarize_files_tool_impl(session, args).await
     }
 
     pub(super) fn read_only_file_summaries_tool(
@@ -231,29 +205,7 @@ impl<'a> ToolService<'a> {
         session: &Value,
         args: &Value,
     ) -> Result<Value, String> {
-        return self.read_only_file_summaries_tool_impl(session, args);
-        let overview = self.get_directory_overview(
-            session
-                .get("rootPath")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
-            Some(session),
-            session
-                .get("responseLanguage")
-                .and_then(Value::as_str)
-                .unwrap_or("zh"),
-        )?;
-        let items = summarize_inventory_items(&overview.inventory, args, false);
-        Ok(json!({
-            "message": local_text(
-                session.get("responseLanguage").and_then(Value::as_str).unwrap_or("zh"),
-                &format!("已读取 {} 条已有摘要。", items.len()),
-                &format!("Read {} existing summaries.", items.len())
-            ),
-            "total": items.len(),
-            "items": items,
-        }))
+        self.read_only_file_summaries_tool_impl(session, args)
     }
 
     pub(super) fn preview_plan_from_value(
@@ -488,81 +440,7 @@ impl<'a> ToolService<'a> {
         request: &Value,
         apply_preference_capture: bool,
     ) -> Result<Value, String> {
-        return self.apply_reclassification_request_impl(
-            session,
-            request,
-            apply_preference_capture,
-        );
-        let change = request
-            .get("change")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let change_type = change
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-            })?;
-
-        match change_type {
-            "move_selection_to_category" => {
-                let selection_id = change
-                    .get("selectionId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-                    })?;
-                let target_category_id = change
-                    .get("targetCategoryId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-                    })?;
-                self.apply_reclassification(
-                    session,
-                    selection_id,
-                    &[target_category_id.to_string()],
-                )
-                .map(|mut job| {
-                    if let Some(obj) = job.as_object_mut() {
-                        obj.insert("request".to_string(), request.clone());
-                    }
-                    job
-                })
-            }
-            "split_selection_to_new_category" => {
-                let selection_id = change
-                    .get("selectionId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-                    })?;
-                let new_category_name = change
-                    .get("newCategoryName")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-                    })?;
-                let source_category = change
-                    .get("sourceCategoryId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("未分类");
-                self.apply_reclassification(
-                    session,
-                    selection_id,
-                    &[source_category.to_string(), new_category_name.to_string()],
-                )
-                .map(|mut job| {
-                    if let Some(obj) = job.as_object_mut() {
-                        obj.insert("request".to_string(), request.clone());
-                    }
-                    job
-                })
-            }
-            _ => Err("当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()),
-        }
+        self.apply_reclassification_request_impl(session, request, apply_preference_capture)
     }
 
     pub(super) fn rollback_reclassification(
@@ -1899,52 +1777,58 @@ async fn summarize_batch_with_model(
     let mut errors = Vec::new();
     for item in batch {
         let prompt = build_summary_prompt(item, mode, lang);
-        let request = json!({
-            "model": route.model,
-            "messages": [
-                { "role": "system", "content": summary_system_prompt(lang, mode) },
-                { "role": "user", "content": prompt }
+        let api_format = detect_api_format(&route.endpoint);
+        let request = build_completion_payload(
+            api_format,
+            &route.model,
+            &[
+                json!({ "role": "system", "content": summary_system_prompt(lang, mode) }),
+                json!({ "role": "user", "content": prompt }),
             ],
-            "temperature": 0
-        });
+            None,
+            0.0,
+            DEFAULT_MAX_TOKENS,
+        )
+        .map_err(|e| vec![json!({ "path": item.path, "reason": e })])?;
         let mut attempt = 0;
         let mut success = None;
         while attempt < 2 && success.is_none() {
             attempt += 1;
-            let mut req = client
-                .post(format!("{}/chat/completions", route.endpoint.trim_end_matches('/')))
+            let req = client
+                .post(build_messages_url(&route.endpoint, api_format))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .json(&request);
-            if !route.api_key.is_empty() {
-                req = req
-                    .header("Authorization", format!("Bearer {}", route.api_key))
-                    .header("x-api-key", route.api_key.clone())
-                    .header("api-key", route.api_key.clone());
-            }
+            let req = apply_auth_headers(req, api_format, &route.api_key);
             match req.send().await {
-                Ok(resp) => match resp.text().await {
-                    Ok(body) => {
-                        if let Some((short, normal)) = parse_summary_response(&body) {
-                            success = Some(json!({
-                                "rootPathKey": persist::create_root_path_key(root_path),
-                                "pathKey": persist::create_root_path_key(&item.path),
-                                "path": item.path,
-                                "name": item.name,
-                                "summaryShort": short,
-                                "summaryNormal": normal,
-                                "source": "model",
-                                "mode": mode,
-                                "updatedAt": now_iso(),
-                            }));
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(body) => {
+                            let assistant_text = parse_completion_response(api_format, status, &body)
+                                .map(|parsed| parsed.assistant_text)
+                                .unwrap_or_else(|_| body.clone());
+                            if let Some((short, normal)) = parse_summary_response(&assistant_text) {
+                                success = Some(json!({
+                                    "rootPathKey": persist::create_root_path_key(root_path),
+                                    "pathKey": persist::create_root_path_key(&item.path),
+                                    "path": item.path,
+                                    "name": item.name,
+                                    "summaryShort": short,
+                                    "summaryNormal": normal,
+                                    "source": "model",
+                                    "mode": mode,
+                                    "updatedAt": now_iso(),
+                                }));
+                            }
+                        }
+                        Err(err) => {
+                            if attempt >= 2 {
+                                errors.push(json!({ "path": item.path, "reason": err.to_string() }));
+                            }
                         }
                     }
-                    Err(err) => {
-                        if attempt >= 2 {
-                            errors.push(json!({ "path": item.path, "reason": err.to_string() }));
-                        }
-                    }
-                },
+                }
                 Err(err) => {
                     if attempt >= 2 {
                         errors.push(json!({ "path": item.path, "reason": err.to_string() }));
@@ -2262,31 +2146,6 @@ fn filter_inventory_by_args(inventory: &[InventoryItem], args: &Value) -> Vec<In
     });
     rows.truncate(limit);
     rows
-}
-
-fn summarize_inventory_items(
-    inventory: &[InventoryItem],
-    args: &Value,
-    fill_missing: bool,
-) -> Vec<Value> {
-    let selected = filter_inventory_by_args(inventory, args);
-    selected
-        .into_iter()
-        .map(|item| {
-            let summary = if item.summary_short.clone().unwrap_or_default().trim().is_empty() && fill_missing {
-                format!("{}，{}，{}", item.name, item.kind, format_size_text(item.size))
-            } else {
-                item.summary_short.clone().unwrap_or_default()
-            };
-            json!({
-                "path": item.path,
-                "name": item.name,
-                "summaryShort": if summary.trim().is_empty() { Value::Null } else { Value::String(summary.clone()) },
-                "summaryNormal": if summary.trim().is_empty() { Value::Null } else { Value::String(summary) },
-                "warning": Value::Null,
-            })
-        })
-        .collect()
 }
 
 fn format_size_text(size: u64) -> String {

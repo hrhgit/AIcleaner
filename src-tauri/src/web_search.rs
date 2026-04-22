@@ -17,8 +17,6 @@ pub struct WebSearchTrace {
     pub query: String,
     pub reason: String,
     pub answer: Option<String>,
-    pub response_time: Option<String>,
-    pub request_id: Option<String>,
     pub results: Vec<Value>,
 }
 
@@ -133,20 +131,6 @@ pub async fn tavily_search(
             .and_then(Value::as_str)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        response_time: body
-            .get("response_time")
-            .and_then(|value| {
-                value
-                    .as_str()
-                    .map(|text| text.trim().to_string())
-                    .or_else(|| value.as_f64().map(|number| number.to_string()))
-            })
-            .filter(|value| !value.is_empty()),
-        request_id: body
-            .get("request_id")
-            .and_then(Value::as_str)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
         results: body
             .get("results")
             .and_then(Value::as_array)
@@ -238,19 +222,6 @@ pub fn format_web_search_context(trace: &WebSearchTrace, response_language: &str
     }
 
     lines.join("\n")
-}
-
-pub fn web_search_trace_to_value(trace: &WebSearchTrace) -> Value {
-    json!({
-        "request": {
-            "query": trace.query,
-            "reason": trace.reason,
-        },
-        "answer": trace.answer,
-        "responseTime": trace.response_time,
-        "requestId": trace.request_id,
-        "results": trace.results,
-    })
 }
 
 #[cfg(test)]

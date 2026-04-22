@@ -5,52 +5,19 @@ import {
   saveCredentials,
   saveSettings,
 } from '../utils/api.js';
-import { showToast } from '../main.js';
 import {
   refreshCredentialsStatus,
   registerCredentialsStatusChangeHandler,
 } from '../utils/secret-ui.js';
 import { registerLangChangeHandler, t } from '../utils/i18n.js';
-
-const PROVIDER_PRESETS = [
-  { name: 'DeepSeek', endpoint: 'https://api.deepseek.com' },
-  { name: 'OpenAI', endpoint: 'https://api.openai.com/v1' },
-  { name: 'Google Gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/' },
-  { name: 'Qwen', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-  { name: 'GLM', endpoint: 'https://open.bigmodel.cn/api/paas/v4' },
-  { name: 'Moonshot', endpoint: 'https://api.moonshot.cn/v1' },
-];
-
-const PROVIDER_MODELS = {
-  'https://api.openai.com/v1': [
-    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
-    { value: 'gpt-4o', label: 'gpt-4o' },
-    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
-  ],
-  'https://api.deepseek.com': [
-    { value: 'deepseek-chat', label: 'deepseek-chat' },
-    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
-  ],
-  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
-    { value: 'qwen-plus', label: 'qwen-plus' },
-    { value: 'qwen-turbo', label: 'qwen-turbo' },
-    { value: 'qwen-max', label: 'qwen-max' },
-  ],
-  'https://open.bigmodel.cn/api/paas/v4': [
-    { value: 'glm-4-flash', label: 'glm-4-flash' },
-    { value: 'glm-4', label: 'glm-4' },
-  ],
-  'https://api.moonshot.cn/v1': [
-    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
-    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
-  ],
-  'https://generativelanguage.googleapis.com/v1beta/openai/': [
-    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
-    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
-    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
-  ],
-};
+import {
+  DEFAULT_PROVIDER_ENDPOINT,
+  defaultModelByEndpoint,
+  fallbackModelsByEndpoint,
+  normalizeRemoteModels,
+  PROVIDER_OPTIONS,
+} from '../utils/provider-registry.js';
+import { showToast } from '../utils/toast.js';
 
 const remoteModelsCache = new Map();
 const requestTokens = new Map();
@@ -112,29 +79,6 @@ function getErrorMessage(err) {
   }
 }
 
-function normalizeModels(models) {
-  const seen = new Set();
-  const normalized = [];
-  for (const item of models || []) {
-    const value = String(item?.value || '').trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    normalized.push({
-      value,
-      label: String(item?.label || value),
-    });
-  }
-  return normalized;
-}
-
-function fallbackModelsByEndpoint(endpoint) {
-  return normalizeModels(PROVIDER_MODELS[String(endpoint || '').trim()] || [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }]);
-}
-
-function defaultModelByEndpoint(endpoint) {
-  return fallbackModelsByEndpoint(endpoint)[0]?.value || 'gpt-4o-mini';
-}
-
 function normalizeProviders(settings) {
   const merged = [];
   const byEndpoint = settings?.providerConfigs && typeof settings.providerConfigs === 'object'
@@ -142,14 +86,14 @@ function normalizeProviders(settings) {
     : {};
 
   const presetSet = new Set();
-  for (const preset of PROVIDER_PRESETS) {
-    presetSet.add(preset.endpoint);
-    const config = byEndpoint[preset.endpoint] || {};
+  for (const preset of PROVIDER_OPTIONS) {
+    presetSet.add(preset.value);
+    const config = byEndpoint[preset.value] || {};
     merged.push({
-      name: String(config?.name || preset.name),
-      endpoint: preset.endpoint,
+      name: String(config?.name || preset.label),
+      endpoint: preset.value,
       apiKey: '',
-      model: String(config?.model || defaultModelByEndpoint(preset.endpoint)),
+      model: String(config?.model || defaultModelByEndpoint(preset.value)),
     });
   }
 
@@ -167,9 +111,9 @@ function normalizeProviders(settings) {
   if (!merged.length) {
     merged.push({
       name: 'OpenAI',
-      endpoint: 'https://api.openai.com/v1',
+      endpoint: DEFAULT_PROVIDER_ENDPOINT,
       apiKey: '',
-      model: 'gpt-4o-mini',
+      model: defaultModelByEndpoint(DEFAULT_PROVIDER_ENDPOINT),
     });
   }
 
@@ -459,7 +403,7 @@ async function loadModelsForProvider(endpoint, forceRefresh = false) {
         const resp = providerState.apiKey
           ? await getProviderModels(endpoint, providerState.apiKey)
           : await getProviderModels(endpoint);
-        models = normalizeModels(resp?.models || []);
+        models = normalizeRemoteModels(resp?.models || []);
         remoteModelsCache.set(cacheKey, models);
       }
     }
@@ -468,7 +412,7 @@ async function loadModelsForProvider(endpoint, forceRefresh = false) {
   }
 
   if (!models.length) models = fallbackModelsByEndpoint(endpoint);
-  if (!models.length) models = [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }];
+  if (!models.length) models = [{ value: defaultModelByEndpoint(endpoint), label: defaultModelByEndpoint(endpoint) }];
   if (requestTokens.get(endpoint) !== token) return;
 
   renderModelOptions(modelSelect, models, selectedModel || providerState.model);
@@ -600,7 +544,7 @@ function collectPayloadFromDOM() {
   const checkedDefault = listEl?.querySelector('input[name="provider-default"]:checked');
   const defaultProviderEndpoint = String(checkedDefault?.value || state.defaultProviderEndpoint || '').trim()
     || Object.keys(providerConfigs)[0]
-    || PROVIDER_PRESETS[0].endpoint;
+    || DEFAULT_PROVIDER_ENDPOINT;
   const activeConfig = providerConfigs[defaultProviderEndpoint] || {
     endpoint: defaultProviderEndpoint,
     model: defaultModelByEndpoint(defaultProviderEndpoint),
