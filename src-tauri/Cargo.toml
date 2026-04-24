@@ -19,6 +19,7 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 base64 = "0.22"
+async-trait = "0.1"
 check_elevation = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3", features = ["windows-native"] }

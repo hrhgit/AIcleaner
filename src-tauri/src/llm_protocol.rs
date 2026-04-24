@@ -149,6 +149,8 @@ fn build_openai_payload(
         payload["tools"] = Value::Array(tools.to_vec());
         payload["tool_choice"] = Value::String("auto".to_string());
     }
+    // DeepSeek V4: enable thinking mode by default
+    payload["extra_body"] = json!({ "thinking": true });
     payload
 }
 
@@ -178,6 +180,12 @@ fn normalize_message_for_openai(message: &Value) -> Value {
             .collect::<Vec<_>>();
         if !tool_calls.is_empty() {
             out["tool_calls"] = Value::Array(tool_calls);
+        }
+        // DeepSeek V4: preserve reasoning_content for passback
+        if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
+            if !rc.trim().is_empty() {
+                out["reasoning_content"] = Value::String(rc.to_string());
+            }
         }
     } else if role == "tool" {
         out["tool_call_id"] = message

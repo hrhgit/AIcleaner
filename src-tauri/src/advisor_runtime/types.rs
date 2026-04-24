@@ -6,15 +6,15 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(super) const CARD_TREE: &str = "tree";
-pub(super) const CARD_RECLASS: &str = "reclassification_result";
-pub(super) const CARD_PREFERENCE: &str = "preference_draft";
-pub(super) const CARD_PLAN_PREVIEW: &str = "plan_preview";
-pub(super) const CARD_EXECUTION: &str = "execution_result";
+pub(crate) const CARD_TREE: &str = "tree";
+pub(crate) const CARD_RECLASS: &str = "reclassification_result";
+pub(crate) const CARD_PREFERENCE: &str = "preference_draft";
+pub(crate) const CARD_PLAN_PREVIEW: &str = "plan_preview";
+pub(crate) const CARD_EXECUTION: &str = "execution_result";
 
-pub(super) const WORKFLOW_UNDERSTAND: &str = "understand";
-pub(super) const WORKFLOW_PREVIEW_READY: &str = "preview_ready";
-pub(super) const WORKFLOW_EXECUTE_READY: &str = "execute_ready";
+pub(crate) const WORKFLOW_UNDERSTAND: &str = "understand";
+pub(crate) const WORKFLOW_PREVIEW_READY: &str = "preview_ready";
+pub(crate) const WORKFLOW_EXECUTE_READY: &str = "execute_ready";
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -41,14 +41,14 @@ pub struct AdvisorCardActionInput {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct ContextAssets {
+pub(crate) struct ContextAssets {
     pub organize_task_id: Option<String>,
     pub organize_snapshot: Option<OrganizeSnapshot>,
     pub latest_tree: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct InventoryItem {
+pub(crate) struct InventoryItem {
     pub path: String,
     pub name: String,
     pub size: u64,
@@ -63,7 +63,7 @@ pub(super) struct InventoryItem {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct DirectoryOverview {
+pub(crate) struct DirectoryOverview {
     pub assets: ContextAssets,
     pub inventory: Vec<InventoryItem>,
     pub derived_tree: Option<Value>,
@@ -78,7 +78,7 @@ pub(super) fn is_english(lang: &str) -> bool {
     lang.trim().eq_ignore_ascii_case("en")
 }
 
-pub(super) fn local_text<'a>(lang: &str, zh: &'a str, en: &'a str) -> &'a str {
+pub(crate) fn local_text<'a>(lang: &str, zh: &'a str, en: &'a str) -> &'a str {
     if is_english(lang) {
         en
     } else {

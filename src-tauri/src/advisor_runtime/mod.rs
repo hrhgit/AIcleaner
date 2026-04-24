@@ -3,8 +3,8 @@ mod bootstrap;
 mod llm;
 mod orchestrator;
 mod payload;
-mod tools;
-mod types;
+pub(crate) mod tools;
+pub(crate) mod types;
 
 use crate::backend::AppState;
 use crate::persist;

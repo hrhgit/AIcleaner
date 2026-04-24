@@ -10,6 +10,7 @@ import {
   registerCredentialsStatusChangeHandler,
 } from '../utils/secret-ui.js';
 import { registerLangChangeHandler, t } from '../utils/i18n.js';
+import { escapeHtml } from '../utils/html.js';
 import {
   DEFAULT_PROVIDER_ENDPOINT,
   defaultModelByEndpoint,
@@ -17,6 +18,7 @@ import {
   normalizeRemoteModels,
   PROVIDER_OPTIONS,
 } from '../utils/provider-registry.js';
+import { normalizeProviders, normalizeSearchApi } from './provider-manager/normalizers.js';
 import { showToast } from '../utils/toast.js';
 
 const remoteModelsCache = new Map();
@@ -60,15 +62,6 @@ let closeConfirmCancelBtn;
 let closeConfirmDiscardBtn;
 let initialized = false;
 
-function escapeHtml(value) {
-  return String(value || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
 function getErrorMessage(err) {
   if (typeof err === 'string') return err;
   if (err && typeof err.message === 'string' && err.message.trim()) return err.message;
@@ -77,76 +70,6 @@ function getErrorMessage(err) {
   } catch {
     return String(err || 'Unknown error');
   }
-}
-
-function normalizeProviders(settings) {
-  const merged = [];
-  const byEndpoint = settings?.providerConfigs && typeof settings.providerConfigs === 'object'
-    ? settings.providerConfigs
-    : {};
-
-  const presetSet = new Set();
-  for (const preset of PROVIDER_OPTIONS) {
-    presetSet.add(preset.value);
-    const config = byEndpoint[preset.value] || {};
-    merged.push({
-      name: String(config?.name || preset.label),
-      endpoint: preset.value,
-      apiKey: '',
-      model: String(config?.model || defaultModelByEndpoint(preset.value)),
-    });
-  }
-
-  for (const [key, rawConfig] of Object.entries(byEndpoint)) {
-    const endpoint = String(rawConfig?.endpoint || key || '').trim();
-    if (!endpoint || presetSet.has(endpoint)) continue;
-    merged.push({
-      name: String(rawConfig?.name || endpoint),
-      endpoint,
-      apiKey: '',
-      model: String(rawConfig?.model || defaultModelByEndpoint(endpoint)),
-    });
-  }
-
-  if (!merged.length) {
-    merged.push({
-      name: 'OpenAI',
-      endpoint: DEFAULT_PROVIDER_ENDPOINT,
-      apiKey: '',
-      model: defaultModelByEndpoint(DEFAULT_PROVIDER_ENDPOINT),
-    });
-  }
-
-  let defaultProviderEndpoint = String(settings?.defaultProviderEndpoint || '').trim();
-  if (!merged.some((item) => item.endpoint === defaultProviderEndpoint)) {
-    defaultProviderEndpoint = merged[0].endpoint;
-  }
-
-  return { providers: merged, defaultProviderEndpoint };
-}
-
-function normalizeSearchApi(settings) {
-  const source = settings?.searchApi && typeof settings.searchApi === 'object'
-    ? settings.searchApi
-    : {};
-  const scopesSource = source?.scopes && typeof source.scopes === 'object'
-    ? source.scopes
-    : {};
-  const workflowEnabled = !!(
-    source?.enabled
-    || scopesSource.classify
-    || scopesSource.organizer
-  );
-
-  return {
-    provider: 'tavily',
-    enabled: workflowEnabled,
-    apiKey: '',
-    scopes: {
-      classify: workflowEnabled,
-      organizer: workflowEnabled,
-    },
-  };
 }
 
 function setSavingState(isSaving) {
@@ -241,12 +164,6 @@ function renderProviderRows() {
               placeholder="${escapeHtml(hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? t('provider_modal.api_key_saved_placeholder') : 'tvly-xxxxxxxxxxxxxxx')}"
               value="${escapeHtml(state.editableCredentials?.searchApiKey || '')}"
             />
-            ${hasStoredSearchApiSecret() && !state.editableCredentials?.searchApiKey ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
-            <div class="form-hint">
-              <a href="https://tavily.com/" data-open-external="true" target="_blank" rel="noopener noreferrer" style="color: var(--accent-info); text-decoration: underline;">
-                ${escapeHtml(t('provider_modal.search_api_hint'))}
-              </a>
-            </div>
           </div>
         </div>
       </div>
@@ -289,7 +206,6 @@ function renderProviderRows() {
                 placeholder="${escapeHtml(secretUnavailable ? t('provider_modal.api_key_saved_placeholder') : t('provider_modal.api_key_placeholder'))}"
                 value="${escapeHtml(state.editableCredentials?.providerSecrets?.[provider.endpoint] || '')}"
               />
-              ${secretUnavailable ? `<div class="form-hint">${escapeHtml(t('provider_modal.api_key_saved_hint'))}</div>` : ''}
             </div>
             <div class="form-group">
               <label class="form-label">${t('provider_modal.model')}</label>
@@ -305,7 +221,6 @@ function renderProviderRows() {
   }
 
   listEl.innerHTML = `
-    <div class="form-hint" style="margin-bottom: 12px; padding: 0 16px;">${escapeHtml(t('provider_modal.credentials_hint'))}</div>
     <div class="provider-layout">
       ${sidebarHtml}
       <div class="provider-content">

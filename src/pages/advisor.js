@@ -241,7 +241,6 @@ function renderCard(card) {
       ` : ''}
       ${card?.cardType === 'preference_draft' ? `
         <div class="advisor-card-copy">${escapeHtml(card?.body?.summary || '')}</div>
-        <div class="form-hint">${escapeHtml(text('建议作用域：', 'Suggested scope: '))}${escapeHtml(card?.body?.suggestedScope || 'session')}</div>
       ` : ''}
       ${card?.cardType === 'reclassification_result' ? `
         <div class="advisor-card-copy">${escapeHtml(card?.body?.summary || summarizeCard(card))}</div>
@@ -276,11 +275,8 @@ function renderTimeline() {
       <div class="card advisor-empty-panel">
         <div class="empty-state advisor-empty-compact">
           <div class="empty-state-text">${escapeHtml(finished
-            ? text('归类结果已经准备好，可以开始对话。', 'Organize results are ready. Start the conversation when you are ready.')
-            : text('会话启动后，消息流和结果卡会显示在这里。', 'The timeline and cards will appear here once the session starts.'))}</div>
-          <div class="empty-state-hint">${escapeHtml(finished
-            ? text('上方已经展示当前目录的归类结果；开始对话后，顾问会直接复用它。', 'The latest organize result is already shown above. The advisor will reuse it once the session starts.')
-            : text('可以先启动归类，也可以直接开始会话；没有归类结果时，顾问会先基于目录元信息工作。', 'You can organize first or start the session directly. Without organize results, the advisor starts from directory metadata.'))}</div>
+            ? text('归类结果已就绪', 'Organize results ready')
+            : text('暂无会话内容', 'No session content'))}</div>
         </div>
       </div>
     `;
@@ -342,11 +338,6 @@ function renderContextSummary() {
           <div class="advisor-context-chip">${escapeHtml(text('可复用树', 'Reusable Tree'))}: ${escapeHtml(directorySummary?.treeAvailable ? text('是', 'Yes') : text('否', 'No'))}</div>
           <div class="advisor-context-chip">${escapeHtml(text('联网搜索', 'Web Search'))}: ${escapeHtml(webSearch?.webSearchEnabled ? text('可用', 'Available') : (webSearch?.useWebSearch ? text('已开启但缺少密钥', 'Enabled but unavailable') : text('关闭', 'Off')))}</div>
         </div>
-        <div class="advisor-context-notes">
-          ${contextBar?.memorySummary?.message ? `<div class="form-hint">${escapeHtml(contextBar.memorySummary.message)}</div>` : ''}
-          ${directorySummary?.message ? `<div class="form-hint">${escapeHtml(directorySummary.message)}</div>` : ''}
-          ${webSearch?.message ? `<div class="form-hint">${escapeHtml(webSearch.message)}</div>` : ''}
-        </div>
       `}
     </section>
   `;
@@ -355,12 +346,7 @@ function renderContextSummary() {
 function renderOrganizeSummary(snapshot) {
   if (!snapshot) {
     return `
-      <div class="advisor-organize-summary">
-        <div class="form-hint">${escapeHtml(text(
-          '还没有当前目录的归类结果。你可以先启动归类，也可以直接开始会话。',
-          'There is no organize result for this folder yet. You can organize first or start the session directly.',
-        ))}</div>
-      </div>
+      <div class="advisor-organize-summary"></div>
     `;
   }
 
@@ -390,16 +376,13 @@ function renderOrganizeSummary(snapshot) {
         <div class="advisor-organize-progress-track">
           <div class="advisor-organize-progress-fill" style="width: ${getOrganizeProgress(snapshot)}%"></div>
         </div>
-        <div class="form-hint">${escapeHtml(text('当前进度', 'Progress'))}: ${escapeHtml(getOrganizeProgress(snapshot))}%</div>
       </div>
       ${error ? `<div class="form-hint">${escapeHtml(text('错误: ', 'Error: '))}${escapeHtml(error)}</div>` : ''}
       ${treeChildren.length ? `
         <div class="advisor-tree-shell">
           <ul class="advisor-tree-list">${treeChildren.slice(0, 18).map(renderTreeNode).join('')}</ul>
         </div>
-      ` : `
-        <div class="form-hint">${escapeHtml(text('当前还没有可展示的分类树。', 'There is no tree to show yet.'))}</div>
-      `}
+      ` : ''}
     </section>
   `;
 }
@@ -412,16 +395,12 @@ function renderOrganizePanel() {
     : isOrganizeFinished(snapshot)
       ? text('开始对话', 'Start Conversation')
       : text('直接开始会话', 'Start Conversation');
-  const conversationHint = isOrganizeFinished(snapshot)
-    ? text('归类完成后，顾问会直接复用上面的结果树和统计。', 'Once the conversation starts, the advisor will reuse the organize tree and stats above.')
-    : text('如果你先开始会话，顾问会暂时基于目录元信息工作。', 'If you start the conversation now, the advisor will temporarily work from directory metadata.');
-
   return `
     <section class="card advisor-organize-panel">
       <div class="advisor-section-head">
         <div>
           <div class="workflow-kicker workflow-kicker-subtle">${escapeHtml(text('前置归类', 'Organize First'))}</div>
-          <h2 class="card-title">${escapeHtml(text('先归类，再进入顾问对话。', 'Organize first, then continue in the advisor conversation.'))}</h2>
+          <h2 class="card-title">${escapeHtml(text('归类与顾问对话', 'Organize and Advisor'))}</h2>
         </div>
         <div class="advisor-inline-actions advisor-organize-actions">
           <button id="advisor-organize-start-btn" class="btn btn-primary" type="button" ${state.organizeStarting || isOrganizeRunning(snapshot) ? 'disabled' : ''}>${escapeHtml(state.organizeStarting ? text('启动中...', 'Starting...') : text('开始归类', 'Start Organizing'))}</button>
@@ -445,18 +424,15 @@ function renderOrganizePanel() {
                 <option value="${escapeHtml(mode)}" ${state.summaryStrategy === mode ? 'selected' : ''}>${escapeHtml(summaryModeLabel(mode))}</option>
               `).join('')}
             </select>
-            <div class="form-hint">${escapeHtml(summaryModeHint(state.summaryStrategy))}</div>
           </div>
           <label class="advisor-organize-toggle">
             <input id="advisor-workflow-web-search" type="checkbox" ${state.useWebSearch ? 'checked' : ''} ${state.syncingSearch ? 'disabled' : ''} />
             <span class="advisor-organize-toggle-copy">
-              <span class="advisor-organize-toggle-title">${escapeHtml(text('为当前整理工作流启用联网搜索', 'Enable Web Search for the current cleanup workflow'))}</span>
-              <span class="advisor-organize-toggle-hint">${escapeHtml(text('这个开关会同时影响归类阶段和顾问对话中的 web_search 工具。', 'This single switch controls organize-time search and the advisor web_search tool.'))}</span>
+              <span class="advisor-organize-toggle-title">${escapeHtml(text('联网搜索', 'Web Search'))}</span>
             </span>
           </label>
         </div>
       </div>
-      <div class="form-hint">${escapeHtml(conversationHint)}</div>
       ${renderOrganizeSummary(snapshot)}
     </section>
   `;
@@ -471,8 +447,7 @@ function renderPage() {
         <div class="workflow-hero-row">
           <div class="workflow-hero-copy">
             <div class="workflow-kicker">${escapeHtml(text('顾问工作流', 'Advisor Workflow'))}</div>
-            <h1>${escapeHtml(text('在同一页面里完成归类、建议、预览和执行。', 'Organize, advise, preview, and execute from one page.'))}</h1>
-            <p>${escapeHtml(text('顶部先跑归类，拿到结果后直接进入顾问对话；如果你不想等待，也可以直接开始会话。', 'Run organize at the top first, then continue straight into the advisor conversation. If you do not want to wait, you can still start the session immediately.'))}</p>
+            <h1>${escapeHtml(text('归类、建议、预览和执行', 'Organize, Advise, Preview, Execute'))}</h1>
           </div>
           <div class="workflow-hero-actions advisor-hero-actions">
             <span class="advisor-stage-chip">${escapeHtml(stageLabel)}</span>
@@ -497,7 +472,6 @@ function renderPage() {
             <div class="advisor-composer-stage">
               <div class="workflow-kicker workflow-kicker-subtle">${escapeHtml(text('当前阶段', 'Current Stage'))}</div>
               <div class="advisor-composer-stage-value">${escapeHtml(stageLabel)}</div>
-              <div class="form-hint">${escapeHtml(text('按 Ctrl/Cmd + Enter 快速发送。', 'Press Ctrl/Cmd + Enter to send quickly.'))}</div>
             </div>
             <button id="advisor-send-btn" class="btn btn-primary advisor-send-btn" type="button" ${state.sending || !state.sessionId ? 'disabled' : ''}>${escapeHtml(state.sessionData?.composer?.submitLabel || text('发送', 'Send'))}</button>
           </div>
@@ -545,7 +519,7 @@ async function ensureWorkflowCredentials(requireSearchApi) {
   await ensureRequiredCredentialsConfigured({
     providerEndpoints: [defaultProviderEndpoint],
     requireSearchApi,
-    reasonText: text('请先在“服务商 API”里补齐当前工作流所需密钥。', 'Configure the required API keys in Service Provider API first.'),
+    reasonText: text('缺少 API Key。', 'API key required.'),
   });
 }
 

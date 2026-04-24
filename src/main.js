@@ -80,9 +80,7 @@ function updateShellCopy() {
     if (organizerLabel) organizerLabel.textContent = t('nav.organizer');
     if (organizerResultsLabel) organizerResultsLabel.textContent = t('nav.organizer_results');
     if (bootSubtitle) bootSubtitle.textContent = currentLang === 'en' ? 'Loading workspace...' : '正在加载工作台...';
-    if (bootHint) bootHint.textContent = currentLang === 'en'
-        ? 'The first dev-mode load may be slower while frontend assets connect.'
-        : '开发模式下首次连接前端资源会稍慢一些，但不应再出现空白窗口。';
+    if (bootHint) bootHint.textContent = '';
 }
 
 async function handleExternalLinkClick(event) {

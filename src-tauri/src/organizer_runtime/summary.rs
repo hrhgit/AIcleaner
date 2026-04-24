@@ -1,4 +1,8 @@
 use super::*;
+use crate::llm_tools::{
+    serialize_tool_result_content, ToolContext, ToolExecutionContext, ToolId, ToolRegistry,
+    ToolWorkflow,
+};
 
 fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -485,22 +489,7 @@ async fn chat_completion_with_messages(
     })?;
     let started_at = Instant::now();
     if let Some(diagnostics) = diagnostics {
-        diagnostics.record(
-            "info",
-            "organizer_model_request",
-            "organizer model request started",
-            json!({
-                "stage": stage,
-                "endpoint": route.endpoint.clone(),
-                "model": route.model.clone(),
-                "url": url.clone(),
-                "messages": messages,
-                "tools": tools.unwrap_or(&[]),
-                "payload": payload.clone(),
-            }),
-            None,
-            None,
-        );
+        diagnostics.model_request(stage, route, &url, messages, tools.unwrap_or(&[]), &payload);
     }
     let req = client
         .post(url.clone())
@@ -517,18 +506,16 @@ async fn chat_completion_with_messages(
             Ok(resp) => resp,
             Err(e) => {
                 if let Some(diagnostics) = diagnostics_for_request.as_ref() {
-                    diagnostics.record(
-                        "error",
-                        "organizer_model_error",
+                    diagnostics.model_error(
+                        &stage_for_request,
+                        &endpoint_for_request,
+                        &model_for_request,
                         "organizer model request failed",
                         json!({
-                            "stage": stage_for_request.clone(),
-                            "endpoint": endpoint_for_request.clone(),
-                            "model": model_for_request.clone(),
                             "url": url.clone(),
+                            "error": { "message": e.to_string() },
                         }),
-                        Some(json!({ "message": e.to_string() })),
-                        Some(started_at.elapsed()),
+                        started_at.elapsed(),
                     );
                 }
                 return Err(ChatCompletionError {
@@ -542,18 +529,16 @@ async fn chat_completion_with_messages(
             Ok(raw_body) => raw_body,
             Err(e) => {
                 if let Some(diagnostics) = diagnostics_for_request.as_ref() {
-                    diagnostics.record(
-                        "error",
-                        "organizer_model_error",
+                    diagnostics.model_error(
+                        &stage_for_request,
+                        &endpoint_for_request,
+                        &model_for_request,
                         "organizer model response body read failed",
                         json!({
-                            "stage": stage_for_request,
-                            "endpoint": endpoint_for_request.clone(),
-                            "model": model_for_request.clone(),
                             "status": status.as_u16(),
+                            "error": { "message": e.to_string() },
                         }),
-                        Some(json!({ "message": e.to_string() })),
-                        Some(started_at.elapsed()),
+                        started_at.elapsed(),
                     );
                 }
                 return Err(ChatCompletionError {
@@ -563,19 +548,13 @@ async fn chat_completion_with_messages(
             }
         };
         if let Some(diagnostics) = diagnostics_for_request.as_ref() {
-            diagnostics.record(
-                if status.is_success() { "info" } else { "error" },
-                "organizer_model_response",
-                "organizer model response received",
-                json!({
-                    "stage": stage_for_request,
-                    "endpoint": endpoint_for_request.clone(),
-                    "model": model_for_request.clone(),
-                    "status": status.as_u16(),
-                    "rawBody": raw_body.clone(),
-                }),
-                None,
-                Some(started_at.elapsed()),
+            diagnostics.model_response(
+                &stage_for_request,
+                &endpoint_for_request,
+                &model_for_request,
+                status.as_u16(),
+                &raw_body,
+                started_at.elapsed(),
             );
         }
         parse_chat_completion_http_body(&endpoint_for_request, status, &raw_body)
@@ -829,116 +808,6 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
         .collect()
 }
 
-fn build_organize_tools(allow_web_search: bool) -> Vec<Value> {
-    let mut tools = Vec::new();
-    if allow_web_search {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for external context that is missing from the local file summaries.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "reason": { "type": "string" }
-                    },
-                    "required": ["query"]
-                }
-            }
-        }));
-    }
-    tools.push(json!({
-        "type": "function",
-        "function": {
-            "name": "submit_organize_result",
-            "description": "Submit the final category tree and assignments for this batch.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tree": { "type": "object" },
-                    "assignments": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "itemId": { "type": "string" },
-                                "leafNodeId": { "type": "string" },
-                                "categoryPath": {
-                                    "type": "array",
-                                    "items": { "type": "string" }
-                                },
-                                "reason": { "type": "string" }
-                            },
-                            "required": ["itemId"]
-                        }
-                    }
-                },
-                "required": ["tree", "assignments"]
-            }
-        }
-    }));
-    tools
-}
-
-fn normalize_web_search_query(value: &str) -> String {
-    let compact = value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string();
-    if compact.chars().count() <= 240 {
-        compact
-    } else {
-        compact.chars().take(240).collect()
-    }
-}
-
-fn parse_web_search_tool_arguments(value: &Value) -> Result<WebSearchRequest, String> {
-    let query = value
-        .get("query")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| "web_search requires a non-empty query".to_string())?;
-    let reason = value
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    Ok(WebSearchRequest {
-        query: normalize_web_search_query(query),
-        reason,
-    })
-}
-
-fn parse_submit_organize_result_arguments(value: &Value) -> Result<Value, String> {
-    let tree = value
-        .get("tree")
-        .cloned()
-        .ok_or_else(|| "submit_organize_result is missing tree".to_string())?;
-    if !tree.is_object() {
-        return Err("submit_organize_result tree must be an object".to_string());
-    }
-    let assignments = value
-        .get("assignments")
-        .cloned()
-        .ok_or_else(|| "submit_organize_result is missing assignments".to_string())?;
-    if !assignments.is_array() {
-        return Err("submit_organize_result assignments must be an array".to_string());
-    }
-    Ok(json!({
-        "tree": tree,
-        "assignments": assignments,
-    }))
-}
-
-fn serialize_tool_result_content(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
 fn search_budget_exhausted_message(response_language: &str) -> &'static str {
     if response_language
         .trim()
@@ -1016,9 +885,11 @@ pub(super) async fn classify_organize_batch(
     ];
     let mut search_calls = 0usize;
     let mut budget_exhausted_prompt_sent = false;
+    let tool_registry = ToolRegistry::new();
 
     for step_idx in 0..max_steps {
         let allow_web_search = search_enabled && search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        let search_remaining = ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls);
         messages[0]["content"] = Value::String(build_organize_system_prompt(
             response_language,
             allow_web_search,
@@ -1041,15 +912,17 @@ pub(super) async fn classify_organize_batch(
             budget_exhausted_prompt_sent = true;
         }
 
-        let tools = build_organize_tools(allow_web_search);
-        let available_tool_names = tools
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|value| value.get("name"))
-                    .and_then(Value::as_str)
-            })
-            .collect::<Vec<_>>();
+        let tool_context = ToolContext {
+            workflow: ToolWorkflow::Organizer,
+            stage,
+            session: None,
+            bootstrap_turn: false,
+            response_language,
+            web_search_allowed: allow_web_search,
+            search_remaining,
+        };
+        let tools = tool_registry.definitions(&tool_context);
+        let available_tool_names = tool_registry.available_names(&tool_context);
 
         let completion = match chat_completion_with_messages(
             text_route,
@@ -1130,128 +1003,71 @@ pub(super) async fn classify_organize_batch(
             });
         };
 
-        match tool_call.name.as_str() {
-            "web_search" => {
-                if !allow_web_search {
+        let tool_id = tool_registry.id_for_name(&tool_call.name);
+        let tool_result = {
+            let mut tool_context = ToolExecutionContext {
+                workflow: ToolWorkflow::Organizer,
+                stage,
+                session: None,
+                bootstrap_turn: false,
+                response_language,
+                web_search_allowed: allow_web_search,
+                search_remaining,
+                state: None,
+                search_api_key: Some(search_api_key),
+                diagnostics,
+            };
+            match tool_registry.dispatch(&mut tool_context, &tool_call).await {
+                Ok(result) => result,
+                Err(err) => {
                     return Ok(ClassifyOrganizeBatchOutput {
                         parsed: None,
                         usage: total_usage,
                         raw_output: round_trace.join("\n\n====================\n\n"),
-                        error: Some(
-                            "classification response attempted web_search after budget exhaustion"
-                                .to_string(),
-                        ),
+                        error: Some(err),
                     });
                 }
-                search_calls = search_calls.saturating_add(1);
-                let tool_result = match parse_web_search_tool_arguments(&tool_call.arguments) {
-                    Ok(request) => match tavily_search(search_api_key, &request).await {
-                        Ok(trace) => {
-                            if let Some(diagnostics) = diagnostics {
-                                diagnostics.record(
-                                    "info",
-                                    "organizer_web_search",
-                                    "organizer web search succeeded",
-                                    json!({
-                                        "stage": stage,
-                                        "query": trace.query.clone(),
-                                        "reason": trace.reason.clone(),
-                                        "resultCount": trace.results.len(),
-                                        "results": trace.results.clone(),
-                                    }),
-                                    None,
-                                    None,
-                                );
-                            }
-                            append_batch_trace_note(
-                                &mut round_trace,
-                                "web_search",
-                                vec![
-                                    format!("Query: {}", trace.query),
-                                    format!("Reason: {}", trace.reason),
-                                    format!("Result Count: {}", trace.results.len()),
-                                    format!(
-                                        "Search Budget Remaining: {}",
-                                        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls)
-                                    ),
-                                ],
-                            );
-                            json!({
-                                "ok": true,
-                                "query": trace.query,
-                                "reason": trace.reason,
-                                "answer": trace.answer,
-                                "results": trace.results,
-                                "formattedContext": format_web_search_context(&trace, response_language),
-                            })
-                        }
-                        Err(err) => {
-                            if let Some(diagnostics) = diagnostics {
-                                diagnostics.record(
-                                    "error",
-                                    "organizer_web_search",
-                                    "organizer web search failed",
-                                    json!({
-                                        "stage": stage,
-                                        "arguments": tool_call.arguments.clone(),
-                                    }),
-                                    Some(json!({ "message": err.clone() })),
-                                    None,
-                                );
-                            }
-                            append_batch_trace_note(
-                                &mut round_trace,
-                                "web_search",
-                                vec![
-                                    format!("Error: {}", err),
-                                    format!(
-                                        "Search Budget Remaining: {}",
-                                        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls)
-                                    ),
-                                ],
-                            );
-                            json!({
-                                "ok": false,
-                                "error": err,
-                            })
-                        }
-                    },
-                    Err(err) => {
-                        append_batch_trace_note(
-                            &mut round_trace,
-                            "web_search",
-                            vec![
-                                format!("Error: {}", err),
-                                format!(
-                                    "Search Budget Remaining: {}",
-                                    ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls)
-                                ),
-                            ],
-                        );
-                        json!({
-                            "ok": false,
-                            "error": err,
-                        })
-                    }
-                };
+            }
+        };
+
+        match tool_id {
+            Some(ToolId::WebSearch) => {
+                if tool_result
+                    .diagnostics
+                    .as_ref()
+                    .and_then(|value| value.get("searchConsumed"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    search_calls = search_calls.saturating_add(1);
+                }
+                let result = &tool_result.result;
+                let mut note = Vec::new();
+                if let Some(query) = result.get("query").and_then(Value::as_str) {
+                    note.push(format!("Query: {}", query));
+                }
+                if let Some(reason) = result.get("reason").and_then(Value::as_str) {
+                    note.push(format!("Reason: {}", reason));
+                }
+                if let Some(results) = result.get("results").and_then(Value::as_array) {
+                    note.push(format!("Result Count: {}", results.len()));
+                }
+                if let Some(error) = result.get("error").and_then(Value::as_str) {
+                    note.push(format!("Error: {}", error));
+                }
+                note.push(format!(
+                    "Search Budget Remaining: {}",
+                    ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls)
+                ));
+                append_batch_trace_note(&mut round_trace, "web_search", note);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": serialize_tool_result_content(&tool_result),
+                    "content": serialize_tool_result_content(&tool_result.result),
                 }));
             }
-            "submit_organize_result" => {
-                let parsed = match parse_submit_organize_result_arguments(&tool_call.arguments) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Ok(ClassifyOrganizeBatchOutput {
-                            parsed: None,
-                            usage: total_usage,
-                            raw_output: round_trace.join("\n\n====================\n\n"),
-                            error: Some(err),
-                        });
-                    }
-                };
+            Some(ToolId::SubmitOrganizeResult) => {
+                let parsed = tool_result.result;
                 append_batch_trace_note(
                     &mut round_trace,
                     "submit_organize_result",
@@ -1274,12 +1090,12 @@ pub(super) async fn classify_organize_batch(
                     error: None,
                 });
             }
-            other => {
+            _ => {
                 return Ok(ClassifyOrganizeBatchOutput {
                     parsed: None,
                     usage: total_usage,
                     raw_output: round_trace.join("\n\n====================\n\n"),
-                    error: Some(format!("unsupported organizer tool: {other}")),
+                    error: Some(format!("unsupported organizer tool: {}", tool_call.name)),
                 });
             }
         }
@@ -1335,46 +1151,6 @@ pub(super) fn emit_organize_summary_ready<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn organize_tools_only_include_submit_when_search_disabled() {
-        let tools = build_organize_tools(false);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "submit_organize_result");
-    }
-
-    #[test]
-    fn parse_web_search_tool_arguments_requires_query() {
-        let err =
-            parse_web_search_tool_arguments(&json!({})).expect_err("missing query should fail");
-        assert!(err.contains("non-empty query"));
-
-        let parsed = parse_web_search_tool_arguments(&json!({
-            "query": "  unity   cache   folder  ",
-            "reason": "Need vendor context"
-        }))
-        .expect("query");
-        assert_eq!(parsed.query, "unity cache folder");
-        assert_eq!(parsed.reason, "Need vendor context");
-    }
-
-    #[test]
-    fn parse_submit_organize_result_arguments_validates_shape() {
-        let parsed = parse_submit_organize_result_arguments(&json!({
-            "tree": { "nodeId": "root", "name": "", "children": [] },
-            "assignments": []
-        }))
-        .expect("valid submit payload");
-        assert!(parsed["tree"].is_object());
-        assert!(parsed["assignments"].is_array());
-
-        let err = parse_submit_organize_result_arguments(&json!({
-            "tree": [],
-            "assignments": {}
-        }))
-        .expect_err("invalid shape");
-        assert!(err.contains("tree must be an object"));
-    }
 
     #[test]
     fn search_budget_exhausted_message_is_localized() {

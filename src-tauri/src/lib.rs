@@ -3,6 +3,7 @@ mod backend;
 mod diagnostics;
 mod file_representation;
 mod llm_protocol;
+mod llm_tools;
 mod organizer_runtime;
 mod persist;
 mod system_ops;

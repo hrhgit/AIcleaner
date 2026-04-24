@@ -1,4 +1,4 @@
-﻿import {
+import {
   applyOrganize,
   browseFolder,
   connectOrganizeStream,
@@ -12,6 +12,7 @@
   stopOrganize,
 } from '../utils/api.js';
 import { getLang, t } from '../utils/i18n.js';
+import { escapeHtml } from '../utils/html.js';
 import {
   ensureRequiredCredentialsConfigured,
   getProviderCredentialPresence,
@@ -21,7 +22,6 @@ import {
   DEFAULT_PROVIDER_ENDPOINT,
   defaultModelByEndpoint,
   ensureProviderOptionExists,
-  getProviderLabel,
   normalizeRemoteModels,
   populateProviderOptions,
   PROVIDER_MODELS,
@@ -36,68 +36,29 @@ import {
   getPersisted,
   getPersistedApplyManifest,
   invalidateOrganizerRuntimeCacheIfNeeded,
-  isOrganizerLogCollapsed,
-  isOrganizerRecordGroupCollapsed,
   PERSIST_KEYS,
   persistForm,
   removePersisted,
   restoreDefaults,
-  setOrganizerLogCollapsed,
-  setOrganizerRecordGroupCollapsed,
   setPersisted,
   setPersistedApplyManifest,
   SUMMARY_MODES,
 } from './organizer-storage.js';
-
-const MOVE_RESULT_TEXT = {
-  zh: {
-    title: '移动结果',
-    moved: '已移动',
-    skipped: '已跳过',
-    failed: '失败',
-    total: '总数',
-    status: '状态',
-    reason: '原因',
-    empty: '暂无最近一次移动结果',
-    clean: '本次移动没有失败或跳过项',
-    reasonSkipped: '源路径与目标路径相同，无需重复移动',
-    statusMoved: '已移动',
-    statusSkipped: '已跳过',
-    statusFailed: '失败',
-  },
-  en: {
-    title: 'Move Results',
-    moved: 'Moved',
-    skipped: 'Skipped',
-    failed: 'Failed',
-    total: 'Total',
-    status: 'Status',
-    reason: 'Reason',
-    empty: 'No recent move result yet',
-    clean: 'This move had no failed or skipped items',
-    reasonSkipped: 'Source and target are identical, so the move was skipped',
-    statusMoved: 'Moved',
-    statusSkipped: 'Skipped',
-    statusFailed: 'Failed',
-  },
-};
-
-const MODEL_SELECT_IDS = {
-  text: 'org-model-text',
-  image: 'org-model-image',
-  video: 'org-model-video',
-  audio: 'org-model-audio',
-};
-
-const PROVIDER_SELECT_IDS = {
-  text: 'org-provider-text',
-  image: 'org-provider-image',
-  video: 'org-provider-video',
-  audio: 'org-provider-audio',
-};
-
-const COPY_TEXT_ROUTE_BTN_ID = 'org-copy-text-route-btn';
-
+import {
+  COPY_TEXT_ROUTE_BTN_ID,
+  MODEL_SELECT_IDS,
+  PROVIDER_SELECT_IDS,
+} from './organizer/constants.js';
+import { getMoveResultText } from './organizer/move-result.js';
+import {
+  renderOrganizerMoveResultPanel,
+  renderOrganizerPreviewPanel,
+  renderOrganizerStatsGrid,
+  renderPipelineStage,
+  renderRoutingCard,
+  stripDecorativePrefix,
+} from './organizer/templates.js';
+import { createOrganizerLogController } from './organizer/log.js';
 
 let activeTaskId = null;
 let activeEventSource = null;
@@ -108,12 +69,10 @@ const remoteModelsCache = new Map();
 const modelsRequestToken = { text: 0, image: 0, video: 0, audio: 0 };
 let organizerProviderSettingsUpdatedHandler = null;
 let renderVersion = 0;
-let organizerLogEntries = [];
-const expandedOrganizerDetailLogIds = new Set();
-const loggedOrganizerRawBatchKeys = new Set();
-const loggedOrganizerSummaryKeys = new Set();
-let organizerLogTaskId = null;
-let organizerLogProgressBaseline = null;
+const organizerLog = createOrganizerLogController({
+  getActiveTaskId: () => activeTaskId,
+  getLatestSnapshot: () => latestSnapshot,
+});
 
 function getErrorMessage(err) {
   if (typeof err === 'string' && err.trim()) {
@@ -129,11 +88,6 @@ function getErrorMessage(err) {
   }
   const text = String(err ?? '').trim();
   return text && text !== '[object Object]' ? text : 'unknown error';
-}
-
-function getMoveResultText(key) {
-  const lang = getLang() === 'en' ? 'en' : 'zh';
-  return MOVE_RESULT_TEXT[lang]?.[key] || MOVE_RESULT_TEXT.zh[key] || key;
 }
 
 function parseListInput(text) {
@@ -295,28 +249,8 @@ async function syncSummaryModeTikaToSettings(summaryMode, settings = null) {
   return getSettings();
 }
 
-function escapeHtml(value) {
-  const div = document.createElement('div');
-  div.textContent = String(value ?? '');
-  return div.innerHTML;
-}
-
 function organizerText(zh, en) {
   return getLang() === 'en' ? en : zh;
-}
-
-function getOrganizerCategoryLabel(data = {}) {
-  if (String(data.reason || '').trim() === 'classification_error' || String(data.classificationError || '').trim()) {
-    return organizerText('分类错误', 'Classification Error');
-  }
-  if (Array.isArray(data.categoryPath) && data.categoryPath.length > 0) {
-    return data.categoryPath.map((segment) => String(segment || '').trim()).filter(Boolean).join(' / ');
-  }
-  return String(data.category || '').trim() || t('organizer.uncategorized');
-}
-
-function getOrganizerLogTime() {
-  return new Date().toLocaleTimeString([], { hour12: false });
 }
 
 function getOrganizerSummaryModeLabel(mode) {
@@ -353,682 +287,6 @@ function getOrganizerSummaryText(row = {}) {
   if (summarySource === 'agent_fallback_local') return t('organizer.summary_placeholder_agent_fallback');
   return t('organizer.summary_placeholder_empty');
 }
-
-function buildOrganizerLogEntry({
-  type = 'scanning',
-  kind = 'simple',
-  summary = '',
-  text = '',
-  detail = '',
-  batchKey = '',
-  summaryKey = '',
-  taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null,
-} = {}) {
-  const detailText = String(detail || '').trim();
-  return {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
-    type,
-    kind,
-    time: getOrganizerLogTime(),
-    taskId: taskId ? String(taskId) : null,
-    batchKey: String(batchKey || '').trim() || null,
-    summaryKey: String(summaryKey || '').trim() || null,
-    summary: String(summary || text || '').trim(),
-    text: String(text || summary || '').trim(),
-    detailHtml: detailText ? escapeHtml(detailText).replace(/\n/g, '<br>') : '',
-  };
-}
-
-function normalizeOrganizerLogStringList(value) {
-  return Array.isArray(value)
-    ? value.map((item) => String(item || '').trim()).filter(Boolean)
-    : [];
-}
-
-function getOrganizerSummarySourceLabel(source) {
-  if (source === 'agent_summary') return organizerText('Agent 摘要', 'Agent Summary');
-  if (source === 'agent_fallback_local') return organizerText('Agent 失败后回退本地摘要', 'Agent fallback to local summary');
-  if (source === 'local_summary') return organizerText('本地摘要', 'Local Summary');
-  if (source === 'filename_only') return organizerText('仅文件名', 'Filename Only');
-  return String(source || '').trim() || '-';
-}
-
-function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } = {}) {
-  if (!row || getOrganizerSummaryStrategy(row) === 'filename_only') return '';
-  const representation = getOrganizerRepresentation(row);
-  const extraction = row?.localExtraction && typeof row.localExtraction === 'object' ? row.localExtraction : null;
-  const extractionKeywords = normalizeOrganizerLogStringList(extraction?.keywords);
-  const extractionWarnings = normalizeOrganizerLogStringList(extraction?.warnings);
-  const extractionMetadata = normalizeOrganizerLogStringList(extraction?.metadata);
-  const summaryKeywords = normalizeOrganizerLogStringList(representation?.keywords);
-  const summaryWarnings = normalizeOrganizerLogStringList(row?.warnings ?? row?.summaryWarnings);
-  const excerpt = String(extraction?.excerpt || '').trim();
-  const metadataSummary = String(representation?.metadata || '').trim();
-  const shortSummary = String(representation?.short || '').trim();
-  const longSummary = String(representation?.long || '').trim();
-  const title = String(extraction?.title || '').trim();
-  const parser = String(extraction?.parser || '').trim();
-  const confidence = String(representation?.confidence || '').trim();
-
-  if (
-    !extraction
-    && !metadataSummary
-    && !shortSummary
-    && !longSummary
-    && !summaryWarnings.length
-    && !summaryKeywords.length
-  ) {
-    return '';
-  }
-
-  const detail = [
-    `${organizerText('文件', 'Item')}: ${String(row?.name || row?.path || '-').trim() || '-'}`,
-    `${organizerText('路径', 'Path')}: ${String(row?.path || '-').trim() || '-'}`,
-    `${organizerText('分类', 'Category')}: ${category}`,
-    `${organizerText('模型', 'Model')}: ${route}`,
-    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(getOrganizerSummaryStrategy(row))}`,
-    `${organizerText('摘要来源', 'Summary Source')}: ${getOrganizerSummarySourceLabel(representation?.source)}`,
-    parser ? `${organizerText('提取器', 'Extractor')}: ${parser}` : '',
-    title ? `${organizerText('标题', 'Title')}: ${title}` : '',
-    confidence ? `${organizerText('置信度', 'Confidence')}: ${confidence}` : '',
-    extractionKeywords.length ? `${organizerText('提取关键词', 'Extraction Keywords')}: ${extractionKeywords.join(', ')}` : '',
-    summaryKeywords.length ? `${organizerText('摘要关键词', 'Summary Keywords')}: ${summaryKeywords.join(', ')}` : '',
-    extractionWarnings.length ? `${organizerText('提取告警', 'Extraction Warnings')}: ${extractionWarnings.join(' | ')}` : '',
-    summaryWarnings.length ? `${organizerText('摘要告警', 'Summary Warnings')}: ${summaryWarnings.join(' | ')}` : '',
-    extractionMetadata.length ? `\n${organizerText('提取元数据', 'Extraction Metadata')}:\n${extractionMetadata.join('\n')}` : '',
-    excerpt ? `\n${organizerText('本地提取摘录', 'Local Extraction Excerpt')}:\n${excerpt}` : '',
-    metadataSummary ? `\n${organizerText('元信息摘要', 'Metadata Summary')}:\n${metadataSummary}` : '',
-    shortSummary ? `\n${organizerText('短摘要', 'Short Summary')}:\n${shortSummary}` : '',
-    longSummary ? `\n${organizerText('长摘要', 'Long Summary')}:\n${longSummary}` : '',
-  ].filter(Boolean).join('\n');
-
-  return detail.trim();
-}
-
-function syncOrganizerRawBatchKeys() {
-  loggedOrganizerRawBatchKeys.clear();
-  loggedOrganizerSummaryKeys.clear();
-  for (const entry of organizerLogEntries) {
-    const batchKey = String(entry?.batchKey || '').trim();
-    if (batchKey) loggedOrganizerRawBatchKeys.add(batchKey);
-    const summaryKey = String(entry?.summaryKey || '').trim();
-    if (summaryKey) loggedOrganizerSummaryKeys.add(summaryKey);
-  }
-}
-
-function buildOrganizerSummaryLogKey(row, taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null) {
-  const resolvedTaskId = String(taskId || row?.taskId || '').trim();
-  const pathKey = String(row?.path || row?.relativePath || row?.name || '').trim();
-  if (!resolvedTaskId || !pathKey) return '';
-  return `${resolvedTaskId}::summary::${pathKey}`;
-}
-
-function isGroupedOrganizerLogType(type) {
-  return ['scanning', 'analyzing', 'found'].includes(type);
-}
-
-function getOrganizerLogIcon(type) {
-  if (type === 'found') return '+';
-  if (type === 'analyzing') return '*';
-  if (type === 'agent_call') return '>';
-  if (type === 'agent_response') return '<';
-  if (type === 'error') return '!';
-  return '-';
-}
-
-function setOrganizerDetailLogExpanded(entryId, expanded) {
-  if (entryId == null) return;
-  if (expanded) {
-    expandedOrganizerDetailLogIds.add(entryId);
-  } else {
-    expandedOrganizerDetailLogIds.delete(entryId);
-  }
-}
-
-function isOrganizerLogPinnedToBottom(log) {
-  if (!log) return true;
-  return (log.scrollHeight - log.scrollTop - log.clientHeight) <= 24;
-}
-
-function refreshOrganizerLogPanel() {
-  const collapsed = isOrganizerLogCollapsed();
-  const panel = document.getElementById('org-log-panel');
-  const toggleBtn = document.getElementById('org-toggle-log-btn');
-  const hint = document.getElementById('org-log-collapsed-hint');
-  const hasPreview = organizerLogEntries.length > 0;
-  if (panel) {
-    panel.classList.toggle('is-collapsed', collapsed);
-    panel.classList.toggle('is-clickable-preview', collapsed && hasPreview);
-    panel.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-    if (collapsed && hasPreview) {
-      panel.setAttribute('role', 'button');
-      panel.setAttribute('tabindex', '0');
-      panel.setAttribute('aria-label', t('organizer.log_preview_hint'));
-    } else {
-      panel.removeAttribute('role');
-      panel.removeAttribute('tabindex');
-      panel.removeAttribute('aria-label');
-    }
-  }
-  if (toggleBtn) {
-    toggleBtn.textContent = collapsed ? t('organizer.log_expand') : t('organizer.log_collapse');
-    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  }
-  if (hint) {
-    hint.style.display = collapsed && hasPreview ? '' : 'none';
-  }
-}
-
-function createOrganizerSimpleLogEntryElement(entry) {
-  const el = document.createElement('div');
-  el.className = `scan-log-entry ${entry.type}`;
-  el.innerHTML = `
-    <span class="log-icon">${getOrganizerLogIcon(entry.type)}</span>
-    <span class="log-time" style="color: var(--text-muted); margin-right: 6px;">[${entry.time}]</span>
-    <span class="log-text">${entry.text}</span>
-  `;
-  return el;
-}
-
-function createOrganizerDetailLogEntryElement(entry) {
-  const expanded = expandedOrganizerDetailLogIds.has(entry.id);
-  const wrapper = document.createElement('div');
-  wrapper.className = `scan-log-entry ${entry.type}`;
-  wrapper.innerHTML = `
-    <span class="log-icon">${getOrganizerLogIcon(entry.type)}</span>
-    <div class="log-content">
-      <div class="log-detail-header" style="cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px;">
-        <span class="log-time" style="color: var(--text-muted); margin-right: 4px;">[${entry.time}]</span>
-        <span class="log-detail-arrow" style="transition: transform 0.2s; display: inline-block; font-size: 0.65rem; transform: ${expanded ? 'rotate(90deg)' : 'rotate(0deg)'};">></span>
-        <span class="log-summary">${entry.summary}</span>
-      </div>
-      <div class="log-detail-body" style="display: ${expanded ? 'block' : 'none'}; margin-top: 8px; padding: 10px 12px; background: rgba(0,0,0,0.35); border-radius: 6px; border: 1px solid rgba(255,255,255,0.06); font-size: 0.72rem; line-height: 1.7; word-break: break-all; white-space: pre-wrap; max-height: 600px; overflow-y: auto; color: var(--text-secondary);">
-        ${entry.detailHtml}
-      </div>
-    </div>
-  `;
-
-  const header = wrapper.querySelector('.log-detail-header');
-  const body = wrapper.querySelector('.log-detail-body');
-  const arrow = wrapper.querySelector('.log-detail-arrow');
-  header?.addEventListener('click', () => {
-    if (!body || !arrow) return;
-    const nextOpen = body.style.display === 'none';
-    setOrganizerDetailLogExpanded(entry.id, nextOpen);
-    body.style.display = nextOpen ? 'block' : 'none';
-    arrow.style.transform = nextOpen ? 'rotate(90deg)' : 'rotate(0deg)';
-  });
-
-  return wrapper;
-}
-
-function createOrganizerRecordGroupElement(entries) {
-  const wrapper = document.createElement('div');
-  wrapper.className = `scan-log-group${isOrganizerRecordGroupCollapsed() ? ' is-collapsed' : ''}`;
-
-  const header = document.createElement('div');
-  header.className = 'scan-log-group-header';
-  header.innerHTML = `
-    <div class="scan-log-group-title">
-      <span class="scan-log-group-arrow">></span>
-      <span>${t('organizer.log_records')} (${entries.length})</span>
-    </div>
-  `;
-
-  const body = document.createElement('div');
-  body.className = 'scan-log-group-body';
-  for (const entry of entries) {
-    body.appendChild(createOrganizerSimpleLogEntryElement(entry));
-  }
-
-  header.addEventListener('click', () => {
-    const nextCollapsed = !wrapper.classList.contains('is-collapsed');
-    setOrganizerRecordGroupCollapsed(nextCollapsed);
-    wrapper.classList.toggle('is-collapsed', nextCollapsed);
-  });
-
-  wrapper.appendChild(header);
-  wrapper.appendChild(body);
-  return wrapper;
-}
-
-function applyOrganizerLogScrollPosition(log, { shouldStickToBottom, insertMode, previousScrollTop, previousScrollHeight }) {
-  if (shouldStickToBottom) {
-    log.scrollTop = log.scrollHeight;
-    return;
-  }
-
-  if (insertMode === 'top') {
-    const heightDelta = Math.max(0, log.scrollHeight - previousScrollHeight);
-    log.scrollTop = previousScrollTop + heightDelta;
-    return;
-  }
-
-  const maxScrollTop = Math.max(0, log.scrollHeight - log.clientHeight);
-  log.scrollTop = Math.min(previousScrollTop, maxScrollTop);
-}
-
-function updateOrganizerRecordGroupHeader(wrapper, count) {
-  if (!wrapper) return;
-  const titleText = wrapper.querySelector('.scan-log-group-title span:last-child');
-  if (titleText) {
-    titleText.textContent = `${t('organizer.log_records')} (${count})`;
-  }
-}
-
-function ensureOrganizerRecordGroup(log) {
-  if (!log) return null;
-  let group = log.querySelector('.scan-log-group');
-  if (group) return group;
-
-  group = createOrganizerRecordGroupElement([]);
-  log.prepend(group);
-  return group;
-}
-
-function renderOrganizerLogEntries(insertMode = 'reset') {
-  const log = document.getElementById('org-log');
-  if (!log) return;
-  const shouldStickToBottom = isOrganizerLogPinnedToBottom(log);
-  const previousScrollTop = log.scrollTop;
-  const previousScrollHeight = log.scrollHeight;
-
-  log.innerHTML = '';
-  const groupedEntries = organizerLogEntries.filter((entry) => isGroupedOrganizerLogType(entry.type));
-  const detailEntries = organizerLogEntries.filter((entry) => !isGroupedOrganizerLogType(entry.type));
-
-  if (groupedEntries.length > 0) {
-    log.appendChild(createOrganizerRecordGroupElement(groupedEntries));
-  }
-
-  for (const entry of detailEntries) {
-    if (entry.kind === 'detail') {
-      log.appendChild(createOrganizerDetailLogEntryElement(entry));
-    } else {
-      log.appendChild(createOrganizerSimpleLogEntryElement(entry));
-    }
-  }
-
-  applyOrganizerLogScrollPosition(log, {
-    shouldStickToBottom,
-    insertMode,
-    previousScrollTop,
-    previousScrollHeight,
-  });
-}
-
-function replaceOrganizerLogEntries(nextEntries = [], { persist = true, taskId = organizerLogTaskId || activeTaskId || latestSnapshot?.id || null } = {}) {
-  organizerLogEntries = Array.isArray(nextEntries) ? nextEntries : [];
-  organizerLogTaskId = taskId ? String(taskId) : null;
-  expandedOrganizerDetailLogIds.clear();
-  syncOrganizerRawBatchKeys();
-  if (persist) {
-    setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
-    if (organizerLogTaskId) {
-      setPersisted(PERSIST_KEYS.logTaskId, organizerLogTaskId);
-    } else {
-      removePersisted(PERSIST_KEYS.logTaskId);
-    }
-  }
-
-  const logEl = document.getElementById('org-log');
-  if (logEl) {
-    if (organizerLogEntries.length > 0) {
-      renderOrganizerLogEntries();
-    } else {
-      logEl.innerHTML = '';
-    }
-  }
-  refreshOrganizerLogPanel();
-}
-
-function appendOrganizerLogEntry(entry, { persist = true } = {}) {
-  if (!entry) return;
-  organizerLogEntries = [...organizerLogEntries, entry];
-  organizerLogTaskId = entry.taskId ? String(entry.taskId) : (organizerLogTaskId || null);
-  if (entry.batchKey) {
-    loggedOrganizerRawBatchKeys.add(String(entry.batchKey));
-  }
-  if (entry.summaryKey) {
-    loggedOrganizerSummaryKeys.add(String(entry.summaryKey));
-  }
-  if (persist) {
-    setPersisted(PERSIST_KEYS.logEntries, organizerLogEntries);
-    if (organizerLogTaskId) {
-      setPersisted(PERSIST_KEYS.logTaskId, organizerLogTaskId);
-    }
-  }
-
-  const log = document.getElementById('org-log');
-  if (!log) {
-    refreshOrganizerLogPanel();
-    return;
-  }
-
-  const shouldStickToBottom = isOrganizerLogPinnedToBottom(log);
-  const previousScrollTop = log.scrollTop;
-  const previousScrollHeight = log.scrollHeight;
-  const insertMode = isGroupedOrganizerLogType(entry.type) ? 'top' : 'bottom';
-
-  if (isGroupedOrganizerLogType(entry.type)) {
-    const group = ensureOrganizerRecordGroup(log);
-    const body = group?.querySelector('.scan-log-group-body');
-    if (body) {
-      body.appendChild(createOrganizerSimpleLogEntryElement(entry));
-    }
-    updateOrganizerRecordGroupHeader(group, organizerLogEntries.filter((item) => isGroupedOrganizerLogType(item.type)).length);
-  } else if (entry.kind === 'detail') {
-    log.appendChild(createOrganizerDetailLogEntryElement(entry));
-  } else {
-    log.appendChild(createOrganizerSimpleLogEntryElement(entry));
-  }
-
-  applyOrganizerLogScrollPosition(log, {
-    shouldStickToBottom,
-    insertMode,
-    previousScrollTop,
-    previousScrollHeight,
-  });
-  refreshOrganizerLogPanel();
-}
-
-function bindOrganizerLogPanelEvents() {
-  document.getElementById('org-toggle-log-btn')?.addEventListener('click', () => {
-    setOrganizerLogCollapsed(!isOrganizerLogCollapsed());
-    refreshOrganizerLogPanel();
-  });
-  document.getElementById('org-log-panel')?.addEventListener('click', (event) => {
-    if (!isOrganizerLogCollapsed() || !organizerLogEntries.length) return;
-    const target = event.target;
-    if (target instanceof Element && target.closest('button, a, input, textarea, select, label')) {
-      return;
-    }
-    setOrganizerLogCollapsed(false);
-    refreshOrganizerLogPanel();
-  });
-  document.getElementById('org-log-panel')?.addEventListener('keydown', (event) => {
-    if (!isOrganizerLogCollapsed() || !organizerLogEntries.length) return;
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    event.preventDefault();
-    setOrganizerLogCollapsed(false);
-    refreshOrganizerLogPanel();
-  });
-  document.getElementById('org-clear-log-btn')?.addEventListener('click', () => {
-    replaceOrganizerLogEntries([], { persist: true, taskId: organizerLogTaskId });
-  });
-}
-
-function syncOrganizerLogProgressBaseline(snapshot) {
-  if (!snapshot?.id) {
-    organizerLogProgressBaseline = null;
-    return;
-  }
-  organizerLogProgressBaseline = {
-    taskId: String(snapshot.id),
-    status: String(snapshot.status || 'idle'),
-    processedFiles: Number(snapshot.processedFiles || 0),
-    processedBatches: Number(snapshot.processedBatches || 0),
-    totalBatches: Number(snapshot.totalBatches || 0),
-    tokenTotal: Number(snapshot.tokenUsage?.total || 0),
-  };
-}
-
-function restoreOrganizerLogState(snapshot = null) {
-  const rawEntries = getPersisted(PERSIST_KEYS.logEntries, []);
-  organizerLogEntries = Array.isArray(rawEntries) ? rawEntries : [];
-  organizerLogTaskId = String(getPersisted(PERSIST_KEYS.logTaskId, '') || '').trim() || null;
-  expandedOrganizerDetailLogIds.clear();
-  syncOrganizerRawBatchKeys();
-  syncOrganizerLogProgressBaseline(snapshot);
-}
-
-function buildOrganizerBatchRawOutputEntries(results = [], taskId = organizerLogTaskId) {
-  const grouped = new Map();
-  for (const row of Array.isArray(results) ? results : []) {
-    const batchIndex = Number(row?.batchIndex || 0);
-    const rawOutput = String(row?.modelRawOutput || '').trim();
-    const classificationError = String(row?.classificationError || '').trim();
-    if (!batchIndex || (!rawOutput && !classificationError)) continue;
-    if (!grouped.has(batchIndex)) {
-      grouped.set(batchIndex, {
-        batchIndex,
-        taskId: String(row?.taskId || taskId || '').trim() || null,
-        route: formatOrganizerRouteLabel(row?.provider, row?.model),
-        rawOutput,
-        classificationError,
-        names: [],
-      });
-    }
-    const item = grouped.get(batchIndex);
-    const name = String(row?.name || row?.path || '').trim();
-    if (name) item.names.push(name);
-    if (!item.rawOutput && rawOutput) item.rawOutput = rawOutput;
-    if (!item.classificationError && classificationError) item.classificationError = classificationError;
-  }
-
-  return Array.from(grouped.values())
-    .sort((a, b) => a.batchIndex - b.batchIndex)
-    .map((item) => {
-      const detail = [
-        `${organizerText('批次', 'Batch')}: ${item.batchIndex}`,
-        `${organizerText('模型', 'Model')}: ${item.route}`,
-        item.names.length ? `${organizerText('文件', 'Items')}: ${item.names.join(', ')}` : '',
-        item.classificationError ? `${organizerText('分类错误', 'Classification Error')}: ${item.classificationError}` : '',
-        '',
-        item.rawOutput || organizerText('模型没有返回可记录的 HTTP 原始响应。', 'The model did not return any recordable HTTP raw response.'),
-      ].filter(Boolean).join('\n');
-      return buildOrganizerLogEntry({
-        type: item.classificationError ? 'error' : 'agent_response',
-        kind: 'detail',
-        summary: organizerText(`批次 ${item.batchIndex} HTTP 原始响应`, `Batch ${item.batchIndex} HTTP raw response`),
-        detail,
-        batchKey: `${item.taskId || ''}::${item.batchIndex}`,
-        taskId: item.taskId,
-      });
-    });
-}
-
-function ensureOrganizerLogsForSnapshot(snapshot) {
-  const snapshotTaskId = String(snapshot?.id || '').trim();
-  if (!snapshotTaskId) return;
-  if (organizerLogEntries.length > 0 && organizerLogTaskId === snapshotTaskId) return;
-
-  const summary = organizerText('已恢复最近一次归类任务', 'Restored the most recent organize task');
-  const detail = [
-    `${organizerText('状态', 'Status')}: ${String(snapshot.status || 'idle')}`,
-    `${organizerText('目录', 'Root')}: ${snapshot.rootPath || '-'}`,
-    `${organizerText('文件', 'Files')}: ${Number(snapshot.processedFiles || 0)}/${Number(snapshot.totalFiles || 0)}`,
-    `${organizerText('批次', 'Batches')}: ${Number(snapshot.processedBatches || 0)}/${Number(snapshot.totalBatches || 0)}`,
-    `${organizerText('Token', 'Token')}: ${Number(snapshot.tokenUsage?.total || 0).toLocaleString()}`,
-  ].join('\n');
-  replaceOrganizerLogEntries([
-    buildOrganizerLogEntry({
-      type: 'agent_response',
-      kind: 'detail',
-      summary,
-      detail,
-      taskId: snapshotTaskId,
-    }),
-    ...buildOrganizerBatchRawOutputEntries(snapshot?.results, snapshotTaskId),
-  ], { persist: true, taskId: snapshotTaskId });
-}
-
-function formatOrganizerRouteLabel(endpoint, model) {
-  const providerLabel = getProviderLabel(endpoint);
-  return `${providerLabel}/${String(model || '').trim() || '-'}`;
-}
-
-function recordOrganizerStartLog(form, taskId, capability) {
-  const textRoute = form?.modelRouting?.text || {};
-  const selectedProviders = capability?.selectedProviders || latestCapability?.selectedProviders || {};
-  const selectedModels = capability?.selectedModels || latestCapability?.selectedModels || {};
-  const detail = [
-    `${organizerText('目录', 'Root')}: ${form.rootPath || '-'}`,
-    `${organizerText('批大小', 'Batch Size')}: ${Number(form.batchSize || DEFAULT_BATCH_SIZE)}`,
-    `${organizerText('聚类深度', 'Cluster Depth')}: ${form.maxClusterDepth == null ? organizerText('不限', 'Unlimited') : Number(form.maxClusterDepth)}`,
-    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(form.summaryStrategy)}`,
-    `${organizerText('联网搜索', 'Web Search')}: ${form.useWebSearch ? organizerText('开启', 'Enabled') : organizerText('关闭', 'Disabled')}`,
-    `${organizerText('文本路由', 'Text Route')}: ${formatOrganizerRouteLabel(textRoute.endpoint || selectedProviders.text, textRoute.model || selectedModels.text)}`,
-  ].join('\n');
-
-  replaceOrganizerLogEntries([], { persist: true, taskId });
-  appendOrganizerLogEntry(buildOrganizerLogEntry({
-    type: 'agent_call',
-    kind: 'detail',
-    summary: organizerText('开始归类任务', 'Organize task started'),
-    detail,
-    taskId,
-  }));
-}
-
-function recordOrganizerProgressLog(snapshot) {
-  if (!snapshot?.id) return;
-  const previous = organizerLogProgressBaseline;
-  const current = {
-    taskId: String(snapshot.id),
-    status: String(snapshot.status || 'idle'),
-    processedFiles: Number(snapshot.processedFiles || 0),
-    processedBatches: Number(snapshot.processedBatches || 0),
-    totalBatches: Number(snapshot.totalBatches || 0),
-    tokenTotal: Number(snapshot.tokenUsage?.total || 0),
-  };
-
-  if (!previous || previous.taskId !== current.taskId) {
-    appendOrganizerLogEntry(buildOrganizerLogEntry({
-      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
-      text: organizerText(
-        `任务状态: ${current.status} | 文件 ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | 批次 ${current.processedBatches}/${current.totalBatches} | Token ${current.tokenTotal.toLocaleString()}`,
-        `Task status: ${current.status} | Files ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Batches ${current.processedBatches}/${current.totalBatches} | Token ${current.tokenTotal.toLocaleString()}`
-      ),
-      taskId: current.taskId,
-    }));
-    return;
-  }
-
-  if (previous.status !== current.status) {
-    appendOrganizerLogEntry(buildOrganizerLogEntry({
-      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
-      text: organizerText(
-        `阶段切换为 ${current.status}`,
-        `Stage changed to ${current.status}`
-      ),
-      taskId: current.taskId,
-    }));
-  }
-
-  if (previous.processedBatches !== current.processedBatches || previous.tokenTotal !== current.tokenTotal) {
-    appendOrganizerLogEntry(buildOrganizerLogEntry({
-      type: current.status === 'classifying' ? 'analyzing' : 'scanning',
-      text: organizerText(
-        `批次 ${current.processedBatches}/${current.totalBatches} | 已处理 ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Token ${current.tokenTotal.toLocaleString()}`,
-        `Batches ${current.processedBatches}/${current.totalBatches} | Processed ${current.processedFiles}/${Number(snapshot.totalFiles || 0)} | Token ${current.tokenTotal.toLocaleString()}`
-      ),
-      taskId: current.taskId,
-    }));
-  }
-}
-
-function recordOrganizerFileDoneLog(row) {
-  if (!row) return;
-  const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
-  const batchIndex = Number(row.batchIndex || 0);
-  const batchKey = batchIndex ? `${taskId || ''}::${batchIndex}` : '';
-  const summaryKey = buildOrganizerSummaryLogKey(row, taskId);
-  const category = getOrganizerCategoryLabel(row);
-  const route = formatOrganizerRouteLabel(row.provider, row.model);
-  const degradedText = row.degraded ? ` | ${organizerText('降级', 'Degraded')}` : '';
-  const classificationError = String(row.classificationError || '').trim();
-  const isClassificationErrorRow =
-    String(row.reason || '').trim() === 'classification_error' || !!classificationError;
-  const isFallbackBatchRow =
-    String(row.reason || '').trim() === 'fallback_uncategorized'
-    && (!!classificationError || (batchKey && loggedOrganizerRawBatchKeys.has(batchKey)));
-  if (batchKey && !loggedOrganizerRawBatchKeys.has(batchKey)) {
-    const rawOutput = String(row.modelRawOutput || '').trim();
-    if (rawOutput || classificationError) {
-      const detail = [
-        `${organizerText('批次', 'Batch')}: ${batchIndex}`,
-        `${organizerText('模型', 'Model')}: ${route}`,
-        classificationError ? `${organizerText('分类错误', 'Classification Error')}: ${classificationError}` : '',
-        classificationError ? organizerText('该批次未拿到最终分类结果，下面显示的是中间输出或可记录的原始响应。', 'This batch did not produce a final classification result. The content below is intermediate output or the raw response we managed to record.') : '',
-        '',
-        rawOutput || organizerText('模型没有返回可记录的 HTTP 原始响应。', 'The model did not return any recordable HTTP raw response.'),
-      ].filter(Boolean).join('\n');
-      appendOrganizerLogEntry(buildOrganizerLogEntry({
-        type: classificationError ? 'error' : 'agent_response',
-        kind: 'detail',
-        summary: organizerText(`批次 ${batchIndex} HTTP 原始响应`, `Batch ${batchIndex} HTTP raw response`),
-        detail,
-        batchKey,
-        taskId,
-      }));
-    }
-  }
-  const localSummaryDetail = buildOrganizerLocalSummaryDetail(row, { category, route });
-  if (localSummaryDetail && (!summaryKey || !loggedOrganizerSummaryKeys.has(summaryKey))) {
-    appendOrganizerLogEntry(buildOrganizerLogEntry({
-      type: 'agent_response',
-      kind: 'detail',
-      summary: organizerText(
-        `本地摘要 | ${row.name || row.path || '-'}`,
-        `Local summary | ${row.name || row.path || '-'}`,
-      ),
-      detail: localSummaryDetail,
-      taskId,
-      summaryKey,
-    }));
-  }
-  if (isFallbackBatchRow) {
-    return;
-  }
-  appendOrganizerLogEntry(buildOrganizerLogEntry({
-    type: isClassificationErrorRow ? 'error' : 'found',
-    text: organizerText(
-      `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`,
-      `${row.name || row.path || '-'} -> ${category} | ${route}${degradedText}`
-    ),
-    taskId,
-  }));
-}
-
-function recordOrganizerTerminalLog(snapshot, kind, message, detail) {
-  appendOrganizerLogEntry(buildOrganizerLogEntry({
-    type: kind === 'error' ? 'error' : 'agent_response',
-    kind: 'detail',
-    summary: message,
-    detail,
-    taskId: snapshot?.id || organizerLogTaskId || activeTaskId || null,
-  }));
-}
-
-function recordOrganizerSummaryReadyLog(row) {
-  if (!row) return;
-  const taskId = String(row.taskId || organizerLogTaskId || activeTaskId || '').trim() || null;
-  const route = formatOrganizerRouteLabel(row.provider, row.model);
-  const summaryKey = buildOrganizerSummaryLogKey(row, taskId);
-  if (summaryKey && loggedOrganizerSummaryKeys.has(summaryKey)) {
-    return;
-  }
-  const detail = buildOrganizerLocalSummaryDetail(row, {
-    category: organizerText('待分类', 'Pending Classification'),
-    route,
-  });
-  if (!detail) {
-    return;
-  }
-  appendOrganizerLogEntry(buildOrganizerLogEntry({
-    type: 'agent_response',
-    kind: 'detail',
-    summary: organizerText(
-      `分类前摘要 | ${row.name || row.path || '-'}`,
-      `Pre-classification summary | ${row.name || row.path || '-'}`,
-    ),
-    detail,
-    taskId,
-    summaryKey,
-  }));
-}
-
 function setStatusText(snapshot) {
   const el = document.getElementById('org-status');
   if (!el) return;
@@ -1525,7 +783,7 @@ function refreshView(snapshot) {
     removePersisted(PERSIST_KEYS.lastJobId);
   }
   syncBatchConfigInputs(snapshot);
-  syncOrganizerLogProgressBaseline(snapshot);
+  organizerLog.syncProgressBaseline(snapshot);
   setStatusText(snapshot);
   updatePipeline(snapshot);
   renderCapability(snapshot);
@@ -1547,14 +805,14 @@ function connectTaskStream(taskId) {
   closeActiveSSE();
   activeEventSource = connectOrganizeStream(taskId, {
     onProgress: (snap) => {
-      recordOrganizerProgressLog(snap);
+      organizerLog.recordProgress(snap);
       refreshView(snap);
     },
     onSummaryReady: (row) => {
-      recordOrganizerSummaryReadyLog(row);
+      organizerLog.recordSummaryReady(row);
     },
     onFileDone: (row) => {
-      recordOrganizerFileDoneLog(row);
+      organizerLog.recordFileDone(row);
     },
     onDone: (snap) => {
       const detail = [
@@ -1564,7 +822,7 @@ function connectTaskStream(taskId) {
         `${organizerText('降级', 'Degraded')}: ${Number((snap?.results || []).filter((item) => item?.representation?.degraded).length)}`,
         `${organizerText('Token', 'Token')}: ${Number(snap?.tokenUsage?.total || 0).toLocaleString()}`,
       ].join('\n');
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         snap,
         'done',
         organizerText('归类完成，结果已就绪', 'Organize task completed'),
@@ -1580,7 +838,7 @@ function connectTaskStream(taskId) {
         `${organizerText('文件', 'Files')}: ${Number(snap?.processedFiles || 0)}/${Number(snap?.totalFiles || 0)}`,
         `${organizerText('批次', 'Batches')}: ${Number(snap?.processedBatches || 0)}/${Number(snap?.totalBatches || 0)}`,
       ].join('\n');
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         snap,
         'stopped',
         organizerText('归类任务已停止', 'Organize task stopped'),
@@ -1591,7 +849,7 @@ function connectTaskStream(taskId) {
     onError: (err) => {
       const detail = getErrorMessage(err);
       const errSnapshot = err?.snapshot && typeof err.snapshot === 'object' ? err.snapshot : latestSnapshot;
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         errSnapshot,
         'error',
         organizerText('归类任务失败', 'Organize task failed'),
@@ -1688,7 +946,7 @@ async function handleStart() {
       await ensureRequiredCredentialsConfigured({
         providerEndpoints: Array.from(new Set(selectedEndpoints)),
         requireSearchApi: !!form.useWebSearch,
-        reasonText: t('settings.api_key_managed_hint'),
+        reasonText: t('settings.api_key'),
       });
       settingsSnapshot = await getSettings();
       syncProviderApiKeys(settingsSnapshot);
@@ -1700,7 +958,7 @@ async function handleStart() {
     const stillMissingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
     const stillMissingSearchSecret = !!form.useWebSearch && !getSearchCredentialPresence(settingsSnapshot || {});
     if (stillMissingProviderSecret || stillMissingSearchSecret) {
-      showToast(t('settings.api_key_managed_hint'), 'error');
+      showToast(t('settings.api_key'), 'error');
       return;
     }
   }
@@ -1723,7 +981,7 @@ async function handleStart() {
     renderCapability();
     renderApplyResultPanel(null);
     setPersisted(PERSIST_KEYS.lastTaskId, activeTaskId);
-    recordOrganizerStartLog(form, activeTaskId, result);
+    organizerLog.recordStart(form, activeTaskId, result);
     refreshView(buildOptimisticRunningSnapshot(activeTaskId, form, result));
     connectTaskStream(activeTaskId);
     showToast(t('organizer.toast_started'), 'success');
@@ -1767,7 +1025,7 @@ async function handleApply() {
       const skipped = Number(summary.skipped || 0);
       const failed = Number(summary.failed || 0);
       const total = Number(summary.total || 0);
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         latestSnapshot,
         failed > 0 ? 'error' : 'done',
         organizerText('移动任务已完成', 'Move operation completed'),
@@ -1783,7 +1041,7 @@ async function handleApply() {
         failed > 0 ? 'error' : (skipped > 0 ? 'info' : 'success')
       );
     } else {
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         latestSnapshot,
         'done',
         organizerText('移动任务已完成', 'Move operation completed'),
@@ -1871,7 +1129,7 @@ async function handleRollback() {
       }
     }
     if (summary) {
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         latestSnapshot,
         summary.failed > 0 ? 'error' : 'done',
         organizerText('回滚任务已完成', 'Rollback completed'),
@@ -1886,7 +1144,7 @@ async function handleRollback() {
         summary.failed > 0 ? 'info' : 'success'
       );
     } else {
-      recordOrganizerTerminalLog(
+      organizerLog.recordTerminal(
         latestSnapshot,
         'done',
         organizerText('回滚任务已完成', 'Rollback completed'),
@@ -1984,36 +1242,6 @@ function bindModelRoutingListeners() {
       renderCapability();
     });
   }
-}
-
-function stripDecorativePrefix(text) {
-  return String(text || '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
-}
-
-function renderPipelineStage(stepId, order, label) {
-  return `
-    <div class="organizer-stage" id="org-stage-${stepId}" data-state="pending">
-      <span class="organizer-stage-index">${order}</span>
-      <div class="organizer-stage-copy">
-        <span class="organizer-stage-title">${escapeHtml(label)}</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderRoutingCard(modality) {
-  const label = t(`organizer.model_${modality}`);
-  return `
-    <div class="organizer-route-card">
-      <div class="organizer-route-card-header">
-        <span class="organizer-route-chip">${escapeHtml(label)}</span>
-      </div>
-      <div class="provider-model-inline organizer-route-inputs">
-        <select id="${PROVIDER_SELECT_IDS[modality]}" class="form-input"></select>
-        <select id="${MODEL_SELECT_IDS[modality]}" class="form-input"></select>
-      </div>
-    </div>
-  `;
 }
 
 function updateStatusDecor(snapshot) {
@@ -2116,7 +1344,7 @@ async function restoreOrganizerSnapshot(cachedSnapshot, isStale) {
       const snapshot = await getOrganizeResult(lastTaskId);
       if (isStale()) return;
       activeTaskId = lastTaskId;
-      ensureOrganizerLogsForSnapshot(snapshot);
+      organizerLog.ensureForSnapshot(snapshot);
       refreshView(snapshot);
 
       if (['scanning', 'classifying', 'moving'].includes(snapshot.status)) {
@@ -2125,7 +1353,7 @@ async function restoreOrganizerSnapshot(cachedSnapshot, isStale) {
       return;
     } catch {
       if (cachedSnapshot?.id === lastTaskId) {
-        ensureOrganizerLogsForSnapshot(cachedSnapshot);
+        organizerLog.ensureForSnapshot(cachedSnapshot);
         refreshView(cachedSnapshot);
         return;
       }
@@ -2139,94 +1367,6 @@ async function restoreOrganizerSnapshot(cachedSnapshot, isStale) {
   }
 }
 
-function renderOrganizerStatsGrid(animationDelay = '0.09s') {
-  return `
-    <div class="stats-grid organizer-stats-grid animate-in" style="animation-delay: ${animationDelay};">
-      <div class="stat-card organizer-stat-card">
-        <span class="stat-label">${t('organizer.total_files')}</span>
-        <span class="stat-value" id="org-total">0</span>
-      </div>
-      <div class="stat-card organizer-stat-card">
-        <span class="stat-label">${t('organizer.done_files')}</span>
-        <span class="stat-value success" id="org-done">0</span>
-      </div>
-      <div class="stat-card organizer-stat-card">
-        <span class="stat-label">Token</span>
-        <span class="stat-value warning" id="org-token">0</span>
-      </div>
-      <div class="stat-card organizer-stat-card">
-        <span class="stat-label">${t('organizer.degraded')}</span>
-        <span class="stat-value danger" id="org-degraded">0</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderOrganizerPreviewPanel(animationDelay = '0.13s', subtitle = t('organizer.subtitle')) {
-  return `
-    <section class="card organizer-panel organizer-preview-panel animate-in" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;">
-      <div class="card-header organizer-panel-header">
-        <div>
-          <h2 class="card-title">${t('organizer.preview_title')}</h2>
-          <div class="form-hint">${escapeHtml(subtitle)}</div>
-        </div>
-      </div>
-      <div id="org-preview-groups" class="preview-groups organizer-preview-groups"></div>
-      <div id="org-preview-empty" class="empty-state organizer-empty-state" style="padding: 32px;">
-        <div class="organizer-empty-glyph" aria-hidden="true"></div>
-        <div class="empty-state-text">${t('organizer.preview_empty')}</div>
-      </div>
-    </section>
-  `;
-}
-
-function renderOrganizerMoveResultPanel(animationDelay = '0.17s') {
-  return `
-    <section id="org-move-result-card" class="card organizer-panel animate-in mt-24" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;" hidden>
-      <div class="card-header organizer-panel-header">
-        <div>
-          <h2 class="card-title">${escapeHtml(getMoveResultText('title'))}</h2>
-          <div class="form-hint">${t('organizer.apply_move')}</div>
-        </div>
-      </div>
-      <div class="stats-grid organizer-stats-grid organizer-stats-grid-compact" style="padding: 20px 20px 0;">
-        <div class="stat-card organizer-stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('moved'))}</span>
-          <span id="org-move-moved" class="stat-value success">0</span>
-        </div>
-        <div class="stat-card organizer-stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('skipped'))}</span>
-          <span id="org-move-skipped" class="stat-value warning">0</span>
-        </div>
-        <div class="stat-card organizer-stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('failed'))}</span>
-          <span id="org-move-failed" class="stat-value danger">0</span>
-        </div>
-        <div class="stat-card organizer-stat-card">
-          <span class="stat-label">${escapeHtml(getMoveResultText('total'))}</span>
-          <span id="org-move-total" class="stat-value">0</span>
-        </div>
-      </div>
-      <div class="organizer-table-wrap" style="padding: 20px 20px 0;">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th style="width: 10%;">${escapeHtml(getMoveResultText('status'))}</th>
-              <th style="width: 32%;">${t('organizer.source')}</th>
-              <th style="width: 32%;">${t('organizer.target')}</th>
-              <th style="width: 26%;">${escapeHtml(getMoveResultText('reason'))}</th>
-            </tr>
-          </thead>
-          <tbody id="org-move-result-body"></tbody>
-        </table>
-      </div>
-      <div id="org-move-result-empty" class="empty-state organizer-empty-state" style="padding: 24px;">
-        <div class="empty-state-text">${escapeHtml(getMoveResultText('empty'))}</div>
-      </div>
-    </section>
-  `;
-}
-
 export async function renderOrganizer(container) {
   const expectedRenderVersion = ++renderVersion;
   const isStale = () => expectedRenderVersion !== renderVersion || !container.isConnected;
@@ -2234,7 +1374,7 @@ export async function renderOrganizer(container) {
   invalidateOrganizerRuntimeCacheIfNeeded();
   const defaults = restoreDefaults();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
-  restoreOrganizerLogState(cachedSnapshot);
+  organizerLog.restoreState(cachedSnapshot);
 
   container.innerHTML = `
     <div class="organizer-shell">
@@ -2244,12 +1384,6 @@ export async function renderOrganizer(container) {
             <div class="page-header organizer-page-header">
               <div class="organizer-kicker">${t('organizer.config')}</div>
               <h1 class="page-title">${escapeHtml(stripDecorativePrefix(t('organizer.title')) || t('organizer.title'))}</h1>
-              <p class="page-subtitle">${t('organizer.subtitle')}</p>
-            </div>
-            <div class="organizer-feature-pills">
-              <span class="organizer-feature-pill">${t('organizer.activity_log')}</span>
-              <span class="organizer-feature-pill">${t('organizer.preview_title')}</span>
-              <span class="organizer-feature-pill">${t('organizer.multimodal')}</span>
             </div>
             <div class="organizer-pipeline">
               ${renderPipelineStage('scanning', '01', t('organizer.status_scanning'))}
@@ -2296,7 +1430,6 @@ export async function renderOrganizer(container) {
             <div class="card-header organizer-section-header">
               <div>
                 <h2 class="card-title">${t('organizer.config')}</h2>
-                <div class="form-hint">${t('organizer.batch_cluster_hint')}</div>
               </div>
             </div>
 
@@ -2312,7 +1445,6 @@ export async function renderOrganizer(container) {
               <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.batch_size')}</label>
                 <input id="org-batch-size" type="number" min="1" max="200" class="form-input no-spin" value="${Number(defaults.batchSize) || DEFAULT_BATCH_SIZE}" />
-                <div class="form-hint">${t('organizer.batch_size_hint')}</div>
               </div>
               <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.summary_mode')}</label>
@@ -2321,12 +1453,10 @@ export async function renderOrganizer(container) {
                   <option value="local_summary" ${defaults.summaryStrategy === 'local_summary' ? 'selected' : ''}>${t('organizer.summary_mode_local_summary')}</option>
                   <option value="agent_summary" ${defaults.summaryStrategy === 'agent_summary' ? 'selected' : ''}>${t('organizer.summary_mode_agent_summary')}</option>
                 </select>
-                <div class="form-hint" id="org-summary-mode-hint">${t(`organizer.summary_mode_${defaults.summaryStrategy || DEFAULT_SUMMARY_MODE}_hint`)}</div>
               </div>
               <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.max_cluster_depth')}</label>
                 <input id="org-max-cluster-depth" type="number" min="1" class="form-input no-spin" value="${defaults.maxClusterDepth == null ? '' : Number(defaults.maxClusterDepth)}" placeholder="${t('organizer.max_cluster_depth_unlimited')}" />
-                <div class="form-hint">${t('organizer.max_cluster_depth_hint')}</div>
               </div>
             </div>
 
@@ -2335,7 +1465,6 @@ export async function renderOrganizer(container) {
                 <input id="org-enable-web-search" type="checkbox" ${defaults.useWebSearch === true ? 'checked' : ''} />
                 <span class="organizer-toggle-copy">
                   <span class="organizer-toggle-title">${t('organizer.use_web_search')}</span>
-                  <span class="organizer-toggle-hint">${t('organizer.use_web_search_hint')}</span>
                 </span>
               </label>
             </div>
@@ -2345,7 +1474,6 @@ export async function renderOrganizer(container) {
             <div class="card-header organizer-section-header">
               <div>
                 <h2 class="card-title">${t('organizer.model_routing')}</h2>
-                <div class="form-hint">${t('organizer.model_routing_hint')}</div>
               </div>
             </div>
 
@@ -2356,7 +1484,7 @@ export async function renderOrganizer(container) {
               ${renderRoutingCard('audio')}
             </div>
 
-            <div id="org-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key_managed_hint')}</div>
+            <div id="org-api-config-hint" class="form-hint api-config-hint">${t('settings.api_key')}</div>
 
             <div class="organizer-routing-footer">
               <button id="${COPY_TEXT_ROUTE_BTN_ID}" class="btn btn-secondary" type="button">${t('organizer.copy_text_route')}</button>
@@ -2367,7 +1495,6 @@ export async function renderOrganizer(container) {
             <div class="card-header organizer-section-header">
               <div>
                 <h2 class="card-title">${t('organizer.exclusions')}</h2>
-                <div class="form-hint">${t('organizer.exclusions_hint')}</div>
               </div>
             </div>
 
@@ -2389,7 +1516,6 @@ export async function renderOrganizer(container) {
             <div id="org-log-panel" class="scan-log-panel">
               <div class="scan-activity">
                 <div class="scan-log" id="org-log"></div>
-                <div id="org-log-collapsed-hint" class="scan-log-collapsed-hint" style="display:none;">${t('organizer.log_preview_hint')}</div>
               </div>
             </div>
           </section>
@@ -2412,11 +1538,7 @@ export async function renderOrganizer(container) {
       console.warn('[Organizer] Failed to enable Tika for summary mode:', err);
     });
   });
-  bindOrganizerLogPanelEvents();
-  if (organizerLogEntries.length > 0) {
-    renderOrganizerLogEntries();
-  }
-  refreshOrganizerLogPanel();
+  organizerLog.mountPanel();
 
   const runtimeSettings = await initModelRoutingFields(defaults.modelRouting);
   if (isStale()) return;
@@ -2434,7 +1556,7 @@ export async function renderOrganizer(container) {
   refreshOrganizerApiConfigHint();
   renderCapability();
   if (cachedSnapshot?.id) {
-    ensureOrganizerLogsForSnapshot(cachedSnapshot);
+    organizerLog.ensureForSnapshot(cachedSnapshot);
     refreshView(cachedSnapshot);
   } else {
     refreshView(null);
@@ -2473,7 +1595,7 @@ export async function renderOrganizerResults(container) {
   cleanupLegacyPersistedState();
   invalidateOrganizerRuntimeCacheIfNeeded();
   const cachedSnapshot = getPersisted(PERSIST_KEYS.lastSnapshot, null);
-  restoreOrganizerLogState(cachedSnapshot);
+  organizerLog.restoreState(cachedSnapshot);
   if (organizerProviderSettingsUpdatedHandler) {
     window.removeEventListener('provider-settings-updated', organizerProviderSettingsUpdatedHandler);
     organizerProviderSettingsUpdatedHandler = null;
@@ -2482,14 +1604,12 @@ export async function renderOrganizerResults(container) {
   container.innerHTML = `
     <div class="page-header animate-in">
       <h1 class="page-title">${t('organizer.results_title')}</h1>
-      <p class="page-subtitle">${t('organizer.results_subtitle')}</p>
     </div>
 
     <section id="org-results-empty-card" class="card animate-in mb-24" style="animation-delay: 0.05s;">
       <div class="empty-state organizer-empty-state" style="padding: 36px;">
         <div class="organizer-empty-glyph" aria-hidden="true"></div>
         <div class="empty-state-text">${t('organizer.results_empty')}</div>
-        <div class="empty-state-hint">${t('organizer.results_empty_hint')}</div>
         <button id="org-results-go-btn" class="btn btn-primary" type="button">${t('organizer.go_organize')}</button>
       </div>
     </section>
@@ -2499,7 +1619,6 @@ export async function renderOrganizerResults(container) {
         <div class="card-header organizer-panel-header">
           <div>
             <h2 class="card-title">${t('organizer.results_title')}</h2>
-            <div class="form-hint">${t('organizer.results_subtitle')}</div>
           </div>
           <div class="organizer-results-toolbar">
             <span id="org-status" class="badge badge-info">${t('organizer.status_idle')}</span>
@@ -2516,7 +1635,7 @@ export async function renderOrganizerResults(container) {
       </section>
 
       ${renderOrganizerStatsGrid('0.1s')}
-      ${renderOrganizerPreviewPanel('0.14s', t('organizer.results_subtitle'))}
+      ${renderOrganizerPreviewPanel('0.14s')}
       ${renderOrganizerMoveResultPanel('0.18s')}
     </div>
   `;
@@ -2528,7 +1647,7 @@ export async function renderOrganizerResults(container) {
   document.getElementById('org-rollback-btn')?.addEventListener('click', handleRollback);
 
   if (cachedSnapshot?.id) {
-    ensureOrganizerLogsForSnapshot(cachedSnapshot);
+    organizerLog.ensureForSnapshot(cachedSnapshot);
     refreshView(cachedSnapshot);
   } else {
     refreshView(null);
@@ -2536,6 +1655,7 @@ export async function renderOrganizerResults(container) {
 
   await restoreOrganizerSnapshot(cachedSnapshot, isStale);
 }
+
 
 
 
