@@ -34,6 +34,7 @@ impl<'a> ConversationOrchestrator<'a> {
             return Err("message is required".to_string());
         }
         let mut session = super::load_session(self.state, input.session_id.trim())?;
+        self.refresh_session_overview(&mut session)?;
         let session_id = session
             .get("sessionId")
             .and_then(Value::as_str)
@@ -99,7 +100,9 @@ impl<'a> ConversationOrchestrator<'a> {
         let action = input.action.trim();
         let card_id = input.card_id.trim();
         if card_id.is_empty() {
-            return Err(format!("cardId is required for advisor card action: {action}"));
+            return Err(format!(
+                "cardId is required for advisor card action: {action}"
+            ));
         }
         let mut card = self.load_action_card(&session_id, card_id)?;
         match action {
@@ -119,7 +122,11 @@ impl<'a> ConversationOrchestrator<'a> {
         build_session_payload(self.state, &session)
     }
 
-    fn toggle_context_bar(&self, session: &mut Value, payload: Option<&Value>) -> Result<(), String> {
+    fn toggle_context_bar(
+        &self,
+        session: &mut Value,
+        payload: Option<&Value>,
+    ) -> Result<(), String> {
         let collapsed = payload
             .and_then(|value| value.get("collapsed"))
             .and_then(Value::as_bool)
@@ -209,7 +216,9 @@ impl<'a> ConversationOrchestrator<'a> {
             .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (_job, result, rollback) = self.tools.execute_plan_by_preview_id(session_id, preview_id)?;
+        let (_job, result, rollback) = self
+            .tools
+            .execute_plan_by_preview_id(session_id, preview_id)?;
         let turn = persist::create_advisor_turn(
             &self.state.db_path(),
             session_id,
@@ -246,7 +255,10 @@ impl<'a> ConversationOrchestrator<'a> {
             WORKFLOW_UNDERSTAND,
             None,
             None,
-            rollback.get("available").and_then(Value::as_bool).unwrap_or(false),
+            rollback
+                .get("available")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         );
         Ok(())
     }
@@ -325,7 +337,10 @@ impl<'a> ConversationOrchestrator<'a> {
         self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, None, false);
         let turn = persist::create_advisor_turn(
             &self.state.db_path(),
-            session.get("sessionId").and_then(Value::as_str).unwrap_or_default(),
+            session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             "assistant",
             local_text(
                 &lang,
@@ -367,7 +382,10 @@ impl<'a> ConversationOrchestrator<'a> {
         self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, None, false);
         let turn = persist::create_advisor_turn(
             &self.state.db_path(),
-            session.get("sessionId").and_then(Value::as_str).unwrap_or_default(),
+            session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
             "assistant",
             local_text(
                 &lang,
@@ -400,12 +418,16 @@ impl<'a> ConversationOrchestrator<'a> {
             .and_then(Value::as_str)
             .unwrap_or("zh")
             .to_string();
+        let (use_web_search, web_search_enabled) =
+            super::resolve_workflow_web_search_state(self.state);
         let overview = self.tools.get_directory_overview(
             session
                 .get("rootPath")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session
+                .pointer("/sessionMeta/organizeTaskId")
+                .and_then(Value::as_str),
             Some(session),
             &lang,
         )?;
@@ -414,6 +436,21 @@ impl<'a> ConversationOrchestrator<'a> {
             obj.insert(
                 "derivedTree".to_string(),
                 overview.derived_tree.unwrap_or(Value::Null),
+            );
+        }
+        super::apply_workflow_web_search_state(session, use_web_search, web_search_enabled);
+        if let Some(meta) = session
+            .get_mut("sessionMeta")
+            .and_then(Value::as_object_mut)
+        {
+            meta.insert(
+                "organizeTaskId".to_string(),
+                overview
+                    .assets
+                    .organize_task_id
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
             );
         }
         Ok(())
@@ -442,7 +479,10 @@ impl<'a> ConversationOrchestrator<'a> {
         rollback_available: bool,
     ) {
         if let Some(obj) = session.as_object_mut() {
-            obj.insert("workflowStage".to_string(), Value::String(workflow.to_string()));
+            obj.insert(
+                "workflowStage".to_string(),
+                Value::String(workflow.to_string()),
+            );
             obj.insert(
                 "activeSelectionId".to_string(),
                 selection_id
@@ -471,7 +511,10 @@ impl<'a> ConversationOrchestrator<'a> {
     }
 
     fn store_trace(&self, session: &mut Value, trace: &Value) {
-        if let Some(meta) = session.get_mut("sessionMeta").and_then(Value::as_object_mut) {
+        if let Some(meta) = session
+            .get_mut("sessionMeta")
+            .and_then(Value::as_object_mut)
+        {
             meta.insert("lastAgentTrace".to_string(), trace.clone());
         }
     }

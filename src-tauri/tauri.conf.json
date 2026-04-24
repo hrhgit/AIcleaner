@@ -28,9 +28,6 @@
   },
   "bundle": {
     "active": true,
-    "resources": [
-      "../bin/scanner.exe"
-    ],
     "targets": [
       "nsis"
     ],

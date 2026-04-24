@@ -110,9 +110,9 @@ pub(super) fn extract_unit_content_for_summary(
     let ext = extension_key(Path::new(&unit.path));
     match ext.as_str() {
         ".txt" | ".md" | ".csv" | ".json" | ".yaml" | ".yml" | ".toml" | ".xml" | ".log"
-        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py"
-        | ".java" | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql"
-        | ".sh" | ".bat" | ".ps1" => extract_plain_text_summary(unit),
+        | ".ini" | ".cfg" | ".conf" | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py" | ".java"
+        | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html" | ".sql" | ".sh" | ".bat"
+        | ".ps1" => extract_plain_text_summary(unit),
         _ if unit.modality == "text" && !supports_tika_extraction(unit) => {
             extract_plain_text_summary(unit)
         }
@@ -251,14 +251,38 @@ pub(super) fn build_local_summary(
 ) -> SummaryBuildResult {
     if unit.item_type != "directory" && extracted.excerpt.trim().is_empty() {
         return SummaryBuildResult {
-            summary: String::new(),
-            source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
-            degraded: true,
+            representation: FileRepresentation {
+                metadata: Some(unit.name.clone()),
+                short: None,
+                long: None,
+                source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
+                degraded: true,
+                confidence: None,
+                keywords: extracted.keywords.clone(),
+            },
             warnings: extracted.warnings.clone(),
-            confidence: None,
         };
     }
 
+    let metadata = Some(build_representation_metadata(unit, extracted));
+    SummaryBuildResult {
+        representation: FileRepresentation {
+            metadata,
+            short: Some(build_representation_short(unit, extracted)),
+            long: Some(build_representation_long(unit, extracted)),
+            source: SUMMARY_SOURCE_LOCAL_SUMMARY.to_string(),
+            degraded: false,
+            confidence: None,
+            keywords: extracted.keywords.clone(),
+        },
+        warnings: extracted.warnings.clone(),
+    }
+}
+
+pub(super) fn build_representation_metadata(
+    unit: &OrganizeUnit,
+    extracted: &SummaryExtraction,
+) -> String {
     let mut lines = vec![
         format!("name={}", unit.name),
         format!("relativePath={}", unit.relative_path),
@@ -283,6 +307,38 @@ pub(super) fn build_local_summary(
         ));
     }
     lines.extend(extracted.metadata_lines.iter().cloned());
+    lines.join("\n")
+}
+
+fn build_representation_short(unit: &OrganizeUnit, extracted: &SummaryExtraction) -> String {
+    let signal = extracted
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| trim_to_chars(value, 120))
+        .or_else(|| {
+            (!extracted.excerpt.trim().is_empty()).then(|| {
+                trim_to_chars(
+                    &normalize_multiline_text(&extracted.excerpt, 200),
+                    SUMMARY_AGENT_SUMMARY_CHARS,
+                )
+            })
+        })
+        .or_else(|| {
+            (!extracted.metadata_lines.is_empty()).then(|| {
+                trim_to_chars(
+                    &normalize_multiline_text(&extracted.metadata_lines.join("；"), 200),
+                    SUMMARY_AGENT_SUMMARY_CHARS,
+                )
+            })
+        })
+        .unwrap_or_else(|| format!("{} | {}", unit.item_type, unit.modality));
+    format!("{} | {}", unit.name, signal)
+}
+
+fn build_representation_long(unit: &OrganizeUnit, extracted: &SummaryExtraction) -> String {
+    let mut lines = vec![build_representation_metadata(unit, extracted)];
     if !extracted.excerpt.trim().is_empty() {
         lines.push(format!(
             "excerpt={}",
@@ -292,14 +348,7 @@ pub(super) fn build_local_summary(
             )
         ));
     }
-
-    SummaryBuildResult {
-        summary: lines.join("\n"),
-        source: SUMMARY_SOURCE_LOCAL_SUMMARY.to_string(),
-        degraded: false,
-        warnings: extracted.warnings.clone(),
-        confidence: None,
-    }
+    lines.join("\n")
 }
 
 fn sanitize_json_block(content: &str) -> String {
@@ -377,15 +426,16 @@ pub(super) fn parse_chat_completion_http_body(
     status: StatusCode,
     raw_body: &str,
 ) -> Result<ChatCompletionOutput, ChatCompletionError> {
-    let parsed = parse_completion_response(detect_api_format(endpoint), status, raw_body)
-        .map_err(|message| ChatCompletionError {
+    let parsed = parse_completion_response(detect_api_format(endpoint), status, raw_body).map_err(
+        |message| ChatCompletionError {
             message: format!(
                 "{} | body: {}",
                 message,
                 summarize_response_body_for_error(raw_body)
             ),
             raw_body: raw_body.to_string(),
-        })?;
+        },
+    )?;
     if parsed.assistant_text.trim().is_empty() && parsed.tool_calls.is_empty() {
         return Err(ChatCompletionError {
             message: format!(
@@ -409,6 +459,8 @@ async fn chat_completion_with_messages(
     messages: &[Value],
     tools: Option<&[Value]>,
     stop: &AtomicBool,
+    diagnostics: Option<&OrganizerDiagnostics>,
+    stage: &str,
 ) -> Result<ChatCompletionOutput, ChatCompletionError> {
     let api_format = detect_api_format(&route.endpoint);
     let url = build_messages_url(&route.endpoint, api_format);
@@ -431,23 +483,102 @@ async fn chat_completion_with_messages(
         message,
         raw_body: String::new(),
     })?;
+    let started_at = Instant::now();
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record(
+            "info",
+            "organizer_model_request",
+            "organizer model request started",
+            json!({
+                "stage": stage,
+                "endpoint": route.endpoint.clone(),
+                "model": route.model.clone(),
+                "url": url.clone(),
+                "messages": messages,
+                "tools": tools.unwrap_or(&[]),
+                "payload": payload.clone(),
+            }),
+            None,
+            None,
+        );
+    }
     let req = client
-        .post(url)
+        .post(url.clone())
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .json(&payload);
     let req = apply_auth_headers(req, api_format, &route.api_key);
+    let diagnostics_for_request = diagnostics.cloned();
+    let endpoint_for_request = route.endpoint.clone();
+    let model_for_request = route.model.clone();
+    let stage_for_request = stage.to_string();
     let request_future = async move {
-        let resp = req.send().await.map_err(|e| ChatCompletionError {
-            message: e.to_string(),
-            raw_body: String::new(),
-        })?;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if let Some(diagnostics) = diagnostics_for_request.as_ref() {
+                    diagnostics.record(
+                        "error",
+                        "organizer_model_error",
+                        "organizer model request failed",
+                        json!({
+                            "stage": stage_for_request.clone(),
+                            "endpoint": endpoint_for_request.clone(),
+                            "model": model_for_request.clone(),
+                            "url": url.clone(),
+                        }),
+                        Some(json!({ "message": e.to_string() })),
+                        Some(started_at.elapsed()),
+                    );
+                }
+                return Err(ChatCompletionError {
+                    message: e.to_string(),
+                    raw_body: String::new(),
+                });
+            }
+        };
         let status = resp.status();
-        let raw_body = resp.text().await.map_err(|e| ChatCompletionError {
-            message: format!("error reading response body: {}", e),
-            raw_body: String::new(),
-        })?;
-        parse_chat_completion_http_body(&route.endpoint, status, &raw_body)
+        let raw_body = match resp.text().await {
+            Ok(raw_body) => raw_body,
+            Err(e) => {
+                if let Some(diagnostics) = diagnostics_for_request.as_ref() {
+                    diagnostics.record(
+                        "error",
+                        "organizer_model_error",
+                        "organizer model response body read failed",
+                        json!({
+                            "stage": stage_for_request,
+                            "endpoint": endpoint_for_request.clone(),
+                            "model": model_for_request.clone(),
+                            "status": status.as_u16(),
+                        }),
+                        Some(json!({ "message": e.to_string() })),
+                        Some(started_at.elapsed()),
+                    );
+                }
+                return Err(ChatCompletionError {
+                    message: format!("error reading response body: {}", e),
+                    raw_body: String::new(),
+                });
+            }
+        };
+        if let Some(diagnostics) = diagnostics_for_request.as_ref() {
+            diagnostics.record(
+                if status.is_success() { "info" } else { "error" },
+                "organizer_model_response",
+                "organizer model response received",
+                json!({
+                    "stage": stage_for_request,
+                    "endpoint": endpoint_for_request.clone(),
+                    "model": model_for_request.clone(),
+                    "status": status.as_u16(),
+                    "rawBody": raw_body.clone(),
+                }),
+                None,
+                Some(started_at.elapsed()),
+            );
+        }
+        parse_chat_completion_http_body(&endpoint_for_request, status, &raw_body)
     };
     tokio::pin!(request_future);
 
@@ -470,6 +601,8 @@ async fn chat_completion(
     system_prompt: &str,
     user_prompt: &str,
     stop: &AtomicBool,
+    diagnostics: Option<&OrganizerDiagnostics>,
+    stage: &str,
 ) -> Result<ChatCompletionOutput, ChatCompletionError> {
     chat_completion_with_messages(
         route,
@@ -479,6 +612,8 @@ async fn chat_completion(
         ],
         None,
         stop,
+        diagnostics,
+        stage,
     )
     .await
 }
@@ -486,14 +621,14 @@ async fn chat_completion(
 fn build_summary_agent_system_prompt(response_language: &str) -> String {
     let output_language = localized_language_name(response_language, response_language);
     [
-        "You prepare short standardized summaries for a later file classification step."
+        "You prepare standardized short and long summaries for a later file classification step."
             .to_string(),
         "Return JSON only.".to_string(),
-        "Schema: {\"items\":[{\"itemId\":\"...\",\"summary\":\"...\",\"keywords\":[\"...\"],\"confidence\":\"high|medium|low\",\"warnings\":[\"...\"]}]}".to_string(),
+        "Schema: {\"items\":[{\"itemId\":\"...\",\"summaryShort\":\"...\",\"summaryLong\":\"...\",\"keywords\":[\"...\"],\"confidence\":\"high|medium|low\",\"warnings\":[\"...\"]}]}".to_string(),
         "Cover every input item exactly once and preserve itemId verbatim.".to_string(),
         "Do not classify, rename, or omit items.".to_string(),
         format!(
-            "Write summary and warnings in {output_language} only. Keep each summary under about {SUMMARY_AGENT_SUMMARY_CHARS} characters."
+            "Write summaries and warnings in {output_language} only. Keep summaryShort under about {SUMMARY_AGENT_SUMMARY_CHARS} characters and summaryLong under about {SUMMARY_AGENT_LONG_CHARS} characters."
         ),
         "Use the provided local extraction material first. If content is sparse, say so briefly instead of inventing details.".to_string(),
     ]
@@ -514,8 +649,14 @@ pub(super) fn parse_summary_agent_output(
         let Some(item_id) = item.get("itemId").and_then(Value::as_str) else {
             continue;
         };
-        let summary = item
-            .get("summary")
+        let summary_short = item
+            .get("summaryShort")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let summary_long = item
+            .get("summaryLong")
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or("")
@@ -543,7 +684,8 @@ pub(super) fn parse_summary_agent_output(
         out.insert(
             item_id.to_string(),
             SummaryAgentItem {
-                summary,
+                summary_short,
+                summary_long,
                 keywords,
                 confidence: sanitize_summary_confidence(
                     item.get("confidence").and_then(Value::as_str),
@@ -560,6 +702,8 @@ pub(super) async fn summarize_batch_with_agent(
     response_language: &str,
     stop: &AtomicBool,
     batch_rows: &[Value],
+    diagnostics: Option<&OrganizerDiagnostics>,
+    stage: &str,
 ) -> SummaryAgentBatchOutput {
     if text_route.api_key.trim().is_empty() {
         return SummaryAgentBatchOutput {
@@ -586,15 +730,22 @@ pub(super) async fn summarize_batch_with_agent(
             "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
             "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
             "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-            "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-            "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
-            "summaryKeywords": row.get("summaryKeywords").cloned().unwrap_or(Value::Array(Vec::new())),
+            "representation": row.get("representation").cloned().unwrap_or_else(|| FileRepresentation::default().to_value()),
             "summaryWarnings": row.get("summaryWarnings").cloned().unwrap_or(Value::Array(Vec::new())),
             "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
         })).collect::<Vec<_>>(),
     });
 
-    match chat_completion(text_route, &system_prompt, &payload.to_string(), stop).await {
+    match chat_completion(
+        text_route,
+        &system_prompt,
+        &payload.to_string(),
+        stop,
+        diagnostics,
+        stage,
+    )
+    .await
+    {
         Ok(output) => {
             let usage = output.usage.clone();
             SummaryAgentBatchOutput {
@@ -630,10 +781,10 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
             .to_string(),
         "Call at most one tool per reply.".to_string(),
         "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
-        "When an item summary includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the summary clearly shows unrelated mixed content.".to_string(),
-        "Some items may have an empty summary and only provide file name, path, type, or modality. In that case, classify using those fields instead of assuming missing content.".to_string(),
-        "The classification payload only includes normalized summaries and lightweight metadata, not raw extraction text.".to_string(),
-        "Prefer using summary first when it exists; otherwise fall back to name, relativePath, itemType, and modality.".to_string(),
+        "When an item representation or summaryText includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the evidence clearly shows unrelated mixed content.".to_string(),
+        "Some items may only provide metadata-level representation without summaryText. In that case, classify using name, relativePath, itemType, modality, and representation metadata instead of assuming missing content.".to_string(),
+        "The classification payload includes lightweight representation data, not raw extraction text.".to_string(),
+        "Prefer using summaryText first when it exists; otherwise fall back to representation.metadata, name, relativePath, itemType, and modality.".to_string(),
         format!("Use {output_language} names and keep labels short."),
         format!("The assignment \"reason\" field must be written in {output_language} only."),
     ];
@@ -657,6 +808,8 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
         .map(|row| {
             let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
             let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
+            let representation =
+                FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
             json!({
                 "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -665,13 +818,8 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
                 "createdAge": created_age,
                 "modifiedAge": modified_age,
-                "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
-                "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
-                "summaryKeywords": row
-                    .get("summaryKeywords")
-                    .cloned()
-                    .unwrap_or(Value::Array(Vec::new())),
+                "summaryText": representation.best_text(),
+                "representation": representation.to_value(),
                 "summaryWarnings": row
                     .get("summaryWarnings")
                     .cloned()
@@ -813,6 +961,8 @@ pub(super) async fn classify_organize_batch(
     reference_structure: Option<&String>,
     use_web_search: bool,
     search_api_key: &str,
+    diagnostics: Option<&OrganizerDiagnostics>,
+    stage: &str,
 ) -> Result<ClassifyOrganizeBatchOutput, String> {
     let search_enabled = use_web_search && !search_api_key.trim().is_empty();
     let mut total_usage = TokenUsage::default();
@@ -828,6 +978,8 @@ pub(super) async fn classify_organize_batch(
         .map(|row| {
             let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
             let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
+            let representation =
+                FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
             json!({
                 "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -836,7 +988,8 @@ pub(super) async fn classify_organize_batch(
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
                 "createdAge": created_age,
                 "modifiedAge": modified_age,
-                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(""),
+                "summaryText": representation.best_text(),
+                "representationSource": representation.source,
             })
         })
         .collect::<Vec<_>>();
@@ -866,8 +1019,10 @@ pub(super) async fn classify_organize_batch(
 
     for step_idx in 0..max_steps {
         let allow_web_search = search_enabled && search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
-        messages[0]["content"] =
-            Value::String(build_organize_system_prompt(response_language, allow_web_search));
+        messages[0]["content"] = Value::String(build_organize_system_prompt(
+            response_language,
+            allow_web_search,
+        ));
 
         if search_enabled && !allow_web_search && !budget_exhausted_prompt_sent {
             let prompt = search_budget_exhausted_message(response_language).to_string();
@@ -896,29 +1051,37 @@ pub(super) async fn classify_organize_batch(
             })
             .collect::<Vec<_>>();
 
-        let completion =
-            match chat_completion_with_messages(text_route, &messages, Some(&tools), stop).await {
-                Ok(output) => output,
-                Err(err) => {
-                    append_batch_trace(
-                        &mut round_trace,
-                        step_idx + 1,
-                        text_route,
-                        "http_error",
-                        &err.raw_body,
-                        None,
-                        Some(&err.message),
-                        &available_tool_names,
-                        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls),
-                    );
-                    return Ok(ClassifyOrganizeBatchOutput {
-                        parsed: None,
-                        usage: total_usage,
-                        raw_output: round_trace.join("\n\n====================\n\n"),
-                        error: Some(err.message),
-                    });
-                }
-            };
+        let completion = match chat_completion_with_messages(
+            text_route,
+            &messages,
+            Some(&tools),
+            stop,
+            diagnostics,
+            stage,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                append_batch_trace(
+                    &mut round_trace,
+                    step_idx + 1,
+                    text_route,
+                    "http_error",
+                    &err.raw_body,
+                    None,
+                    Some(&err.message),
+                    &available_tool_names,
+                    ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls),
+                );
+                return Ok(ClassifyOrganizeBatchOutput {
+                    parsed: None,
+                    usage: total_usage,
+                    raw_output: round_trace.join("\n\n====================\n\n"),
+                    error: Some(err.message),
+                });
+            }
+        };
         total_usage.prompt = total_usage.prompt.saturating_add(completion.usage.prompt);
         total_usage.completion = total_usage
             .completion
@@ -984,6 +1147,22 @@ pub(super) async fn classify_organize_batch(
                 let tool_result = match parse_web_search_tool_arguments(&tool_call.arguments) {
                     Ok(request) => match tavily_search(search_api_key, &request).await {
                         Ok(trace) => {
+                            if let Some(diagnostics) = diagnostics {
+                                diagnostics.record(
+                                    "info",
+                                    "organizer_web_search",
+                                    "organizer web search succeeded",
+                                    json!({
+                                        "stage": stage,
+                                        "query": trace.query.clone(),
+                                        "reason": trace.reason.clone(),
+                                        "resultCount": trace.results.len(),
+                                        "results": trace.results.clone(),
+                                    }),
+                                    None,
+                                    None,
+                                );
+                            }
                             append_batch_trace_note(
                                 &mut round_trace,
                                 "web_search",
@@ -1007,6 +1186,19 @@ pub(super) async fn classify_organize_batch(
                             })
                         }
                         Err(err) => {
+                            if let Some(diagnostics) = diagnostics {
+                                diagnostics.record(
+                                    "error",
+                                    "organizer_web_search",
+                                    "organizer web search failed",
+                                    json!({
+                                        "stage": stage,
+                                        "arguments": tool_call.arguments.clone(),
+                                    }),
+                                    Some(json!({ "message": err.clone() })),
+                                    None,
+                                );
+                            }
                             append_batch_trace_note(
                                 &mut round_trace,
                                 "web_search",
@@ -1097,7 +1289,9 @@ pub(super) async fn classify_organize_batch(
         parsed: None,
         usage: total_usage,
         raw_output: round_trace.join("\n\n====================\n\n"),
-        error: Some("classification tool loop exhausted without submit_organize_result".to_string()),
+        error: Some(
+            "classification tool loop exhausted without submit_organize_result".to_string(),
+        ),
     })
 }
 
@@ -1116,20 +1310,11 @@ pub(super) fn emit_organize_summary_ready<R: Runtime>(
         "size": row.get("size").and_then(Value::as_u64).unwrap_or(0),
         "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
         "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-        "summaryMode": row
-            .get("summaryMode")
+        "summaryStrategy": row
+            .get("summaryStrategy")
             .cloned()
             .unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
-        "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-        "summarySource": row
-            .get("summarySource")
-            .and_then(Value::as_str)
-            .unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
-        "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
-        "summaryKeywords": row
-            .get("summaryKeywords")
-            .cloned()
-            .unwrap_or(Value::Array(Vec::new())),
+        "representation": row.get("representation").cloned().unwrap_or_else(|| FileRepresentation::default().to_value()),
         "summaryWarnings": row
             .get("summaryWarnings")
             .cloned()
@@ -1160,8 +1345,8 @@ mod tests {
 
     #[test]
     fn parse_web_search_tool_arguments_requires_query() {
-        let err = parse_web_search_tool_arguments(&json!({}))
-            .expect_err("missing query should fail");
+        let err =
+            parse_web_search_tool_arguments(&json!({})).expect_err("missing query should fail");
         assert!(err.contains("non-empty query"));
 
         let parsed = parse_web_search_tool_arguments(&json!({

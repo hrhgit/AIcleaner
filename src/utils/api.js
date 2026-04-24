@@ -104,41 +104,6 @@ export async function openExternalUrl(url) {
   return call('system_open_external_url', { data: { url } });
 }
 
-export async function getActiveScan() {
-  return call('scan_get_active');
-}
-
-export async function listScanHistory(limit = 20) {
-  return call('scan_list_history', { limit });
-}
-
-export async function deleteScanHistory(taskId) {
-  return call('scan_delete_history', { taskId });
-}
-
-export async function startScan(params) {
-  return call('scan_start', { input: params });
-}
-
-export async function stopScan(taskId) {
-  return call('scan_stop', { taskId });
-}
-
-export async function getScanResult(taskId) {
-  return call('scan_get_result', { taskId });
-}
-
-export function connectScanStream(taskId, handlers) {
-  const stream = createStream(taskId, [
-    ['scan_progress', (p) => handlers.onProgress?.(p)],
-    ['scan_warning', (p) => handlers.onWarning?.(p)],
-    ['scan_done', (p) => { handlers.onDone?.(p); stream.close(); }],
-    ['scan_error', (p) => { handlers.onError?.(p); stream.close(); }],
-    ['scan_stopped', (p) => { handlers.onStopped?.(p); stream.close(); }],
-  ]);
-  return stream;
-}
-
 export async function getOrganizeCapability() {
   return call('organize_get_capability');
 }

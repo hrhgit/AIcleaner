@@ -1,11 +1,7 @@
-use super::{
-    ScanPersistentRuleRecord, ScanPersistentRules, ScanRuleTopChild,
-};
 use crate::backend::provider_registry::default_model_for_endpoint;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) fn default_settings() -> Value {
     json!({
@@ -19,20 +15,14 @@ pub(crate) fn default_settings() -> Value {
             "https://api.moonshot.cn/v1": { "name": "Moonshot", "endpoint": "https://api.moonshot.cn/v1", "apiKey": "", "model": "moonshot-v1-8k" },
             "https://api.minimax.io/anthropic/v1": { "name": "MiniMax (Anthropic)", "endpoint": "https://api.minimax.io/anthropic/v1", "apiKey": "", "model": "MiniMax-M2.7" }
         },
-        "scanPath": "",
-        "maxDepth": 5,
-        "maxDepthUnlimited": false,
-        "scanIgnorePaths": [],
-        "lastScanTime": null,
         "searchApi": {
             "provider": "tavily",
             "enabled": false,
             "apiKey": "",
-            "scopes": { "scan": false, "classify": false, "organizer": false }
-        },
-        "scanPersistentRules": {
-            "keepExact": [],
-            "safeDeleteExact": []
+            "scopes": {
+                "classify": false,
+                "organizer": false
+            }
         },
         "contentExtraction": {
             "tika": {
@@ -81,7 +71,7 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
 
     let legacy_endpoint = value_as_non_empty_string(obj.get("apiEndpoint"));
     let legacy_model = value_as_non_empty_string(obj.get("model"));
-    let legacy_scan_enabled = obj.get("enableWebSearch").and_then(Value::as_bool);
+    let legacy_search_enabled = obj.get("enableWebSearch").and_then(Value::as_bool);
     let legacy_classify_enabled = obj.get("enableWebSearchClassify").and_then(Value::as_bool);
     let legacy_organizer_enabled = obj.get("enableWebSearchOrganizer").and_then(Value::as_bool);
     let legacy_search_api_key = value_as_non_empty_string(obj.get("tavilyApiKey")).or_else(|| {
@@ -118,9 +108,9 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
                     config.insert(
                         "model".to_string(),
                         Value::String(
-                            legacy_model
-                                .clone()
-                                .unwrap_or_else(|| default_model_for_endpoint(&endpoint).to_string()),
+                            legacy_model.clone().unwrap_or_else(|| {
+                                default_model_for_endpoint(&endpoint).to_string()
+                            }),
                         ),
                     );
                 }
@@ -128,7 +118,7 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
         }
     }
 
-    let has_legacy_search_settings = legacy_scan_enabled.is_some()
+    let has_legacy_search_settings = legacy_search_enabled.is_some()
         || legacy_classify_enabled.is_some()
         || legacy_organizer_enabled.is_some()
         || legacy_search_api_key.is_some();
@@ -144,7 +134,7 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
                 search.insert("provider".to_string(), Value::String("tavily".to_string()));
             }
             if !search.contains_key("enabled") {
-                let enabled = legacy_scan_enabled.unwrap_or(false)
+                let enabled = legacy_search_enabled.unwrap_or(false)
                     || legacy_classify_enabled.unwrap_or(false)
                     || legacy_organizer_enabled.unwrap_or(false);
                 search.insert("enabled".to_string(), Value::Bool(enabled));
@@ -162,18 +152,12 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
                 *scopes = json!({});
             }
             if let Some(scopes_obj) = scopes.as_object_mut() {
-                if !scopes_obj.contains_key("scan") {
-                    scopes_obj.insert(
-                        "scan".to_string(),
-                        Value::Bool(legacy_scan_enabled.unwrap_or(false)),
-                    );
-                }
                 if !scopes_obj.contains_key("classify") {
                     scopes_obj.insert(
                         "classify".to_string(),
                         Value::Bool(
                             legacy_classify_enabled
-                                .unwrap_or(legacy_organizer_enabled.unwrap_or(false)),
+                                .unwrap_or(legacy_search_enabled.unwrap_or(false)),
                         ),
                     );
                 }
@@ -181,8 +165,10 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
                     scopes_obj.insert(
                         "organizer".to_string(),
                         Value::Bool(
-                            legacy_organizer_enabled
-                                .unwrap_or(legacy_classify_enabled.unwrap_or(false)),
+                            legacy_organizer_enabled.unwrap_or(
+                                legacy_classify_enabled
+                                    .unwrap_or(legacy_search_enabled.unwrap_or(false)),
+                            ),
                         ),
                     );
                 }
@@ -204,7 +190,10 @@ fn normalize_settings_shape(value: &mut Value) {
         .trim()
         .to_string();
 
-    if let Some(configs) = obj.get_mut("providerConfigs").and_then(Value::as_object_mut) {
+    if let Some(configs) = obj
+        .get_mut("providerConfigs")
+        .and_then(Value::as_object_mut)
+    {
         let mut first_endpoint = String::new();
         for (key, config) in configs.iter_mut() {
             let endpoint = config
@@ -269,43 +258,36 @@ fn normalize_settings_shape(value: &mut Value) {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let scan_enabled = search_scopes
+    let legacy_scan_enabled = search_scopes
         .get("scan")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| search_api.get("enabled").and_then(Value::as_bool).unwrap_or(false));
+        .unwrap_or(false);
     let classify_enabled = search_scopes
         .get("classify")
         .and_then(Value::as_bool)
-        .unwrap_or(scan_enabled);
+        .unwrap_or(legacy_scan_enabled);
     let organizer_enabled = search_scopes
         .get("organizer")
         .and_then(Value::as_bool)
         .unwrap_or(classify_enabled);
+    let workflow_search_enabled = classify_enabled || organizer_enabled;
     let search_enabled = search_api
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(scan_enabled || classify_enabled || organizer_enabled);
+        .unwrap_or(workflow_search_enabled);
     obj.insert(
         "searchApi".to_string(),
         json!({
             "provider": "tavily",
-            "enabled": search_enabled,
+            "enabled": search_enabled || workflow_search_enabled,
             "apiKey": search_api.get("apiKey").and_then(Value::as_str).unwrap_or(""),
             "scopes": {
-                "scan": scan_enabled,
-                "classify": classify_enabled,
-                "organizer": organizer_enabled
+                "classify": workflow_search_enabled,
+                "organizer": workflow_search_enabled
             }
         }),
     );
-    obj.insert(
-        "scanPersistentRules".to_string(),
-        serde_json::to_value(normalize_scan_persistent_rules(obj.get("scanPersistentRules")))
-            .unwrap_or_else(|_| json!({
-                "keepExact": [],
-                "safeDeleteExact": []
-            })),
-    );
+
     let tika = obj
         .get("contentExtraction")
         .and_then(|value| value.get("tika"))
@@ -348,6 +330,12 @@ fn normalize_settings_shape(value: &mut Value) {
     obj.remove("enableWebSearchClassify");
     obj.remove("enableWebSearchOrganizer");
     obj.remove("tavilyApiKey");
+    obj.remove("scanPath");
+    obj.remove("maxDepth");
+    obj.remove("maxDepthUnlimited");
+    obj.remove("scanIgnorePaths");
+    obj.remove("lastScanTime");
+    obj.remove("scanPersistentRules");
 }
 
 fn merge_json(base: &mut Value, patch: &Value) {
@@ -379,168 +367,6 @@ pub(crate) fn read_settings(path: &Path) -> Value {
     merged
 }
 
-pub(crate) fn normalize_scan_ignore_paths(value: Option<&Value>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter_map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            let path = PathBuf::from(trimmed).to_string_lossy().to_string();
-            let key = path.trim().to_lowercase();
-            if key.is_empty() || !seen.insert(key) {
-                return None;
-            }
-            Some(path)
-        })
-        .collect()
-}
-
-fn normalize_scan_rule_top_children(records: &[ScanRuleTopChild]) -> Vec<ScanRuleTopChild> {
-    records
-        .iter()
-        .filter_map(|record| {
-            let name = record.name.trim();
-            if name.is_empty() {
-                return None;
-            }
-            let item_type = match record.item_type.trim() {
-                "directory" => "directory",
-                "file" => "file",
-                _ => return None,
-            };
-            Some(ScanRuleTopChild {
-                name: name.to_string(),
-                item_type: item_type.to_string(),
-                size: record.size,
-            })
-        })
-        .take(5)
-        .collect()
-}
-
-fn normalize_scan_rule_name_tags(tags: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    tags.iter()
-        .filter_map(|tag| {
-            let normalized = tag.trim().to_ascii_lowercase();
-            if normalized.is_empty() || !seen.insert(normalized.clone()) {
-                return None;
-            }
-            Some(normalized)
-        })
-        .collect()
-}
-
-fn normalize_scan_persistent_rule_record(
-    raw: ScanPersistentRuleRecord,
-    fallback_classification: &str,
-) -> Option<ScanPersistentRuleRecord> {
-    let path = PathBuf::from(raw.path.trim()).to_string_lossy().to_string();
-    if path.trim().is_empty() {
-        return None;
-    }
-    let node_type = match raw.node_type.trim() {
-        "directory" => "directory",
-        "file" => "file",
-        _ => return None,
-    }
-    .to_string();
-    let classification = match raw.classification.trim() {
-        "keep" => "keep",
-        "safe_to_delete" => "safe_to_delete",
-        _ => fallback_classification,
-    }
-    .to_string();
-    let source = if raw.source.trim().is_empty() {
-        "ai_promoted".to_string()
-    } else {
-        raw.source.trim().to_string()
-    };
-    let risk = if raw.risk.trim().is_empty() {
-        if classification == "keep" {
-            "high".to_string()
-        } else {
-            "low".to_string()
-        }
-    } else {
-        raw.risk.trim().to_string()
-    };
-
-    Some(ScanPersistentRuleRecord {
-        path,
-        node_type,
-        classification,
-        reason: raw.reason.trim().to_string(),
-        risk,
-        source,
-        size: raw.size,
-        self_size: raw.self_size,
-        child_count: raw.child_count,
-        name_tags: normalize_scan_rule_name_tags(&raw.name_tags),
-        top_children: normalize_scan_rule_top_children(&raw.top_children),
-    })
-}
-
-fn normalize_scan_persistent_rule_records(
-    value: Option<&Value>,
-    fallback_classification: &str,
-) -> Vec<ScanPersistentRuleRecord> {
-    let mut seen = HashSet::new();
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| serde_json::from_value::<ScanPersistentRuleRecord>(item.clone()).ok())
-        .filter_map(|item| normalize_scan_persistent_rule_record(item, fallback_classification))
-        .filter(|record| seen.insert(record.path.to_lowercase()))
-        .collect()
-}
-
-#[cfg(test)]
-fn remove_local_rule_records(rules: &mut ScanPersistentRules) -> bool {
-    let keep_before = rules.keep_exact.len();
-    let safe_before = rules.safe_delete_exact.len();
-    rules
-        .keep_exact
-        .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
-    rules
-        .safe_delete_exact
-        .retain(|record| !record.source.eq_ignore_ascii_case("local_rule"));
-    keep_before != rules.keep_exact.len() || safe_before != rules.safe_delete_exact.len()
-}
-
-pub(crate) fn normalize_scan_persistent_rules(value: Option<&Value>) -> ScanPersistentRules {
-    ScanPersistentRules {
-        keep_exact: normalize_scan_persistent_rule_records(
-            value.and_then(|rules| rules.get("keepExact")),
-            "keep",
-        ),
-        safe_delete_exact: normalize_scan_persistent_rule_records(
-            value.and_then(|rules| rules.get("safeDeleteExact")),
-            "safe_to_delete",
-        ),
-    }
-}
-
-pub(crate) fn read_scan_ignore_paths(path: &Path) -> Vec<String> {
-    let settings = read_settings(path);
-    normalize_scan_ignore_paths(settings.get("scanIgnorePaths"))
-}
-
-#[cfg(test)]
-pub(crate) fn read_scan_persistent_rules_with_cleanup(path: &Path) -> (ScanPersistentRules, bool) {
-    let settings = read_settings(path);
-    let mut rules = normalize_scan_persistent_rules(settings.get("scanPersistentRules"));
-    let cleaned = remove_local_rule_records(&mut rules);
-    (rules, cleaned)
-}
-
 pub(crate) fn strip_secret_fields(v: &mut Value) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("secretStatus");
@@ -568,18 +394,6 @@ pub(crate) fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
         default_settings()
     };
     merge_json(&mut merged, value);
-    let normalized_ignore_paths = normalize_scan_ignore_paths(merged.get("scanIgnorePaths"));
-    if let Some(obj) = merged.as_object_mut() {
-        obj.insert(
-            "scanIgnorePaths".to_string(),
-            Value::Array(
-                normalized_ignore_paths
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-    }
     normalize_settings_shape(&mut merged);
     strip_secret_fields(&mut merged);
     fs::write(
@@ -587,4 +401,28 @@ pub(crate) fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
         serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_settings_shape_unifies_workflow_search_scopes() {
+        let mut value = json!({
+            "searchApi": {
+                "enabled": false,
+                "scopes": {
+                    "classify": true,
+                    "organizer": false
+                }
+            }
+        });
+
+        normalize_settings_shape(&mut value);
+
+        assert_eq!(value["searchApi"]["enabled"], Value::Bool(true));
+        assert_eq!(value["searchApi"]["scopes"]["classify"], Value::Bool(true));
+        assert_eq!(value["searchApi"]["scopes"]["organizer"], Value::Bool(true));
+    }
 }

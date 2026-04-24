@@ -2,7 +2,6 @@
  * src/main.js
  * 应用入口 — 路由管理与页面切换
  */
-import { renderScanner } from './pages/scanner.js';
 import { renderAdvisor } from './pages/advisor.js';
 import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
 import { browseFolder, getSettings, moveDataDir, openExternalUrl } from './utils/api.js';
@@ -11,10 +10,9 @@ import { initProviderManager } from './components/provider-manager.js';
 import { showToast } from './utils/toast.js';
 
 const pages = {
-    scanner: renderScanner,
+    advisor: renderAdvisor,
     organizer: renderOrganizer,
     'organizer-results': renderOrganizerResults,
-    advisor: renderAdvisor,
 };
 
 let currentPage = null;
@@ -68,19 +66,19 @@ function navigate(pageName) {
 
 function getPageFromHash() {
     const hash = normalizePageName(window.location.hash.replace('#/', ''));
-    return pages[hash] ? hash : 'scanner';
+    return pages[hash] ? hash : 'advisor';
 }
 
 function updateShellCopy() {
     const currentLang = getLang();
-    const scannerLabel = document.getElementById('nav-scanner-label');
-    const organizerLabel = document.getElementById('nav-organizer-label');
     const advisorLabel = document.getElementById('nav-advisor-label');
+    const organizerLabel = document.getElementById('nav-organizer-label');
+    const organizerResultsLabel = document.getElementById('nav-organizer-results-label');
     const bootSubtitle = document.getElementById('boot-subtitle');
     const bootHint = document.getElementById('boot-hint');
-    if (scannerLabel) scannerLabel.textContent = currentLang === 'en' ? 'Inventory' : '盘点';
-    if (organizerLabel) organizerLabel.textContent = currentLang === 'en' ? 'Organizer' : '归类';
     if (advisorLabel) advisorLabel.textContent = currentLang === 'en' ? 'Advisor' : '顾问';
+    if (organizerLabel) organizerLabel.textContent = t('nav.organizer');
+    if (organizerResultsLabel) organizerResultsLabel.textContent = t('nav.organizer_results');
     if (bootSubtitle) bootSubtitle.textContent = currentLang === 'en' ? 'Loading workspace...' : '正在加载工作台...';
     if (bootHint) bootHint.textContent = currentLang === 'en'
         ? 'The first dev-mode load may be slower while frontend assets connect.'

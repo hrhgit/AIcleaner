@@ -2,7 +2,7 @@ export const PERSIST_KEYS = {
     rootPath: 'wipeout.organizer.global.root_path.v2',
     exclusions: 'wipeout.organizer.global.exclusions.v2',
     batchSize: 'wipeout.organizer.global.batch_size.v2',
-    summaryMode: 'wipeout.organizer.global.summary_mode.v1',
+    summaryStrategy: 'wipeout.organizer.global.summary_strategy.v1',
     maxClusterDepth: 'wipeout.organizer.global.max_cluster_depth.v2',
     useWebSearch: 'wipeout.organizer.global.use_web_search.v2',
     modelRouting: 'wipeout.organizer.global.model_routing.v2',
@@ -121,7 +121,7 @@ export function persistForm(data) {
     setPersisted(PERSIST_KEYS.rootPath, data.rootPath);
     setPersisted(PERSIST_KEYS.exclusions, data.excludedPatterns);
     setPersisted(PERSIST_KEYS.batchSize, data.batchSize);
-    setPersisted(PERSIST_KEYS.summaryMode, data.summaryMode || DEFAULT_SUMMARY_MODE);
+    setPersisted(PERSIST_KEYS.summaryStrategy, data.summaryStrategy || DEFAULT_SUMMARY_MODE);
     setPersisted(PERSIST_KEYS.maxClusterDepth, data.maxClusterDepth);
     setPersisted(PERSIST_KEYS.useWebSearch, data.useWebSearch);
     setPersisted(PERSIST_KEYS.modelRouting, data.modelRouting || {});
@@ -133,7 +133,7 @@ export function restoreDefaults() {
         rootPath: getPersisted(PERSIST_KEYS.rootPath, ''),
         excludedPatterns: getPersisted(PERSIST_KEYS.exclusions, DEFAULT_EXCLUSIONS),
         batchSize: getPersisted(PERSIST_KEYS.batchSize, DEFAULT_BATCH_SIZE),
-        summaryMode: getPersisted(PERSIST_KEYS.summaryMode, DEFAULT_SUMMARY_MODE),
+        summaryStrategy: getPersisted(PERSIST_KEYS.summaryStrategy, DEFAULT_SUMMARY_MODE),
         maxClusterDepth: getPersisted(PERSIST_KEYS.maxClusterDepth, null),
         useWebSearch: getPersisted(PERSIST_KEYS.useWebSearch, null),
         modelRouting: modelRouting || {},

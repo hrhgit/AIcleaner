@@ -59,11 +59,7 @@ pub fn build_messages_url(endpoint: &str, format: ApiFormat) -> String {
     }
 }
 
-pub fn apply_auth_headers(
-    req: RequestBuilder,
-    format: ApiFormat,
-    api_key: &str,
-) -> RequestBuilder {
+pub fn apply_auth_headers(req: RequestBuilder, format: ApiFormat, api_key: &str) -> RequestBuilder {
     if api_key.trim().is_empty() {
         return req;
     }
@@ -88,13 +84,9 @@ pub fn build_completion_payload(
 ) -> Result<Value, String> {
     match format {
         ApiFormat::OpenAi => Ok(build_openai_payload(model, messages, tools, temperature)),
-        ApiFormat::Anthropic => build_anthropic_payload(
-            model,
-            messages,
-            tools,
-            temperature,
-            max_tokens.max(1),
-        ),
+        ApiFormat::Anthropic => {
+            build_anthropic_payload(model, messages, tools, temperature, max_tokens.max(1))
+        }
     }
 }
 
@@ -127,10 +119,7 @@ fn content_part_to_text(part: &Value) -> Option<String> {
         return Some(text.to_string());
     }
     match part.get("type").and_then(Value::as_str) {
-        Some("text") => part
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        Some("text") => part.get("text").and_then(Value::as_str).map(str::to_string),
         Some("output_text") => part
             .get("text")
             .or_else(|| part.get("content"))
@@ -218,7 +207,8 @@ fn build_anthropic_payload(
     }
     if let Some(tools) = tools.filter(|rows| !rows.is_empty()) {
         payload["tools"] = Value::Array(
-            tools.iter()
+            tools
+                .iter()
                 .filter_map(openai_tool_to_anthropic)
                 .collect::<Vec<_>>(),
         );
@@ -291,10 +281,12 @@ fn convert_messages_to_anthropic(messages: &[Value]) -> Result<(String, Vec<Valu
 fn anthropic_blocks_for_message(role: &str, message: &Value) -> Vec<Value> {
     if role == "assistant" {
         let existing = normalize_existing_anthropic_blocks(message.get("content"));
-        if existing
-            .iter()
-            .any(|block| matches!(block.get("type").and_then(Value::as_str), Some("tool_use" | "thinking")))
-        {
+        if existing.iter().any(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("tool_use" | "thinking")
+            )
+        }) {
             return existing;
         }
 
@@ -335,11 +327,14 @@ fn normalize_existing_anthropic_blocks(value: Option<&Value>) -> Vec<Value> {
     value
         .and_then(Value::as_array)
         .map(|parts| {
-            parts.iter()
+            parts
+                .iter()
                 .filter_map(|part| {
                     if part.get("type").is_some() {
                         Some(part.clone())
-                    } else if let Some(text) = part.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+                    } else if let Some(text) =
+                        part.as_str().map(str::trim).filter(|v| !v.is_empty())
+                    {
                         Some(json!({ "type": "text", "text": text }))
                     } else {
                         None
@@ -538,7 +533,8 @@ fn extract_tool_calls_from_anthropic_content(content: &Value) -> Vec<ParsedToolC
     content
         .as_array()
         .map(|parts| {
-            parts.iter()
+            parts
+                .iter()
                 .filter_map(|part| {
                     if part.get("type").and_then(Value::as_str) != Some("tool_use") {
                         return None;
@@ -638,8 +634,14 @@ mod tests {
         )
         .expect("payload");
 
-        assert_eq!(payload["system"], Value::String("system prompt".to_string()));
-        assert_eq!(payload["messages"][1]["role"], Value::String("assistant".to_string()));
+        assert_eq!(
+            payload["system"],
+            Value::String("system prompt".to_string())
+        );
+        assert_eq!(
+            payload["messages"][1]["role"],
+            Value::String("assistant".to_string())
+        );
         assert_eq!(
             payload["messages"][1]["content"][0]["type"],
             Value::String("thinking".to_string())
@@ -648,7 +650,10 @@ mod tests {
             payload["messages"][2]["content"][0]["type"],
             Value::String("tool_result".to_string())
         );
-        assert_eq!(payload["tools"][0]["name"], Value::String("find_files".to_string()));
+        assert_eq!(
+            payload["tools"][0]["name"],
+            Value::String("find_files".to_string())
+        );
     }
 
     #[test]
@@ -667,7 +672,10 @@ mod tests {
 
         let parsed =
             parse_completion_response(ApiFormat::Anthropic, StatusCode::OK, &raw).expect("parsed");
-        assert_eq!(parsed.assistant_text, "Need to inspect filesI need more context.");
+        assert_eq!(
+            parsed.assistant_text,
+            "Need to inspect filesI need more context."
+        );
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "find_files");
         assert_eq!(parsed.usage.total, 15);

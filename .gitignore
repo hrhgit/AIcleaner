@@ -3,7 +3,6 @@ dist/
 bin/*
 !bin/
 *.exe
-!bin/scanner.exe
 .env
 .env.*
 !.env.example
@@ -11,6 +10,4 @@ bin/*
 .codex-candidates.json
 AGENTS.md
 .encoding-policy.json
-
-native/scanner/target/
 src-tauri/target/

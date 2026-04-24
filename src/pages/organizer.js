@@ -203,8 +203,8 @@ function collectForm() {
   const maxClusterDepthInput = String(document.getElementById('org-max-cluster-depth')?.value || '').trim();
   const parsedMaxClusterDepth = maxClusterDepthInput ? Number(maxClusterDepthInput) : null;
   const useWebSearch = !!document.getElementById('org-enable-web-search')?.checked;
-  const summaryModeRaw = String(document.getElementById('org-summary-mode')?.value || '').trim();
-  const summaryMode = SUMMARY_MODES.includes(summaryModeRaw) ? summaryModeRaw : DEFAULT_SUMMARY_MODE;
+  const summaryStrategyRaw = String(document.getElementById('org-summary-mode')?.value || '').trim();
+  const summaryStrategy = SUMMARY_MODES.includes(summaryStrategyRaw) ? summaryStrategyRaw : DEFAULT_SUMMARY_MODE;
   const modelRouting = readModelRoutingFromDOM();
   const batchSize = Number.isFinite(batchSizeRaw)
     ? Math.max(1, Math.min(200, Math.floor(batchSizeRaw)))
@@ -218,7 +218,7 @@ function collectForm() {
     recursive,
     excludedPatterns: excludedPatterns.length ? excludedPatterns : [...DEFAULT_EXCLUSIONS],
     batchSize,
-    summaryMode,
+    summaryStrategy,
     maxClusterDepth,
     useWebSearch,
     modelRouting,
@@ -331,10 +331,24 @@ function getOrganizerSummaryModeDescription(mode) {
   return t('organizer.summary_mode_filename_only_hint');
 }
 
+function getOrganizerSummaryStrategy(value) {
+  const raw = typeof value === 'string'
+    ? value
+    : value?.summaryStrategy || value?.summaryMode || '';
+  return SUMMARY_MODES.includes(String(raw || '').trim()) ? String(raw).trim() : DEFAULT_SUMMARY_MODE;
+}
+
+function getOrganizerRepresentation(row = {}) {
+  return row?.representation && typeof row.representation === 'object'
+    ? row.representation
+    : {};
+}
+
 function getOrganizerSummaryText(row = {}) {
-  const summary = String(row.summary || '').trim();
+  const representation = getOrganizerRepresentation(row);
+  const summary = String(representation.long || representation.short || representation.metadata || '').trim();
   if (summary) return summary;
-  const summarySource = String(row.summarySource || '').trim();
+  const summarySource = String(representation.source || '').trim();
   if (summarySource === 'filename_only') return t('organizer.summary_placeholder_filename_only');
   if (summarySource === 'agent_fallback_local') return t('organizer.summary_placeholder_agent_fallback');
   return t('organizer.summary_placeholder_empty');
@@ -380,22 +394,27 @@ function getOrganizerSummarySourceLabel(source) {
 }
 
 function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } = {}) {
-  if (!row || String(row.summaryMode || '').trim() === 'filename_only') return '';
+  if (!row || getOrganizerSummaryStrategy(row) === 'filename_only') return '';
+  const representation = getOrganizerRepresentation(row);
   const extraction = row?.localExtraction && typeof row.localExtraction === 'object' ? row.localExtraction : null;
   const extractionKeywords = normalizeOrganizerLogStringList(extraction?.keywords);
   const extractionWarnings = normalizeOrganizerLogStringList(extraction?.warnings);
   const extractionMetadata = normalizeOrganizerLogStringList(extraction?.metadata);
-  const summaryKeywords = normalizeOrganizerLogStringList(row?.summaryKeywords);
+  const summaryKeywords = normalizeOrganizerLogStringList(representation?.keywords);
   const summaryWarnings = normalizeOrganizerLogStringList(row?.warnings ?? row?.summaryWarnings);
   const excerpt = String(extraction?.excerpt || '').trim();
-  const summary = String(row?.summary || '').trim();
+  const metadataSummary = String(representation?.metadata || '').trim();
+  const shortSummary = String(representation?.short || '').trim();
+  const longSummary = String(representation?.long || '').trim();
   const title = String(extraction?.title || '').trim();
   const parser = String(extraction?.parser || '').trim();
-  const confidence = String(row?.summaryConfidence || '').trim();
+  const confidence = String(representation?.confidence || '').trim();
 
   if (
     !extraction
-    && !summary
+    && !metadataSummary
+    && !shortSummary
+    && !longSummary
     && !summaryWarnings.length
     && !summaryKeywords.length
   ) {
@@ -407,8 +426,8 @@ function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } =
     `${organizerText('路径', 'Path')}: ${String(row?.path || '-').trim() || '-'}`,
     `${organizerText('分类', 'Category')}: ${category}`,
     `${organizerText('模型', 'Model')}: ${route}`,
-    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(row?.summaryMode || DEFAULT_SUMMARY_MODE)}`,
-    `${organizerText('摘要来源', 'Summary Source')}: ${getOrganizerSummarySourceLabel(row?.summarySource)}`,
+    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(getOrganizerSummaryStrategy(row))}`,
+    `${organizerText('摘要来源', 'Summary Source')}: ${getOrganizerSummarySourceLabel(representation?.source)}`,
     parser ? `${organizerText('提取器', 'Extractor')}: ${parser}` : '',
     title ? `${organizerText('标题', 'Title')}: ${title}` : '',
     confidence ? `${organizerText('置信度', 'Confidence')}: ${confidence}` : '',
@@ -418,7 +437,9 @@ function buildOrganizerLocalSummaryDetail(row, { category = '-', route = '-' } =
     summaryWarnings.length ? `${organizerText('摘要告警', 'Summary Warnings')}: ${summaryWarnings.join(' | ')}` : '',
     extractionMetadata.length ? `\n${organizerText('提取元数据', 'Extraction Metadata')}:\n${extractionMetadata.join('\n')}` : '',
     excerpt ? `\n${organizerText('本地提取摘录', 'Local Extraction Excerpt')}:\n${excerpt}` : '',
-    summary ? `\n${organizerText('最终摘要', 'Final Summary')}:\n${summary}` : '',
+    metadataSummary ? `\n${organizerText('元信息摘要', 'Metadata Summary')}:\n${metadataSummary}` : '',
+    shortSummary ? `\n${organizerText('短摘要', 'Short Summary')}:\n${shortSummary}` : '',
+    longSummary ? `\n${organizerText('长摘要', 'Long Summary')}:\n${longSummary}` : '',
   ].filter(Boolean).join('\n');
 
   return detail.trim();
@@ -845,7 +866,7 @@ function recordOrganizerStartLog(form, taskId, capability) {
     `${organizerText('目录', 'Root')}: ${form.rootPath || '-'}`,
     `${organizerText('批大小', 'Batch Size')}: ${Number(form.batchSize || DEFAULT_BATCH_SIZE)}`,
     `${organizerText('聚类深度', 'Cluster Depth')}: ${form.maxClusterDepth == null ? organizerText('不限', 'Unlimited') : Number(form.maxClusterDepth)}`,
-    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(form.summaryMode)}`,
+    `${organizerText('输入模式', 'Summary Mode')}: ${getOrganizerSummaryModeLabel(form.summaryStrategy)}`,
     `${organizerText('联网搜索', 'Web Search')}: ${form.useWebSearch ? organizerText('开启', 'Enabled') : organizerText('关闭', 'Disabled')}`,
     `${organizerText('文本路由', 'Text Route')}: ${formatOrganizerRouteLabel(textRoute.endpoint || selectedProviders.text, textRoute.model || selectedModels.text)}`,
   ].join('\n');
@@ -1265,12 +1286,13 @@ function renderPreview(snapshot) {
     const rows = items.map((item, rowIdx) => {
       const row = resultsMap.get(item.sourcePath);
       const summaryText = getOrganizerSummaryText(row);
-      const summarySource = String(row?.summarySource || '').trim();
-      const degraded = row?.degraded
+      const representation = getOrganizerRepresentation(row);
+      const summarySource = String(representation?.source || '').trim();
+      const degraded = representation?.degraded
         ? `<div style="margin-top:6px;"><span class="badge badge-warning">${t('organizer.degraded')}</span></div>`
         : '';
       const summaryBadge = summarySource
-        ? `<div style="margin-top:6px;"><span class="badge badge-info">${escapeHtml(getOrganizerSummaryModeLabel(row?.summaryMode || DEFAULT_SUMMARY_MODE))}</span></div>`
+        ? `<div style="margin-top:6px;"><span class="badge badge-info">${escapeHtml(getOrganizerSummaryModeLabel(getOrganizerSummaryStrategy(row)))}</span></div>`
         : '';
 
       return `
@@ -1481,9 +1503,7 @@ function syncBatchConfigInputs(snapshot) {
 
   const summaryModeSelect = document.getElementById('org-summary-mode');
   if (summaryModeSelect) {
-    const nextValue = SUMMARY_MODES.includes(String(snapshot.summaryMode || '').trim())
-      ? String(snapshot.summaryMode).trim()
-      : DEFAULT_SUMMARY_MODE;
+    const nextValue = getOrganizerSummaryStrategy(snapshot);
     if (String(summaryModeSelect.value || '') !== nextValue) {
       summaryModeSelect.value = nextValue;
     }
@@ -1541,7 +1561,7 @@ function connectTaskStream(taskId) {
         `${organizerText('状态', 'Status')}: ${String(snap?.status || 'completed')}`,
         `${organizerText('文件', 'Files')}: ${Number(snap?.processedFiles || 0)}/${Number(snap?.totalFiles || 0)}`,
         `${organizerText('批次', 'Batches')}: ${Number(snap?.processedBatches || 0)}/${Number(snap?.totalBatches || 0)}`,
-        `${organizerText('降级', 'Degraded')}: ${Number((snap?.results || []).filter((item) => item?.degraded).length)}`,
+        `${organizerText('降级', 'Degraded')}: ${Number((snap?.results || []).filter((item) => item?.representation?.degraded).length)}`,
         `${organizerText('Token', 'Token')}: ${Number(snap?.tokenUsage?.total || 0).toLocaleString()}`,
       ].join('\n');
       recordOrganizerTerminalLog(
@@ -1596,7 +1616,7 @@ function buildOptimisticRunningSnapshot(taskId, form, capability) {
     recursive: true,
     excludedPatterns: Array.isArray(form.excludedPatterns) ? form.excludedPatterns : [],
     batchSize: Number(form.batchSize) || DEFAULT_BATCH_SIZE,
-    summaryMode: form.summaryMode || DEFAULT_SUMMARY_MODE,
+    summaryStrategy: form.summaryStrategy || DEFAULT_SUMMARY_MODE,
     maxClusterDepth: form.maxClusterDepth ?? null,
     useWebSearch: !!form.useWebSearch,
     webSearchEnabled: !!form.useWebSearch,
@@ -1658,7 +1678,7 @@ async function handleStart() {
   const missingProviderSecret = Array.from(new Set(selectedEndpoints)).some((endpoint) => !getApiKeyForEndpoint(endpoint));
   let settingsSnapshot = await getSettings().catch(() => null);
   try {
-    settingsSnapshot = await syncSummaryModeTikaToSettings(form.summaryMode, settingsSnapshot);
+    settingsSnapshot = await syncSummaryModeTikaToSettings(form.summaryStrategy, settingsSnapshot);
   } catch (err) {
     console.warn('[Organizer] Failed to sync Tika setting for summary mode:', err);
   }
@@ -2297,11 +2317,11 @@ export async function renderOrganizer(container) {
               <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.summary_mode')}</label>
                 <select id="org-summary-mode" class="form-input">
-                  <option value="filename_only" ${defaults.summaryMode === 'filename_only' ? 'selected' : ''}>${t('organizer.summary_mode_filename_only')}</option>
-                  <option value="local_summary" ${defaults.summaryMode === 'local_summary' ? 'selected' : ''}>${t('organizer.summary_mode_local_summary')}</option>
-                  <option value="agent_summary" ${defaults.summaryMode === 'agent_summary' ? 'selected' : ''}>${t('organizer.summary_mode_agent_summary')}</option>
+                  <option value="filename_only" ${defaults.summaryStrategy === 'filename_only' ? 'selected' : ''}>${t('organizer.summary_mode_filename_only')}</option>
+                  <option value="local_summary" ${defaults.summaryStrategy === 'local_summary' ? 'selected' : ''}>${t('organizer.summary_mode_local_summary')}</option>
+                  <option value="agent_summary" ${defaults.summaryStrategy === 'agent_summary' ? 'selected' : ''}>${t('organizer.summary_mode_agent_summary')}</option>
                 </select>
-                <div class="form-hint" id="org-summary-mode-hint">${t(`organizer.summary_mode_${defaults.summaryMode || DEFAULT_SUMMARY_MODE}_hint`)}</div>
+                <div class="form-hint" id="org-summary-mode-hint">${t(`organizer.summary_mode_${defaults.summaryStrategy || DEFAULT_SUMMARY_MODE}_hint`)}</div>
               </div>
               <div class="form-group organizer-metric-field">
                 <label class="form-label">${t('organizer.max_cluster_depth')}</label>

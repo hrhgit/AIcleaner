@@ -1,9 +1,10 @@
 mod advisor_runtime;
 mod backend;
+mod diagnostics;
+mod file_representation;
 mod llm_protocol;
 mod organizer_runtime;
 mod persist;
-mod scan_runtime;
 mod system_ops;
 mod web_search;
 
@@ -32,12 +33,6 @@ pub fn run() {
             backend::system_get_privilege,
             backend::system_request_elevation,
             backend::system_open_external_url,
-            backend::scan_get_active,
-            backend::scan_list_history,
-            backend::scan_delete_history,
-            backend::scan_start,
-            backend::scan_stop,
-            backend::scan_get_result,
             backend::organize_get_capability,
             backend::organize_start,
             backend::organize_stop,

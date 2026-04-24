@@ -71,40 +71,6 @@ if ($needsInstall) {
   Write-Skip "node_modules up to date"
 }
 
-# --- Native scanner: rebuild only when source files changed ---
-
-Write-Step "Native scanner"
-
-$scannerSrc        = Join-Path $PSScriptRoot "native\scanner"
-$scannerTarget     = Join-Path $PSScriptRoot "bin\scanner.exe"
-$needsScannerBuild = $Force -or (Test-SourceNewer $scannerSrc $scannerTarget)
-
-if ($needsScannerBuild) {
-  Write-Host "  Source changed or scanner.exe missing - building..." -ForegroundColor DarkGray
-  Push-Location $scannerSrc
-  try {
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "Native scanner build failed." }
-  } finally {
-    Pop-Location
-  }
-
-  $built = Join-Path $PSScriptRoot "native\scanner\target\release\scanner.exe"
-  if (-not (Test-Path $built)) { throw "scanner.exe not produced at: $built" }
-
-  if (-not (Test-Path (Join-Path $PSScriptRoot "bin"))) {
-    New-Item -ItemType Directory -Path (Join-Path $PSScriptRoot "bin") | Out-Null
-  }
-  Copy-Item $built $scannerTarget -Force
-  Write-Ok "scanner.exe updated -> bin\scanner.exe"
-} else {
-  Write-Skip "scanner.exe up to date"
-}
-
-if (-not (Test-Path $scannerTarget)) {
-  throw "bin\scanner.exe is missing and could not be built."
-}
-
 # --- Tauri release build (Cargo handles incremental compilation automatically) ---
 
 Write-Step "Tauri release build (Cargo handles incremental compilation)"

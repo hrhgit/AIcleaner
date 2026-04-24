@@ -6,11 +6,11 @@ use crate::llm_protocol::{
     parse_completion_response, DEFAULT_MAX_TOKENS,
 };
 use reqwest::StatusCode;
-use serde_json::Value;
-use std::time::Duration;
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use serde_json::json;
+use serde_json::json as test_json;
 
 const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
 const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
@@ -75,11 +75,20 @@ impl<'a> AdvisorLlm<'a> {
         &self,
         messages: &[Value],
         tools: &[Value],
+        session_id: Option<&str>,
     ) -> Result<AdvisorCompletionOutput, String> {
         let route = self.resolve_route(None, None)?;
-        chat_completion(&route, messages, Some(tools))
-            .await
-            .map_err(|err| render_chat_error(&err))
+        let operation_id = crate::diagnostics::new_operation_id();
+        chat_completion(
+            self.state,
+            &route,
+            messages,
+            Some(tools),
+            &operation_id,
+            session_id,
+        )
+        .await
+        .map_err(|err| render_chat_error(&err))
     }
 }
 
@@ -87,7 +96,11 @@ fn render_chat_error(err: &ChatCompletionError) -> String {
     if err.raw_body.trim().is_empty() {
         err.message.clone()
     } else {
-        format!("{} | body: {}", err.message, summarize_response_body(&err.raw_body))
+        format!(
+            "{} | body: {}",
+            err.message,
+            summarize_response_body(&err.raw_body)
+        )
     }
 }
 
@@ -131,9 +144,12 @@ fn parse_chat_completion_http_body(
 }
 
 async fn chat_completion(
+    state: &AppState,
     route: &AdvisorModelRoute,
     messages: &[Value],
     tools: Option<&[Value]>,
+    operation_id: &str,
+    session_id: Option<&str>,
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
     let api_format = detect_api_format(&route.endpoint);
     let url = build_messages_url(&route.endpoint, api_format);
@@ -157,22 +173,101 @@ async fn chat_completion(
         message,
         raw_body: String::new(),
     })?;
+    let started_at = Instant::now();
+    crate::diagnostics::record_state_event(
+        state,
+        "info",
+        "advisor",
+        "advisor_model_request",
+        Some(operation_id),
+        "advisor model request started",
+        json!({
+            "sessionId": session_id.unwrap_or(""),
+            "endpoint": route.endpoint.clone(),
+            "model": route.model.clone(),
+            "url": url.clone(),
+            "messages": messages,
+            "tools": tools.unwrap_or(&[]),
+            "payload": payload.clone(),
+        }),
+        None,
+        None,
+    );
 
     let req = client
-        .post(url)
+        .post(url.clone())
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .json(&payload);
     let req = apply_auth_headers(req, api_format, &route.api_key);
-    let resp = req.send().await.map_err(|e| ChatCompletionError {
-        message: e.to_string(),
-        raw_body: String::new(),
-    })?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            crate::diagnostics::record_state_event(
+                state,
+                "error",
+                "advisor",
+                "advisor_model_error",
+                Some(operation_id),
+                "advisor model request failed",
+                json!({
+                    "sessionId": session_id.unwrap_or(""),
+                    "endpoint": route.endpoint.clone(),
+                    "model": route.model.clone(),
+                    "url": url.clone(),
+                }),
+                Some(json!({ "message": e.to_string() })),
+                Some(started_at.elapsed()),
+            );
+            return Err(ChatCompletionError {
+                message: e.to_string(),
+                raw_body: String::new(),
+            });
+        }
+    };
     let status = resp.status();
-    let raw_body = resp.text().await.map_err(|e| ChatCompletionError {
-        message: format!("error reading response body: {e}"),
-        raw_body: String::new(),
-    })?;
+    let raw_body = match resp.text().await {
+        Ok(raw_body) => raw_body,
+        Err(e) => {
+            crate::diagnostics::record_state_event(
+                state,
+                "error",
+                "advisor",
+                "advisor_model_error",
+                Some(operation_id),
+                "advisor model response body read failed",
+                json!({
+                    "sessionId": session_id.unwrap_or(""),
+                    "endpoint": route.endpoint.clone(),
+                    "model": route.model.clone(),
+                    "status": status.as_u16(),
+                }),
+                Some(json!({ "message": e.to_string() })),
+                Some(started_at.elapsed()),
+            );
+            return Err(ChatCompletionError {
+                message: format!("error reading response body: {e}"),
+                raw_body: String::new(),
+            });
+        }
+    };
+    crate::diagnostics::record_state_event(
+        state,
+        if status.is_success() { "info" } else { "error" },
+        "advisor",
+        "advisor_model_response",
+        Some(operation_id),
+        "advisor model response received",
+        json!({
+            "sessionId": session_id.unwrap_or(""),
+            "endpoint": route.endpoint.clone(),
+            "model": route.model.clone(),
+            "status": status.as_u16(),
+            "rawBody": raw_body.clone(),
+        }),
+        None,
+        Some(started_at.elapsed()),
+    );
     parse_chat_completion_http_body(route, status, &raw_body)
 }
 
@@ -190,7 +285,7 @@ mod tests {
 
     #[test]
     fn parses_tool_call_arguments_from_string() {
-        let raw = json!({
+        let raw = test_json!({
             "choices": [{
                 "finish_reason": "tool_calls",
                 "message": {
@@ -217,7 +312,7 @@ mod tests {
 
     #[test]
     fn parses_content_array_and_multiple_tool_calls() {
-        let raw = json!({
+        let raw = test_json!({
             "choices": [{
                 "finish_reason": "tool_calls",
                 "message": {
@@ -253,7 +348,7 @@ mod tests {
 
     #[test]
     fn parses_plain_final_reply() {
-        let raw = json!({
+        let raw = test_json!({
             "choices": [{
                 "finish_reason": "stop",
                 "message": {

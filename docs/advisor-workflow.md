@@ -46,17 +46,17 @@
 
 1. 为文件生成摘要。
 2. 为目录生成摘要。
-3. 支持 `metadata_summary`、`model_summary_short`、`model_summary_normal` 三种摘要模式。
-4. 默认批量摘要使用 `model_summary_short`。
-5. 用户明确要求更详细时，或 AI 判断当前信息不足时，再使用 `model_summary_normal`。
+3. 统一输出 `representation` 对象，包含 `metadata`、`short`、`long`、`source`、`degraded`、`confidence`、`keywords`。
+4. `summarize_files` 与 `read_only_file_summaries` 使用 `representationLevel` 控制返回层级，取值为 `metadata`、`short`、`long`。
+5. 归类页的摘要策略另行使用 `filename_only`、`local_summary`、`agent_summary`，其结果同样落到 `representation`。
 6. 摘要结果写入数据库。
 7. 支持系统流程调用，也支持顾问对话中按需调用。
 8. 支持批量输入。
-9. 支持并发请求。
-10. 支持分批、重试、降并发等调度兜底。
-11. 调度兜底后仍失败时返回错误结果。
-12. 不自动退回到 `metadata_summary`。
-13. 是否改用 `metadata_summary` 由用户决定。
+9. 支持通过 `batchSize` 分批，并通过 `maxConcurrency + Semaphore` 控制并发请求。
+10. 当出现超时、连接失败或 HTTP `408/429/500/502/503/504` 时，摘要调度会保留已成功结果，并对失败项做重试与降并发兜底。
+11. 调度兜底后仍失败时返回错误结果，并返回 scheduler 统计信息。
+12. 不自动把失败项退回到 `metadata` 层级。
+13. 是否改用 `metadata` 层级由用户或上层流程决定。
 14. 输出摘要置信度。
 15. 输出摘要 warnings。
 
@@ -234,8 +234,15 @@
    - `categoryId`
    - `sizeText`
    - `modifiedAgeText`
-   - `summaryShort`
-      - 无摘要时为 `null`
+   - `representation`
+      - `metadata`
+      - `short`
+      - `long`
+      - `source`
+      - `degraded`
+      - `confidence`
+      - `keywords`
+      - 无摘要时各层字段可为 `null`
 
 说明：
 
@@ -264,10 +271,10 @@
 1. `sessionId`
 2. `paths`
 3. `categoryIds`
-4. `mode`
-   - `metadata_summary`
-   - `model_summary_short`
-   - `model_summary_normal`
+4. `representationLevel`
+   - `metadata`
+   - `short`
+   - `long`
 5. `missingOnly`
 6. `batchSize`
 7. `maxConcurrency`
@@ -278,27 +285,38 @@
    - `ok`
    - `error`
 2. `message`
-3. `mode`
+3. `representationLevel`
 4. `total`
 5. `completed`
 6. `failed`
 7. `items`
    - `path`
    - `name`
-   - `summaryShort`
-   - `summaryNormal`
+   - `representation`
+      - `metadata`
+      - `short`
+      - `long`
+      - `source`
+      - `degraded`
+      - `confidence`
+      - `keywords`
    - `warning`
 8. `errors`
    - `path`
    - `reason`
+9. `scheduler`
+   - `initialConcurrency`
+   - `finalConcurrency`
+   - `retryRounds`
+   - `degradedConcurrency`
 
 说明：
 
 1. 这个工具支持批量输入。
-2. 这个工具支持并发请求。
-3. 这个工具的内部实现要支持分批、重试、降并发。
-4. 如果因为批量限制、限流、超时或网络不稳定而最终无法完成，就返回 `status=error`。
-5. 不自动退回到 `metadata_summary`。
+2. 这个工具支持通过 `batchSize` 分批和通过 `maxConcurrency` 控制并发请求。
+3. 如果发生超时、连接失败或 HTTP `408/429/500/502/503/504`，调度器会保留已成功结果，并对失败项做重试和降并发。
+4. 如果调度兜底后仍无法完成，就返回 `status=error`。
+5. 不自动退回到 `metadata` 层级。
 
 ### 6.4 `read_only_file_summaries`
 
@@ -319,9 +337,10 @@
 1. `sessionId`
 2. `paths`
 3. `categoryIds`
-4. `detailLevel`
+4. `representationLevel`
+   - `metadata`
    - `short`
-   - `normal`
+   - `long`
 5. `limit`
 
 输出：
@@ -331,8 +350,14 @@
 3. `items`
    - `path`
    - `name`
-   - `summaryShort`
-   - `summaryNormal`
+   - `representation`
+      - `metadata`
+      - `short`
+      - `long`
+      - `source`
+      - `degraded`
+      - `confidence`
+      - `keywords`
 
 ### 6.5 `capture_preference`
 
@@ -739,7 +764,7 @@
 
 1. 当前工作目录。
 2. 顾问模式。
-3. 最近可复用的盘点来源。
+3. 最近可复用的归类结果。
 4. 启动会话入口。
 
 初始化区行为：
@@ -749,7 +774,7 @@
 3. 折叠后的上下文条持续显示：
    - 当前目录
    - 当前模式
-   - 当前盘点来源
+   - 当前归类来源
    - 展开入口
 4. 用户可以再次展开上下文条，重新选择目录、切换模式或重建会话。
 

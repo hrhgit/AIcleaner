@@ -1,43 +1,16 @@
-use crate::backend::{OrganizeSnapshot, ScanResultItem, ScanSnapshot, TokenUsage};
+use crate::backend::OrganizeSnapshot;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha1::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 const ORGANIZER_SCHEMA_VERSION: &str = "tree_v2";
-const SCAN_CACHE_MAINTENANCE_VERSION: &str = "scan_cache_v2";
-const SCAN_DRAFT_SCHEMA_VERSION: &str = "scan_draft_v1";
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ScanNode {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub path: String,
-    pub name: String,
-    pub node_type: String,
-    pub depth: u32,
-    pub self_size: u64,
-    pub size: u64,
-    pub child_count: u64,
-    pub mtime_ms: Option<i64>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct ScanFindingRecord {
-    pub item: ScanResultItem,
-    pub should_expand: bool,
-}
 
 static FULL_DB_BOOTSTRAP_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static SCAN_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ORGANIZER_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ADVISOR_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static SCAN_MODULE_PREPARED_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ORGANIZER_MODULE_PREPARED_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn open_db_raw(db_path: &Path) -> Result<Connection, String> {
@@ -85,13 +58,6 @@ fn ensure_db_bootstrapped(db_path: &Path) -> Result<(), String> {
     })
 }
 
-pub(crate) fn ensure_scan_read_ready(db_path: &Path) -> Result<(), String> {
-    run_cached_db_action(&SCAN_READ_READY_CACHE, db_path, || {
-        let conn = open_db_raw(db_path)?;
-        ensure_scan_schema(&conn)
-    })
-}
-
 pub(crate) fn ensure_organizer_read_ready(db_path: &Path) -> Result<(), String> {
     run_cached_db_action(&ORGANIZER_READ_READY_CACHE, db_path, || {
         let conn = open_db_raw(db_path)?;
@@ -103,13 +69,6 @@ pub(crate) fn ensure_advisor_read_ready(db_path: &Path) -> Result<(), String> {
     run_cached_db_action(&ADVISOR_READ_READY_CACHE, db_path, || {
         let conn = open_db_raw(db_path)?;
         ensure_advisor_read_schema(&conn)
-    })
-}
-
-pub(crate) fn prepare_scan_module_access(db_path: &Path) -> Result<(), String> {
-    ensure_scan_read_ready(db_path)?;
-    run_cached_db_action(&SCAN_MODULE_PREPARED_CACHE, db_path, || {
-        mark_stale_scan_tasks(db_path)
     })
 }
 
@@ -129,11 +88,6 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn parse_json_or_default<T: DeserializeOwned + Default>(raw: Option<String>) -> T {
-    raw.and_then(|x| serde_json::from_str::<T>(&x).ok())
-        .unwrap_or_default()
-}
-
 fn bool_to_i64(value: bool) -> i64 {
     if value {
         1
@@ -144,12 +98,10 @@ fn bool_to_i64(value: bool) -> i64 {
 
 mod advisor;
 mod organize;
-mod scan;
 mod schema;
 
 pub use advisor::*;
 pub use organize::*;
-pub use scan::*;
 pub use schema::*;
 
 pub fn create_node_id(path_value: &str) -> String {
@@ -170,72 +122,10 @@ pub fn create_root_path_key(path_value: &str) -> String {
     normalize_root_path(path_value)
 }
 
-fn is_same_or_descendant_path(path: &str, parent: &str) -> bool {
-    path == parent || path.starts_with(&format!("{parent}\\"))
-}
-
-fn path_depth(path: &str) -> usize {
-    normalize_root_path(path)
-        .split('\\')
-        .filter(|segment| !segment.is_empty())
-        .count()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScanStorage {
-    Committed,
-    Draft,
-}
-
-impl ScanStorage {
-    fn tasks_table(self) -> &'static str {
-        match self {
-            Self::Committed => "scan_tasks",
-            Self::Draft => "scan_drafts",
-        }
-    }
-
-    fn nodes_table(self) -> &'static str {
-        match self {
-            Self::Committed => "scan_nodes",
-            Self::Draft => "scan_draft_nodes",
-        }
-    }
-
-    fn findings_table(self) -> &'static str {
-        match self {
-            Self::Committed => "scan_findings",
-            Self::Draft => "scan_draft_findings",
-        }
-    }
-}
-
-fn resolve_scan_storage_by_task_id(
-    conn: &Connection,
-    task_id: &str,
-) -> Result<ScanStorage, String> {
-    let is_draft = conn
-        .query_row(
-            "SELECT 1 FROM scan_drafts WHERE task_id = ?1 LIMIT 1",
-            params![task_id],
-            |_row| Ok(()),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .is_some();
-    Ok(if is_draft {
-        ScanStorage::Draft
-    } else {
-        ScanStorage::Committed
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{
-        default_organize_summary_mode, OrganizeSnapshot, ScanSnapshot, TokenUsage,
-    };
+    use crate::backend::{default_organize_summary_strategy, TokenUsage};
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -247,41 +137,12 @@ mod tests {
     fn table_exists(conn: &Connection, table_name: &str) -> bool {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-            params![table_name],
+            rusqlite::params![table_name],
             |_row| Ok(()),
         )
         .optional()
         .expect("query sqlite_master")
         .is_some()
-    }
-
-    fn make_scan_snapshot(task_id: &str, root_path: &str) -> ScanSnapshot {
-        ScanSnapshot {
-            id: task_id.to_string(),
-            status: "idle".to_string(),
-            scan_mode: "full_rescan_incremental".to_string(),
-            baseline_task_id: None,
-            visible_latest: true,
-            root_path_key: create_root_path_key(root_path),
-            target_path: root_path.to_string(),
-            auto_analyze: true,
-            root_node_id: create_node_id(root_path),
-            configured_max_depth: Some(3),
-            max_scanned_depth: 0,
-            current_path: root_path.to_string(),
-            current_depth: 0,
-            scanned_count: 0,
-            total_entries: 0,
-            processed_entries: 0,
-            deletable_count: 0,
-            total_cleanable: 0,
-            target_size: 0,
-            token_usage: TokenUsage::default(),
-            deletable: Vec::new(),
-            permission_denied_count: 0,
-            permission_denied_paths: Vec::new(),
-            error_message: String::new(),
-        }
     }
 
     fn make_organize_snapshot(task_id: &str, root_path: &str) -> OrganizeSnapshot {
@@ -293,7 +154,7 @@ mod tests {
             recursive: true,
             excluded_patterns: vec!["node_modules".to_string()],
             batch_size: 20,
-            summary_mode: default_organize_summary_mode(),
+            summary_strategy: default_organize_summary_strategy(),
             max_cluster_depth: None,
             use_web_search: false,
             web_search_enabled: false,
@@ -354,7 +215,7 @@ mod tests {
         let raw_snapshot = conn
             .query_row(
                 "SELECT snapshot_json FROM organize_tasks WHERE task_id = ?1",
-                params![snapshot.id.clone()],
+                rusqlite::params![snapshot.id.clone()],
                 |row| row.get::<_, String>(0),
             )
             .expect("read snapshot json");
@@ -452,22 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_read_ready_does_not_initialize_advisor_or_organizer_tables() {
-        let db_path = temp_db_path("scan-read-ready");
-        ensure_scan_read_ready(&db_path).expect("ensure scan read ready");
-
-        let conn = open_db_raw(&db_path).expect("open raw db");
-        assert!(table_exists(&conn, "scan_tasks"));
-        assert!(table_exists(&conn, "scan_nodes"));
-        assert!(table_exists(&conn, "scan_findings"));
-        assert!(!table_exists(&conn, "organize_tasks"));
-        assert!(!table_exists(&conn, "advisor_sessions"));
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn advisor_read_ready_does_not_initialize_scan_or_organizer_tables() {
+    fn advisor_read_ready_does_not_initialize_organizer_tables() {
         let db_path = temp_db_path("advisor-read-ready");
         ensure_advisor_read_ready(&db_path).expect("ensure advisor read ready");
 
@@ -475,174 +321,20 @@ mod tests {
         assert!(table_exists(&conn, "advisor_sessions"));
         assert!(table_exists(&conn, "advisor_turns"));
         assert!(table_exists(&conn, "advisor_cards"));
-        assert!(!table_exists(&conn, "scan_tasks"));
         assert!(!table_exists(&conn, "organize_tasks"));
 
         let _ = fs::remove_file(db_path);
     }
 
     #[test]
-    fn scan_finding_write_skips_immediate_stat_refresh_but_delete_paths_recomputes_stats() {
-        let db_path = temp_db_path("scan-finding-stats");
-        init_db(&db_path).expect("init db");
+    fn organizer_read_ready_does_not_initialize_advisor_tables() {
+        let db_path = temp_db_path("organizer-read-ready");
+        ensure_organizer_read_ready(&db_path).expect("ensure organizer read ready");
 
-        let task_id = "scan_task";
-        let root_path = r"C:\scan-root";
-        init_scan_task(
-            &db_path,
-            task_id,
-            root_path,
-            0,
-            Some(3),
-            true,
-            None,
-            "full_rescan_incremental",
-            true,
-        )
-        .expect("init scan task");
-        let snapshot = make_scan_snapshot(task_id, root_path);
-        save_scan_snapshot(&db_path, &snapshot).expect("seed scan snapshot");
-
-        let item = ScanResultItem {
-            name: "alpha.txt".to_string(),
-            path: r"C:\scan-root\folder\alpha.txt".to_string(),
-            size: 4096,
-            item_type: "file".to_string(),
-            purpose: String::new(),
-            reason: "safe".to_string(),
-            risk: "low".to_string(),
-            classification: "safe_to_delete".to_string(),
-            source: "model".to_string(),
-        };
-        upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");
-
-        let before_refresh = load_scan_snapshot(&db_path, task_id)
-            .expect("load before refresh")
-            .expect("snapshot exists");
-        assert_eq!(before_refresh.deletable_count, 0);
-        assert_eq!(before_refresh.total_cleanable, 0);
-
-        refresh_scan_stats(&db_path, task_id).expect("refresh scan stats");
-        let after_refresh = load_scan_snapshot(&db_path, task_id)
-            .expect("load after refresh")
-            .expect("snapshot exists");
-        assert_eq!(after_refresh.deletable_count, 1);
-        assert_eq!(after_refresh.total_cleanable, 4096);
-
-        delete_scan_data_for_paths(&db_path, task_id, &[r"C:\scan-root\folder".to_string()])
-            .expect("delete scan data");
-        let after_delete = load_scan_snapshot(&db_path, task_id)
-            .expect("load after delete")
-            .expect("snapshot exists");
-        assert_eq!(after_delete.deletable_count, 0);
-        assert_eq!(after_delete.total_cleanable, 0);
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn delete_scan_descendants_recomputes_stats_after_pruning() {
-        let db_path = temp_db_path("scan-descendants-stats");
-        init_db(&db_path).expect("init db");
-
-        let task_id = "scan_desc";
-        let root_path = r"C:\scan-root";
-        init_scan_task(
-            &db_path,
-            task_id,
-            root_path,
-            0,
-            Some(3),
-            true,
-            None,
-            "full_rescan_incremental",
-            true,
-        )
-        .expect("init scan task");
-        let snapshot = make_scan_snapshot(task_id, root_path);
-        save_scan_snapshot(&db_path, &snapshot).expect("seed scan snapshot");
-
-        let item = ScanResultItem {
-            name: "deep.txt".to_string(),
-            path: r"C:\scan-root\folder\deep\deep.txt".to_string(),
-            size: 2048,
-            item_type: "file".to_string(),
-            purpose: String::new(),
-            reason: "safe".to_string(),
-            risk: "low".to_string(),
-            classification: "safe_to_delete".to_string(),
-            source: "model".to_string(),
-        };
-        upsert_scan_finding(&db_path, task_id, &item, false).expect("upsert finding");
-        refresh_scan_stats(&db_path, task_id).expect("refresh scan stats");
-
-        delete_scan_descendants_for_paths(&db_path, task_id, &[r"C:\scan-root\folder".to_string()])
-            .expect("delete descendants");
-        let after_delete = load_scan_snapshot(&db_path, task_id)
-            .expect("load after delete")
-            .expect("snapshot exists");
-        assert_eq!(after_delete.deletable_count, 0);
-        assert_eq!(after_delete.total_cleanable, 0);
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn init_db_cleans_residual_full_scan_drafts() {
-        let db_path = temp_db_path("scan-draft-cleanup");
-        init_db(&db_path).expect("init db");
-
-        let task_id = "scan_draft_task";
-        let root_path = r"C:\scan-root";
-        init_full_scan_draft(&db_path, task_id, root_path, 0, Some(2), true, None)
-            .expect("init full scan draft");
-        let mut snapshot = make_scan_snapshot(task_id, root_path);
-        snapshot.status = "scanning".to_string();
-        snapshot.visible_latest = false;
-        save_full_scan_draft_snapshot(&db_path, &snapshot).expect("save draft snapshot");
-
-        let before_cleanup = load_full_scan_draft_snapshot(&db_path, task_id)
-            .expect("load draft before cleanup")
-            .expect("draft exists before cleanup");
-        assert_eq!(before_cleanup.status, "scanning");
-
-        init_db(&db_path).expect("re-init db cleans drafts");
-        let after_cleanup =
-            load_full_scan_draft_snapshot(&db_path, task_id).expect("load draft after cleanup");
-        assert!(after_cleanup.is_none());
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn prepare_scan_module_access_marks_stale_scan_tasks() {
-        let db_path = temp_db_path("scan-module-prepare");
-        init_db(&db_path).expect("init db");
-
-        let task_id = "scan_stale_task";
-        let root_path = r"C:\scan-root";
-        init_scan_task(
-            &db_path,
-            task_id,
-            root_path,
-            0,
-            Some(2),
-            true,
-            None,
-            "full_rescan_incremental",
-            true,
-        )
-        .expect("init scan task");
-        let mut snapshot = make_scan_snapshot(task_id, root_path);
-        snapshot.status = "scanning".to_string();
-        save_scan_snapshot(&db_path, &snapshot).expect("save stale scan snapshot");
-
-        prepare_scan_module_access(&db_path).expect("prepare scan module access");
-
-        let prepared = load_scan_snapshot(&db_path, task_id)
-            .expect("load prepared snapshot")
-            .expect("snapshot exists");
-        assert_eq!(prepared.status, "stopped");
+        let conn = open_db_raw(&db_path).expect("open raw db");
+        assert!(table_exists(&conn, "organize_tasks"));
+        assert!(table_exists(&conn, "organize_results"));
+        assert!(!table_exists(&conn, "advisor_sessions"));
 
         let _ = fs::remove_file(db_path);
     }

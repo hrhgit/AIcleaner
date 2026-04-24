@@ -4,25 +4,64 @@ use super::types::{
     set_inventory_override, ContextAssets, DirectoryOverview, InventoryItem,
 };
 use crate::backend::AppState;
+use crate::file_representation::{FileRepresentation, RepresentationLevel};
 use crate::llm_protocol::{
     apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
     parse_completion_response, DEFAULT_MAX_TOKENS,
 };
-use crate::persist::{self, ScanFindingRecord};
+use crate::persist;
 use crate::system_ops;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+const FS_FALLBACK_MAX_FILES: usize = 500;
+const FS_FALLBACK_MAX_DIRS: usize = 1500;
+const FS_FALLBACK_MAX_DEPTH: usize = 5;
+const FS_FALLBACK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    "target",
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+];
 
 #[derive(Default)]
 struct TreeDraftNode {
     name: String,
     item_count: u64,
     children: BTreeMap<String, TreeDraftNode>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SummarySchedulerStats {
+    initial_concurrency: usize,
+    final_concurrency: usize,
+    retry_rounds: usize,
+    degraded_concurrency: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryErrorRow {
+    path: String,
+    reason: String,
+    retryable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryFailedItem {
+    item: InventoryItem,
+    error: SummaryErrorRow,
 }
 
 pub(super) struct ToolService<'a> {
@@ -37,12 +76,12 @@ impl<'a> ToolService<'a> {
     pub(super) fn get_directory_overview(
         &self,
         root_path: &str,
-        scan_task_id: Option<&str>,
+        organize_task_id: Option<&str>,
         session: Option<&Value>,
         response_language: &str,
     ) -> Result<DirectoryOverview, String> {
-        let assets = self.load_assets(root_path, scan_task_id)?;
-        let inventory = self.build_inventory(&assets, session);
+        let assets = self.load_assets(root_path, organize_task_id)?;
+        let inventory = self.build_inventory(root_path, &assets, session);
         let preferences = self.list_preferences(
             session
                 .and_then(|value| value.get("sessionId"))
@@ -57,7 +96,7 @@ impl<'a> ToolService<'a> {
             &inventory,
             &preferences,
             response_language,
-            derived_tree.is_some(),
+            assets.organize_snapshot.is_some() || assets.latest_tree.is_some(),
         );
         Ok(DirectoryOverview {
             assets,
@@ -79,7 +118,7 @@ impl<'a> ToolService<'a> {
                 .get("rootPath")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session_organize_task_id(session),
             Some(session),
             session
                 .get("responseLanguage")
@@ -100,13 +139,17 @@ impl<'a> ToolService<'a> {
         }))
     }
 
-    pub(super) fn find_files_by_args(&self, session: &Value, args: &Value) -> Result<Value, String> {
+    pub(super) fn find_files_by_args(
+        &self,
+        session: &Value,
+        args: &Value,
+    ) -> Result<Value, String> {
         let overview = self.get_directory_overview(
             session
                 .get("rootPath")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session_organize_task_id(session),
             Some(session),
             session
                 .get("responseLanguage")
@@ -253,9 +296,9 @@ impl<'a> ToolService<'a> {
                 .unwrap_or("review");
             let selection = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
                 .ok_or_else(|| {
-                    "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续生成预览。"
-                        .to_string()
-                })?;
+                "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续生成预览。"
+                    .to_string()
+            })?;
             ensure_session_owned(&selection, session_id, "selection")?;
             let items = selection
                 .get("items")
@@ -296,7 +339,11 @@ impl<'a> ToolService<'a> {
 
         let can_execute = all_entries
             .iter()
-            .filter(|row| row.get("canExecute").and_then(Value::as_bool).unwrap_or(false))
+            .filter(|row| {
+                row.get("canExecute")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
             .count();
         let preview_id = Uuid::new_v4().to_string();
         let preview = json!({
@@ -350,9 +397,8 @@ impl<'a> ToolService<'a> {
         session_id: &str,
         preview_id: &str,
     ) -> Result<(Value, Value, Value), String> {
-        self.execute_plan(session_id, preview_id).map_err(|_| {
-            "当前预览不存在或已过期，请先重新生成 preview，再执行。".to_string()
-        })
+        self.execute_plan(session_id, preview_id)
+            .map_err(|_| "当前预览不存在或已过期，请先重新生成 preview，再执行。".to_string())
     }
 
     pub(super) fn rollback_plan(
@@ -403,7 +449,7 @@ impl<'a> ToolService<'a> {
                 .get("rootPath")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session_organize_task_id(session),
             Some(session),
             session
                 .get("responseLanguage")
@@ -469,7 +515,7 @@ impl<'a> ToolService<'a> {
                 .get("rootPath")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session_organize_task_id(session),
             Some(session),
             session
                 .get("responseLanguage")
@@ -521,39 +567,34 @@ impl<'a> ToolService<'a> {
             .unwrap_or_default();
         let overview = self.get_directory_overview(
             root_path,
-            session.get("scanTaskId").and_then(Value::as_str),
+            session_organize_task_id(session),
             Some(session),
             lang,
         )?;
-        let mode = args
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("metadata_summary")
-            .trim()
-            .to_string();
+        let level =
+            RepresentationLevel::parse(args.get("representationLevel").and_then(Value::as_str));
         let selected = filter_inventory_by_args(&overview.inventory, args);
         let total = selected.len();
         let missing_only = args
             .get("missingOnly")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if mode == "metadata_summary" {
+        if level == RepresentationLevel::Metadata {
             let mut items = Vec::new();
             for item in selected {
                 if missing_only {
-                    if let Some(row) = load_summary_row(
-                        &self.state.db_path(),
-                        root_path,
-                        &item.path,
-                        mode.as_str(),
-                        true,
-                    )? {
-                        items.push(summary_row_to_tool_item(&row));
+                    if let Some(row) =
+                        load_summary_row(&self.state.db_path(), root_path, &item.path, level, true)?
+                    {
+                        items.push(summary_row_to_tool_item(
+                            &row,
+                            RepresentationLevel::Metadata,
+                        ));
                         continue;
                     }
                 }
-                let row = self.persist_summary(root_path, &item, &mode, None, None)?;
-                items.push(summary_row_to_tool_item(&row));
+                let row = self.persist_summary(root_path, &item, level, None)?;
+                items.push(summary_row_to_tool_item(&row, level));
             }
             return Ok(json!({
                 "status": "ok",
@@ -562,12 +603,18 @@ impl<'a> ToolService<'a> {
                     &format!("已完成 {} 条文件摘要。", items.len()),
                     &format!("Completed {} file summaries.", items.len())
                 ),
-                "mode": mode,
+                "representationLevel": level.as_str(),
                 "total": total,
                 "completed": items.len(),
                 "failed": 0,
                 "items": items,
                 "errors": [],
+                "scheduler": {
+                    "initialConcurrency": 1,
+                    "finalConcurrency": 1,
+                    "retryRounds": 0,
+                    "degradedConcurrency": false
+                },
             }));
         }
 
@@ -575,13 +622,9 @@ impl<'a> ToolService<'a> {
         let mut generation_items = Vec::new();
         for item in selected {
             if missing_only {
-                if let Some(row) = load_summary_row(
-                    &self.state.db_path(),
-                    root_path,
-                    &item.path,
-                    mode.as_str(),
-                    true,
-                )? {
+                if let Some(row) =
+                    load_summary_row(&self.state.db_path(), root_path, &item.path, level, true)?
+                {
                     cached_rows.push(row);
                     continue;
                 }
@@ -595,43 +638,25 @@ impl<'a> ToolService<'a> {
             .and_then(Value::as_u64)
             .unwrap_or(2) as usize;
         let route = AdvisorLlm::new(self.state).resolve_route(None, None)?;
-        let batches = generation_items
-            .chunks(batch_size.max(1))
-            .map(|rows| rows.to_vec())
-            .collect::<Vec<_>>();
-        let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
-        let mut set = tokio::task::JoinSet::new();
-        for batch in batches {
-            let permit = semaphore.clone().acquire_owned().await.map_err(|e| e.to_string())?;
-            let route = route.clone();
-            let root_path = root_path.to_string();
-            let mode = mode.clone();
-            let lang = lang.to_string();
-            set.spawn(async move {
-                let _permit = permit;
-                summarize_batch_with_model(
-                    &route,
-                    &root_path,
-                    &batch,
-                    &mode,
-                    &lang,
-                )
-                .await
-            });
-        }
-
         let mut rows = cached_rows;
-        let mut errors = Vec::new();
-        while let Some(result) = set.join_next().await {
-            match result.map_err(|e| e.to_string())? {
-                Ok(batch_rows) => rows.extend(batch_rows),
-                Err(batch_errors) => errors.extend(batch_errors),
-            }
-        }
+        let (generated_rows, errors, scheduler) = run_summary_scheduler(
+            &route,
+            root_path,
+            &generation_items,
+            level,
+            lang,
+            batch_size.max(1),
+            max_concurrency.max(1),
+        )
+        .await?;
+        rows.extend(generated_rows);
         for row in &rows {
             persist::save_advisor_file_summary(&self.state.db_path(), row)?;
         }
-        let items = rows.iter().map(summary_row_to_tool_item).collect::<Vec<_>>();
+        let items = rows
+            .iter()
+            .map(|row| summary_row_to_tool_item(row, level))
+            .collect::<Vec<_>>();
         Ok(json!({
             "status": if errors.is_empty() { "ok" } else { "error" },
             "message": if errors.is_empty() {
@@ -647,12 +672,21 @@ impl<'a> ToolService<'a> {
                     "Some summaries failed. Check errors and retry."
                 ).to_string())
             },
-            "mode": mode,
+            "representationLevel": level.as_str(),
             "total": total,
             "completed": items.len(),
             "failed": errors.len(),
             "items": items,
-            "errors": errors,
+            "errors": errors.into_iter().map(|error| json!({
+                "path": error.path,
+                "reason": error.reason,
+            })).collect::<Vec<_>>(),
+            "scheduler": {
+                "initialConcurrency": scheduler.initial_concurrency,
+                "finalConcurrency": scheduler.final_concurrency,
+                "retryRounds": scheduler.retry_rounds,
+                "degradedConcurrency": scheduler.degraded_concurrency,
+            },
         }))
     }
 
@@ -662,25 +696,29 @@ impl<'a> ToolService<'a> {
         args: &Value,
     ) -> Result<Value, String> {
         let overview = self.get_directory_overview(
-            session.get("rootPath").and_then(Value::as_str).unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session
+                .get("rootPath")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            session_organize_task_id(session),
             Some(session),
             session
                 .get("responseLanguage")
                 .and_then(Value::as_str)
                 .unwrap_or("zh"),
         )?;
-        let detail_level = args
-            .get("detailLevel")
-            .and_then(Value::as_str)
-            .unwrap_or("short");
+        let level =
+            RepresentationLevel::parse(args.get("representationLevel").and_then(Value::as_str));
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(24) as usize;
-        let root_path = session.get("rootPath").and_then(Value::as_str).unwrap_or_default();
+        let root_path = session
+            .get("rootPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let items = filter_inventory_by_args(&overview.inventory, args)
             .into_iter()
             .take(limit)
             .filter_map(|item| {
-                read_existing_summary_item(&self.state.db_path(), root_path, &item, detail_level)
+                read_existing_summary_item(&self.state.db_path(), root_path, &item, level)
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -699,21 +737,22 @@ impl<'a> ToolService<'a> {
         &self,
         root_path: &str,
         item: &InventoryItem,
-        mode: &str,
-        summary_short: Option<String>,
-        summary_normal: Option<String>,
+        level: RepresentationLevel,
+        representation: Option<FileRepresentation>,
     ) -> Result<Value, String> {
-        let short = summary_short.unwrap_or_else(|| metadata_summary_short(item));
-        let normal = summary_normal.unwrap_or_else(|| metadata_summary_normal(item));
+        let representation = representation
+            .unwrap_or_else(|| metadata_representation(item))
+            .prune_to_level(level);
         let row = json!({
             "rootPathKey": persist::create_root_path_key(root_path),
             "pathKey": persist::create_root_path_key(&item.path),
             "path": item.path,
             "name": item.name,
-            "summaryShort": short,
-            "summaryNormal": normal,
-            "source": if mode == "metadata_summary" { "metadata" } else { "model" },
-            "mode": mode,
+            "representation": representation.to_value(),
+            "summaryShort": representation.short.clone(),
+            "summaryNormal": representation.long.clone(),
+            "source": representation.source,
+            "representationLevel": level.as_str(),
             "updatedAt": now_iso(),
         });
         persist::save_advisor_file_summary(&self.state.db_path(), &row)?;
@@ -741,9 +780,15 @@ impl<'a> ToolService<'a> {
                 let target_category_id = required_change_str(&change, "targetCategoryId")?;
                 let selection = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
                     .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
-                let items = selection.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+                let items = selection
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 let category_path = category_path_from_category_id(session, target_category_id)?
-                    .ok_or_else(|| "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string())?;
+                    .ok_or_else(|| {
+                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+                    })?;
                 apply_reclassification_selection(session, &items, &category_path)?
             }
             "split_selection_to_new_category" => {
@@ -752,9 +797,14 @@ impl<'a> ToolService<'a> {
                 let new_category_name = required_change_str(&change, "newCategoryName")?;
                 let selection = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
                     .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
-                let items = selection.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
-                let mut category_path = category_path_from_category_id(session, source_category_id)?
+                let items = selection
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
                     .unwrap_or_default();
+                let mut category_path =
+                    category_path_from_category_id(session, source_category_id)?
+                        .unwrap_or_default();
                 category_path.push(new_category_name.to_string());
                 apply_reclassification_selection(session, &items, &category_path)?
             }
@@ -763,7 +813,7 @@ impl<'a> ToolService<'a> {
             "delete_empty_category" => delete_empty_category(session, &change)?,
             _ => {
                 return Err(
-                    "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+                    "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string(),
                 )
             }
         };
@@ -786,10 +836,16 @@ impl<'a> ToolService<'a> {
             )?;
         }
         let overview = self.get_directory_overview(
-            session.get("rootPath").and_then(Value::as_str).unwrap_or_default(),
-            session.get("scanTaskId").and_then(Value::as_str),
+            session
+                .get("rootPath")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            session_organize_task_id(session),
             Some(session),
-            session.get("responseLanguage").and_then(Value::as_str).unwrap_or("zh"),
+            session
+                .get("responseLanguage")
+                .and_then(Value::as_str)
+                .unwrap_or("zh"),
         )?;
         Ok(json!({
             "jobId": Uuid::new_v4().to_string(),
@@ -818,29 +874,18 @@ impl<'a> ToolService<'a> {
     fn load_assets(
         &self,
         root_path: &str,
-        scan_task_id: Option<&str>,
+        organize_task_id: Option<&str>,
     ) -> Result<ContextAssets, String> {
         let db_path = self.state.db_path();
-        let resolved_scan_task_id = if let Some(task_id) = scan_task_id
+        let resolved_organize_task_id = if let Some(task_id) = organize_task_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
             Some(task_id.to_string())
         } else {
-            persist::find_latest_visible_scan_task_id_for_path(&db_path, root_path)?
+            persist::find_latest_organize_task_id_for_root(&db_path, root_path)?
         };
-        let scan_snapshot = resolved_scan_task_id
-            .as_deref()
-            .map(|task_id| persist::load_scan_snapshot(&db_path, task_id))
-            .transpose()?
-            .flatten();
-        let finding_map = resolved_scan_task_id
-            .as_deref()
-            .map(|task_id| persist::load_scan_findings_map(&db_path, task_id))
-            .transpose()?
-            .unwrap_or_default();
-        let organize_task_id = persist::find_latest_organize_task_id_for_root(&db_path, root_path)?;
-        let organize_snapshot = organize_task_id
+        let organize_snapshot = resolved_organize_task_id
             .as_deref()
             .map(|task_id| persist::load_organize_snapshot(&db_path, task_id))
             .transpose()?
@@ -850,17 +895,15 @@ impl<'a> ToolService<'a> {
             .or_else(|| organize_snapshot.as_ref().map(|row| row.tree.clone()));
 
         Ok(ContextAssets {
-            scan_task_id: resolved_scan_task_id,
-            scan_snapshot,
-            organize_task_id,
+            organize_task_id: resolved_organize_task_id,
             organize_snapshot,
             latest_tree,
-            finding_map,
         })
     }
 
     fn build_inventory(
         &self,
+        root_path: &str,
         assets: &ContextAssets,
         session: Option<&Value>,
     ) -> Vec<InventoryItem> {
@@ -881,18 +924,8 @@ impl<'a> ToolService<'a> {
                     continue;
                 }
                 let key = normalize_path_key(&path);
-                let summary = row
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .or_else(|| row.get("reason").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let risk = assets
-                    .finding_map
-                    .get(&key)
-                    .map(|record| record.item.risk.clone())
-                    .unwrap_or_else(|| "medium".to_string());
+                let representation = representation_from_organize_row(row);
+                let summary = representation.best_text();
                 let mut category_path = overrides
                     .get(&key)
                     .cloned()
@@ -920,61 +953,16 @@ impl<'a> ToolService<'a> {
                         category_id,
                         parent_category_id,
                         category_path,
-                        summary_short: if summary.is_empty() { None } else { Some(summary.clone()) },
-                        summary_normal: if summary.is_empty() { None } else { Some(summary) },
-                        risk,
-                        source: "organize".to_string(),
+                        representation,
+                        risk: "medium".to_string(),
                     },
                 );
             }
         }
 
-        if let Some(snapshot) = &assets.scan_snapshot {
-            for row in &snapshot.deletable {
-                let key = normalize_path_key(&row.path);
-                if map.contains_key(&key) {
-                    continue;
-                }
-                let mut category_path = overrides.get(&key).cloned().unwrap_or_else(|| {
-                    assets
-                        .finding_map
-                        .get(&key)
-                        .map(derive_scan_category)
-                        .unwrap_or_default()
-                });
-                if category_path.is_empty() {
-                    category_path.push("其他待定".to_string());
-                }
-                let category_id = category_id_from_path(&category_path);
-                let parent_category_id = parent_category_id_from_path(&category_path);
-                let (created_at, modified_at) =
-                    infer_inventory_timestamps(&row.path, None, None);
-                map.insert(
-                    key,
-                    InventoryItem {
-                        name: row.name.clone(),
-                        path: row.path.clone(),
-                        size: row.size,
-                        created_at,
-                        modified_at,
-                        kind: infer_kind(&row.path, &row.reason, row.classification.trim()),
-                        category_id,
-                        parent_category_id,
-                        category_path,
-                        summary_short: if row.reason.trim().is_empty() {
-                            None
-                        } else {
-                            Some(row.reason.clone())
-                        },
-                        summary_normal: if row.reason.trim().is_empty() {
-                            None
-                        } else {
-                            Some(row.reason.clone())
-                        },
-                        risk: row.risk.clone(),
-                        source: "scan".to_string(),
-                    },
-                );
+        if map.is_empty() {
+            for item in collect_inventory_from_fs(root_path, &overrides) {
+                map.insert(normalize_path_key(&item.path), item);
             }
         }
 
@@ -999,7 +987,12 @@ pub(super) fn build_context_bar(
     tree_available: bool,
 ) -> Value {
     let memory_summary_message = if preferences.is_empty() {
-        local_text(lang, "当前没有已保存偏好。", "No saved preferences are active.").to_string()
+        local_text(
+            lang,
+            "当前没有已保存偏好。",
+            "No saved preferences are active.",
+        )
+        .to_string()
     } else {
         local_text(
             lang,
@@ -1021,12 +1014,7 @@ pub(super) fn build_context_bar(
             "id": "single_agent",
             "label": local_text(lang, "顾问模式：单智能体", "Advisor Mode: Single Agent")
         },
-        "scanTaskId": assets.scan_task_id,
         "organizeTaskId": assets.organize_task_id,
-        "scanSummary": {
-            "deletableCount": assets.scan_snapshot.as_ref().map(|row| row.deletable_count).unwrap_or(0),
-            "totalCleanable": assets.scan_snapshot.as_ref().map(|row| row.total_cleanable).unwrap_or(0),
-        },
         "organizeSummary": {
             "totalFiles": assets.organize_snapshot.as_ref().map(|row| row.total_files).unwrap_or(0),
             "processedFiles": assets.organize_snapshot.as_ref().map(|row| row.processed_files).unwrap_or(0),
@@ -1035,13 +1023,13 @@ pub(super) fn build_context_bar(
             "activeCount": preferences.len(),
             "message": memory_summary_message,
         },
-        "inventorySummary": {
+        "directorySummary": {
             "itemCount": inventory.len(),
             "treeAvailable": tree_available,
             "message": if tree_available {
-                local_text(lang, "已载入最近一次整理树，可直接对话收敛方案。", "Latest organize tree loaded and ready for guided cleanup.")
+                local_text(lang, "已载入最近一次归类结果，可直接对话收敛方案。", "Latest organize result loaded and ready for guided cleanup.")
             } else {
-                local_text(lang, "当前没有可复用的整理树，会话先停留在理解阶段。", "No reusable organize tree is available yet, so the session stays in understand mode.")
+                local_text(lang, "当前没有可复用的归类结果，顾问会先基于目录元信息工作。", "No reusable organize result is available yet, so advisor starts from directory metadata.")
             }
         }
     })
@@ -1198,15 +1186,10 @@ fn infer_kind(path: &str, summary: &str, fallback: &str) -> String {
     }
 }
 
-fn derive_scan_category(item: &ScanFindingRecord) -> Vec<String> {
-    match item.item.classification.trim() {
-        "installer" => vec!["安装包".to_string()],
-        "archive" => vec!["压缩包".to_string()],
-        "screenshot" => vec!["截图".to_string()],
-        "temp" => vec!["临时文件".to_string()],
-        "log" => vec!["日志".to_string()],
-        _ => Vec::new(),
-    }
+fn session_organize_task_id(session: &Value) -> Option<&str> {
+    session
+        .pointer("/sessionMeta/organizeTaskId")
+        .and_then(Value::as_str)
 }
 
 fn create_selection(
@@ -1233,10 +1216,8 @@ fn create_selection(
             "categoryId": item.category_id,
             "parentCategoryId": item.parent_category_id,
             "categoryPath": item.category_path,
-            "summaryShort": item.summary_short.clone().unwrap_or_else(|| metadata_summary_short(item)),
-            "summaryNormal": item.summary_normal.clone().unwrap_or_else(|| metadata_summary_normal(item)),
+            "representation": item.representation.to_value(),
             "risk": item.risk,
-            "source": item.source,
         })).collect::<Vec<_>>(),
         "createdAt": now,
         "updatedAt": now,
@@ -1537,11 +1518,16 @@ fn parent_category_id_from_path(category_path: &[String]) -> Option<String> {
     if category_path.len() <= 1 {
         None
     } else {
-        Some(category_id_from_path(&category_path[..category_path.len() - 1]))
+        Some(category_id_from_path(
+            &category_path[..category_path.len() - 1],
+        ))
     }
 }
 
-fn category_path_from_category_id(session: &Value, category_id: &str) -> Result<Option<Vec<String>>, String> {
+fn category_path_from_category_id(
+    session: &Value,
+    category_id: &str,
+) -> Result<Option<Vec<String>>, String> {
     let tree = session.get("derivedTree").cloned().unwrap_or(Value::Null);
     Ok(find_category_path_in_tree(&tree, category_id))
 }
@@ -1553,7 +1539,11 @@ fn find_category_path_in_tree(tree: &Value, category_id: &str) -> Option<Vec<Str
     }
     obj.get("children")
         .and_then(Value::as_array)
-        .and_then(|children| children.iter().find_map(|child| find_category_path_in_tree(child, category_id)))
+        .and_then(|children| {
+            children
+                .iter()
+                .find_map(|child| find_category_path_in_tree(child, category_id))
+        })
 }
 
 fn infer_inventory_timestamps(
@@ -1592,24 +1582,135 @@ fn metadata_summary_short(item: &InventoryItem) -> String {
     )
 }
 
-fn metadata_summary_normal(item: &InventoryItem) -> String {
-    let age = modified_age_text(item);
-    if age.is_empty() {
-        format!(
-            "{}，分类为 {}，大小 {}。",
-            item.name,
-            item.category_path.join(" / "),
-            format_size_text(item.size)
-        )
-    } else {
-        format!(
-            "{}，分类为 {}，大小 {}，{}。",
-            item.name,
-            item.category_path.join(" / "),
-            format_size_text(item.size),
-            age
-        )
+fn metadata_representation(item: &InventoryItem) -> FileRepresentation {
+    FileRepresentation {
+        metadata: Some(metadata_summary_short(item)),
+        short: None,
+        long: None,
+        source: "metadata".to_string(),
+        degraded: false,
+        confidence: None,
+        keywords: Vec::new(),
     }
+}
+
+fn representation_from_organize_row(row: &Value) -> FileRepresentation {
+    if let Some(value) = row.get("representation") {
+        let parsed = FileRepresentation::from_value(value);
+        if parsed.has_level(RepresentationLevel::Metadata)
+            || parsed.has_level(RepresentationLevel::Short)
+            || parsed.has_level(RepresentationLevel::Long)
+        {
+            return parsed;
+        }
+    }
+    let summary = row
+        .get("summary")
+        .or_else(|| row.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    FileRepresentation {
+        metadata: summary.clone(),
+        short: summary.clone(),
+        long: summary,
+        source: row
+            .get("summarySource")
+            .and_then(Value::as_str)
+            .unwrap_or("organize")
+            .to_string(),
+        degraded: row
+            .get("summaryDegraded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        confidence: row
+            .get("summaryConfidence")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        keywords: row
+            .get("summaryKeywords")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+    }
+}
+
+fn collect_inventory_from_fs(
+    root_path: &str,
+    overrides: &HashMap<String, Vec<String>>,
+) -> Vec<InventoryItem> {
+    if root_path.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut output = Vec::new();
+    let mut visited_dirs = 0usize;
+    let mut stack = vec![(PathBuf::from(root_path), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        visited_dirs += 1;
+        if visited_dirs > FS_FALLBACK_MAX_DIRS {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if depth < FS_FALLBACK_MAX_DEPTH && !should_skip_fallback_dir(&path) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            if output.len() >= FS_FALLBACK_MAX_FILES {
+                return output;
+            }
+            let path_string = path.to_string_lossy().to_string();
+            let key = normalize_path_key(&path_string);
+            let mut category_path = overrides.get(&key).cloned().unwrap_or_default();
+            if category_path.is_empty() {
+                category_path.push("其他待定".to_string());
+            }
+            let category_id = category_id_from_path(&category_path);
+            let parent_category_id = parent_category_id_from_path(&category_path);
+            let mut item = InventoryItem {
+                path: path_string.clone(),
+                name: basename(&path_string),
+                size: metadata.len(),
+                created_at: metadata.created().ok().map(system_time_to_iso),
+                modified_at: metadata.modified().ok().map(system_time_to_iso),
+                kind: infer_kind(&path_string, "", ""),
+                category_id,
+                parent_category_id,
+                category_path,
+                representation: FileRepresentation::default(),
+                risk: "unknown".to_string(),
+            };
+            item.representation = metadata_representation(&item);
+            output.push(item);
+        }
+    }
+    output
+}
+
+fn should_skip_fallback_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            FS_FALLBACK_SKIP_DIRS
+                .iter()
+                .any(|blocked| name.eq_ignore_ascii_case(blocked))
+        })
 }
 
 fn modified_age_text(item: &InventoryItem) -> String {
@@ -1635,7 +1736,7 @@ fn load_summary_row(
     db_path: &Path,
     root_path: &str,
     path: &str,
-    mode: &str,
+    level: RepresentationLevel,
     missing_only: bool,
 ) -> Result<Option<Value>, String> {
     let row = persist::load_advisor_file_summary(
@@ -1647,13 +1748,8 @@ fn load_summary_row(
         return Ok(row);
     }
     Ok(row.filter(|value| {
-        value.get("mode").and_then(Value::as_str) == Some(mode)
-            || value
-                .get("summaryShort")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
+        FileRepresentation::from_value(value.get("representation").unwrap_or(&Value::Null))
+            .has_level(level)
     }))
 }
 
@@ -1661,59 +1757,58 @@ fn read_existing_summary_item(
     db_path: &Path,
     root_path: &str,
     item: &InventoryItem,
-    detail_level: &str,
+    level: RepresentationLevel,
 ) -> Result<Option<Value>, String> {
     if let Some(row) = persist::load_advisor_file_summary(
         db_path,
         &persist::create_root_path_key(root_path),
         &persist::create_root_path_key(&item.path),
     )? {
-        return Ok(Some(summary_row_to_read_item(&row, detail_level)));
+        let representation =
+            FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
+        if representation.has_level(level) {
+            return Ok(Some(summary_row_to_read_item(&row, level)));
+        }
     }
-    if let Some(text) = item
-        .summary_normal
-        .clone()
-        .or_else(|| item.summary_short.clone())
-        .filter(|value| !value.trim().is_empty())
-    {
+    if item.representation.has_level(level) {
         return Ok(Some(json!({
             "path": item.path,
             "name": item.name,
-            "summaryShort": item.summary_short.clone().unwrap_or_else(|| text.clone()),
-            "summaryNormal": if detail_level == "normal" { Value::String(text) } else { Value::Null },
+            "representation": item.representation.prune_to_level(level).to_value(),
+            "warning": Value::Null,
         })));
     }
     Ok(None)
 }
 
-fn summary_row_to_tool_item(row: &Value) -> Value {
+fn summary_row_to_tool_item(row: &Value, level: RepresentationLevel) -> Value {
     json!({
         "path": row.get("path").cloned().unwrap_or(Value::Null),
         "name": row.get("name").cloned().unwrap_or(Value::Null),
-        "summaryShort": row.get("summaryShort").cloned().unwrap_or(Value::Null),
-        "summaryNormal": row.get("summaryNormal").cloned().unwrap_or(Value::Null),
+        "representation": FileRepresentation::from_value(
+            row.get("representation").unwrap_or(&Value::Null),
+        ).prune_to_level(level).to_value(),
         "warning": Value::Null,
     })
 }
 
-fn summary_row_to_read_item(row: &Value, detail_level: &str) -> Value {
+fn summary_row_to_read_item(row: &Value, level: RepresentationLevel) -> Value {
     json!({
         "path": row.get("path").cloned().unwrap_or(Value::Null),
         "name": row.get("name").cloned().unwrap_or(Value::Null),
-        "summaryShort": row.get("summaryShort").cloned().unwrap_or(Value::Null),
-        "summaryNormal": if detail_level == "normal" {
-            row.get("summaryNormal").cloned().unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        },
+        "representation": FileRepresentation::from_value(
+            row.get("representation").unwrap_or(&Value::Null),
+        ).prune_to_level(level).to_value(),
     })
 }
 
 fn rename_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
     let source_category_id = required_change_str(change, "sourceCategoryId")?;
     let new_category_name = required_change_str(change, "newCategoryName")?;
-    let source_path = category_path_from_category_id(session, source_category_id)?
-        .ok_or_else(|| "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string())?;
+    let source_path =
+        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+            "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+        })?;
     let mut target_path = source_path.clone();
     if let Some(last) = target_path.last_mut() {
         *last = new_category_name.to_string();
@@ -1724,17 +1819,23 @@ fn rename_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, St
 fn merge_category_into_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
     let source_category_id = required_change_str(change, "sourceCategoryId")?;
     let target_category_id = required_change_str(change, "targetCategoryId")?;
-    let source_path = category_path_from_category_id(session, source_category_id)?
-        .ok_or_else(|| "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string())?;
-    let target_path = category_path_from_category_id(session, target_category_id)?
-        .ok_or_else(|| "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string())?;
+    let source_path =
+        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+            "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+        })?;
+    let target_path =
+        category_path_from_category_id(session, target_category_id)?.ok_or_else(|| {
+            "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+        })?;
     reclass_by_category_path(session, &source_path, &target_path)
 }
 
 fn delete_empty_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
     let source_category_id = required_change_str(change, "sourceCategoryId")?;
-    let source_path = category_path_from_category_id(session, source_category_id)?
-        .ok_or_else(|| "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string())?;
+    let source_path =
+        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+            "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+        })?;
     let overrides = super::types::inventory_overrides(session);
     if overrides.values().any(|path| path == &source_path) {
         return Err("当前分类下仍有文件，不能删除非空分类。".to_string());
@@ -1757,145 +1858,373 @@ fn reclass_by_category_path(
 }
 
 fn build_reclassification_change_summary(change: &Value, rollback_entries: &[Value]) -> String {
-    let change_type = change.get("type").and_then(Value::as_str).unwrap_or("unknown");
+    let change_type = change
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let file_count = rollback_entries.len();
     format!("{change_type}: {file_count} items updated")
 }
 
 async fn summarize_batch_with_model(
+    client: &reqwest::Client,
     route: &super::llm::AdvisorModelRoute,
     root_path: &str,
     batch: &[InventoryItem],
-    mode: &str,
+    level: RepresentationLevel,
     lang: &str,
-) -> Result<Vec<Value>, Vec<Value>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| vec![json!({ "path": "", "reason": e.to_string() })])?;
+) -> (Vec<Value>, Vec<SummaryFailedItem>) {
     let mut output = Vec::new();
     let mut errors = Vec::new();
     for item in batch {
-        let prompt = build_summary_prompt(item, mode, lang);
-        let api_format = detect_api_format(&route.endpoint);
-        let request = build_completion_payload(
-            api_format,
-            &route.model,
-            &[
-                json!({ "role": "system", "content": summary_system_prompt(lang, mode) }),
-                json!({ "role": "user", "content": prompt }),
-            ],
-            None,
-            0.0,
-            DEFAULT_MAX_TOKENS,
-        )
-        .map_err(|e| vec![json!({ "path": item.path, "reason": e })])?;
-        let mut attempt = 0;
-        let mut success = None;
-        while attempt < 2 && success.is_none() {
-            attempt += 1;
-            let req = client
-                .post(build_messages_url(&route.endpoint, api_format))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .json(&request);
-            let req = apply_auth_headers(req, api_format, &route.api_key);
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    match resp.text().await {
-                        Ok(body) => {
-                            let assistant_text = parse_completion_response(api_format, status, &body)
-                                .map(|parsed| parsed.assistant_text)
-                                .unwrap_or_else(|_| body.clone());
-                            if let Some((short, normal)) = parse_summary_response(&assistant_text) {
-                                success = Some(json!({
-                                    "rootPathKey": persist::create_root_path_key(root_path),
-                                    "pathKey": persist::create_root_path_key(&item.path),
-                                    "path": item.path,
-                                    "name": item.name,
-                                    "summaryShort": short,
-                                    "summaryNormal": normal,
-                                    "source": "model",
-                                    "mode": mode,
-                                    "updatedAt": now_iso(),
-                                }));
-                            }
-                        }
-                        Err(err) => {
-                            if attempt >= 2 {
-                                errors.push(json!({ "path": item.path, "reason": err.to_string() }));
-                            }
-                        }
+        match summarize_item_with_model(client, route, root_path, item, level, lang).await {
+            Ok(row) => output.push(row),
+            Err(error) => errors.push(SummaryFailedItem {
+                item: item.clone(),
+                error,
+            }),
+        }
+    }
+    (output, errors)
+}
+
+async fn summarize_item_with_model(
+    client: &reqwest::Client,
+    route: &super::llm::AdvisorModelRoute,
+    root_path: &str,
+    item: &InventoryItem,
+    level: RepresentationLevel,
+    lang: &str,
+) -> Result<Value, SummaryErrorRow> {
+    let prompt = build_summary_prompt(item, level, lang);
+    let api_format = detect_api_format(&route.endpoint);
+    let request = build_completion_payload(
+        api_format,
+        &route.model,
+        &[
+            json!({ "role": "system", "content": summary_system_prompt(lang, level) }),
+            json!({ "role": "user", "content": prompt }),
+        ],
+        None,
+        0.0,
+        DEFAULT_MAX_TOKENS,
+    )
+    .map_err(|reason| SummaryErrorRow {
+        path: item.path.clone(),
+        reason,
+        retryable: false,
+    })?;
+
+    let mut last_error = None;
+    for _attempt in 0..2 {
+        let req = client
+            .post(build_messages_url(&route.endpoint, api_format))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&request);
+        let req = apply_auth_headers(req, api_format, &route.api_key);
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        last_error = Some(SummaryErrorRow {
+                            path: item.path.clone(),
+                            reason: format!("summary_body_read_failed:{err}"),
+                            retryable: false,
+                        });
+                        continue;
                     }
+                };
+                if !status.is_success() {
+                    last_error = Some(SummaryErrorRow {
+                        path: item.path.clone(),
+                        reason: format_http_summary_error(status, &body),
+                        retryable: is_retryable_status(status),
+                    });
+                    continue;
                 }
-                Err(err) => {
-                    if attempt >= 2 {
-                        errors.push(json!({ "path": item.path, "reason": err.to_string() }));
-                    }
-                }
+                let assistant_text = parse_completion_response(api_format, status, &body)
+                    .map(|parsed| parsed.assistant_text)
+                    .unwrap_or_else(|_| body.clone());
+                let Some((short, long)) = parse_summary_response(&assistant_text) else {
+                    last_error = Some(SummaryErrorRow {
+                        path: item.path.clone(),
+                        reason: "summary_response_parse_failed".to_string(),
+                        retryable: false,
+                    });
+                    continue;
+                };
+                let metadata = item
+                    .representation
+                    .metadata
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| Some(metadata_summary_short(item)));
+                let representation = FileRepresentation {
+                    metadata,
+                    short: Some(short),
+                    long: Some(long),
+                    source: "model".to_string(),
+                    degraded: false,
+                    confidence: item.representation.confidence.clone(),
+                    keywords: item.representation.keywords.clone(),
+                };
+                return Ok(build_summary_row(root_path, item, level, representation));
+            }
+            Err(err) => {
+                last_error = Some(SummaryErrorRow {
+                    path: item.path.clone(),
+                    reason: format_transport_summary_error(&err),
+                    retryable: is_retryable_transport_error(&err),
+                });
             }
         }
-        if let Some(row) = success {
-            output.push(row);
-        } else if !errors.iter().any(|row| row.get("path").and_then(Value::as_str) == Some(&item.path)) {
-            errors.push(json!({ "path": item.path, "reason": "summary_generation_failed" }));
-        }
     }
-    if errors.is_empty() {
-        Ok(output)
+    Err(last_error.unwrap_or_else(|| SummaryErrorRow {
+        path: item.path.clone(),
+        reason: "summary_generation_failed".to_string(),
+        retryable: false,
+    }))
+}
+
+fn build_summary_row(
+    root_path: &str,
+    item: &InventoryItem,
+    level: RepresentationLevel,
+    representation: FileRepresentation,
+) -> Value {
+    let representation = representation.prune_to_level(level);
+    json!({
+        "rootPathKey": persist::create_root_path_key(root_path),
+        "pathKey": persist::create_root_path_key(&item.path),
+        "path": item.path,
+        "name": item.name,
+        "representation": representation.to_value(),
+        "summaryShort": representation.short.clone(),
+        "summaryNormal": representation.long.clone(),
+        "source": representation.source,
+        "representationLevel": level.as_str(),
+        "updatedAt": now_iso(),
+    })
+}
+
+fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn format_transport_summary_error(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        format!("summary_request_timeout:{err}")
+    } else if err.is_connect() {
+        format!("summary_request_connect_failed:{err}")
     } else {
-        Err(errors)
+        format!("summary_request_failed:{err}")
     }
 }
 
-fn summary_system_prompt(lang: &str, mode: &str) -> String {
-    let target = if mode == "model_summary_short" {
-        "Return one short summary sentence and one normal summary sentence."
+fn format_http_summary_error(status: StatusCode, body: &str) -> String {
+    let snippet = body.trim().chars().take(240).collect::<String>();
+    if snippet.is_empty() {
+        format!("summary_http_{}", status.as_u16())
     } else {
-        "Return one concise short summary sentence and one richer normal summary sentence."
+        format!("summary_http_{}:{}", status.as_u16(), snippet)
+    }
+}
+
+async fn run_summary_round(
+    route: &super::llm::AdvisorModelRoute,
+    root_path: &str,
+    items: &[InventoryItem],
+    level: RepresentationLevel,
+    lang: &str,
+    batch_size: usize,
+    max_concurrency: usize,
+) -> Result<(Vec<Value>, Vec<SummaryFailedItem>), String> {
+    if items.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+    let mut handles = Vec::new();
+    for chunk in items.chunks(batch_size.max(1)) {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let client = client.clone();
+        let route = route.clone();
+        let root_path = root_path.to_string();
+        let lang = lang.to_string();
+        let batch = chunk.to_vec();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            summarize_batch_with_model(&client, &route, &root_path, &batch, level, &lang).await
+        }));
+    }
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+    for handle in handles {
+        let (mut batch_rows, mut batch_failures) = handle
+            .await
+            .map_err(|e| format!("summary_batch_join_failed:{e}"))?;
+        rows.append(&mut batch_rows);
+        failures.append(&mut batch_failures);
+    }
+    Ok((rows, failures))
+}
+
+async fn run_summary_scheduler(
+    route: &super::llm::AdvisorModelRoute,
+    root_path: &str,
+    items: &[InventoryItem],
+    level: RepresentationLevel,
+    lang: &str,
+    batch_size: usize,
+    max_concurrency: usize,
+) -> Result<(Vec<Value>, Vec<SummaryErrorRow>, SummarySchedulerStats), String> {
+    let initial_concurrency = max_concurrency.max(1);
+    if items.is_empty() {
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            SummarySchedulerStats {
+                initial_concurrency,
+                final_concurrency: initial_concurrency,
+                retry_rounds: 0,
+                degraded_concurrency: false,
+            },
+        ));
+    }
+
+    let mut completed_rows = Vec::new();
+    let mut final_errors = Vec::new();
+    let mut pending = items.to_vec();
+    let mut current_concurrency = initial_concurrency;
+    let mut retry_rounds = 0usize;
+    let mut degraded_concurrency = false;
+    let backoffs_ms = [500u64, 1000u64, 2000u64];
+
+    loop {
+        let (mut rows, failures) = run_summary_round(
+            route,
+            root_path,
+            &pending,
+            level,
+            lang,
+            batch_size,
+            current_concurrency,
+        )
+        .await?;
+        completed_rows.append(&mut rows);
+
+        let mut retryable_items = Vec::new();
+        for failure in failures {
+            if failure.error.retryable {
+                retryable_items.push(failure);
+            } else {
+                final_errors.push(failure.error);
+            }
+        }
+
+        if retryable_items.is_empty() {
+            break;
+        }
+        if current_concurrency == 1 {
+            final_errors.extend(retryable_items.into_iter().map(|failure| failure.error));
+            break;
+        }
+
+        retry_rounds += 1;
+        let next_concurrency = (current_concurrency / 2).max(1);
+        if next_concurrency < current_concurrency {
+            degraded_concurrency = true;
+        }
+        let delay_ms = backoffs_ms
+            .get(retry_rounds.saturating_sub(1))
+            .copied()
+            .unwrap_or(2000);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        current_concurrency = next_concurrency;
+        pending = retryable_items
+            .into_iter()
+            .map(|failure| failure.item)
+            .collect();
+    }
+
+    Ok((
+        completed_rows,
+        final_errors,
+        SummarySchedulerStats {
+            initial_concurrency,
+            final_concurrency: current_concurrency,
+            retry_rounds,
+            degraded_concurrency,
+        },
+    ))
+}
+
+fn summary_system_prompt(lang: &str, level: RepresentationLevel) -> String {
+    let target = if level == RepresentationLevel::Short {
+        "Return one short summary sentence and one longer summary sentence."
+    } else {
+        "Return one concise short summary sentence and one richer long summary sentence."
     };
     if lang.eq_ignore_ascii_case("en") {
-        format!("{target} Return JSON only: {{\"summaryShort\":\"...\",\"summaryNormal\":\"...\"}}")
+        format!("{target} Return JSON only: {{\"summaryShort\":\"...\",\"summaryLong\":\"...\"}}")
     } else {
-        format!("{target} 只返回 JSON：{{\"summaryShort\":\"...\",\"summaryNormal\":\"...\"}}")
+        format!("{target} 只返回 JSON：{{\"summaryShort\":\"...\",\"summaryLong\":\"...\"}}")
     }
 }
 
-fn build_summary_prompt(item: &InventoryItem, _mode: &str, _lang: &str) -> String {
+fn build_summary_prompt(item: &InventoryItem, _level: RepresentationLevel, _lang: &str) -> String {
     format!(
-        "path: {}\nname: {}\ncategory: {}\nsize: {}\nexisting short summary: {}\nexisting normal summary: {}",
+        "path: {}\nname: {}\ncategory: {}\nsize: {}\nexisting metadata: {}\nexisting short summary: {}\nexisting long summary: {}",
         item.path,
         item.name,
         item.category_path.join(" / "),
         format_size_text(item.size),
-        item.summary_short.clone().unwrap_or_default(),
-        item.summary_normal.clone().unwrap_or_default()
+        item.representation.metadata.clone().unwrap_or_default(),
+        item.representation.short.clone().unwrap_or_default(),
+        item.representation.long.clone().unwrap_or_default()
     )
 }
 
 fn parse_summary_response(body: &str) -> Option<(String, String)> {
-    let parsed = serde_json::from_str::<Value>(body)
-        .ok()
-        .or_else(|| {
-            let start = body.find('{')?;
-            let end = body.rfind('}')?;
-            serde_json::from_str::<Value>(&body[start..=end]).ok()
-        })?;
+    let parsed = serde_json::from_str::<Value>(body).ok().or_else(|| {
+        let start = body.find('{')?;
+        let end = body.rfind('}')?;
+        serde_json::from_str::<Value>(&body[start..=end]).ok()
+    })?;
     let content = parsed
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or(body);
-    let payload = serde_json::from_str::<Value>(content)
-        .ok()
-        .or_else(|| {
-            let start = content.find('{')?;
-            let end = content.rfind('}')?;
-            serde_json::from_str::<Value>(&content[start..=end]).ok()
-        })?;
+    let payload = serde_json::from_str::<Value>(content).ok().or_else(|| {
+        let start = content.find('{')?;
+        let end = content.rfind('}')?;
+        serde_json::from_str::<Value>(&content[start..=end]).ok()
+    })?;
     Some((
         payload.get("summaryShort")?.as_str()?.trim().to_string(),
-        payload.get("summaryNormal")?.as_str()?.trim().to_string(),
+        payload.get("summaryLong")?.as_str()?.trim().to_string(),
     ))
 }
 
@@ -1930,7 +2259,11 @@ fn build_tree_text(tree: &Value) -> String {
     lines.join("\n")
 }
 
-fn append_tree_text_lines(node: &serde_json::Map<String, Value>, depth: usize, lines: &mut Vec<String>) {
+fn append_tree_text_lines(
+    node: &serde_json::Map<String, Value>,
+    depth: usize,
+    lines: &mut Vec<String>,
+) {
     let indent = "  ".repeat(depth);
     let name = node.get("name").and_then(Value::as_str).unwrap_or("-");
     let count = node.get("itemCount").and_then(Value::as_u64).unwrap_or(0);
@@ -1946,14 +2279,20 @@ fn append_tree_text_lines(node: &serde_json::Map<String, Value>, depth: usize, l
 
 fn infer_preference_kind(text: &str) -> String {
     let lower = normalize_message(text);
-    if ["归档", "archive"].iter().any(|needle| lower.contains(needle)) {
+    if ["归档", "archive"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
         "archive_preferred".to_string()
     } else if ["不要删", "别删", "保留", "keep", "don't delete"]
         .iter()
         .any(|needle| lower.contains(needle))
     {
         "keep".to_string()
-    } else if ["总是", "始终", "always"].iter().any(|needle| lower.contains(needle)) {
+    } else if ["总是", "始终", "always"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
         "long_term_preference".to_string()
     } else {
         "general_preference".to_string()
@@ -1973,7 +2312,12 @@ fn summarize_find_query(args: &Value) -> String {
         }
     }
     for key in ["nameQuery", "nameExact", "pathContains"] {
-        if let Some(value) = args.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(value) = args
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             parts.push(value.to_string());
         }
     }
@@ -2031,14 +2375,14 @@ fn filter_inventory_by_args(inventory: &[InventoryItem], args: &Value) -> Vec<In
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let min_size = args.get("minSizeBytes").and_then(Value::as_u64).unwrap_or(0);
+    let min_size = args
+        .get("minSizeBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let max_size = args.get("maxSizeBytes").and_then(Value::as_u64);
     let older_than_days = args.get("olderThanDays").and_then(Value::as_i64);
     let newer_than_days = args.get("newerThanDays").and_then(Value::as_i64);
-    let sort_by = args
-        .get("sortBy")
-        .and_then(Value::as_str)
-        .unwrap_or("size");
+    let sort_by = args.get("sortBy").and_then(Value::as_str).unwrap_or("size");
     let sort_order = args
         .get("sortOrder")
         .and_then(Value::as_str)
@@ -2069,10 +2413,15 @@ fn filter_inventory_by_args(inventory: &[InventoryItem], args: &Value) -> Vec<In
             if !name_exact.is_empty() && normalize_message(&item.name) != name_exact {
                 return false;
             }
-            if !path_contains.is_empty() && !normalize_message(&item.path).contains(&path_contains) {
+            if !path_contains.is_empty() && !normalize_message(&item.path).contains(&path_contains)
+            {
                 return false;
             }
-            if !paths.is_empty() && !paths.iter().any(|path| path == &normalize_path_key(&item.path)) {
+            if !paths.is_empty()
+                && !paths
+                    .iter()
+                    .any(|path| path == &normalize_path_key(&item.path))
+            {
                 return false;
             }
             if !extensions.is_empty() {
@@ -2200,23 +2549,13 @@ fn value_to_inventory_item(value: &Value) -> InventoryItem {
             .and_then(Value::as_str)
             .map(str::to_string),
         category_path: array_of_strings(value.get("categoryPath")),
-        summary_short: value
-            .get("summaryShort")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        summary_normal: value
-            .get("summaryNormal")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        representation: FileRepresentation::from_value(
+            value.get("representation").unwrap_or(&Value::Null),
+        ),
         risk: value
             .get("risk")
             .and_then(Value::as_str)
             .unwrap_or("medium")
-            .to_string(),
-        source: value
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("advisor")
             .to_string(),
     }
 }
@@ -2250,10 +2589,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_test_state() -> AppState {
-        let root = std::env::temp_dir().join(format!(
-            "wipeout-advisor-tools-test-{}",
-            Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("wipeout-advisor-tools-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create temp dir");
         AppState::bootstrap(PathBuf::from(root)).expect("bootstrap app state")
     }
@@ -2269,10 +2606,8 @@ mod tests {
             category_id: String::new(),
             parent_category_id: None,
             category_path: Vec::new(),
-            summary_short: None,
-            summary_normal: None,
+            representation: FileRepresentation::default(),
             risk: risk.to_string(),
-            source: "scan".to_string(),
         }
     }
 
@@ -2282,13 +2617,34 @@ mod tests {
             make_item(r"C:\test\shot1.png", "screenshot", "low"),
             make_item(r"C:\test\setup.exe", "installer", "medium"),
         ];
-        let matches = filter_inventory_by_args(&inventory, &json!({
-            "nameQuery": "shot",
-            "sortBy": "size",
-            "sortOrder": "desc",
-        }));
+        let matches = filter_inventory_by_args(
+            &inventory,
+            &json!({
+                "nameQuery": "shot",
+                "sortBy": "size",
+                "sortOrder": "desc",
+            }),
+        );
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, "screenshot");
+    }
+
+    #[test]
+    fn fs_fallback_inventory_is_bounded_and_skips_heavy_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "wipeout-advisor-fs-fallback-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("node_modules")).expect("create skipped dir");
+        fs::write(root.join("node_modules").join("ignored.js"), "ignored").expect("write ignored");
+        for idx in 0..(FS_FALLBACK_MAX_FILES + 20) {
+            fs::write(root.join(format!("file-{idx}.txt")), "x").expect("write file");
+        }
+
+        let rows = collect_inventory_from_fs(&root.to_string_lossy(), &HashMap::new());
+
+        assert_eq!(rows.len(), FS_FALLBACK_MAX_FILES);
+        assert!(!rows.iter().any(|item| item.path.contains("node_modules")));
     }
 
     #[test]
@@ -2409,8 +2765,57 @@ mod tests {
             .expect("load all preferences");
         assert_eq!(all.len(), 2);
 
-        let globals = service.list_preferences(None).expect("load global preferences");
+        let globals = service
+            .list_preferences(None)
+            .expect("load global preferences");
         assert_eq!(globals.len(), 1);
         assert_eq!(globals[0]["scope"], "global");
+    }
+
+    #[test]
+    fn summary_row_to_tool_item_prunes_representation_by_level() {
+        let row = json!({
+            "path": r"C:\test\report.pdf",
+            "name": "report.pdf",
+            "representation": {
+                "metadata": "report.pdf，document，1.0 MB",
+                "short": "季度报告",
+                "long": "季度报告，包含财务指标与结论。",
+                "source": "model",
+                "degraded": false,
+                "confidence": "high",
+                "keywords": ["季度", "财务"]
+            }
+        });
+
+        let short_item = summary_row_to_tool_item(&row, RepresentationLevel::Short);
+        assert_eq!(
+            short_item
+                .pointer("/representation/metadata")
+                .and_then(Value::as_str),
+            Some("report.pdf，document，1.0 MB")
+        );
+        assert_eq!(
+            short_item
+                .pointer("/representation/short")
+                .and_then(Value::as_str),
+            Some("季度报告")
+        );
+        assert_eq!(
+            short_item.pointer("/representation/long"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn retryable_statuses_match_scheduler_policy() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
     }
 }

@@ -4,13 +4,10 @@
     "description": "AI-driven space cleaning desktop app powered by Tauri v2 and Rust",
     "type": "module",
     "scripts": {
-        "scanner:sync": "node scripts/sync-scanner.mjs",
         "dev": "vite",
         "build": "vite build",
         "tauri": "tauri",
-        "pretauri:dev": "npm run scanner:sync",
         "tauri:dev": "node scripts/tauri-dev.mjs",
-        "pretauri:build": "npm run scanner:sync",
         "tauri:build": "tauri build",
         "start": "npm run tauri:dev"
     },

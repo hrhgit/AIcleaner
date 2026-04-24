@@ -132,14 +132,19 @@ function normalizeSearchApi(settings) {
   const scopesSource = source?.scopes && typeof source.scopes === 'object'
     ? source.scopes
     : {};
+  const workflowEnabled = !!(
+    source?.enabled
+    || scopesSource.classify
+    || scopesSource.organizer
+  );
 
   return {
     provider: 'tavily',
-    enabled: !!source?.enabled,
+    enabled: workflowEnabled,
     apiKey: '',
     scopes: {
-      classify: !!scopesSource.classify,
-      organizer: !!scopesSource.organizer,
+      classify: workflowEnabled,
+      organizer: workflowEnabled,
     },
   };
 }

@@ -1,6 +1,5 @@
 param(
   [switch]$SkipInstall,
-  [switch]$SkipScannerBuild,
   [switch]$CheckOnly
 )
 
@@ -46,19 +45,6 @@ if (-not $SkipInstall) {
   } else {
     Write-Step "npm dependencies already present"
   }
-}
-
-$scannerTarget = Join-Path $PSScriptRoot "bin\scanner.exe"
-if (-not $SkipScannerBuild) {
-  Write-Step "Syncing native scanner"
-  npm run scanner:sync
-  if ($LASTEXITCODE -ne 0) {
-    throw "scanner sync failed."
-  }
-}
-
-if (-not (Test-Path $scannerTarget)) {
-  throw "bin\scanner.exe is missing. Build it first or run this script without -SkipScannerBuild."
 }
 
 if ($CheckOnly) {

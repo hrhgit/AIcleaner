@@ -4,21 +4,29 @@ import {
   advisorSessionGet,
   advisorSessionStart,
   browseFolder,
-  listScanHistory,
+  connectOrganizeStream,
+  getOrganizeResult,
+  getSettings,
+  saveSettings,
+  startOrganize,
+  stopOrganize,
 } from '../utils/api.js';
 import { getLang } from '../utils/i18n.js';
-import { formatSize } from '../utils/storage.js';
-import { scanTaskController } from '../utils/scan-task-controller.js';
+import { ensureRequiredCredentialsConfigured } from '../utils/secret-ui.js';
+import {
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_EXCLUSIONS,
+  DEFAULT_SUMMARY_MODE,
+  PERSIST_KEYS as ORGANIZER_PERSIST_KEYS,
+  SUMMARY_MODES,
+} from './organizer-storage.js';
 import { showToast } from '../utils/toast.js';
 
 const PERSIST_KEYS = {
   rootPath: 'wipeout.advisor.global.root_path.v2',
   sessionId: 'wipeout.advisor.global.session_id.v2',
   messageDraft: 'wipeout.advisor.global.message_draft.v2',
-  handoff: 'wipeout.advisor.global.handoff.v1',
 };
-
-const QUICK_SCAN_LIMIT = 8;
 
 let pageContainer = null;
 let state = createInitialState();
@@ -27,20 +35,7 @@ function text(zh, en) {
   return getLang() === 'en' ? en : zh;
 }
 
-function createInitialState() {
-  return {
-    rootPath: resolveInitialRootPath(),
-    sessionId: getPersisted(PERSIST_KEYS.sessionId, ''),
-    messageDraft: getPersisted(PERSIST_KEYS.messageDraft, ''),
-    sessionData: null,
-    quickScans: [],
-    loading: false,
-    sending: false,
-    acting: false,
-  };
-}
-
-function getPersisted(key, fallback) {
+function readPersisted(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
     return raw == null ? fallback : JSON.parse(raw);
@@ -49,7 +44,7 @@ function getPersisted(key, fallback) {
   }
 }
 
-function setPersisted(key, value) {
+function writePersisted(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
@@ -65,40 +60,49 @@ function removePersisted(key) {
   }
 }
 
+function createInitialState() {
+  return {
+    rootPath: resolveInitialRootPath(),
+    summaryStrategy: resolveInitialSummaryStrategy(),
+    useWebSearch: resolveInitialUseWebSearch(),
+    sessionId: readPersisted(PERSIST_KEYS.sessionId, ''),
+    messageDraft: readPersisted(PERSIST_KEYS.messageDraft, ''),
+    sessionData: null,
+    organizeTaskId: String(readPersisted(ORGANIZER_PERSIST_KEYS.lastTaskId, '') || ''),
+    organizeSnapshot: sanitizeSnapshot(readPersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot, null)),
+    organizeStream: null,
+    loading: false,
+    sending: false,
+    acting: false,
+    organizeStarting: false,
+    organizeStopping: false,
+    syncingSearch: false,
+  };
+}
+
+function sanitizeSnapshot(snapshot) {
+  return snapshot && typeof snapshot === 'object' ? snapshot : null;
+}
+
+function resolveInitialRootPath() {
+  const persisted = String(readPersisted(PERSIST_KEYS.rootPath, '') || '').trim();
+  if (persisted) return persisted;
+  return String(readPersisted(ORGANIZER_PERSIST_KEYS.rootPath, '') || '').trim();
+}
+
+function resolveInitialSummaryStrategy() {
+  const persisted = String(readPersisted(ORGANIZER_PERSIST_KEYS.summaryStrategy, DEFAULT_SUMMARY_MODE) || '').trim();
+  return SUMMARY_MODES.includes(persisted) ? persisted : DEFAULT_SUMMARY_MODE;
+}
+
+function resolveInitialUseWebSearch() {
+  return !!readPersisted(ORGANIZER_PERSIST_KEYS.useWebSearch, false);
+}
+
 function escapeHtml(value) {
   const div = document.createElement('div');
   div.textContent = String(value ?? '');
   return div.innerHTML;
-}
-
-function getCurrentScanSnapshot() {
-  return scanTaskController.getState()?.snapshot || null;
-}
-
-function takeAdvisorHandoff() {
-  const handoff = getPersisted(PERSIST_KEYS.handoff, null);
-  removePersisted(PERSIST_KEYS.handoff);
-  return handoff && typeof handoff === 'object' ? handoff : null;
-}
-
-function resolveInitialRootPath() {
-  const handoff = takeAdvisorHandoff();
-  if (handoff?.rootPath) {
-    setPersisted(PERSIST_KEYS.rootPath, handoff.rootPath);
-    window.__wipeoutAdvisorHandoff = handoff;
-    return String(handoff.rootPath).trim();
-  }
-  const persisted = String(getPersisted(PERSIST_KEYS.rootPath, '') || '').trim();
-  if (persisted) return persisted;
-  const snapshot = getCurrentScanSnapshot();
-  return String(snapshot?.targetPath || snapshot?.rootPath || '').trim();
-}
-
-function getPendingHandoff() {
-  const value = window.__wipeoutAdvisorHandoff;
-  if (!value) return null;
-  window.__wipeoutAdvisorHandoff = null;
-  return value;
 }
 
 function formatDateTime(value) {
@@ -106,6 +110,19 @@ function formatDateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString(getLang() === 'en' ? 'en-US' : 'zh-CN');
+}
+
+function normalizePath(value) {
+  return String(value || '').trim().replace(/[\\/]+/g, '/').toLowerCase();
+}
+
+function getCurrentSnapshot() {
+  const snapshot = sanitizeSnapshot(state.organizeSnapshot);
+  if (!snapshot) return null;
+  const rootPath = String(state.rootPath || '').trim();
+  const snapshotRoot = String(snapshot.rootPath || snapshot.root_path || '').trim();
+  if (!rootPath || !snapshotRoot) return snapshot;
+  return normalizePath(rootPath) === normalizePath(snapshotRoot) ? snapshot : null;
 }
 
 function getWorkflowStage() {
@@ -117,6 +134,40 @@ function getStageLabel() {
   if (stage === 'execute_ready') return text('可执行', 'Ready to Execute');
   if (stage === 'preview_ready') return text('可预览', 'Ready to Preview');
   return text('理解中', 'Understanding');
+}
+
+function getOrganizeStatus(snapshot = getCurrentSnapshot()) {
+  return String(snapshot?.status || '').trim().toLowerCase();
+}
+
+function isOrganizeRunning(snapshot = getCurrentSnapshot()) {
+  return ['idle', 'scanning', 'classifying', 'stopping', 'moving'].includes(getOrganizeStatus(snapshot));
+}
+
+function isOrganizeFinished(snapshot = getCurrentSnapshot()) {
+  return ['completed', 'done'].includes(getOrganizeStatus(snapshot));
+}
+
+function getOrganizeStatusLabel(snapshot = getCurrentSnapshot()) {
+  const status = getOrganizeStatus(snapshot);
+  if (status === 'scanning') return text('扫描中', 'Scanning');
+  if (status === 'classifying') return text('归类中', 'Classifying');
+  if (status === 'stopping') return text('停止中', 'Stopping');
+  if (status === 'moving') return text('执行中', 'Applying');
+  if (status === 'completed' || status === 'done') return text('归类完成', 'Completed');
+  if (status === 'stopped') return text('已停止', 'Stopped');
+  if (status === 'error') return text('出错', 'Error');
+  if (state.organizeStarting) return text('启动中', 'Starting');
+  return text('待开始', 'Idle');
+}
+
+function getOrganizeProgress(snapshot = getCurrentSnapshot()) {
+  const total = Number(snapshot?.totalFiles || snapshot?.total_files || 0);
+  const processed = Number(snapshot?.processedFiles || snapshot?.processed_files || 0);
+  if (total <= 0) {
+    return isOrganizeFinished(snapshot) ? 100 : 0;
+  }
+  return Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
 }
 
 function summarizeCard(card) {
@@ -218,12 +269,18 @@ function renderCard(card) {
 
 function renderTimeline() {
   const timeline = Array.isArray(state.sessionData?.timeline) ? state.sessionData.timeline : [];
+  const snapshot = getCurrentSnapshot();
   if (!timeline.length) {
+    const finished = isOrganizeFinished(snapshot);
     return `
       <div class="card advisor-empty-panel">
         <div class="empty-state advisor-empty-compact">
-          <div class="empty-state-text">${escapeHtml(text('启动会话后，消息流和结果卡会显示在这里。', 'The timeline and cards will appear here once the session starts.'))}</div>
-          <div class="empty-state-hint">${escapeHtml(text('先选择目录，再启动会话或从最近扫描直接接入。', 'Pick a folder, then start a session or jump in from a recent scan.'))}</div>
+          <div class="empty-state-text">${escapeHtml(finished
+            ? text('归类结果已经准备好，可以开始对话。', 'Organize results are ready. Start the conversation when you are ready.')
+            : text('会话启动后，消息流和结果卡会显示在这里。', 'The timeline and cards will appear here once the session starts.'))}</div>
+          <div class="empty-state-hint">${escapeHtml(finished
+            ? text('上方已经展示当前目录的归类结果；开始对话后，顾问会直接复用它。', 'The latest organize result is already shown above. The advisor will reuse it once the session starts.')
+            : text('可以先启动归类，也可以直接开始会话；没有归类结果时，顾问会先基于目录元信息工作。', 'You can organize first or start the session directly. Without organize results, the advisor starts from directory metadata.'))}</div>
         </div>
       </div>
     `;
@@ -254,28 +311,14 @@ function renderTimeline() {
   `).join('');
 }
 
-function renderQuickScans() {
-  if (!state.quickScans.length) {
-    return `<div class="form-hint">${escapeHtml(text('暂无可复用的盘点记录', 'No reusable scan records yet'))}</div>`;
-  }
-  return state.quickScans.map((task) => {
-    const taskId = String(task?.taskId || task?.id || '').trim();
-    const rootPath = String(task?.targetPath || task?.rootPath || '').trim();
-    return `
-      <button class="advisor-quick-scan" type="button" data-task-id="${escapeHtml(taskId)}" data-root-path="${escapeHtml(rootPath)}">
-        <span class="advisor-quick-scan-title">${escapeHtml(rootPath || '-')}</span>
-        <span class="advisor-quick-scan-meta">${escapeHtml(formatSize(task?.totalCleanable || 0))} · ${escapeHtml(formatDateTime(task?.updatedAt || task?.createdAt))}</span>
-      </button>
-    `;
-  }).join('');
-}
-
 function renderContextSummary() {
   if (!state.sessionData) return '';
   const contextBar = state.sessionData?.contextBar || {};
   const collapsed = !!contextBar?.collapsed;
   const rootPath = contextBar?.rootPath || state.rootPath || '-';
   const modeLabel = contextBar?.mode?.label || text('顾问模式：单智能体', 'Advisor Mode: Single Agent');
+  const directorySummary = contextBar?.directorySummary || {};
+  const webSearch = contextBar?.webSearch || {};
   const stageLabel = getStageLabel();
   return `
     <section class="card advisor-context-summary ${collapsed ? 'collapsed' : ''}">
@@ -294,23 +337,133 @@ function renderContextSummary() {
       ` : `
         <div class="advisor-context-grid">
           <div class="advisor-context-chip">${escapeHtml(modeLabel)}</div>
-          <div class="advisor-context-chip">${escapeHtml(text('扫描记录', 'Scan'))}: ${escapeHtml(contextBar?.scanTaskId || '-')}</div>
           <div class="advisor-context-chip">${escapeHtml(text('分类记录', 'Organize'))}: ${escapeHtml(contextBar?.organizeTaskId || '-')}</div>
-          <div class="advisor-context-chip">${escapeHtml(text('项目数', 'Items'))}: ${escapeHtml(contextBar?.inventorySummary?.itemCount || 0)}</div>
-          <div class="advisor-context-chip">${escapeHtml(text('可复用树', 'Reusable Tree'))}: ${escapeHtml(contextBar?.inventorySummary?.treeAvailable ? text('是', 'Yes') : text('否', 'No'))}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('项目数', 'Items'))}: ${escapeHtml(directorySummary?.itemCount || 0)}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('可复用树', 'Reusable Tree'))}: ${escapeHtml(directorySummary?.treeAvailable ? text('是', 'Yes') : text('否', 'No'))}</div>
+          <div class="advisor-context-chip">${escapeHtml(text('联网搜索', 'Web Search'))}: ${escapeHtml(webSearch?.webSearchEnabled ? text('可用', 'Available') : (webSearch?.useWebSearch ? text('已开启但缺少密钥', 'Enabled but unavailable') : text('关闭', 'Off')))}</div>
         </div>
         <div class="advisor-context-notes">
           ${contextBar?.memorySummary?.message ? `<div class="form-hint">${escapeHtml(contextBar.memorySummary.message)}</div>` : ''}
-          ${contextBar?.inventorySummary?.message ? `<div class="form-hint">${escapeHtml(contextBar.inventorySummary.message)}</div>` : ''}
+          ${directorySummary?.message ? `<div class="form-hint">${escapeHtml(directorySummary.message)}</div>` : ''}
+          ${webSearch?.message ? `<div class="form-hint">${escapeHtml(webSearch.message)}</div>` : ''}
         </div>
       `}
     </section>
   `;
 }
 
+function renderOrganizeSummary(snapshot) {
+  if (!snapshot) {
+    return `
+      <div class="advisor-organize-summary">
+        <div class="form-hint">${escapeHtml(text(
+          '还没有当前目录的归类结果。你可以先启动归类，也可以直接开始会话。',
+          'There is no organize result for this folder yet. You can organize first or start the session directly.',
+        ))}</div>
+      </div>
+    `;
+  }
+
+  const totalFiles = Number(snapshot.totalFiles || snapshot.total_files || 0);
+  const processedFiles = Number(snapshot.processedFiles || snapshot.processed_files || 0);
+  const error = String(snapshot.error || '').trim();
+  const treeChildren = Array.isArray(snapshot?.tree?.children) ? snapshot.tree.children : [];
+
+  return `
+    <section class="advisor-organize-summary">
+      <div class="advisor-organize-summary-head">
+        <div class="advisor-hero-stat">
+          <span class="advisor-hero-stat-label">${escapeHtml(text('归类状态', 'Organize Status'))}</span>
+          <strong>${escapeHtml(getOrganizeStatusLabel(snapshot))}</strong>
+        </div>
+        <div class="advisor-organize-summary-meta">
+          <span class="badge badge-info">${escapeHtml(text('摘要模式', 'Summary'))}: ${escapeHtml(snapshot.summaryStrategy || snapshot.summary_strategy || state.summaryStrategy)}</span>
+          <span class="badge ${snapshot.webSearchEnabled ? 'badge-success' : (snapshot.useWebSearch ? 'badge-warning' : 'badge-info')}">${escapeHtml(snapshot.webSearchEnabled ? text('联网可用', 'Web Search Ready') : (snapshot.useWebSearch ? text('联网未就绪', 'Web Search Unavailable') : text('联网关闭', 'Web Search Off')))}</span>
+        </div>
+      </div>
+      <div class="advisor-organize-stats">
+        <div class="advisor-context-chip">${escapeHtml(text('文件数', 'Files'))}: ${escapeHtml(totalFiles)}</div>
+        <div class="advisor-context-chip">${escapeHtml(text('已处理', 'Processed'))}: ${escapeHtml(processedFiles)}</div>
+        <div class="advisor-context-chip">${escapeHtml(text('任务 ID', 'Task ID'))}: ${escapeHtml(snapshot.id || '-')}</div>
+      </div>
+      <div class="advisor-organize-progress">
+        <div class="advisor-organize-progress-track">
+          <div class="advisor-organize-progress-fill" style="width: ${getOrganizeProgress(snapshot)}%"></div>
+        </div>
+        <div class="form-hint">${escapeHtml(text('当前进度', 'Progress'))}: ${escapeHtml(getOrganizeProgress(snapshot))}%</div>
+      </div>
+      ${error ? `<div class="form-hint">${escapeHtml(text('错误: ', 'Error: '))}${escapeHtml(error)}</div>` : ''}
+      ${treeChildren.length ? `
+        <div class="advisor-tree-shell">
+          <ul class="advisor-tree-list">${treeChildren.slice(0, 18).map(renderTreeNode).join('')}</ul>
+        </div>
+      ` : `
+        <div class="form-hint">${escapeHtml(text('当前还没有可展示的分类树。', 'There is no tree to show yet.'))}</div>
+      `}
+    </section>
+  `;
+}
+
+function renderOrganizePanel() {
+  const snapshot = getCurrentSnapshot();
+  const hasSession = !!state.sessionData;
+  const sessionBtnLabel = hasSession
+    ? text('重建会话', 'Restart Session')
+    : isOrganizeFinished(snapshot)
+      ? text('开始对话', 'Start Conversation')
+      : text('直接开始会话', 'Start Conversation');
+  const conversationHint = isOrganizeFinished(snapshot)
+    ? text('归类完成后，顾问会直接复用上面的结果树和统计。', 'Once the conversation starts, the advisor will reuse the organize tree and stats above.')
+    : text('如果你先开始会话，顾问会暂时基于目录元信息工作。', 'If you start the conversation now, the advisor will temporarily work from directory metadata.');
+
+  return `
+    <section class="card advisor-organize-panel">
+      <div class="advisor-section-head">
+        <div>
+          <div class="workflow-kicker workflow-kicker-subtle">${escapeHtml(text('前置归类', 'Organize First'))}</div>
+          <h2 class="card-title">${escapeHtml(text('先归类，再进入顾问对话。', 'Organize first, then continue in the advisor conversation.'))}</h2>
+        </div>
+        <div class="advisor-inline-actions advisor-organize-actions">
+          <button id="advisor-organize-start-btn" class="btn btn-primary" type="button" ${state.organizeStarting || isOrganizeRunning(snapshot) ? 'disabled' : ''}>${escapeHtml(state.organizeStarting ? text('启动中...', 'Starting...') : text('开始归类', 'Start Organizing'))}</button>
+          <button id="advisor-organize-stop-btn" class="btn btn-secondary" type="button" ${state.organizeStopping || !isOrganizeRunning(snapshot) ? 'disabled' : ''}>${escapeHtml(state.organizeStopping ? text('停止中...', 'Stopping...') : text('停止归类', 'Stop Organizing'))}</button>
+          <button id="advisor-start-btn" class="btn btn-secondary" type="button" ${(state.loading || state.organizeStarting) ? 'disabled' : ''}>${escapeHtml(sessionBtnLabel)}</button>
+        </div>
+      </div>
+      <div class="advisor-organize-config-grid">
+        <div class="advisor-source-field">
+          <label class="form-label" for="advisor-root-path">${escapeHtml(text('工作目录', 'Working Directory'))}</label>
+          <div class="advisor-path-actions">
+            <input id="advisor-root-path" class="form-input advisor-input-path" type="text" value="${escapeHtml(state.rootPath)}" placeholder="${escapeHtml(text('选择目录', 'Choose a folder'))}">
+            <button id="advisor-browse-btn" class="btn btn-secondary" type="button">${escapeHtml(text('浏览', 'Browse'))}</button>
+          </div>
+        </div>
+        <div class="advisor-organize-fields">
+          <div class="form-group">
+            <label class="form-label" for="advisor-summary-mode">${escapeHtml(text('摘要模式', 'Summary Mode'))}</label>
+            <select id="advisor-summary-mode" class="form-input">
+              ${SUMMARY_MODES.map((mode) => `
+                <option value="${escapeHtml(mode)}" ${state.summaryStrategy === mode ? 'selected' : ''}>${escapeHtml(summaryModeLabel(mode))}</option>
+              `).join('')}
+            </select>
+            <div class="form-hint">${escapeHtml(summaryModeHint(state.summaryStrategy))}</div>
+          </div>
+          <label class="advisor-organize-toggle">
+            <input id="advisor-workflow-web-search" type="checkbox" ${state.useWebSearch ? 'checked' : ''} ${state.syncingSearch ? 'disabled' : ''} />
+            <span class="advisor-organize-toggle-copy">
+              <span class="advisor-organize-toggle-title">${escapeHtml(text('为当前整理工作流启用联网搜索', 'Enable Web Search for the current cleanup workflow'))}</span>
+              <span class="advisor-organize-toggle-hint">${escapeHtml(text('这个开关会同时影响归类阶段和顾问对话中的 web_search 工具。', 'This single switch controls organize-time search and the advisor web_search tool.'))}</span>
+            </span>
+          </label>
+        </div>
+      </div>
+      <div class="form-hint">${escapeHtml(conversationHint)}</div>
+      ${renderOrganizeSummary(snapshot)}
+    </section>
+  `;
+}
+
 function renderPage() {
   if (!pageContainer) return;
-  const hasSession = !!state.sessionData;
   const stageLabel = getStageLabel();
   pageContainer.innerHTML = `
     <section class="workflow-shell advisor-workspace">
@@ -318,41 +471,14 @@ function renderPage() {
         <div class="workflow-hero-row">
           <div class="workflow-hero-copy">
             <div class="workflow-kicker">${escapeHtml(text('顾问工作流', 'Advisor Workflow'))}</div>
-            <h1>${escapeHtml(text('在一条会话流里完成理解、预览和执行。', 'Run understanding, preview, and execution in one conversation flow.'))}</h1>
-            <p>${escapeHtml(text('扫描页负责提供目录与历史记录；这里负责连续对话、附着式结果卡和最终动作确认。', 'The inventory page provides directories and reusable scans; this page handles conversation, attached result cards, and final actions.'))}</p>
+            <h1>${escapeHtml(text('在同一页面里完成归类、建议、预览和执行。', 'Organize, advise, preview, and execute from one page.'))}</h1>
+            <p>${escapeHtml(text('顶部先跑归类，拿到结果后直接进入顾问对话；如果你不想等待，也可以直接开始会话。', 'Run organize at the top first, then continue straight into the advisor conversation. If you do not want to wait, you can still start the session immediately.'))}</p>
           </div>
           <div class="workflow-hero-actions advisor-hero-actions">
             <span class="advisor-stage-chip">${escapeHtml(stageLabel)}</span>
-            <button id="advisor-start-btn" class="btn btn-primary" type="button" ${state.loading ? 'disabled' : ''}>${escapeHtml(state.sessionId ? text('重建会话', 'Restart Session') : text('开始会话', 'Start Session'))}</button>
           </div>
         </div>
-
-        <div class="advisor-source-grid">
-          <div class="advisor-source-field">
-            <label class="form-label" for="advisor-root-path">${escapeHtml(text('工作目录', 'Working Directory'))}</label>
-            <div class="advisor-path-actions">
-              <input id="advisor-root-path" class="form-input advisor-input-path" type="text" value="${escapeHtml(state.rootPath)}" placeholder="${escapeHtml(text('选择目录，或从扫描页带入目录', 'Choose a folder or hand off from the inventory page'))}">
-              <button id="advisor-browse-btn" class="btn btn-secondary" type="button">${escapeHtml(text('浏览', 'Browse'))}</button>
-            </div>
-          </div>
-          <div class="advisor-source-note">
-            <div class="advisor-hero-stat">
-              <span class="advisor-hero-stat-label">${escapeHtml(text('会话状态', 'Session Status'))}</span>
-              <strong>${escapeHtml(hasSession ? text('已连接顾问会话', 'Connected to advisor session') : text('等待启动会话', 'Waiting to start a session'))}</strong>
-            </div>
-            <div class="form-hint">${escapeHtml(text('支持从最近扫描直接启动，也支持手动切换目录后重建会话。', 'You can start directly from a recent scan or switch directories and rebuild the session.'))}</div>
-          </div>
-        </div>
-
-        <div class="advisor-quick-scan-shell">
-          <div class="advisor-section-head">
-            <div>
-              <div class="card-title">${escapeHtml(text('最近扫描', 'Recent Scans'))}</div>
-              <div class="form-hint">${escapeHtml(text('点击一条记录可直接把目录和扫描上下文带入顾问。', 'Click a record to hand the directory and scan context to the advisor.'))}</div>
-            </div>
-          </div>
-          <div class="advisor-quick-scan-grid">${renderQuickScans()}</div>
-        </div>
+        ${renderOrganizePanel()}
       </section>
 
       ${renderContextSummary()}
@@ -383,12 +509,20 @@ function renderPage() {
   bindEvents();
 }
 
-async function refreshQuickScans() {
-  try {
-    state.quickScans = await listScanHistory(QUICK_SCAN_LIMIT);
-  } catch {
-    state.quickScans = [];
+function summaryModeLabel(mode) {
+  if (mode === 'agent_summary') return text('AI 摘要', 'Agent Summary');
+  if (mode === 'local_summary') return text('本地摘要', 'Local Summary');
+  return text('仅文件名', 'Filename Only');
+}
+
+function summaryModeHint(mode) {
+  if (mode === 'agent_summary') {
+    return text('先提取文本层，再调用摘要模型生成标准化摘要。', 'Extract text locally first, then call the summary model for normalized summaries.');
   }
+  if (mode === 'local_summary') {
+    return text('只做本地提取和模板摘要，不额外调用摘要模型。', 'Only use local extraction and template summaries, without extra summary model calls.');
+  }
+  return text('最低成本，只用文件名、路径和基础元信息归类。', 'Lowest-cost mode. Classify from filenames, paths, and metadata only.');
 }
 
 async function hydrateSession(sessionId) {
@@ -398,41 +532,253 @@ async function hydrateSession(sessionId) {
   try {
     state.sessionData = await advisorSessionGet(sessionId);
     state.sessionId = String(state.sessionData?.sessionId || sessionId);
-    setPersisted(PERSIST_KEYS.sessionId, state.sessionId);
+    writePersisted(PERSIST_KEYS.sessionId, state.sessionId);
   } finally {
     state.loading = false;
     renderPage();
   }
 }
 
+async function ensureWorkflowCredentials(requireSearchApi) {
+  const settings = await getSettings();
+  const defaultProviderEndpoint = String(settings?.defaultProviderEndpoint || '').trim() || 'https://api.openai.com/v1';
+  await ensureRequiredCredentialsConfigured({
+    providerEndpoints: [defaultProviderEndpoint],
+    requireSearchApi,
+    reasonText: text('请先在“服务商 API”里补齐当前工作流所需密钥。', 'Configure the required API keys in Service Provider API first.'),
+  });
+}
+
+function persistRootPath(rootPath) {
+  const value = String(rootPath || '').trim();
+  state.rootPath = value;
+  writePersisted(PERSIST_KEYS.rootPath, value);
+  writePersisted(ORGANIZER_PERSIST_KEYS.rootPath, value);
+}
+
+function persistSummaryStrategy(summaryStrategy) {
+  state.summaryStrategy = SUMMARY_MODES.includes(summaryStrategy) ? summaryStrategy : DEFAULT_SUMMARY_MODE;
+  writePersisted(ORGANIZER_PERSIST_KEYS.summaryStrategy, state.summaryStrategy);
+}
+
+function persistUseWebSearch(useWebSearch) {
+  state.useWebSearch = !!useWebSearch;
+  writePersisted(ORGANIZER_PERSIST_KEYS.useWebSearch, state.useWebSearch);
+}
+
+function persistOrganizeSnapshot(snapshot) {
+  state.organizeSnapshot = sanitizeSnapshot(snapshot);
+  if (state.organizeSnapshot) {
+    writePersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot, state.organizeSnapshot);
+  } else {
+    removePersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot);
+  }
+}
+
+function persistOrganizeTaskId(taskId) {
+  state.organizeTaskId = String(taskId || '').trim();
+  if (state.organizeTaskId) {
+    writePersisted(ORGANIZER_PERSIST_KEYS.lastTaskId, state.organizeTaskId);
+  } else {
+    removePersisted(ORGANIZER_PERSIST_KEYS.lastTaskId);
+  }
+}
+
+function closeOrganizeStream() {
+  try {
+    state.organizeStream?.close?.();
+  } catch {
+    // ignore
+  }
+  state.organizeStream = null;
+}
+
+function applyLocalWebSearchState() {
+  if (!state.sessionData || typeof state.sessionData !== 'object') return;
+  state.sessionData.useWebSearch = !!state.useWebSearch;
+  state.sessionData.webSearchEnabled = !!state.useWebSearch;
+  if (state.sessionData.session && typeof state.sessionData.session === 'object') {
+    state.sessionData.session.useWebSearch = !!state.useWebSearch;
+    state.sessionData.session.webSearchEnabled = !!state.useWebSearch;
+  }
+  if (!state.sessionData.contextBar || typeof state.sessionData.contextBar !== 'object') {
+    state.sessionData.contextBar = {};
+  }
+  state.sessionData.contextBar.webSearch = {
+    useWebSearch: !!state.useWebSearch,
+    webSearchEnabled: !!state.useWebSearch,
+    message: state.useWebSearch
+      ? text('下一轮对话会按当前设置开放联网搜索。', 'Web search will be available on the next turn with the current setting.')
+      : text('下一轮对话会关闭联网搜索。', 'Web search will be disabled on the next turn.'),
+  };
+}
+
+function applyOrganizeSnapshot(snapshot) {
+  const nextSnapshot = sanitizeSnapshot(snapshot);
+  if (!nextSnapshot) return;
+  persistOrganizeSnapshot(nextSnapshot);
+  persistOrganizeTaskId(nextSnapshot.id || state.organizeTaskId);
+  if (!isOrganizeRunning(nextSnapshot)) {
+    closeOrganizeStream();
+  }
+  renderPage();
+}
+
+function connectTaskStream(taskId) {
+  closeOrganizeStream();
+  if (!taskId) return;
+  state.organizeStream = connectOrganizeStream(taskId, {
+    onProgress: (snapshot) => applyOrganizeSnapshot(snapshot),
+    onDone: (snapshot) => {
+      applyOrganizeSnapshot(snapshot);
+      showToast(text('归类完成，可以开始对话。', 'Organize finished. You can start the conversation now.'), 'success');
+    },
+    onError: (payload) => {
+      if (payload?.snapshot) applyOrganizeSnapshot(payload.snapshot);
+      showToast(`${text('归类失败: ', 'Organize failed: ')}${payload?.message || text('未知错误', 'Unknown error')}`, 'error');
+    },
+    onStopped: (snapshot) => {
+      applyOrganizeSnapshot(snapshot);
+      showToast(text('归类任务已停止。', 'The organize task has been stopped.'), 'info');
+    },
+  });
+}
+
+async function hydrateOrganizeSnapshot(taskId, { reconnect = true } = {}) {
+  if (!taskId) return;
+  try {
+    const snapshot = await getOrganizeResult(taskId);
+    applyOrganizeSnapshot(snapshot);
+    if (reconnect && isOrganizeRunning(snapshot)) {
+      connectTaskStream(taskId);
+    }
+  } catch {
+    if (state.organizeTaskId === taskId) {
+      persistOrganizeTaskId('');
+    }
+  }
+}
+
+async function syncWorkflowSearchSetting(nextValue) {
+  state.syncingSearch = true;
+  renderPage();
+  try {
+    await saveSettings({
+      searchApi: {
+        provider: 'tavily',
+        enabled: !!nextValue,
+        scopes: {
+          classify: !!nextValue,
+          organizer: !!nextValue,
+        },
+      },
+    });
+    persistUseWebSearch(nextValue);
+    applyLocalWebSearchState();
+  } finally {
+    state.syncingSearch = false;
+    renderPage();
+  }
+}
+
+async function loadWorkflowSettings() {
+  const settings = await getSettings();
+  const searchApi = settings?.searchApi && typeof settings.searchApi === 'object'
+    ? settings.searchApi
+    : {};
+  const scopes = searchApi?.scopes && typeof searchApi.scopes === 'object'
+    ? searchApi.scopes
+    : {};
+  const workflowEnabled = !!(searchApi.enabled || scopes.classify || scopes.organizer);
+  persistUseWebSearch(workflowEnabled);
+}
+
 async function handleBrowse() {
   try {
     const picked = await browseFolder();
     if (picked?.cancelled || !picked?.path) return;
-    state.rootPath = String(picked.path).trim();
-    setPersisted(PERSIST_KEYS.rootPath, state.rootPath);
+    persistRootPath(picked.path);
     renderPage();
   } catch (err) {
     showToast(`${text('选择目录失败: ', 'Failed to select folder: ')}${err?.message || err}`, 'error');
   }
 }
 
-async function handleStart(scanTaskId = null) {
+async function handleStartOrganize() {
   if (!state.rootPath.trim()) {
     showToast(text('请先选择目录', 'Select a folder first'), 'error');
     return;
   }
+  await ensureWorkflowCredentials(state.useWebSearch);
+  state.organizeStarting = true;
+  renderPage();
+  try {
+    const result = await startOrganize({
+      rootPath: state.rootPath.trim(),
+      excludedPatterns: DEFAULT_EXCLUSIONS,
+      batchSize: DEFAULT_BATCH_SIZE,
+      summaryStrategy: state.summaryStrategy,
+      maxClusterDepth: null,
+      useWebSearch: state.useWebSearch,
+      responseLanguage: getLang(),
+    });
+    const taskId = String(result?.taskId || '').trim();
+    persistOrganizeTaskId(taskId);
+    persistOrganizeSnapshot({
+      id: taskId,
+      status: 'idle',
+      rootPath: state.rootPath.trim(),
+      excludedPatterns: DEFAULT_EXCLUSIONS,
+      batchSize: DEFAULT_BATCH_SIZE,
+      summaryStrategy: state.summaryStrategy,
+      maxClusterDepth: null,
+      useWebSearch: state.useWebSearch,
+      webSearchEnabled: state.useWebSearch,
+      totalFiles: 0,
+      processedFiles: 0,
+      tree: { children: [] },
+    });
+    connectTaskStream(taskId);
+    await hydrateOrganizeSnapshot(taskId, { reconnect: true });
+    showToast(text('归类任务已启动。', 'Organize task started.'), 'success');
+  } catch (err) {
+    showToast(`${text('启动归类失败: ', 'Failed to start organize: ')}${err?.message || err}`, 'error');
+  } finally {
+    state.organizeStarting = false;
+    renderPage();
+  }
+}
+
+async function handleStopOrganize() {
+  if (!state.organizeTaskId) return;
+  state.organizeStopping = true;
+  renderPage();
+  try {
+    await stopOrganize(state.organizeTaskId);
+  } catch (err) {
+    showToast(`${text('停止归类失败: ', 'Failed to stop organize: ')}${err?.message || err}`, 'error');
+  } finally {
+    state.organizeStopping = false;
+    renderPage();
+  }
+}
+
+async function handleStartSession() {
+  if (!state.rootPath.trim()) {
+    showToast(text('请先选择目录', 'Select a folder first'), 'error');
+    return;
+  }
+  await ensureWorkflowCredentials(state.useWebSearch);
   state.loading = true;
   renderPage();
   try {
     const payload = await advisorSessionStart({
       rootPath: state.rootPath.trim(),
-      scanTaskId,
       responseLanguage: getLang(),
     });
     state.sessionData = payload;
     state.sessionId = String(payload?.sessionId || '');
-    setPersisted(PERSIST_KEYS.sessionId, state.sessionId);
+    writePersisted(PERSIST_KEYS.sessionId, state.sessionId);
   } catch (err) {
     showToast(`${text('启动会话失败: ', 'Failed to start session: ')}${err?.message || err}`, 'error');
   } finally {
@@ -453,7 +799,7 @@ async function handleSend() {
     });
     state.sessionData = payload;
     state.messageDraft = '';
-    setPersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
+    writePersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
   } catch (err) {
     showToast(`${text('发送失败: ', 'Send failed: ')}${err?.message || err}`, 'error');
   } finally {
@@ -495,20 +841,47 @@ function scrollComposerIntoView() {
 function bindEvents() {
   const rootInput = document.getElementById('advisor-root-path');
   rootInput?.addEventListener('input', (event) => {
-    state.rootPath = String(event.target?.value || '').trim();
-    setPersisted(PERSIST_KEYS.rootPath, state.rootPath);
+    persistRootPath(event.target?.value || '');
+    renderPage();
   });
 
   document.getElementById('advisor-browse-btn')?.addEventListener('click', handleBrowse);
-  document.getElementById('advisor-start-btn')?.addEventListener('click', () => handleStart());
+  document.getElementById('advisor-organize-start-btn')?.addEventListener('click', () => {
+    handleStartOrganize().catch((err) => {
+      showToast(`${text('启动归类失败: ', 'Failed to start organize: ')}${err?.message || err}`, 'error');
+    });
+  });
+  document.getElementById('advisor-organize-stop-btn')?.addEventListener('click', () => {
+    handleStopOrganize().catch((err) => {
+      showToast(`${text('停止归类失败: ', 'Failed to stop organize: ')}${err?.message || err}`, 'error');
+    });
+  });
+  document.getElementById('advisor-start-btn')?.addEventListener('click', () => {
+    handleStartSession().catch((err) => {
+      showToast(`${text('启动会话失败: ', 'Failed to start session: ')}${err?.message || err}`, 'error');
+    });
+  });
   document.getElementById('advisor-toggle-context')?.addEventListener('click', () => {
     handleCardAction('', 'toggle_context_bar');
+  });
+
+  document.getElementById('advisor-summary-mode')?.addEventListener('change', (event) => {
+    persistSummaryStrategy(String(event.target?.value || ''));
+    renderPage();
+  });
+  document.getElementById('advisor-workflow-web-search')?.addEventListener('change', (event) => {
+    const nextValue = !!event.target?.checked;
+    syncWorkflowSearchSetting(nextValue).catch((err) => {
+      showToast(`${text('保存联网搜索开关失败: ', 'Failed to save web search setting: ')}${err?.message || err}`, 'error');
+      persistUseWebSearch(!nextValue);
+      renderPage();
+    });
   });
 
   const messageInput = document.getElementById('advisor-message');
   messageInput?.addEventListener('input', (event) => {
     state.messageDraft = String(event.target?.value || '');
-    setPersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
+    writePersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
   });
   messageInput?.addEventListener('keydown', (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
@@ -519,14 +892,6 @@ function bindEvents() {
 
   document.getElementById('advisor-send-btn')?.addEventListener('click', handleSend);
 
-  pageContainer.querySelectorAll('.advisor-quick-scan').forEach((button) => {
-    button.addEventListener('click', () => {
-      state.rootPath = String(button.dataset.rootPath || '').trim();
-      setPersisted(PERSIST_KEYS.rootPath, state.rootPath);
-      handleStart(String(button.dataset.taskId || '').trim() || null);
-    });
-  });
-
   pageContainer.querySelectorAll('.advisor-card-action').forEach((button) => {
     button.addEventListener('click', () => handleCardAction(button.dataset.cardId, button.dataset.action));
   });
@@ -534,14 +899,15 @@ function bindEvents() {
 
 async function bootstrap() {
   renderPage();
-  await refreshQuickScans();
-  renderPage();
-  const handoff = getPendingHandoff();
-  if (handoff?.rootPath) {
-    state.rootPath = String(handoff.rootPath).trim();
-    setPersisted(PERSIST_KEYS.rootPath, state.rootPath);
-    await handleStart(handoff?.scanTaskId ? String(handoff.scanTaskId).trim() : null);
-    return;
+  try {
+    await loadWorkflowSettings();
+  } catch {
+    // keep persisted fallback
+  }
+  if (state.organizeTaskId) {
+    await hydrateOrganizeSnapshot(state.organizeTaskId, { reconnect: true });
+  } else {
+    renderPage();
   }
   if (state.sessionId) {
     try {
@@ -557,6 +923,7 @@ async function bootstrap() {
 }
 
 export function renderAdvisor(container) {
+  closeOrganizeStream();
   pageContainer = container;
   state = createInitialState();
   bootstrap();

@@ -2,6 +2,7 @@ mod planner;
 mod summary;
 
 use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
+use crate::file_representation::FileRepresentation;
 use crate::llm_protocol::{
     apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
     parse_completion_response, ParsedToolCall, DEFAULT_MAX_TOKENS,
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use uuid::Uuid;
@@ -35,6 +36,7 @@ const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
+const SUMMARY_AGENT_LONG_CHARS: usize = 720;
 const ORGANIZER_WEB_SEARCH_BUDGET: usize = 8;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
@@ -100,7 +102,8 @@ struct SummaryAgentBatchOutput {
 
 #[derive(Clone, Debug, Default)]
 struct SummaryAgentItem {
-    summary: String,
+    summary_short: String,
+    summary_long: String,
     keywords: Vec<String>,
     confidence: Option<String>,
     warnings: Vec<String>,
@@ -118,11 +121,8 @@ struct SummaryExtraction {
 
 #[derive(Clone, Debug, Default)]
 struct SummaryBuildResult {
-    summary: String,
-    source: String,
-    degraded: bool,
+    representation: FileRepresentation,
     warnings: Vec<String>,
-    confidence: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -229,7 +229,39 @@ pub struct OrganizeTaskRuntime {
     search_api_key: String,
     response_language: String,
     extraction_tool: ExtractionToolConfig,
+    diagnostics: OrganizerDiagnostics,
     pub job: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OrganizerDiagnostics {
+    pub data_dir: PathBuf,
+    pub operation_id: String,
+    pub task_id: String,
+}
+
+impl OrganizerDiagnostics {
+    fn record(
+        &self,
+        level: &str,
+        event: &str,
+        message: &str,
+        details: Value,
+        error: Option<Value>,
+        duration: Option<Duration>,
+    ) {
+        crate::diagnostics::record_event(
+            &self.data_dir,
+            level,
+            "organizer",
+            event,
+            Some(&self.operation_id),
+            message,
+            crate::diagnostics::merge_details(details, json!({ "taskId": self.task_id })),
+            error,
+            duration,
+        );
+    }
 }
 
 fn now_iso() -> String {
@@ -2138,12 +2170,13 @@ async fn run_organize_task<R: Runtime>(
     state: &AppState,
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
+    let task_started_at = Instant::now();
     let (
         root_path,
         recursive,
         excluded,
         batch_size,
-        summary_mode,
+        summary_strategy,
         max_cluster_depth,
         use_web_search,
     ) = {
@@ -2153,19 +2186,63 @@ async fn run_organize_task<R: Runtime>(
             snap.recursive,
             snap.excluded_patterns.clone(),
             snap.batch_size,
-            snap.summary_mode.clone(),
+            snap.summary_strategy.clone(),
             snap.max_cluster_depth,
             snap.use_web_search,
         )
     };
+    task.diagnostics.record(
+        "info",
+        "organize_task_started",
+        "organize task started",
+        json!({
+            "rootPath": root_path.clone(),
+            "recursive": recursive,
+            "excludedPatterns": excluded.clone(),
+            "batchSize": batch_size,
+            "summaryStrategy": summary_strategy.clone(),
+            "maxClusterDepth": max_cluster_depth,
+            "useWebSearch": use_web_search,
+        }),
+        None,
+        None,
+    );
     {
         let mut snap = task.snapshot.lock();
         snap.status = "scanning".to_string();
     }
+    let scan_started_at = Instant::now();
+    task.diagnostics.record(
+        "info",
+        "organize_scan_start",
+        "organize scan started",
+        json!({ "rootPath": root_path.clone() }),
+        None,
+        None,
+    );
     emit_snapshot(app, state, task).await?;
 
     let units = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
+    task.diagnostics.record(
+        "info",
+        "organize_scan_done",
+        "organize scan completed",
+        json!({
+            "rootPath": root_path.clone(),
+            "unitCount": units.len(),
+        }),
+        None,
+        Some(scan_started_at.elapsed()),
+    );
     if task.stop.load(Ordering::Relaxed) {
+        task.diagnostics.record(
+            "info",
+            "organize_task_stopped",
+            "organize task stopped after scan",
+            json!({ "stage": "scan" }),
+            None,
+            Some(task_started_at.elapsed()),
+        );
         return Ok(());
     }
     let reference_structure = None;
@@ -2202,7 +2279,28 @@ async fn run_organize_task<R: Runtime>(
     let task_id = task.snapshot.lock().id.clone();
 
     for (batch_idx, batch) in units.chunks(batch_size as usize).enumerate() {
+        let batch_started_at = Instant::now();
+        task.diagnostics.record(
+            "info",
+            "organize_batch_start",
+            "organize batch started",
+            json!({
+                "batchIndex": batch_idx + 1,
+                "batchSize": batch.len(),
+                "totalBatches": total_batches,
+            }),
+            None,
+            None,
+        );
         if task.stop.load(Ordering::Relaxed) {
+            task.diagnostics.record(
+                "info",
+                "organize_task_stopped",
+                "organize task stopped before batch",
+                json!({ "stage": "batch_start", "batchIndex": batch_idx + 1 }),
+                None,
+                Some(task_started_at.elapsed()),
+            );
             return Ok(());
         }
 
@@ -2227,7 +2325,7 @@ async fn run_organize_task<R: Runtime>(
                     api_key: String::new(),
                     model: "gpt-4o-mini".to_string(),
                 });
-            let extracted = match summary_mode.as_str() {
+            let extracted = match summary_strategy.as_str() {
                 SUMMARY_MODE_FILENAME_ONLY => None,
                 _ => Some(
                     summary::extract_unit_content_for_summary_with_tools(
@@ -2239,13 +2337,24 @@ async fn run_organize_task<R: Runtime>(
                     .await,
                 ),
             };
-            let local_result = match summary_mode.as_str() {
+            let local_result = match summary_strategy.as_str() {
                 SUMMARY_MODE_FILENAME_ONLY => SummaryBuildResult {
-                    summary: String::new(),
-                    source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
-                    degraded: false,
+                    representation: FileRepresentation {
+                        metadata: Some(summary::build_representation_metadata(
+                            unit,
+                            &SummaryExtraction {
+                                parser: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
+                                ..SummaryExtraction::default()
+                            },
+                        )),
+                        short: None,
+                        long: None,
+                        source: SUMMARY_SOURCE_FILENAME_ONLY.to_string(),
+                        degraded: false,
+                        confidence: None,
+                        keywords: Vec::new(),
+                    },
                     warnings: Vec::new(),
-                    confidence: None,
                 },
                 _ => summary::build_local_summary(
                     unit,
@@ -2275,35 +2384,36 @@ async fn run_organize_task<R: Runtime>(
                 "modifiedAt": unit.modified_at,
                 "itemType": unit.item_type,
                 "modality": unit.modality,
-                "summaryMode": summary_mode.clone(),
-                "summary": local_result.summary,
-                "summarySource": local_result.source,
-                "summaryConfidence": local_result.confidence,
-                "summaryKeywords": extracted
-                    .as_ref()
-                    .map(|value| Value::Array(value.keywords.iter().cloned().map(Value::String).collect::<Vec<_>>()))
-                    .unwrap_or(Value::Array(Vec::new())),
-                "summaryDegraded": local_result.degraded,
+                "summaryStrategy": summary_strategy.clone(),
+                "representation": local_result.representation.to_value(),
+                "summaryDegraded": local_result.representation.degraded,
                 "summaryWarnings": local_result.warnings,
                 "localExtraction": extraction_json,
                 "provider": route.endpoint,
                 "model": route.model,
             }));
-            if summary_mode == SUMMARY_MODE_LOCAL_SUMMARY {
+            if summary_strategy == SUMMARY_MODE_LOCAL_SUMMARY {
                 if let Some(row) = batch_rows.last() {
-                    summary::emit_organize_summary_ready(&app, &task_id, (batch_idx + 1) as u64, row);
+                    summary::emit_organize_summary_ready(
+                        &app,
+                        &task_id,
+                        (batch_idx + 1) as u64,
+                        row,
+                    );
                 }
             }
             local_results.push(local_result);
         }
 
         let mut summary_usage = TokenUsage::default();
-        if summary_mode == SUMMARY_MODE_AGENT_SUMMARY {
+        if summary_strategy == SUMMARY_MODE_AGENT_SUMMARY {
             let output = summary::summarize_batch_with_agent(
                 &text_route,
                 &task.response_language,
                 &task.stop,
                 &batch_rows,
+                Some(&task.diagnostics),
+                "summary_agent",
             )
             .await;
             summary_usage = output.usage;
@@ -2322,47 +2432,41 @@ async fn run_organize_task<R: Runtime>(
                     .into_iter()
                     .filter_map(|value| value.as_str().map(|item| item.to_string()))
                     .collect::<Vec<_>>();
-                let fallback_source = if local_result.source == SUMMARY_SOURCE_FILENAME_ONLY {
-                    SUMMARY_SOURCE_FILENAME_ONLY
-                } else {
-                    SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL
-                };
+                let fallback_source =
+                    if local_result.representation.source == SUMMARY_SOURCE_FILENAME_ONLY {
+                        SUMMARY_SOURCE_FILENAME_ONLY
+                    } else {
+                        SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL
+                    };
 
                 if let Some(agent_item) = output
                     .error
                     .is_none()
                     .then(|| output.items.get(item_id))
                     .flatten()
-                    .filter(|item| !item.summary.trim().is_empty())
+                    .filter(|item| {
+                        !item.summary_long.trim().is_empty()
+                            || !item.summary_short.trim().is_empty()
+                    })
                 {
                     warnings.extend(agent_item.warnings.clone());
-                    row["summary"] = Value::String(agent_item.summary.clone());
-                    row["summarySource"] = Value::String(SUMMARY_SOURCE_AGENT_SUMMARY.to_string());
-                    row["summaryConfidence"] = agent_item
-                        .confidence
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null);
-                    row["summaryKeywords"] = Value::Array(
-                        agent_item
-                            .keywords
-                            .iter()
-                            .cloned()
-                            .map(Value::String)
-                            .collect::<Vec<_>>(),
-                    );
-                    row["summaryDegraded"] = Value::Bool(local_result.degraded);
+                    let mut representation = local_result.representation.clone();
+                    representation.short = Some(agent_item.summary_short.clone());
+                    representation.long = Some(agent_item.summary_long.clone());
+                    representation.source = SUMMARY_SOURCE_AGENT_SUMMARY.to_string();
+                    representation.confidence = agent_item.confidence.clone();
+                    representation.keywords = agent_item.keywords.clone();
+                    row["representation"] = representation.to_value();
+                    row["summaryDegraded"] = Value::Bool(local_result.representation.degraded);
                     row["summaryWarnings"] =
                         Value::Array(warnings.into_iter().map(Value::String).collect::<Vec<_>>());
                 } else {
                     warnings.push(batch_failed_warning.clone());
-                    row["summary"] = Value::String(local_result.summary);
-                    row["summarySource"] = Value::String(fallback_source.to_string());
-                    row["summaryConfidence"] = Value::Null;
-                    row["summaryKeywords"] = row
-                        .get("summaryKeywords")
-                        .cloned()
-                        .unwrap_or(Value::Array(Vec::new()));
+                    let mut representation = local_result.representation.clone();
+                    representation.source = fallback_source.to_string();
+                    representation.degraded = true;
+                    representation.confidence = None;
+                    row["representation"] = representation.to_value();
                     row["summaryDegraded"] = Value::Bool(true);
                     row["summaryWarnings"] =
                         Value::Array(warnings.into_iter().map(Value::String).collect::<Vec<_>>());
@@ -2390,6 +2494,8 @@ async fn run_organize_task<R: Runtime>(
                 reference_structure.as_ref(),
                 use_web_search,
                 &task.search_api_key,
+                Some(&task.diagnostics),
+                &format!("classification_batch_{}", batch_idx + 1),
             )
             .await
             {
@@ -2470,6 +2576,14 @@ async fn run_organize_task<R: Runtime>(
             }
         }
         if task.stop.load(Ordering::Relaxed) {
+            task.diagnostics.record(
+                "info",
+                "organize_task_stopped",
+                "organize task stopped after classification",
+                json!({ "stage": "classification", "batchIndex": batch_idx + 1 }),
+                None,
+                Some(task_started_at.elapsed()),
+            );
             return Ok(());
         }
 
@@ -2520,11 +2634,8 @@ async fn run_organize_task<R: Runtime>(
                 "size": row.get("size").and_then(Value::as_u64).unwrap_or(0),
                 "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-                "summaryMode": row.get("summaryMode").cloned().unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
-                "summary": row.get("summary").and_then(Value::as_str).unwrap_or(""),
-                "summarySource": row.get("summarySource").and_then(Value::as_str).unwrap_or(SUMMARY_SOURCE_FILENAME_ONLY),
-                "summaryConfidence": row.get("summaryConfidence").cloned().unwrap_or(Value::Null),
-                "summaryKeywords": row.get("summaryKeywords").cloned().unwrap_or(Value::Array(Vec::new())),
+                "summaryStrategy": row.get("summaryStrategy").cloned().unwrap_or(Value::String(SUMMARY_MODE_FILENAME_ONLY.to_string())),
+                "representation": row.get("representation").cloned().unwrap_or_else(|| FileRepresentation::default().to_value()),
                 "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
                 "leafNodeId": leaf_node_id,
                 "categoryPath": category_path,
@@ -2547,6 +2658,7 @@ async fn run_organize_task<R: Runtime>(
                 .saturating_add(persisted_rows.len() as u64);
             snap.results.extend(persisted_rows.iter().cloned());
         }
+        let persisted_row_count = persisted_rows.len();
         for row in persisted_rows {
             app.emit("organize_file_done", row)
                 .map_err(|e| e.to_string())?;
@@ -2574,6 +2686,29 @@ async fn run_organize_task<R: Runtime>(
                 .saturating_add(cluster_usage.total);
         }
         emit_snapshot(app, state, task).await?;
+        task.diagnostics.record(
+            if cluster_failed { "warn" } else { "info" },
+            "organize_batch_done",
+            "organize batch completed",
+            json!({
+                "batchIndex": batch_idx + 1,
+                "persistedRows": persisted_row_count,
+                "clusterFailed": cluster_failed,
+                "clusterError": cluster_error.clone(),
+                "summaryUsage": {
+                    "prompt": summary_usage.prompt,
+                    "completion": summary_usage.completion,
+                    "total": summary_usage.total,
+                },
+                "clusterUsage": {
+                    "prompt": cluster_usage.prompt,
+                    "completion": cluster_usage.completion,
+                    "total": cluster_usage.total,
+                },
+            }),
+            None,
+            Some(batch_started_at.elapsed()),
+        );
     }
 
     let final_snapshot = {
@@ -2595,9 +2730,28 @@ async fn run_organize_task<R: Runtime>(
     )?;
     app.emit(
         "organize_done",
-        serde_json::to_value(final_snapshot).map_err(|e| e.to_string())?,
+        serde_json::to_value(final_snapshot.clone()).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    task.diagnostics.record(
+        "info",
+        "organize_task_completed",
+        "organize task completed",
+        json!({
+            "totalFiles": final_snapshot.total_files,
+            "processedFiles": final_snapshot.processed_files,
+            "totalBatches": final_snapshot.total_batches,
+            "processedBatches": final_snapshot.processed_batches,
+            "previewCount": final_snapshot.preview.len(),
+            "tokenUsage": {
+                "prompt": final_snapshot.token_usage.prompt,
+                "completion": final_snapshot.token_usage.completion,
+                "total": final_snapshot.token_usage.total,
+            },
+        }),
+        None,
+        Some(task_started_at.elapsed()),
+    );
     Ok(())
 }
 
@@ -2619,6 +2773,7 @@ pub async fn organize_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
     input: OrganizeStartInput,
+    operation_id: String,
 ) -> Result<Value, String> {
     if input.root_path.trim().is_empty() {
         return Err("rootPath is required".to_string());
@@ -2626,8 +2781,8 @@ pub async fn organize_start<R: Runtime>(
     let task_id = format!("org_{}", Uuid::new_v4().simple());
     let settings = crate::backend::read_settings(&state.settings_path());
     let mut extraction_tool = extraction_tool_config_from_settings(&settings);
-    let normalized_summary_mode = normalize_summary_mode(input.summary_mode.as_deref());
-    if normalized_summary_mode != SUMMARY_MODE_FILENAME_ONLY {
+    let normalized_summary_strategy = normalize_summary_mode(input.summary_strategy.as_deref());
+    if normalized_summary_strategy != SUMMARY_MODE_FILENAME_ONLY {
         force_enable_tika_for_summary_mode(&mut extraction_tool);
         ensure_tika_server_running(state.inner(), &mut extraction_tool).await;
     }
@@ -2648,7 +2803,7 @@ pub async fn organize_start<R: Runtime>(
         recursive: true,
         excluded_patterns: normalize_excluded(input.excluded_patterns.clone()),
         batch_size: normalize_batch_size(input.batch_size),
-        summary_mode: normalized_summary_mode,
+        summary_strategy: normalized_summary_strategy,
         max_cluster_depth: input.max_cluster_depth.filter(|value| *value > 0),
         use_web_search: input.use_web_search.unwrap_or(false),
         web_search_enabled: input.use_web_search.unwrap_or(false)
@@ -2688,6 +2843,11 @@ pub async fn organize_start<R: Runtime>(
         search_api_key: input.search_api_key.unwrap_or_default(),
         response_language: input.response_language.unwrap_or_else(|| "zh".to_string()),
         extraction_tool,
+        diagnostics: OrganizerDiagnostics {
+            data_dir: state.data_dir(),
+            operation_id,
+            task_id: task_id.clone(),
+        },
         job: Mutex::new(None),
     });
     state
@@ -2707,6 +2867,14 @@ pub async fn organize_start<R: Runtime>(
             let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
             drop(snap);
+            runtime.diagnostics.record(
+                "info",
+                "organize_task_stopped",
+                "organize task stopped",
+                payload.clone(),
+                None,
+                None,
+            );
             let _ = app_clone.emit("organize_stopped", payload);
         } else if let Err(err) = result {
             let mut snap = runtime.snapshot.lock();
@@ -2716,6 +2884,17 @@ pub async fn organize_start<R: Runtime>(
             let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
             drop(snap);
+            runtime.diagnostics.record(
+                "error",
+                "organize_task_failed",
+                "organize task failed",
+                payload.clone(),
+                payload
+                    .get("message")
+                    .cloned()
+                    .map(|message| json!({ "message": message })),
+                None,
+            );
             let _ = app_clone.emit("organize_error", payload);
         }
         state_clone.organize_tasks.lock().remove(&task_id_clone);
@@ -2723,7 +2902,7 @@ pub async fn organize_start<R: Runtime>(
     *task.job.lock() = Some(handle);
     Ok(json!({
         "taskId": task_id,
-        "summaryMode": snapshot.summary_mode,
+        "summaryStrategy": snapshot.summary_strategy,
         "selectedModel": snapshot.selected_model,
         "selectedModels": snapshot.selected_models,
         "selectedProviders": snapshot.selected_providers,
@@ -2894,6 +3073,21 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             "total": entries.len()
         }
     });
+    crate::diagnostics::record_state_event(
+        state.inner(),
+        if failed > 0 { "warn" } else { "info" },
+        "organizer",
+        "organize_apply_manifest",
+        None,
+        "organize apply move results",
+        json!({
+            "taskId": manifest.get("taskId").cloned().unwrap_or(Value::Null),
+            "jobId": manifest.get("jobId").cloned().unwrap_or(Value::Null),
+            "manifest": manifest.clone(),
+        }),
+        None,
+        None,
+    );
     persist::save_organize_manifest(&state.db_path(), &manifest)?;
     snapshot.status = "done".to_string();
     snapshot.job_id = manifest
@@ -3009,6 +3203,26 @@ pub async fn organize_rollback(
             "total": rollback_entries.len()
         }
     });
+    let rollback_failed = rollback
+        .get("summary")
+        .and_then(|summary| summary.get("failed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    crate::diagnostics::record_state_event(
+        state.inner(),
+        if rollback_failed > 0 { "warn" } else { "info" },
+        "organizer",
+        "organize_rollback_result",
+        None,
+        "organize rollback results",
+        json!({
+            "jobId": job_id.clone(),
+            "taskId": task_id.clone(),
+            "rollback": rollback.clone(),
+        }),
+        None,
+        None,
+    );
     persist::save_organize_rollback(&state.db_path(), &job_id, &rollback)?;
 
     let failed = rollback
@@ -3151,7 +3365,7 @@ mod tests {
             recursive: true,
             excluded_patterns: Vec::new(),
             batch_size: 20,
-            summary_mode: SUMMARY_MODE_FILENAME_ONLY.to_string(),
+            summary_strategy: SUMMARY_MODE_FILENAME_ONLY.to_string(),
             max_cluster_depth: None,
             use_web_search: false,
             web_search_enabled: false,
@@ -3190,7 +3404,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_summary_mode_defaults_to_filename_only() {
+    fn normalize_summary_strategy_defaults_to_filename_only() {
         assert_eq!(
             normalize_summary_mode(None),
             SUMMARY_MODE_FILENAME_ONLY.to_string()
@@ -3267,9 +3481,14 @@ mod tests {
         let extracted = summary::extract_unit_content_for_summary(&unit, "zh-CN", &stop);
         let summary = summary::build_local_summary(&unit, &extracted);
         assert!(extracted.excerpt.is_empty());
-        assert_eq!(summary.source, SUMMARY_SOURCE_FILENAME_ONLY);
-        assert!(summary.degraded);
-        assert!(summary.summary.is_empty());
+        assert_eq!(summary.representation.source, SUMMARY_SOURCE_FILENAME_ONLY);
+        assert!(summary.representation.degraded);
+        assert_eq!(
+            summary.representation.metadata.as_deref(),
+            Some("archive.bin")
+        );
+        assert!(summary.representation.short.is_none());
+        assert!(summary.representation.long.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3335,7 +3554,8 @@ mod tests {
                 "items": [
                     {
                         "itemId": "batch1_1",
-                        "summary": "预算表，包含项目负责人和金额。",
+                        "summaryShort": "预算表，包含负责人和金额。",
+                        "summaryLong": "预算表，包含项目负责人、金额等预算信息。",
                         "keywords": ["预算", "项目", "金额"],
                         "confidence": "high",
                         "warnings": ["source_sparse"]
@@ -3345,7 +3565,11 @@ mod tests {
         )
         .expect("parse summary agent output");
         let item = parsed.get("batch1_1").expect("item exists");
-        assert_eq!(item.summary, "预算表，包含项目负责人和金额。");
+        assert_eq!(item.summary_short, "预算表，包含负责人和金额。");
+        assert_eq!(
+            item.summary_long,
+            "预算表，包含项目负责人、金额等预算信息。"
+        );
         assert_eq!(item.keywords, vec!["预算", "项目", "金额"]);
         assert_eq!(item.confidence.as_deref(), Some("high"));
         assert_eq!(item.warnings, vec!["source_sparse"]);
@@ -3363,9 +3587,15 @@ mod tests {
             "modifiedAt": "2026-04-05T00:00:00Z",
             "itemType": "file",
             "modality": "text",
-            "summary": "季度财务报告",
-            "summarySource": "agent_summary",
-            "summaryConfidence": "high",
+            "representation": {
+                "metadata": "report.pdf，document，1.2 KB",
+                "short": "季度财务报告",
+                "long": "季度财务报告，包含季度财务指标与结论。",
+                "source": "agent_summary",
+                "degraded": false,
+                "confidence": "high",
+                "keywords": ["财务", "季度"]
+            },
             "summaryKeywords": ["财务", "季度"],
             "summaryWarnings": ["source_sparse"],
             "localExtraction": {
@@ -3377,14 +3607,19 @@ mod tests {
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(
-            item.get("summary").and_then(Value::as_str),
-            Some("季度财务报告")
+            item.get("summaryText").and_then(Value::as_str),
+            Some("季度财务报告，包含季度财务指标与结论。")
         );
         assert_eq!(
-            item.get("summaryKeywords")
+            item.pointer("/representation/keywords")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(2)
+            Some(2),
+        );
+        assert_eq!(
+            item.pointer("/representation/source")
+                .and_then(Value::as_str),
+            Some("agent_summary")
         );
         assert!(item.get("createdAge").is_some());
         assert!(item.get("modifiedAge").is_some());

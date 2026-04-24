@@ -1,5 +1,6 @@
-use crate::backend::{OrganizeSnapshot, ScanSnapshot};
-use crate::persist::{self, ScanFindingRecord};
+use crate::backend::OrganizeSnapshot;
+use crate::file_representation::FileRepresentation;
+use crate::persist;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -19,7 +20,6 @@ pub(super) const WORKFLOW_EXECUTE_READY: &str = "execute_ready";
 #[serde(rename_all = "camelCase")]
 pub struct AdvisorSessionStartInput {
     pub root_path: String,
-    pub scan_task_id: Option<String>,
     pub mode: Option<String>,
     pub response_language: Option<String>,
 }
@@ -42,12 +42,9 @@ pub struct AdvisorCardActionInput {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ContextAssets {
-    pub scan_task_id: Option<String>,
-    pub scan_snapshot: Option<ScanSnapshot>,
     pub organize_task_id: Option<String>,
     pub organize_snapshot: Option<OrganizeSnapshot>,
     pub latest_tree: Option<Value>,
-    pub finding_map: HashMap<String, ScanFindingRecord>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,10 +58,8 @@ pub(super) struct InventoryItem {
     pub category_id: String,
     pub parent_category_id: Option<String>,
     pub category_path: Vec<String>,
-    pub summary_short: Option<String>,
-    pub summary_normal: Option<String>,
+    pub representation: FileRepresentation,
     pub risk: String,
-    pub source: String,
 }
 
 #[derive(Clone, Debug, Default)]

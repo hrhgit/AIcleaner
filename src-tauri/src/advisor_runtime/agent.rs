@@ -4,9 +4,11 @@ use super::types::{
     local_text, now_iso, CARD_EXECUTION, CARD_PLAN_PREVIEW, CARD_PREFERENCE, CARD_RECLASS,
     CARD_TREE, WORKFLOW_EXECUTE_READY, WORKFLOW_PREVIEW_READY, WORKFLOW_UNDERSTAND,
 };
-use crate::backend::AppState;
+use crate::backend::{resolve_search_api_key, AppState};
 use crate::persist;
+use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
 use serde_json::{json, Value};
+use std::time::Instant;
 use uuid::Uuid;
 
 const MAX_AGENT_STEPS: usize = 8;
@@ -32,13 +34,6 @@ impl<'a> AdvisorAgentRunner<'a> {
         }
     }
 
-    pub(super) async fn run_bootstrap_turn(
-        &self,
-        session: &mut Value,
-    ) -> Result<AgentTurnResult, String> {
-        self.run_turn(session, None).await
-    }
-
     pub(super) async fn run_user_turn(
         &self,
         session: &mut Value,
@@ -62,7 +57,14 @@ impl<'a> AdvisorAgentRunner<'a> {
         let mut messages = vec![
             json!({
                 "role": "system",
-                "content": self.build_system_prompt(&lang, bootstrap_turn),
+                "content": self.build_system_prompt(
+                    &lang,
+                    bootstrap_turn,
+                    session
+                        .get("webSearchEnabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ),
             }),
             json!({
                 "role": "user",
@@ -82,7 +84,15 @@ impl<'a> AdvisorAgentRunner<'a> {
                 bootstrap_turn,
             );
             let tool_defs = build_tool_definitions(&available_tools);
-            let completion = self.llm.complete_with_tools(&messages, &tool_defs).await?;
+            let session_id = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let completion = self
+                .llm
+                .complete_with_tools(&messages, &tool_defs, Some(&session_id))
+                .await?;
             trace_steps.push(json!({
                 "step": step,
                 "route": {
@@ -129,15 +139,53 @@ impl<'a> AdvisorAgentRunner<'a> {
             }
 
             for tool_call in completion.tool_calls {
+                let operation_id = crate::diagnostics::new_operation_id();
+                let tool_started_at = Instant::now();
+                crate::diagnostics::record_state_event(
+                    self.state,
+                    "info",
+                    "advisor",
+                    "advisor_tool_call",
+                    Some(&operation_id),
+                    "advisor tool call started",
+                    json!({
+                        "sessionId": session_id.clone(),
+                        "step": step,
+                        "tool": tool_call.name.clone(),
+                        "arguments": tool_call.arguments.clone(),
+                    }),
+                    None,
+                    None,
+                );
                 match self
                     .dispatch_tool(session, &tool_call.name, &tool_call.arguments)
                     .await
                 {
                     Ok(result) => {
-                        if let Some(card) = result.get("card").cloned().filter(|value| !value.is_null()) {
+                        crate::diagnostics::record_state_event(
+                            self.state,
+                            "info",
+                            "advisor",
+                            "advisor_tool_result",
+                            Some(&operation_id),
+                            "advisor tool call succeeded",
+                            json!({
+                                "sessionId": session_id.clone(),
+                                "step": step,
+                                "tool": tool_call.name.clone(),
+                                "result": result.clone(),
+                            }),
+                            None,
+                            Some(tool_started_at.elapsed()),
+                        );
+                        if let Some(card) =
+                            result.get("card").cloned().filter(|value| !value.is_null())
+                        {
                             cards.push(card);
                         }
-                        if let Some(extra_cards) = result.get("cards").and_then(Value::as_array).cloned() {
+                        if let Some(extra_cards) =
+                            result.get("cards").and_then(Value::as_array).cloned()
+                        {
                             cards.extend(extra_cards);
                         }
                         messages.push(json!({
@@ -148,6 +196,21 @@ impl<'a> AdvisorAgentRunner<'a> {
                         }));
                     }
                     Err(message) => {
+                        crate::diagnostics::record_state_event(
+                            self.state,
+                            "error",
+                            "advisor",
+                            "advisor_tool_result",
+                            Some(&operation_id),
+                            "advisor tool call failed",
+                            json!({
+                                "sessionId": session_id.clone(),
+                                "step": step,
+                                "tool": tool_call.name.clone(),
+                            }),
+                            Some(json!({ "message": message.clone() })),
+                            Some(tool_started_at.elapsed()),
+                        );
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
@@ -166,7 +229,12 @@ impl<'a> AdvisorAgentRunner<'a> {
         .to_string())
     }
 
-    fn build_system_prompt(&self, lang: &str, bootstrap_turn: bool) -> String {
+    fn build_system_prompt(
+        &self,
+        lang: &str,
+        bootstrap_turn: bool,
+        web_search_enabled: bool,
+    ) -> String {
         let language_name = if lang.eq_ignore_ascii_case("en") {
             "English"
         } else {
@@ -186,6 +254,11 @@ impl<'a> AdvisorAgentRunner<'a> {
             lines.push("首轮禁止调用 execute_plan。".to_string());
         } else {
             lines.push("如果工具已经返回结构化结果卡，最终回复只解释结论和下一步。".to_string());
+        }
+        if web_search_enabled {
+            lines.push("当本地证据不足且确实需要外部背景时，可以调用 web_search。".to_string());
+        } else {
+            lines.push("当前轮次不可联网搜索，请基于已有本地证据判断。".to_string());
         }
         lines.join("\n")
     }
@@ -220,9 +293,9 @@ impl<'a> AdvisorAgentRunner<'a> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let memories = self.tools.list_preferences_tool(Some(session_id))?;
-        let overview = self
-            .tools
-            .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
+        let overview =
+            self.tools
+                .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
         let active_selection_card = session
             .get("activeSelectionId")
             .and_then(Value::as_str)
@@ -241,6 +314,10 @@ impl<'a> AdvisorAgentRunner<'a> {
             "workflowStage": session.get("workflowStage").cloned().unwrap_or(Value::String(WORKFLOW_UNDERSTAND.to_string())),
             "rollbackAvailable": session.get("rollbackAvailable").cloned().unwrap_or(Value::Bool(false)),
             "rootPath": session.get("rootPath").cloned().unwrap_or(Value::Null),
+            "webSearch": {
+                "useWebSearch": session.get("useWebSearch").cloned().unwrap_or(Value::Bool(false)),
+                "webSearchEnabled": session.get("webSearchEnabled").cloned().unwrap_or(Value::Bool(false)),
+            },
             "memory": {
                 "session": memories.get("sessionPreferences").cloned().unwrap_or_else(|| json!([])),
                 "global": memories.get("globalPreferences").cloned().unwrap_or_else(|| json!([])),
@@ -295,9 +372,10 @@ impl<'a> AdvisorAgentRunner<'a> {
 
     fn latest_execution_summary(&self, session_id: &str) -> Result<Option<Value>, String> {
         let cards = persist::load_advisor_cards(&self.state.db_path(), session_id)?;
-        let latest = cards.into_iter().rev().find(|card| {
-            card.get("cardType").and_then(Value::as_str) == Some(CARD_EXECUTION)
-        });
+        let latest = cards
+            .into_iter()
+            .rev()
+            .find(|card| card.get("cardType").and_then(Value::as_str) == Some(CARD_EXECUTION));
         Ok(latest.map(|card| {
             json!({
                 "jobId": card.pointer("/body/jobId").cloned().unwrap_or(Value::Null),
@@ -324,6 +402,43 @@ impl<'a> AdvisorAgentRunner<'a> {
             .unwrap_or(WORKFLOW_UNDERSTAND);
 
         match tool {
+            "web_search" => {
+                if !session
+                    .get("webSearchEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return Err(local_text(
+                        &lang,
+                        "当前整理工作流未启用联网搜索，请先基于本地证据继续判断。",
+                        "Web search is unavailable for the current workflow. Continue from local evidence.",
+                    )
+                    .to_string());
+                }
+                let request = parse_web_search_request(&json!({
+                    "action": "web_search",
+                    "query": arguments.get("query").cloned().unwrap_or(Value::Null),
+                    "reason": arguments.get("reason").cloned().unwrap_or(Value::Null),
+                }))
+                .ok_or_else(|| {
+                    local_text(
+                        &lang,
+                        "web_search 需要非空 query。",
+                        "web_search requires a non-empty query.",
+                    )
+                    .to_string()
+                })?;
+                let trace = tavily_search(&resolve_search_api_key(self.state)?, &request).await?;
+                Ok(json!({
+                    "result": {
+                        "query": trace.query,
+                        "reason": trace.reason,
+                        "answer": trace.answer,
+                        "results": trace.results,
+                        "formattedContext": format_web_search_context(&trace, &lang),
+                    }
+                }))
+            }
             "get_directory_overview" => {
                 let result = self.tools.get_directory_overview_tool(
                     session,
@@ -340,7 +455,7 @@ impl<'a> AdvisorAgentRunner<'a> {
                         "body": {
                             "tree": result.get("tree").cloned().unwrap_or(Value::Null),
                             "stats": {
-                                "itemCount": session.pointer("/contextBar/inventorySummary/itemCount").cloned().unwrap_or(Value::from(0))
+                                "itemCount": session.pointer("/contextBar/directorySummary/itemCount").cloned().unwrap_or(Value::from(0))
                             }
                         },
                         "actions": []
@@ -350,8 +465,7 @@ impl<'a> AdvisorAgentRunner<'a> {
             "find_files" => {
                 if !matches!(stage, WORKFLOW_UNDERSTAND | WORKFLOW_PREVIEW_READY) {
                     return Err(
-                        "当前阶段不适合重新筛选，请先处理已有预览或回到理解阶段。"
-                            .to_string(),
+                        "当前阶段不适合重新筛选，请先处理已有预览或回到理解阶段。".to_string()
                     );
                 }
                 let result = self.tools.find_files_by_args(session, arguments)?;
@@ -377,8 +491,14 @@ impl<'a> AdvisorAgentRunner<'a> {
             "capture_preference" => {
                 let result = self.tools.capture_preference(
                     session,
-                    arguments.get("scope").and_then(Value::as_str).unwrap_or("session"),
-                    arguments.get("text").and_then(Value::as_str).unwrap_or_default(),
+                    arguments
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .unwrap_or("session"),
+                    arguments
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
                     arguments
                         .get("sourceMessage")
                         .and_then(Value::as_str)
@@ -496,8 +616,9 @@ impl<'a> AdvisorAgentRunner<'a> {
             .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (_job, result, rollback) =
-            self.tools.execute_plan_by_preview_id(session_id, preview_id)?;
+        let (_job, result, rollback) = self
+            .tools
+            .execute_plan_by_preview_id(session_id, preview_id)?;
         if let Some(obj) = session.as_object_mut() {
             obj.insert(
                 "workflowStage".to_string(),
@@ -507,7 +628,12 @@ impl<'a> AdvisorAgentRunner<'a> {
             obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert(
                 "rollbackAvailable".to_string(),
-                Value::Bool(rollback.get("available").and_then(Value::as_bool).unwrap_or(false)),
+                Value::Bool(
+                    rollback
+                        .get("available")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ),
             );
         }
         Ok(json!({
@@ -593,9 +719,9 @@ impl<'a> AdvisorAgentRunner<'a> {
                 .unwrap_or(false),
         )?;
         persist::save_advisor_reclass_job(&self.state.db_path(), &job)?;
-        let overview = self
-            .tools
-            .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
+        let overview =
+            self.tools
+                .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
         if let Some(obj) = session.as_object_mut() {
             obj.insert(
                 "workflowStage".to_string(),
@@ -651,13 +777,12 @@ impl<'a> AdvisorAgentRunner<'a> {
             .or_else(|| arguments.get("jobId"))
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                "当前归类修改记录不存在或不可回滚，请先确认最近一次归类修改是否成功。"
-                    .to_string()
+                "当前归类修改记录不存在或不可回滚，请先确认最近一次归类修改是否成功。".to_string()
             })?;
         let (_job, result, tree) = self.tools.rollback_reclassification(session, job_id)?;
-        let overview = self
-            .tools
-            .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
+        let overview =
+            self.tools
+                .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
         if let Some(obj) = session.as_object_mut() {
             obj.insert("activeSelectionId".to_string(), Value::Null);
             obj.insert("activePreviewId".to_string(), Value::Null);
@@ -719,12 +844,20 @@ fn available_tools_for_stage(
     bootstrap_turn: bool,
 ) -> Vec<&'static str> {
     if bootstrap_turn {
-        return vec![
+        let mut tools = vec![
             "get_directory_overview",
             "list_preferences",
             "read_only_file_summaries",
             "summarize_files",
         ];
+        if session
+            .get("webSearchEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            tools.push("web_search");
+        }
+        return tools;
     }
 
     let mut tools = vec![
@@ -749,6 +882,13 @@ fn available_tools_for_stage(
         _ => {
             tools.push("find_files");
         }
+    }
+    if session
+        .get("webSearchEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        tools.push("web_search");
     }
     if session
         .get("rollbackAvailable")
@@ -782,6 +922,21 @@ fn tool_definition(name: &str) -> Option<Value> {
                         "rootCategoryId": { "type": "string" },
                         "maxDepth": { "type": "integer" }
                     }
+                }
+            }
+        }),
+        "web_search" => json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "在本地信息不足时查询外部背景信息，返回参考结果。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "reason": { "type": "string" }
+                    },
+                    "required": ["query"]
                 }
             }
         }),
@@ -819,7 +974,7 @@ fn tool_definition(name: &str) -> Option<Value> {
                     "properties": {
                         "paths": { "type": "array", "items": { "type": "string" } },
                         "categoryIds": { "type": "array", "items": { "type": "string" } },
-                        "mode": { "type": "string", "enum": ["metadata_summary", "model_summary_short", "model_summary_normal"] },
+                        "representationLevel": { "type": "string", "enum": ["metadata", "short", "long"] },
                         "missingOnly": { "type": "boolean" },
                         "batchSize": { "type": "integer" },
                         "maxConcurrency": { "type": "integer" }
@@ -837,7 +992,7 @@ fn tool_definition(name: &str) -> Option<Value> {
                     "properties": {
                         "paths": { "type": "array", "items": { "type": "string" } },
                         "categoryIds": { "type": "array", "items": { "type": "string" } },
-                        "detailLevel": { "type": "string", "enum": ["short", "normal"] },
+                        "representationLevel": { "type": "string", "enum": ["metadata", "short", "long"] },
                         "limit": { "type": "integer" }
                     }
                 }
@@ -989,4 +1144,30 @@ pub(super) fn materialize_card(session_id: &str, turn_id: &str, card: &Value) ->
         "createdAt": card.get("createdAt").cloned().unwrap_or(Value::String(now_iso())),
         "updatedAt": card.get("updatedAt").cloned().unwrap_or(Value::String(now_iso())),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_tools_include_web_search_only_when_enabled() {
+        let enabled_session = json!({ "webSearchEnabled": true });
+        let disabled_session = json!({ "webSearchEnabled": false });
+
+        let enabled = available_tools_for_stage(WORKFLOW_UNDERSTAND, &enabled_session, false);
+        let disabled = available_tools_for_stage(WORKFLOW_UNDERSTAND, &disabled_session, false);
+
+        assert!(enabled.contains(&"web_search"));
+        assert!(!disabled.contains(&"web_search"));
+    }
+
+    #[test]
+    fn web_search_tool_definition_is_exposed() {
+        let definition = tool_definition("web_search").expect("web_search definition");
+        assert_eq!(
+            definition["function"]["name"],
+            Value::String("web_search".to_string())
+        );
+    }
 }

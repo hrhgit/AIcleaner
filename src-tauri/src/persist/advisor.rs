@@ -50,7 +50,6 @@ pub(crate) fn create_advisor_tables(conn: &Connection) -> Result<(), String> {
             session_id TEXT PRIMARY KEY,
             root_path TEXT NOT NULL,
             root_path_key TEXT NOT NULL,
-            scan_task_id TEXT,
             response_language TEXT NOT NULL,
             workflow_stage TEXT NOT NULL DEFAULT 'understand',
             status TEXT NOT NULL DEFAULT 'active',
@@ -215,10 +214,6 @@ pub fn save_advisor_session(db_path: &Path, session: &Value) -> Result<(), Strin
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(now_iso);
-    let scan_task_id = session
-        .get("scanTaskId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     let active_selection_id = session
         .get("activeSelectionId")
         .and_then(Value::as_str)
@@ -235,16 +230,15 @@ pub fn save_advisor_session(db_path: &Path, session: &Value) -> Result<(), Strin
     let conn = open_db(db_path)?;
     conn.execute(
         "INSERT OR REPLACE INTO advisor_sessions (
-            session_id, root_path, root_path_key, scan_task_id, response_language,
+            session_id, root_path, root_path_key, response_language,
             workflow_stage, status, context_bar_json, derived_tree_json,
             active_selection_id, active_preview_id, rollback_available,
             session_json, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             session_id,
             root_path,
             create_root_path_key(root_path),
-            scan_task_id,
             response_language,
             workflow_stage,
             status,
@@ -493,14 +487,25 @@ pub fn save_advisor_file_summary(db_path: &Path, row: &Value) -> Result<(), Stri
         .get("pathKey")
         .and_then(Value::as_str)
         .ok_or_else(|| "summary.pathKey is required".to_string())?;
+    let representation = row.get("representation").cloned().unwrap_or(Value::Null);
     let source = row
         .get("source")
+        .or_else(|| representation.get("source"))
         .and_then(Value::as_str)
         .unwrap_or("advisor");
-    let mode = row
-        .get("mode")
+    let level = row
+        .get("representationLevel")
+        .or_else(|| row.get("mode"))
         .and_then(Value::as_str)
-        .unwrap_or("metadata_summary");
+        .unwrap_or("metadata");
+    let summary_short = row
+        .get("summaryShort")
+        .and_then(Value::as_str)
+        .or_else(|| representation.get("short").and_then(Value::as_str));
+    let summary_normal = row
+        .get("summaryNormal")
+        .and_then(Value::as_str)
+        .or_else(|| representation.get("long").and_then(Value::as_str));
     let updated_at = row
         .get("updatedAt")
         .and_then(Value::as_str)
@@ -514,10 +519,10 @@ pub fn save_advisor_file_summary(db_path: &Path, row: &Value) -> Result<(), Stri
         params![
             root_path_key,
             path_key,
-            row.get("summaryShort").and_then(Value::as_str),
-            row.get("summaryNormal").and_then(Value::as_str),
+            summary_short,
+            summary_normal,
             source,
-            mode,
+            level,
             stringify(row)?,
             updated_at,
         ],
