@@ -59,12 +59,22 @@ export function renderOrganizerStatsGrid(animationDelay = '0.09s') {
 
 export function renderOrganizerPreviewPanel(animationDelay = '0.13s') {
   return `
+    <section id="org-category-tree-card" class="card organizer-panel organizer-tree-panel animate-in" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;" hidden>
+      <div class="card-header organizer-panel-header">
+        <div>
+          <h2 class="card-title">${t('organizer.tree_title')}</h2>
+        </div>
+        <span id="org-category-tree-count" class="badge badge-info">0</span>
+      </div>
+      <div id="org-category-tree" class="organizer-tree-shell"></div>
+    </section>
     <section class="card organizer-panel organizer-preview-panel animate-in" style="animation-delay: ${animationDelay}; padding: 0; overflow: hidden;">
       <div class="card-header organizer-panel-header">
         <div>
           <h2 class="card-title">${t('organizer.preview_title')}</h2>
         </div>
       </div>
+      <div id="org-classification-errors" class="organizer-classification-errors" hidden></div>
       <div id="org-preview-groups" class="preview-groups organizer-preview-groups"></div>
       <div id="org-preview-empty" class="empty-state organizer-empty-state" style="padding: 32px;">
         <div class="organizer-empty-glyph" aria-hidden="true"></div>

@@ -2232,6 +2232,60 @@ input[type="number"].no-spin {
     grid-template-columns: 1fr;
 }
 
+.organizer-classification-errors {
+    padding: 16px 20px 0;
+}
+
+.organizer-classification-errors-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.organizer-classification-errors-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.organizer-classification-error-item {
+    border: 1px solid rgba(239, 68, 68, 0.24);
+    background: rgba(127, 29, 29, 0.18);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.organizer-classification-error-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.organizer-classification-error-head strong {
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.organizer-classification-error-message {
+    margin-top: 8px;
+    color: var(--accent-danger);
+    font-size: 13px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.organizer-classification-error-files {
+    margin-top: 8px;
+    color: var(--text-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
 .organizer-empty-state {
     display: grid;
     place-items: center;

@@ -377,6 +377,91 @@ mod tests {
     }
 
     #[test]
+    fn category_inventory_groups_history_without_summaries() {
+        let mut tree = default_tree();
+        let contract_node = ensure_path(
+            &mut tree,
+            &["文档".to_string(), "合同协议".to_string()],
+        );
+        let media_node = ensure_path(&mut tree, &["媒体".to_string(), "图片".to_string()]);
+
+        let inventory = summary::build_category_inventory(
+            &tree,
+            &[
+                json!({
+                    "leafNodeId": contract_node.clone(),
+                    "categoryPath": ["文档", "合同协议"],
+                    "name": "租赁合同.pdf",
+                    "relativePath": "contracts\\租赁合同.pdf",
+                    "summaryText": "should not be copied",
+                    "representation": { "long": "should not be copied" }
+                }),
+                json!({
+                    "leafNodeId": contract_node.clone(),
+                    "categoryPath": ["文档", "合同协议"],
+                    "name": "服务协议.docx",
+                    "relativePath": "contracts\\服务协议.docx"
+                }),
+                json!({
+                    "leafNodeId": contract_node.clone(),
+                    "categoryPath": ["文档", "合同协议"],
+                    "name": "采购协议.pdf",
+                    "relativePath": "2024\\采购协议.pdf"
+                }),
+                json!({
+                    "leafNodeId": contract_node.clone(),
+                    "categoryPath": ["文档", "合同协议"],
+                    "name": "补充协议.pdf",
+                    "relativePath": "2024\\补充协议.pdf"
+                }),
+                json!({
+                    "leafNodeId": media_node.clone(),
+                    "categoryPath": ["媒体", "图片"],
+                    "name": "cover.png",
+                    "relativePath": "images\\cover.png"
+                }),
+                json!({
+                    "leafNodeId": "",
+                    "category": CATEGORY_CLASSIFICATION_ERROR,
+                    "reason": RESULT_REASON_CLASSIFICATION_ERROR,
+                    "name": "bad.txt"
+                }),
+            ],
+            3,
+        );
+
+        assert_eq!(inventory.len(), 2);
+        let contract_entry = inventory
+            .iter()
+            .find(|entry| entry.get("nodeId").and_then(Value::as_str) == Some(&contract_node))
+            .expect("contract inventory exists");
+        assert_eq!(contract_entry.get("count").and_then(Value::as_u64), Some(4));
+        assert_eq!(
+            contract_entry
+                .get("files")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            contract_entry.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(contract_entry.get("summaryText").is_none());
+        assert!(contract_entry.get("representation").is_none());
+
+        let media_entry = inventory
+            .iter()
+            .find(|entry| entry.get("nodeId").and_then(Value::as_str) == Some(&media_node))
+            .expect("media inventory exists");
+        assert_eq!(media_entry.get("count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            media_entry.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn collection_root_detects_download_like_root() {
         let root = temp_dir("download-root").join("Download");
         fs::create_dir_all(root.join("Buzz-1.4.2-Windows-X64")).expect("create buzz dir");

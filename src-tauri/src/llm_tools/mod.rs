@@ -114,6 +114,14 @@ impl ToolResult {
         self
     }
 
+    pub(crate) fn blocked(message: impl Into<String>) -> Self {
+        Self::result(json!({
+            "ok": false,
+            "blocked": true,
+            "message": message.into(),
+        }))
+    }
+
     pub(crate) fn envelope(&self) -> Value {
         let mut out = json!({ "result": self.result });
         if let Some(card) = &self.card {
@@ -184,6 +192,7 @@ impl ToolRegistry {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn available_names(&self, ctx: &ToolContext<'_>) -> Vec<&'static str> {
         self.tools
             .iter()
@@ -235,6 +244,7 @@ fn workflow_name(workflow: ToolWorkflow) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn advisor_session_enabled(ctx: &ToolContext<'_>) -> bool {
     ctx.session
         .and_then(|session| session.get("webSearchEnabled"))
@@ -242,14 +252,17 @@ fn advisor_session_enabled(ctx: &ToolContext<'_>) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn advisor_non_bootstrap(ctx: &ToolContext<'_>) -> bool {
     ctx.workflow == ToolWorkflow::Advisor && !ctx.bootstrap_turn
 }
 
+#[allow(dead_code)]
 fn advisor_any_turn(ctx: &ToolContext<'_>) -> bool {
     ctx.workflow == ToolWorkflow::Advisor
 }
 
+#[allow(dead_code)]
 fn advisor_stage_is(ctx: &ToolContext<'_>, stages: &[&str]) -> bool {
     advisor_non_bootstrap(ctx) && stages.contains(&ctx.stage)
 }
@@ -313,6 +326,20 @@ impl LlmTool for WebSearchTool {
         ctx: &mut ToolExecutionContext<'_>,
         args: &Value,
     ) -> Result<ToolResult, String> {
+        if !ctx.web_search_allowed {
+            return Ok(ToolResult::blocked(local_text(
+                ctx.response_language,
+                "当前轮次不能联网搜索，请基于已有证据继续。",
+                "Web search is unavailable for the current step. Continue from existing evidence.",
+            )));
+        }
+        if ctx.workflow == ToolWorkflow::Organizer && ctx.search_remaining == 0 {
+            return Ok(ToolResult::blocked(local_text(
+                ctx.response_language,
+                "联网搜索额度已用完，请基于已有证据提交最终结果。",
+                "Web search budget is exhausted. Submit the final result from existing evidence.",
+            )));
+        }
         let request_payload = json!({
             "action": "web_search",
             "query": args.get("query").cloned().unwrap_or(Value::Null),
@@ -339,10 +366,26 @@ impl LlmTool for WebSearchTool {
                 let state = ctx
                     .state
                     .ok_or_else(|| "advisor web_search is missing AppState".to_string())?;
-                resolve_search_api_key(state)?
+                match resolve_search_api_key(state) {
+                    Ok(key) if !key.trim().is_empty() => key,
+                    Ok(_) | Err(_) => {
+                        return Ok(ToolResult::blocked(local_text(
+                            ctx.response_language,
+                            "当前没有可用的联网搜索密钥，请基于已有本地证据继续。",
+                            "No web search API key is available. Continue from local evidence.",
+                        )))
+                    }
+                }
             }
             ToolWorkflow::Organizer => ctx.search_api_key.unwrap_or_default().to_string(),
         };
+        if key.trim().is_empty() {
+            return Ok(ToolResult::blocked(local_text(
+                ctx.response_language,
+                "当前没有可用的联网搜索密钥，请基于已有证据继续。",
+                "No web search API key is available. Continue from existing evidence.",
+            )));
+        }
 
         match tavily_search(&key, &request).await {
             Ok(trace) => {
@@ -414,13 +457,13 @@ impl LlmTool for SubmitOrganizeResultTool {
                         "items": {
                             "type": "object",
                             "properties": {
+                                "reason": { "type": "string" },
                                 "itemId": { "type": "string" },
                                 "leafNodeId": { "type": "string" },
                                 "categoryPath": {
                                     "type": "array",
                                     "items": { "type": "string" }
-                                },
-                                "reason": { "type": "string" }
+                                }
                             },
                             "required": ["itemId"]
                         }
@@ -437,9 +480,14 @@ impl LlmTool for SubmitOrganizeResultTool {
 
     async fn execute(
         &self,
-        _ctx: &mut ToolExecutionContext<'_>,
+        ctx: &mut ToolExecutionContext<'_>,
         args: &Value,
     ) -> Result<ToolResult, String> {
+        if ctx.workflow != ToolWorkflow::Organizer {
+            return Ok(ToolResult::blocked(
+                "submit_organize_result 只能在 organizer workflow 中使用。",
+            ));
+        }
         Ok(ToolResult::result(parse_submit_organize_result_arguments(
             args,
         )?))
@@ -573,7 +621,9 @@ impl LlmTool for FindFilesTool {
         args: &Value,
     ) -> Result<ToolResult, String> {
         if ctx.stage != WORKFLOW_UNDERSTAND && ctx.stage != WORKFLOW_PREVIEW_READY {
-            return Err("当前阶段不适合重新筛选，请先处理已有预览或回到理解阶段。".to_string());
+            return Ok(ToolResult::blocked(
+                "当前阶段不适合重新筛选，请先处理已有预览或回到理解阶段。",
+            ));
         }
         let state = ctx
             .state
@@ -855,7 +905,9 @@ impl LlmTool for PreviewPlanTool {
         args: &Value,
     ) -> Result<ToolResult, String> {
         if ctx.stage != WORKFLOW_PREVIEW_READY && ctx.stage != WORKFLOW_EXECUTE_READY {
-            return Err("当前阶段缺少有效筛选结果，请先调用 find_files。".to_string());
+            return Ok(ToolResult::blocked(
+                "当前阶段缺少有效筛选结果，请先调用 find_files。",
+            ));
         }
         let state = ctx
             .state
@@ -944,6 +996,11 @@ impl LlmTool for ExecutePlanTool {
         ctx: &mut ToolExecutionContext<'_>,
         args: &Value,
     ) -> Result<ToolResult, String> {
+        if ctx.stage != WORKFLOW_EXECUTE_READY {
+            return Ok(ToolResult::blocked(
+                "当前还没有可执行预览，请先生成并确认计划预览。",
+            ));
+        }
         let preview_id = args
             .get("previewId")
             .and_then(Value::as_str)
@@ -1286,25 +1343,6 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn advisor_ctx<'a>(
-        session: &'a Value,
-        stage: &'a str,
-        bootstrap_turn: bool,
-    ) -> ToolContext<'a> {
-        ToolContext {
-            workflow: ToolWorkflow::Advisor,
-            stage,
-            session: Some(session),
-            bootstrap_turn,
-            response_language: "zh",
-            web_search_allowed: session
-                .get("webSearchEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            search_remaining: 0,
-        }
-    }
-
     #[test]
     fn registry_tool_names_are_unique() {
         let registry = ToolRegistry::new();
@@ -1320,44 +1358,58 @@ mod tests {
     }
 
     #[test]
-    fn advisor_stage_tools_are_policy_filtered() {
+    fn advisor_tool_policy_respects_stage_and_search_state() {
         let registry = ToolRegistry::new();
         let session = json!({ "webSearchEnabled": true });
-        let bootstrap = registry.available_names(&advisor_ctx(&session, WORKFLOW_UNDERSTAND, true));
-        assert!(bootstrap.contains(&"get_directory_overview"));
-        assert!(bootstrap.contains(&"web_search"));
-        assert!(!bootstrap.contains(&"find_files"));
-        assert!(!bootstrap.contains(&"execute_plan"));
+        let ctx = ToolContext {
+            workflow: ToolWorkflow::Advisor,
+            stage: WORKFLOW_UNDERSTAND,
+            session: Some(&session),
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: true,
+            search_remaining: 0,
+        };
+        let tools = registry.available_names(&ctx);
+        assert!(tools.contains(&"get_directory_overview"));
+        assert!(tools.contains(&"web_search"));
+        assert!(tools.contains(&"find_files"));
+        assert!(!tools.contains(&"execute_plan"));
+        assert!(!tools.contains(&"submit_organize_result"));
 
-        let execute =
-            registry.available_names(&advisor_ctx(&session, WORKFLOW_EXECUTE_READY, false));
-        assert!(execute.contains(&"preview_plan"));
-        assert!(execute.contains(&"execute_plan"));
-        assert!(!execute.contains(&"find_files"));
+        let execute_ctx = ToolContext {
+            stage: WORKFLOW_EXECUTE_READY,
+            ..ctx
+        };
+        let execute_tools = registry.available_names(&execute_ctx);
+        assert!(execute_tools.contains(&"execute_plan"));
     }
 
     #[test]
-    fn organizer_search_budget_controls_web_search() {
+    fn organizer_tool_policy_respects_search_budget() {
         let registry = ToolRegistry::new();
-        let with_budget = ToolContext {
+        let ctx = ToolContext {
             workflow: ToolWorkflow::Organizer,
-            stage: "classification",
+            stage: "classification_batch_1",
             session: None,
             bootstrap_turn: false,
             response_language: "zh",
             web_search_allowed: true,
             search_remaining: 1,
         };
-        let exhausted = ToolContext {
+        let tools = registry.available_names(&ctx);
+        assert!(tools.contains(&"web_search"));
+        assert!(tools.contains(&"submit_organize_result"));
+        assert!(!tools.contains(&"execute_plan"));
+
+        let exhausted_ctx = ToolContext {
+            web_search_allowed: false,
             search_remaining: 0,
-            ..with_budget
+            ..ctx
         };
-        let enabled = registry.available_names(&with_budget);
-        let disabled = registry.available_names(&exhausted);
-        assert!(enabled.contains(&"web_search"));
-        assert!(enabled.contains(&"submit_organize_result"));
-        assert!(!disabled.contains(&"web_search"));
-        assert!(disabled.contains(&"submit_organize_result"));
+        let exhausted_tools = registry.available_names(&exhausted_ctx);
+        assert!(!exhausted_tools.contains(&"web_search"));
+        assert!(exhausted_tools.contains(&"submit_organize_result"));
     }
 
     #[test]

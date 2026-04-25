@@ -253,6 +253,70 @@ function organizerText(zh, en) {
   return getLang() === 'en' ? en : zh;
 }
 
+function treePathKey(path) {
+  return JSON.stringify(path.map((segment) => String(segment || '').trim()).filter(Boolean));
+}
+
+function collectCategoryTreeCounts(results = []) {
+  const counts = new Map();
+  let total = 0;
+  for (const row of results) {
+    if (String(row?.classificationError || '').trim()) continue;
+    const path = Array.isArray(row?.categoryPath)
+      ? row.categoryPath.map((segment) => String(segment || '').trim()).filter(Boolean)
+      : [];
+    if (!path.length) continue;
+    total += 1;
+    for (let index = 1; index <= path.length; index += 1) {
+      const key = treePathKey(path.slice(0, index));
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  return { counts, total };
+}
+
+function renderCategoryTreeNode(node, path, counts) {
+  if (!node || typeof node !== 'object') return '';
+  const name = String(node.name || '').trim();
+  if (!name) return '';
+  const currentPath = [...path, name];
+  const children = Array.isArray(node.children) ? node.children : [];
+  const count = counts.get(treePathKey(currentPath)) || 0;
+  const childHtml = children
+    .map((child) => renderCategoryTreeNode(child, currentPath, counts))
+    .filter(Boolean)
+    .join('');
+  return `
+    <li class="organizer-tree-node">
+      <div class="organizer-tree-node-row">
+        <span class="organizer-tree-node-name">${escapeHtml(name)}</span>
+        <span class="organizer-tree-node-count">${count}</span>
+      </div>
+      ${childHtml ? `<ul>${childHtml}</ul>` : ''}
+    </li>
+  `;
+}
+
+function renderCategoryTree(snapshot) {
+  const card = document.getElementById('org-category-tree-card');
+  const container = document.getElementById('org-category-tree');
+  const countEl = document.getElementById('org-category-tree-count');
+  if (!card || !container || !countEl) return;
+
+  const children = Array.isArray(snapshot?.tree?.children) ? snapshot.tree.children : [];
+  if (!children.length) {
+    card.hidden = true;
+    container.innerHTML = '';
+    countEl.textContent = '0';
+    return;
+  }
+
+  const { counts, total } = collectCategoryTreeCounts(snapshot?.results || []);
+  countEl.textContent = String(total);
+  container.innerHTML = `<ul class="organizer-tree-list">${children.map((child) => renderCategoryTreeNode(child, [], counts)).join('')}</ul>`;
+  card.hidden = false;
+}
+
 function getOrganizerSummaryModeLabel(mode) {
   if (mode === 'local_summary') return t('organizer.summary_mode_local_summary');
   if (mode === 'agent_summary') return t('organizer.summary_mode_agent_summary');
@@ -510,6 +574,8 @@ function renderPreview(snapshot) {
   const empty = document.getElementById('org-preview-empty');
   if (!groupsEl || !empty) return;
 
+  renderClassificationErrors(snapshot);
+
   const preview = snapshot?.preview || [];
   const resultsMap = new Map((snapshot?.results || []).map((x) => [x.path, x]));
 
@@ -587,6 +653,76 @@ function renderPreview(snapshot) {
       </section>
     `;
   }).join('');
+}
+
+function collectClassificationErrors(snapshot) {
+  const grouped = new Map();
+  for (const row of snapshot?.results || []) {
+    const message = String(row?.classificationError || '').trim();
+    if (!message) continue;
+    const batchIndex = Number(row?.batchIndex || 0);
+    const key = batchIndex || `row:${grouped.size + 1}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        batchIndex,
+        message,
+        rawOutput: String(row?.modelRawOutput || '').trim(),
+        names: [],
+      });
+    }
+    const item = grouped.get(key);
+    const name = String(row?.name || row?.relativePath || row?.path || '').trim();
+    if (name && item.names.length < 8) {
+      item.names.push(name);
+    }
+    if (!item.rawOutput) {
+      item.rawOutput = String(row?.modelRawOutput || '').trim();
+    }
+  }
+  return Array.from(grouped.values()).sort((a, b) => a.batchIndex - b.batchIndex);
+}
+
+function renderClassificationErrors(snapshot) {
+  const container = document.getElementById('org-classification-errors');
+  if (!container) return;
+
+  const errors = collectClassificationErrors(snapshot);
+  if (!errors.length) {
+    container.hidden = true;
+    container.innerHTML = '';
+    return;
+  }
+
+  container.hidden = false;
+  container.innerHTML = `
+    <div class="organizer-classification-errors-title">
+      <span class="badge badge-danger">${escapeHtml(organizerText('分类错误', 'Classification Error'))}</span>
+      <span>${escapeHtml(organizerText('部分批次没有生成可执行预览', 'Some batches did not produce executable preview rows'))}</span>
+    </div>
+    <div class="organizer-classification-errors-list">
+      ${errors.map((item) => {
+        const batchLabel = item.batchIndex
+          ? `${organizerText('批次', 'Batch')} ${item.batchIndex}`
+          : organizerText('未知批次', 'Unknown batch');
+        const names = item.names.length
+          ? `<div class="organizer-classification-error-files">${escapeHtml(item.names.join('，'))}</div>`
+          : '';
+        const rawHint = item.rawOutput
+          ? organizerText('原始响应已记录在活动日志中。', 'Raw response is recorded in the activity log.')
+          : organizerText('没有可记录的原始响应。', 'No recordable raw response was available.');
+        return `
+          <div class="organizer-classification-error-item">
+            <div class="organizer-classification-error-head">
+              <strong>${escapeHtml(batchLabel)}</strong>
+              <span>${escapeHtml(rawHint)}</span>
+            </div>
+            <div class="organizer-classification-error-message">${escapeHtml(item.message)}</div>
+            ${names}
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
 }
 
 function getMoveStatusLabel(status) {
@@ -789,6 +925,7 @@ function refreshView(snapshot) {
   renderCapability(snapshot);
   updateStats(snapshot);
   renderOrganizerResultsEmptyState(snapshot);
+  renderCategoryTree(snapshot);
   renderPreview(snapshot);
   renderApplyResultPanel(snapshot);
   updateButtons(snapshot);

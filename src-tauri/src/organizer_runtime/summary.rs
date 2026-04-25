@@ -1,8 +1,9 @@
 use super::*;
-use crate::llm_tools::{
-    serialize_tool_result_content, ToolContext, ToolExecutionContext, ToolId, ToolRegistry,
-    ToolWorkflow,
+use crate::agent_runtime::{
+    AgentCompletion, AgentLlm, AgentLlmError, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop,
+    AgentTurnSpec, ToolCallErrorOutcome, ToolCallOutcome,
 };
+use crate::llm_tools::{ToolExecutionContext, ToolId, ToolRegistry, ToolResult, ToolWorkflow};
 
 fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -598,20 +599,40 @@ async fn chat_completion(
 }
 
 fn build_summary_agent_system_prompt(response_language: &str) -> String {
-    let output_language = localized_language_name(response_language, response_language);
-    [
-        "You prepare standardized short and long summaries for a later file classification step."
-            .to_string(),
-        "Return JSON only.".to_string(),
-        "Schema: {\"items\":[{\"itemId\":\"...\",\"summaryShort\":\"...\",\"summaryLong\":\"...\",\"keywords\":[\"...\"],\"confidence\":\"high|medium|low\",\"warnings\":[\"...\"]}]}".to_string(),
-        "Cover every input item exactly once and preserve itemId verbatim.".to_string(),
-        "Do not classify, rename, or omit items.".to_string(),
-        format!(
-            "Write summaries and warnings in {output_language} only. Keep summaryShort under about {SUMMARY_AGENT_SUMMARY_CHARS} characters and summaryLong under about {SUMMARY_AGENT_LONG_CHARS} characters."
-        ),
-        "Use the provided local extraction material first. If content is sparse, say so briefly instead of inventing details.".to_string(),
-    ]
-    .join("\n")
+    let is_zh = response_language
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("zh");
+    if is_zh {
+        r#"你负责为文件整理系统生成 summaryText。
+
+summaryText 用于为后续文件归类提供内容证据。
+你的任务是概括当前输入中可读或可解析的信息，不是最终归类，也不是生成分类树。
+
+请简洁总结：
+1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
+2. 对分类有帮助的类型、命名或路径线索。
+3. 如果信息不足，请说明具体不确定点。
+
+不要编造未提供的内容。
+
+输出语言使用中文。"#
+            .to_string()
+    } else {
+        r#"You are responsible for generating summaryText for a file organization system.
+
+summaryText provides content evidence for subsequent file classification.
+Your task is to summarize readable or parseable information from the current input, not to perform final classification or generate a category tree.
+
+Please concisely summarize:
+1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
+2. Type, naming, or path clues that help with classification.
+3. If information is insufficient, specify the exact uncertainty.
+
+Do not fabricate content not provided.
+
+Write summaries in English only."#.to_string()
+    }
 }
 
 pub(super) fn parse_summary_agent_output(
@@ -751,34 +772,168 @@ pub(super) async fn summarize_batch_with_agent(
 }
 
 fn build_organize_system_prompt(response_language: &str, allow_web_search: bool) -> String {
-    let output_language = localized_language_name(response_language, response_language);
-    let mut lines = vec![
-        "You cluster file summaries into a hierarchical category tree.".to_string(),
-        "You must use native tool calling. Do not hand-write JSON protocol in assistant text."
-            .to_string(),
-        "Do not return the final tree as plain assistant text. When you are ready, call submit_organize_result."
-            .to_string(),
-        "Call at most one tool per reply.".to_string(),
-        "Existing nodes already have stable nodeId values; keep nodeId when you reuse, rename, or move existing nodes.".to_string(),
-        "When an item representation or summaryText includes resultKind=whole, treat it as a bundle candidate and prefer assigning the directory as one whole unit unless the evidence clearly shows unrelated mixed content.".to_string(),
-        "Some items may only provide metadata-level representation without summaryText. In that case, classify using name, relativePath, itemType, modality, and representation metadata instead of assuming missing content.".to_string(),
-        "The classification payload includes lightweight representation data, not raw extraction text.".to_string(),
-        "Prefer using summaryText first when it exists; otherwise fall back to representation.metadata, name, relativePath, itemType, and modality.".to_string(),
-        format!("Use {output_language} names and keep labels short."),
-        format!("The assignment \"reason\" field must be written in {output_language} only."),
-    ];
-    if allow_web_search {
-        lines.push(
-            "If local metadata is insufficient and external context is necessary, call web_search with one concise query."
-                .to_string(),
-        );
+    let is_zh = response_language
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("zh");
+
+    let web_search_line = if allow_web_search {
+        if is_zh {
+            "如果本地元数据不足，并且确实需要外部上下文，调用 web_search，且只使用一个简短查询。"
+        } else {
+            "If local metadata is insufficient and external context is truly necessary, call web_search with one concise query."
+        }
     } else {
-        lines.push(
+        if is_zh {
+            "web_search 当前不可用。请基于已收集的证据完成判断，并调用 submit_organize_result。"
+        } else {
             "web_search is unavailable for the current step. Base your answer on the evidence already collected and call submit_organize_result."
-                .to_string(),
-        );
+        }
+    };
+
+    if is_zh {
+        format!(
+            r#"你负责将文件摘要聚类为一个层级分类树。
+
+你必须使用原生 tool calling。
+不要在 assistant 文本中手写 JSON 协议。
+不要用普通自然语言返回最终分类树。
+当你准备好时，调用 submit_organize_result。
+每次回复最多调用一个工具。
+
+已有节点已经拥有稳定的 nodeId。
+当你复用、重命名或移动已有节点时，必须保留原 nodeId。
+
+assignment 中的 reason 字段必须放在最前面，格式为 reason、itemId、leafNodeId、categoryPath。
+
+分类目标：
+构建一个实用的文件整理层级分类树。
+
+categoryInventory 字段：
+categoryInventory 是已有分类节点下的历史文件轻量清单，用于理解类别边界。
+每一项包含 nodeId、path、count、files、truncated。
+nodeId 是已有分类节点 ID，复用该类别时应保留这个 nodeId。
+path 是该类别在分类树中的路径。
+count 是该类别下已归类文件总数。
+files 是该类别下的部分或全部历史文件名/短路径，只是文件名和路径线索，不是文件内容或 summary。
+truncated=true 表示 files 只列出了一部分历史文件；truncated=false 表示 files 已完整列出。
+categoryInventory 只能作为历史参考，当前 items 的文件证据优先。
+如果当前文件与历史类别不匹配，可以新建类别或调整分类树。
+不要仅因为某个类别 count 很大，就强行把新文件归入该类别。
+不要把 files 当作文件内容证据。
+
+顶层分类原则：
+顶层分类应优先基于文件的基础类型，例如安装包、文档、压缩包、媒体、代码、数据、应用程序、其他待定等。
+不要在顶层优先按业务用途分类，除非文件的基础类型已经清楚。
+
+证据优先级：
+1. 如果存在 summaryText，优先使用 summaryText。
+2. 其次使用 itemType 和 modality。
+3. 再参考文件扩展名和 MIME 类型。
+4. 再参考文件名关键词和路径模式。
+5. 最后参考大小、时间和其他元数据。
+
+当 summaryText 存在时，优先依据 summaryText 判断。
+当 summaryText 不存在时，使用 name、relativePath、itemType、modality 和 representation metadata 判断。
+不要因为缺少 summaryText 就假设文件内容未知或无法分类。
+
+类型优先规则：
+如果文件的扩展名、文件名模式、MIME 类型或 itemType 能明确指向某个基础类别，即使具体用途不明，也应按该基础类型分类。
+不要仅仅因为不知道文件的业务用途、来源应用或具体内容，就归入"其他待定"。
+
+只有当无法根据 name、extension、MIME type、relativePath、size、time metadata、itemType、modality 或 representation metadata 判断文件基础类型时，才使用"其他待定"。
+
+冲突处理：
+如果语义推断结果与强文件类型证据冲突，优先相信文件类型证据，除非 summaryText 明确证明该文件应归入其他类别。
+如果置信度较低，但文件基础类型仍然可以判断，应归入最接近的类型类别，并在 reason 中简要说明不确定性。
+
+目录整体归类规则：
+当 item representation 或 summaryText 中包含 resultKind=whole 时，将其视为目录整体候选。
+如果该目录内容看起来具有一致的类型或用途，优先将目录作为一个整体分配到分类树中。
+只有当证据明确显示该目录包含无关的混合内容时，才拆分目录中的内容分别归类。
+
+细分规则：
+当某个类别包含 5 个或更多项目，并且这些项目存在明显不同的子类型时，可以考虑拆分为简短、实用的子类别。
+不要为了过度精细而创建过深或过碎的分类层级。
+
+"其他待定"使用规则：
+"其他待定"是最后选择，而不是默认选择。
+如果文件类型可以判断，但具体用途不清楚，应归入对应类型类别，而不是"其他待定"。
+
+{web_search_line}"#
+        )
+    } else {
+        format!(
+            r#"You cluster file summaries into a hierarchical category tree.
+
+You must use native tool calling.
+Do not hand-write JSON protocol in assistant text.
+Do not return the final tree as plain assistant text.
+When you are ready, call submit_organize_result.
+Call at most one tool per reply.
+
+Existing nodes already have stable nodeId values.
+Keep nodeId when you reuse, rename, or move existing nodes.
+
+The assignment "reason" field must come first, in the order: reason, itemId, leafNodeId, categoryPath.
+
+Classification goal:
+Build a practical hierarchical category tree for file organization.
+
+categoryInventory field:
+categoryInventory is a lightweight list of historical files under existing category nodes. Use it to understand category boundaries.
+Each entry contains nodeId, path, count, files, and truncated.
+nodeId is the existing category node ID. Keep this nodeId when reusing the category.
+path is the category path in the tree.
+count is the total number of already-classified files under that category.
+files contains some or all historical filenames or short paths for that category. They are filename/path clues only, not file content or summaries.
+truncated=true means files contains only part of the historical files; truncated=false means files is complete.
+categoryInventory is only historical reference. Current items evidence has priority.
+If a current file does not match historical categories, you may create a new category or adjust the tree.
+Do not force a new file into a category only because count is large.
+Do not treat files as content evidence.
+
+Top-level classification rule:
+Top-level categories should be based primarily on the file's fundamental type, such as installer, document, archive, media, code, data, application, or other pending.
+Do not classify primarily by business purpose at the top level unless the fundamental file type is already clear.
+
+Evidence priority:
+1. Prefer summaryText when it exists.
+2. Then use itemType and modality.
+3. Then use file extension and MIME type.
+4. Then use filename keywords and path patterns.
+5. Finally use size, time, and other metadata.
+
+When summaryText exists, prefer it.
+When summaryText is missing, classify using name, relativePath, itemType, modality, and representation metadata.
+Do not assume missing summaryText means the content is unknown or unclassifiable.
+
+Type-first rule:
+If a file's extension, filename pattern, MIME type, or itemType clearly indicates a fundamental category, classify it by that type even if its specific purpose is unclear.
+Do not use "其他待定" merely because the file's business purpose, source application, or exact content is unknown.
+
+Only use "其他待定" when the file's fundamental type cannot be determined from name, extension, MIME type, relativePath, size, time metadata, itemType, modality, or representation metadata.
+
+Conflict rule:
+If semantic inference conflicts with strong file-type evidence, prefer the file-type evidence unless summaryText clearly proves the file belongs elsewhere.
+If confidence is low but the fundamental type is still identifiable, assign the file to the closest type-based category and briefly explain the uncertainty in the reason.
+
+Bundle rule:
+When an item representation or summaryText includes resultKind=whole, treat it as a whole-directory bundle candidate.
+If the directory appears coherent in type or purpose, prefer assigning the directory as one whole unit.
+Only split the directory when the evidence clearly shows unrelated mixed content.
+
+Subdivision rule:
+When a category contains 5 or more items with clearly different subtypes, consider splitting it into short, practical subcategories.
+Avoid creating overly deep or overly fragmented category hierarchies.
+
+"Other pending" rule:
+"其他待定" is a last resort, not a default category.
+If the file type is identifiable but the specific purpose is unclear, assign it to the corresponding type-based category instead of "其他待定".
+
+{web_search_line}"#
+        )
     }
-    lines.join("\n")
 }
 
 pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Value> {
@@ -808,6 +963,97 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
         .collect()
 }
 
+#[derive(Default)]
+struct CategoryInventoryEntry {
+    node_id: String,
+    path: Vec<String>,
+    count: usize,
+    files: Vec<String>,
+    seen_files: HashSet<String>,
+}
+
+fn compact_history_file_label(row: &Value) -> Option<String> {
+    let relative_path = row
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    relative_path
+        .or(name)
+        .map(|value| trim_to_chars(value, 180))
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub(super) fn build_category_inventory(
+    existing_tree: &CategoryTreeNode,
+    previous_results: &[Value],
+    max_files_per_category: usize,
+) -> Vec<Value> {
+    let mut entries: Vec<CategoryInventoryEntry> = Vec::new();
+    let mut entry_index: HashMap<String, usize> = HashMap::new();
+
+    for row in previous_results {
+        if row_has_classification_error(row) {
+            continue;
+        }
+        let node_id = row
+            .get("leafNodeId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if node_id.is_empty() {
+            continue;
+        }
+        let Some(path) = category_path_for_id(existing_tree, node_id) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+
+        let idx = if let Some(idx) = entry_index.get(node_id).copied() {
+            idx
+        } else {
+            entries.push(CategoryInventoryEntry {
+                node_id: node_id.to_string(),
+                path,
+                ..CategoryInventoryEntry::default()
+            });
+            let idx = entries.len() - 1;
+            entry_index.insert(node_id.to_string(), idx);
+            idx
+        };
+
+        let entry = &mut entries[idx];
+        entry.count = entry.count.saturating_add(1);
+        if entry.files.len() < max_files_per_category {
+            if let Some(label) = compact_history_file_label(row) {
+                if entry.seen_files.insert(label.clone()) {
+                    entry.files.push(label);
+                }
+            }
+        }
+    }
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "nodeId": entry.node_id,
+                "path": entry.path,
+                "count": entry.count,
+                "files": entry.files,
+                "truncated": entry.count > entry.files.len(),
+            })
+        })
+        .collect()
+}
+
 fn search_budget_exhausted_message(response_language: &str) -> &'static str {
     if response_language
         .trim()
@@ -826,6 +1072,7 @@ pub(super) async fn classify_organize_batch(
     stop: &AtomicBool,
     existing_tree: &CategoryTreeNode,
     batch_rows: &[Value],
+    category_inventory: &[Value],
     max_cluster_depth: Option<u32>,
     reference_structure: Option<&String>,
     use_web_search: bool,
@@ -834,13 +1081,6 @@ pub(super) async fn classify_organize_batch(
     stage: &str,
 ) -> Result<ClassifyOrganizeBatchOutput, String> {
     let search_enabled = use_web_search && !search_api_key.trim().is_empty();
-    let mut total_usage = TokenUsage::default();
-    let mut round_trace = Vec::new();
-    let max_steps = if search_enabled {
-        ORGANIZER_WEB_SEARCH_BUDGET + 1
-    } else {
-        1
-    };
     let classification_items = build_classification_batch_items(batch_rows);
     let file_index = batch_rows
         .iter()
@@ -863,8 +1103,8 @@ pub(super) async fn classify_organize_batch(
         })
         .collect::<Vec<_>>();
     let mut payload = json!({
-        "maxClusterDepth": max_cluster_depth,
         "existingTree": category_tree_to_value(existing_tree),
+        "categoryInventory": category_inventory,
         "fileIndex": file_index,
         "items": classification_items,
         "useWebSearch": use_web_search,
@@ -873,7 +1113,7 @@ pub(super) async fn classify_organize_batch(
         payload["referenceStructure"] = Value::String(structure.clone());
     }
 
-    let mut messages = vec![
+    let messages = vec![
         json!({
             "role": "system",
             "content": build_organize_system_prompt(response_language, search_enabled),
@@ -883,193 +1123,312 @@ pub(super) async fn classify_organize_batch(
             "content": payload.to_string(),
         }),
     ];
-    let mut search_calls = 0usize;
-    let mut budget_exhausted_prompt_sent = false;
     let tool_registry = ToolRegistry::new();
+    let llm = OrganizerBatchLlm {
+        route: text_route,
+        stop,
+        diagnostics,
+        stage,
+    };
+    let mut spec = OrganizerBatchSpec {
+        route: text_route,
+        response_language,
+        search_enabled,
+        search_api_key,
+        diagnostics,
+        stage,
+        initial_messages: messages,
+        search_calls: 0,
+        budget_exhausted_prompt_sent: false,
+        total_usage: TokenUsage::default(),
+        round_trace: Vec::new(),
+        available_tool_names: Vec::new(),
+    };
 
-    for step_idx in 0..max_steps {
-        let allow_web_search = search_enabled && search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
-        let search_remaining = ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls);
-        messages[0]["content"] = Value::String(build_organize_system_prompt(
-            response_language,
-            allow_web_search,
-        ));
+    AgentTurnLoop::new(&llm, &tool_registry)
+        .run(&mut spec)
+        .await
+}
 
-        if search_enabled && !allow_web_search && !budget_exhausted_prompt_sent {
-            let prompt = search_budget_exhausted_message(response_language).to_string();
+struct OrganizerBatchLlm<'a> {
+    route: &'a RouteConfig,
+    stop: &'a AtomicBool,
+    diagnostics: Option<&'a OrganizerDiagnostics>,
+    stage: &'a str,
+}
+
+#[async_trait::async_trait]
+impl<'a> AgentLlm for OrganizerBatchLlm<'a> {
+    async fn complete(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        _trace_key: Option<&str>,
+    ) -> Result<AgentCompletion, AgentLlmError> {
+        chat_completion_with_messages(
+            self.route,
+            messages,
+            Some(tools),
+            self.stop,
+            self.diagnostics,
+            self.stage,
+        )
+        .await
+        .map(|output| AgentCompletion {
+            raw_body: output.raw_body,
+            assistant_text: output.content,
+            tool_calls: output.tool_calls,
+            raw_message: output.raw_message,
+            finish_reason: None,
+            usage: output.usage,
+            route: Some(crate::agent_runtime::types::AgentRoute {
+                endpoint: self.route.endpoint.clone(),
+                model: self.route.model.clone(),
+            }),
+        })
+        .map_err(|err| AgentLlmError::new(err.message, err.raw_body))
+    }
+}
+
+struct OrganizerBatchSpec<'a> {
+    route: &'a RouteConfig,
+    response_language: &'a str,
+    search_enabled: bool,
+    search_api_key: &'a str,
+    diagnostics: Option<&'a OrganizerDiagnostics>,
+    stage: &'a str,
+    initial_messages: Vec<Value>,
+    search_calls: usize,
+    budget_exhausted_prompt_sent: bool,
+    total_usage: TokenUsage,
+    round_trace: Vec<String>,
+    available_tool_names: Vec<&'static str>,
+}
+
+impl OrganizerBatchSpec<'_> {
+    fn search_remaining(&self) -> usize {
+        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(self.search_calls)
+    }
+
+    fn output(&self, parsed: Option<Value>, error: Option<String>) -> ClassifyOrganizeBatchOutput {
+        ClassifyOrganizeBatchOutput {
+            parsed,
+            usage: self.total_usage.clone(),
+            raw_output: self.round_trace.join("\n\n====================\n\n"),
+            error,
+        }
+    }
+}
+
+impl AgentTurnSpec for OrganizerBatchSpec<'_> {
+    type Output = ClassifyOrganizeBatchOutput;
+
+    fn max_steps(&self) -> usize {
+        if self.search_enabled {
+            ORGANIZER_WEB_SEARCH_BUDGET + 2
+        } else {
+            2
+        }
+    }
+
+    fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+        let allow_web_search =
+            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        AgentToolPolicy {
+            workflow: ToolWorkflow::Organizer,
+            stage: self.stage,
+            session: None,
+            bootstrap_turn: false,
+            response_language: self.response_language,
+            web_search_allowed: allow_web_search,
+            search_remaining: self.search_remaining(),
+        }
+    }
+
+    fn allow_multiple_tool_calls(&self) -> bool {
+        true
+    }
+
+    fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+        Ok(std::mem::take(&mut self.initial_messages))
+    }
+
+    fn before_step(&mut self, step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
+        let allow_web_search =
+            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        if let Some(system_message) = messages.get_mut(0) {
+            system_message["content"] = Value::String(build_organize_system_prompt(
+                self.response_language,
+                allow_web_search,
+            ));
+        }
+        self.available_tool_names = if allow_web_search {
+            vec!["web_search", "submit_organize_result"]
+        } else {
+            vec!["submit_organize_result"]
+        };
+
+        if self.search_enabled
+            && self.search_calls >= ORGANIZER_WEB_SEARCH_BUDGET
+            && !self.budget_exhausted_prompt_sent
+        {
+            let prompt = search_budget_exhausted_message(self.response_language).to_string();
             messages.push(json!({
                 "role": "user",
                 "content": prompt.clone(),
             }));
             append_batch_trace_note(
-                &mut round_trace,
+                &mut self.round_trace,
                 "budget_exhausted",
-                vec![
-                    format!("Step: {}", step_idx + 1),
-                    format!("Prompt: {}", prompt),
-                ],
+                vec![format!("Step: {}", step + 1), format!("Prompt: {}", prompt)],
             );
-            budget_exhausted_prompt_sent = true;
+            self.budget_exhausted_prompt_sent = true;
         }
+        Ok(())
+    }
 
-        let tool_context = ToolContext {
+    fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+        let allow_web_search =
+            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        let search_remaining = self.search_remaining();
+        ToolExecutionContext {
             workflow: ToolWorkflow::Organizer,
-            stage,
+            stage: self.stage,
             session: None,
             bootstrap_turn: false,
-            response_language,
+            response_language: self.response_language,
             web_search_allowed: allow_web_search,
             search_remaining,
-        };
-        let tools = tool_registry.definitions(&tool_context);
-        let available_tool_names = tool_registry.available_names(&tool_context);
+            state: None,
+            search_api_key: Some(self.search_api_key),
+            diagnostics: self.diagnostics,
+        }
+    }
 
-        let completion = match chat_completion_with_messages(
-            text_route,
-            &messages,
-            Some(&tools),
-            stop,
-            diagnostics,
-            stage,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(err) => {
-                append_batch_trace(
-                    &mut round_trace,
-                    step_idx + 1,
-                    text_route,
-                    "http_error",
-                    &err.raw_body,
-                    None,
-                    Some(&err.message),
-                    &available_tool_names,
-                    ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls),
-                );
-                return Ok(ClassifyOrganizeBatchOutput {
-                    parsed: None,
-                    usage: total_usage,
-                    raw_output: round_trace.join("\n\n====================\n\n"),
-                    error: Some(err.message),
-                });
-            }
-        };
-        total_usage.prompt = total_usage.prompt.saturating_add(completion.usage.prompt);
-        total_usage.completion = total_usage
+    fn on_model_success(
+        &mut self,
+        step: usize,
+        completion: &AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<(), String> {
+        self.total_usage.prompt = self
+            .total_usage
+            .prompt
+            .saturating_add(completion.usage.prompt);
+        self.total_usage.completion = self
+            .total_usage
             .completion
             .saturating_add(completion.usage.completion);
-        total_usage.total = total_usage.total.saturating_add(completion.usage.total);
+        self.total_usage.total = self
+            .total_usage
+            .total
+            .saturating_add(completion.usage.total);
+        let search_remaining = self.search_remaining();
         append_batch_trace(
-            &mut round_trace,
-            step_idx + 1,
-            text_route,
+            &mut self.round_trace,
+            step + 1,
+            self.route,
             "http_ok",
             &completion.raw_body,
-            Some(&completion.content),
+            Some(&completion.assistant_text),
             None,
-            &available_tool_names,
-            ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls),
+            &self.available_tool_names,
+            search_remaining,
         );
+        Ok(())
+    }
 
-        if completion.tool_calls.is_empty() {
-            return Ok(ClassifyOrganizeBatchOutput {
-                parsed: None,
-                usage: total_usage,
-                raw_output: round_trace.join("\n\n====================\n\n"),
-                error: Some(
-                    "classification response did not call a required organizer tool".to_string(),
-                ),
-            });
-        }
-        if completion.tool_calls.len() > 1 {
-            return Ok(ClassifyOrganizeBatchOutput {
-                parsed: None,
-                usage: total_usage,
-                raw_output: round_trace.join("\n\n====================\n\n"),
-                error: Some(
-                    "classification response used multiple tool calls in one step".to_string(),
-                ),
-            });
-        }
+    fn on_model_error(
+        &mut self,
+        step: usize,
+        err: AgentLlmError,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Option<ClassifyOrganizeBatchOutput>, String> {
+        let search_remaining = self.search_remaining();
+        append_batch_trace(
+            &mut self.round_trace,
+            step + 1,
+            self.route,
+            "http_error",
+            &err.raw_body,
+            None,
+            Some(&err.message),
+            &self.available_tool_names,
+            search_remaining,
+        );
+        Ok(Some(self.output(None, Some(err.message))))
+    }
 
-        messages.push(completion.raw_message.clone());
-        let Some(tool_call) = completion.tool_calls.into_iter().next() else {
-            return Ok(ClassifyOrganizeBatchOutput {
-                parsed: None,
-                usage: total_usage,
-                raw_output: round_trace.join("\n\n====================\n\n"),
-                error: Some("classification response lost its organizer tool call".to_string()),
-            });
-        };
+    fn on_no_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ClassifyOrganizeBatchOutput, String> {
+        Ok(self.output(
+            None,
+            Some("classification response did not call a required organizer tool".to_string()),
+        ))
+    }
 
-        let tool_id = tool_registry.id_for_name(&tool_call.name);
-        let tool_result = {
-            let mut tool_context = ToolExecutionContext {
-                workflow: ToolWorkflow::Organizer,
-                stage,
-                session: None,
-                bootstrap_turn: false,
-                response_language,
-                web_search_allowed: allow_web_search,
-                search_remaining,
-                state: None,
-                search_api_key: Some(search_api_key),
-                diagnostics,
-            };
-            match tool_registry.dispatch(&mut tool_context, &tool_call).await {
-                Ok(result) => result,
-                Err(err) => {
-                    return Ok(ClassifyOrganizeBatchOutput {
-                        parsed: None,
-                        usage: total_usage,
-                        raw_output: round_trace.join("\n\n====================\n\n"),
-                        error: Some(err),
-                    });
-                }
-            }
-        };
+    fn on_multiple_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ClassifyOrganizeBatchOutput, String> {
+        Ok(self.output(
+            None,
+            Some("classification response used multiple tool calls in one step".to_string()),
+        ))
+    }
 
+    fn on_tool_success(
+        &mut self,
+        _step: usize,
+        tool_id: Option<ToolId>,
+        call: &ParsedToolCall,
+        result: ToolResult,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallOutcome<ClassifyOrganizeBatchOutput>, String> {
         match tool_id {
             Some(ToolId::WebSearch) => {
-                if tool_result
+                if result
                     .diagnostics
                     .as_ref()
                     .and_then(|value| value.get("searchConsumed"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    search_calls = search_calls.saturating_add(1);
+                    self.search_calls = self.search_calls.saturating_add(1);
                 }
-                let result = &tool_result.result;
                 let mut note = Vec::new();
-                if let Some(query) = result.get("query").and_then(Value::as_str) {
+                if let Some(query) = result.result.get("query").and_then(Value::as_str) {
                     note.push(format!("Query: {}", query));
                 }
-                if let Some(reason) = result.get("reason").and_then(Value::as_str) {
+                if let Some(reason) = result.result.get("reason").and_then(Value::as_str) {
                     note.push(format!("Reason: {}", reason));
                 }
-                if let Some(results) = result.get("results").and_then(Value::as_array) {
+                if let Some(results) = result.result.get("results").and_then(Value::as_array) {
                     note.push(format!("Result Count: {}", results.len()));
                 }
-                if let Some(error) = result.get("error").and_then(Value::as_str) {
+                if let Some(error) = result.result.get("error").and_then(Value::as_str) {
                     note.push(format!("Error: {}", error));
+                }
+                if let Some(message) = result.result.get("message").and_then(Value::as_str) {
+                    note.push(format!("Message: {}", message));
                 }
                 note.push(format!(
                     "Search Budget Remaining: {}",
-                    ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(search_calls)
+                    self.search_remaining()
                 ));
-                append_batch_trace_note(&mut round_trace, "web_search", note);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": serialize_tool_result_content(&tool_result.result),
-                }));
+                append_batch_trace_note(&mut self.round_trace, "web_search", note);
+                Ok(ToolCallOutcome::Continue {
+                    result: result.result,
+                })
             }
             Some(ToolId::SubmitOrganizeResult) => {
-                let parsed = tool_result.result;
+                let parsed = result.result;
                 append_batch_trace_note(
-                    &mut round_trace,
+                    &mut self.round_trace,
                     "submit_organize_result",
                     vec![
                         format!(
@@ -1080,35 +1439,39 @@ pub(super) async fn classify_organize_batch(
                                 .map(|rows| rows.len())
                                 .unwrap_or(0)
                         ),
-                        format!("Search Calls Used: {}", search_calls),
+                        format!("Search Calls Used: {}", self.search_calls),
                     ],
                 );
-                return Ok(ClassifyOrganizeBatchOutput {
-                    parsed: Some(parsed),
-                    usage: total_usage,
-                    raw_output: round_trace.join("\n\n====================\n\n"),
-                    error: None,
-                });
+                Ok(ToolCallOutcome::Finish(self.output(Some(parsed), None)))
             }
-            _ => {
-                return Ok(ClassifyOrganizeBatchOutput {
-                    parsed: None,
-                    usage: total_usage,
-                    raw_output: round_trace.join("\n\n====================\n\n"),
-                    error: Some(format!("unsupported organizer tool: {}", tool_call.name)),
-                });
-            }
+            _ => Ok(ToolCallOutcome::Finish(self.output(
+                None,
+                Some(format!("unsupported organizer tool: {}", call.name)),
+            ))),
         }
     }
 
-    Ok(ClassifyOrganizeBatchOutput {
-        parsed: None,
-        usage: total_usage,
-        raw_output: round_trace.join("\n\n====================\n\n"),
-        error: Some(
-            "classification tool loop exhausted without submit_organize_result".to_string(),
-        ),
-    })
+    fn on_tool_error(
+        &mut self,
+        _step: usize,
+        _call: &ParsedToolCall,
+        message: String,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallErrorOutcome<ClassifyOrganizeBatchOutput>, String> {
+        Ok(ToolCallErrorOutcome::Finish(
+            self.output(None, Some(message)),
+        ))
+    }
+
+    fn on_loop_exhausted(
+        &mut self,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ClassifyOrganizeBatchOutput, String> {
+        Ok(self.output(
+            None,
+            Some("classification tool loop exhausted without submit_organize_result".to_string()),
+        ))
+    }
 }
 
 pub(super) fn emit_organize_summary_ready<R: Runtime>(

@@ -1,14 +1,15 @@
 use super::llm::AdvisorLlm;
 use super::tools::ToolService;
 use super::types::{local_text, now_iso, CARD_EXECUTION, WORKFLOW_UNDERSTAND};
+use crate::agent_runtime::{
+    AgentCompletion, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop, AgentTurnSpec,
+    ToolCallErrorOutcome, ToolCallOutcome,
+};
 use crate::backend::AppState;
 use crate::llm_protocol::ParsedToolCall;
-use crate::llm_tools::{
-    serialize_tool_result_content, ToolContext, ToolExecutionContext, ToolRegistry, ToolWorkflow,
-};
+use crate::llm_tools::{ToolExecutionContext, ToolId, ToolRegistry, ToolResult, ToolWorkflow};
 use crate::persist;
 use serde_json::{json, Value};
-use std::time::Instant;
 use uuid::Uuid;
 
 const MAX_AGENT_STEPS: usize = 8;
@@ -73,200 +74,24 @@ impl<'a> AdvisorAgentRunner<'a> {
                 "content": self.build_user_prompt(&lang, user_message, &context_payload),
             }),
         ];
-        let mut cards = Vec::<Value>::new();
-        let mut trace_steps = Vec::<Value>::new();
-
-        for step in 0..MAX_AGENT_STEPS {
-            let stage_owned = session
-                .get("workflowStage")
-                .and_then(Value::as_str)
-                .unwrap_or(WORKFLOW_UNDERSTAND)
-                .to_string();
-            let stage = stage_owned.as_str();
-            let web_search_allowed = session
-                .get("webSearchEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let tool_defs = {
-                let tool_ctx = ToolContext {
-                    workflow: ToolWorkflow::Advisor,
-                    stage,
-                    session: Some(session),
-                    bootstrap_turn,
-                    response_language: &lang,
-                    web_search_allowed,
-                    search_remaining: 0,
-                };
-                self.tool_registry.definitions(&tool_ctx)
-            };
-            let session_id = session
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let completion = self
-                .llm
-                .complete_with_tools(&messages, &tool_defs, Some(&session_id))
-                .await?;
-            trace_steps.push(json!({
-                "step": step,
-                "route": {
-                    "endpoint": completion.route.endpoint,
-                    "model": completion.route.model,
-                },
-                "usage": {
-                    "prompt": completion.usage.prompt,
-                    "completion": completion.usage.completion,
-                    "total": completion.usage.total,
-                },
-                "finishReason": completion.finish_reason,
-                "assistantText": completion.assistant_text,
-                "toolCalls": completion.tool_calls.iter().map(|call| {
-                    json!({
-                        "id": call.id,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    })
-                }).collect::<Vec<_>>(),
-                "rawBody": completion.raw_body,
-            }));
-            messages.push(normalize_assistant_message(&completion.raw_message));
-
-            if completion.tool_calls.is_empty() {
-                let reply = if bootstrap_turn {
-                    normalize_bootstrap_reply(&completion.assistant_text)
-                } else {
-                    completion.assistant_text.trim().to_string()
-                };
-                if reply.is_empty() {
-                    return Err(local_text(
-                        &lang,
-                        "顾问返回了空回复，请重试。",
-                        "The advisor returned an empty reply. Please try again.",
-                    )
-                    .to_string());
-                }
-                return Ok(AgentTurnResult {
-                    reply,
-                    cards,
-                    trace: json!({ "steps": trace_steps }),
-                });
-            }
-
-            for tool_call in completion.tool_calls {
-                let operation_id = crate::diagnostics::new_operation_id();
-                let tool_started_at = Instant::now();
-                crate::diagnostics::record_state_event(
-                    self.state,
-                    "info",
-                    "advisor",
-                    "advisor_tool_call",
-                    Some(&operation_id),
-                    "advisor tool call started",
-                    json!({
-                        "sessionId": session_id.clone(),
-                        "step": step,
-                        "tool": tool_call.name.clone(),
-                        "arguments": tool_call.arguments.clone(),
-                    }),
-                    None,
-                    None,
-                );
-                let dispatch_stage_owned = session
-                    .get("workflowStage")
-                    .and_then(Value::as_str)
-                    .unwrap_or(WORKFLOW_UNDERSTAND)
-                    .to_string();
-                let dispatch_stage = dispatch_stage_owned.as_str();
-                let dispatch_web_search_allowed = session
-                    .get("webSearchEnabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let dispatch_result = {
-                    let mut tool_ctx = ToolExecutionContext {
-                        workflow: ToolWorkflow::Advisor,
-                        stage: dispatch_stage,
-                        session: Some(session),
-                        bootstrap_turn,
-                        response_language: &lang,
-                        web_search_allowed: dispatch_web_search_allowed,
-                        search_remaining: 0,
-                        state: Some(self.state),
-                        search_api_key: None,
-                        diagnostics: None,
-                    };
-                    let parsed_call = ParsedToolCall {
-                        id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        arguments: tool_call.arguments.clone(),
-                    };
-                    self.tool_registry
-                        .dispatch(&mut tool_ctx, &parsed_call)
-                        .await
-                };
-                match dispatch_result {
-                    Ok(result) => {
-                        let envelope = result.envelope();
-                        crate::diagnostics::record_state_event(
-                            self.state,
-                            "info",
-                            "advisor",
-                            "advisor_tool_result",
-                            Some(&operation_id),
-                            "advisor tool call succeeded",
-                            json!({
-                                "sessionId": session_id.clone(),
-                                "step": step,
-                                "tool": tool_call.name.clone(),
-                                "result": envelope.clone(),
-                            }),
-                            None,
-                            Some(tool_started_at.elapsed()),
-                        );
-                        if let Some(card) = result.card.clone().filter(|value| !value.is_null()) {
-                            cards.push(card);
-                        }
-                        if !result.cards.is_empty() {
-                            cards.extend(result.cards.clone());
-                        }
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": serialize_tool_result_content(&result.result),
-                        }));
-                    }
-                    Err(message) => {
-                        crate::diagnostics::record_state_event(
-                            self.state,
-                            "error",
-                            "advisor",
-                            "advisor_tool_result",
-                            Some(&operation_id),
-                            "advisor tool call failed",
-                            json!({
-                                "sessionId": session_id.clone(),
-                                "step": step,
-                                "tool": tool_call.name.clone(),
-                            }),
-                            Some(json!({ "message": message.clone() })),
-                            Some(tool_started_at.elapsed()),
-                        );
-                        messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": message,
-                        }));
-                    }
-                }
-            }
-        }
-
-        Err(local_text(
-            &lang,
-            "顾问在当前轮次内没有收敛，请重试。",
-            "The advisor did not converge within this turn. Please try again.",
-        )
-        .to_string())
+        let session_id = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut spec = AdvisorTurnSpec {
+            state: self.state,
+            session,
+            session_id,
+            lang,
+            bootstrap_turn,
+            initial_messages: std::mem::take(&mut messages),
+            cards: Vec::new(),
+            dispatch_stage: WORKFLOW_UNDERSTAND.to_string(),
+        };
+        AgentTurnLoop::new(&self.llm, &self.tool_registry)
+            .run(&mut spec)
+            .await
     }
 
     fn build_system_prompt(
@@ -426,6 +251,182 @@ impl<'a> AdvisorAgentRunner<'a> {
     }
 }
 
+struct AdvisorTurnSpec<'a, 's> {
+    state: &'a AppState,
+    session: &'s mut Value,
+    session_id: String,
+    lang: String,
+    bootstrap_turn: bool,
+    initial_messages: Vec<Value>,
+    cards: Vec<Value>,
+    dispatch_stage: String,
+}
+
+impl<'a, 's> AdvisorTurnSpec<'a, 's> {
+    fn refresh_dispatch_stage(&mut self) {
+        self.dispatch_stage = self
+            .session
+            .get("workflowStage")
+            .and_then(Value::as_str)
+            .unwrap_or(WORKFLOW_UNDERSTAND)
+            .to_string();
+    }
+}
+
+impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
+    type Output = AgentTurnResult;
+
+    fn max_steps(&self) -> usize {
+        MAX_AGENT_STEPS
+    }
+
+    fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+        let stage = self
+            .session
+            .get("workflowStage")
+            .and_then(Value::as_str)
+            .unwrap_or(WORKFLOW_UNDERSTAND);
+        let web_search_allowed = self
+            .session
+            .get("webSearchEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        AgentToolPolicy {
+            workflow: ToolWorkflow::Advisor,
+            stage,
+            session: Some(&*self.session),
+            bootstrap_turn: self.bootstrap_turn,
+            response_language: &self.lang,
+            web_search_allowed,
+            search_remaining: 0,
+        }
+    }
+
+    fn trace_key(&self) -> Option<&str> {
+        Some(&self.session_id)
+    }
+
+    fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+        Ok(std::mem::take(&mut self.initial_messages))
+    }
+
+    fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+        self.refresh_dispatch_stage();
+        let web_search_allowed = self
+            .session
+            .get("webSearchEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        ToolExecutionContext {
+            workflow: ToolWorkflow::Advisor,
+            stage: self.dispatch_stage.as_str(),
+            session: Some(&mut *self.session),
+            bootstrap_turn: self.bootstrap_turn,
+            response_language: &self.lang,
+            web_search_allowed,
+            search_remaining: 0,
+            state: Some(self.state),
+            search_api_key: None,
+            diagnostics: None,
+        }
+    }
+
+    fn on_no_tool_calls(
+        &mut self,
+        completion: AgentCompletion,
+        trace: &AgentLoopTrace,
+    ) -> Result<AgentTurnResult, String> {
+        let reply = if self.bootstrap_turn {
+            normalize_bootstrap_reply(&completion.assistant_text)
+        } else {
+            completion.assistant_text.trim().to_string()
+        };
+        if reply.is_empty() {
+            return Err(local_text(
+                &self.lang,
+                "顾问返回了空回复，请重试。",
+                "The advisor returned an empty reply. Please try again.",
+            )
+            .to_string());
+        }
+        Ok(AgentTurnResult {
+            reply,
+            cards: std::mem::take(&mut self.cards),
+            trace: trace.as_json(),
+        })
+    }
+
+    fn on_tool_success(
+        &mut self,
+        step: usize,
+        _tool_id: Option<ToolId>,
+        call: &ParsedToolCall,
+        result: ToolResult,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallOutcome<AgentTurnResult>, String> {
+        let envelope = result.envelope();
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_tool_result",
+            None,
+            "advisor tool call succeeded",
+            json!({
+                "sessionId": self.session_id,
+                "step": step,
+                "tool": call.name,
+                "result": envelope,
+            }),
+            None,
+            None,
+        );
+        if let Some(card) = result.card.clone().filter(|value| !value.is_null()) {
+            self.cards.push(card);
+        }
+        if !result.cards.is_empty() {
+            self.cards.extend(result.cards.clone());
+        }
+        Ok(ToolCallOutcome::Continue {
+            result: result.result,
+        })
+    }
+
+    fn on_tool_error(
+        &mut self,
+        step: usize,
+        call: &ParsedToolCall,
+        message: String,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallErrorOutcome<AgentTurnResult>, String> {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "error",
+            "advisor",
+            "advisor_tool_result",
+            None,
+            "advisor tool call failed",
+            json!({
+                "sessionId": self.session_id,
+                "step": step,
+                "tool": call.name,
+            }),
+            Some(json!({ "message": message.clone() })),
+            None,
+        );
+        Ok(ToolCallErrorOutcome::Continue { message })
+    }
+
+    fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<AgentTurnResult, String> {
+        Err(local_text(
+            &self.lang,
+            "顾问在当前轮次内没有收敛，请重试。",
+            "The advisor did not converge within this turn. Please try again.",
+        )
+        .to_string())
+    }
+}
+
 fn normalize_bootstrap_reply(reply: &str) -> String {
     let lines = reply
         .lines()
@@ -438,12 +439,6 @@ fn normalize_bootstrap_reply(reply: &str) -> String {
     } else {
         lines.join("\n")
     }
-}
-
-fn normalize_assistant_message(message: &Value) -> Value {
-    let mut obj = message.as_object().cloned().unwrap_or_default();
-    obj.insert("role".to_string(), Value::String("assistant".to_string()));
-    Value::Object(obj)
 }
 
 pub(super) fn materialize_card(session_id: &str, turn_id: &str, card: &Value) -> Value {

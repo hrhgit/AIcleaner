@@ -149,6 +149,32 @@ pub async fn organize_get_result(
 }
 
 #[tauri::command]
+pub async fn organize_get_latest_result(
+    state: State<'_, AppState>,
+    root_path: String,
+) -> Result<Value, String> {
+    let state_for_log = state.inner().clone();
+    let details = json!({ "rootPath": root_path.clone() });
+    let (operation_id, started_at) = command_log_start(
+        &state_for_log,
+        "organizer",
+        "organize_get_latest_result",
+        details.clone(),
+    );
+    let result = crate::organizer_runtime::organize_get_latest_result(state, root_path).await;
+    command_log_finish(
+        &state_for_log,
+        "organizer",
+        "organize_get_latest_result",
+        &operation_id,
+        started_at,
+        &result,
+        details,
+    );
+    result
+}
+
+#[tauri::command]
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
     let state_for_log = state.inner().clone();
     let details = json!({ "taskId": task_id.clone() });

@@ -1,3 +1,4 @@
+use crate::agent_runtime::{AgentCompletion, AgentLlm, AgentLlmError};
 use crate::backend::{
     resolve_provider_api_key, resolve_provider_endpoint_and_model, AppState, TokenUsage,
 };
@@ -89,6 +90,46 @@ impl<'a> AdvisorLlm<'a> {
         )
         .await
         .map_err(|err| render_chat_error(&err))
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a> AgentLlm for AdvisorLlm<'a> {
+    async fn complete(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        trace_key: Option<&str>,
+    ) -> Result<AgentCompletion, AgentLlmError> {
+        self.complete_with_tools(messages, tools, trace_key)
+            .await
+            .map(AgentCompletion::from)
+            .map_err(|message| AgentLlmError::new(message, ""))
+    }
+}
+
+impl From<AdvisorCompletionOutput> for AgentCompletion {
+    fn from(value: AdvisorCompletionOutput) -> Self {
+        Self {
+            raw_body: value.raw_body,
+            assistant_text: value.assistant_text,
+            tool_calls: value
+                .tool_calls
+                .into_iter()
+                .map(|call| crate::llm_protocol::ParsedToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                })
+                .collect(),
+            raw_message: value.raw_message,
+            finish_reason: value.finish_reason,
+            usage: value.usage,
+            route: Some(crate::agent_runtime::types::AgentRoute {
+                endpoint: value.route.endpoint,
+                model: value.route.model,
+            }),
+        }
     }
 }
 

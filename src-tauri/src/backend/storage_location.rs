@@ -65,58 +65,33 @@ fn validate_data_dir_target(current_data_dir: &Path, target_data_dir: &Path) -> 
     Ok(())
 }
 
-fn copy_dir_contents_recursive(
-    source_dir: &Path,
-    target_dir: &Path,
-    skip_paths: &HashSet<String>,
-) -> Result<(), String> {
-    fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
-    for entry in fs::read_dir(source_dir).map_err(|e| e.to_string())? {
+pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let source_path = entry.path();
-        let source_key = crate::persist::normalize_root_path(&source_path.to_string_lossy());
-        if skip_paths.contains(&source_key) {
-            continue;
-        }
-        let target_path = target_dir.join(entry.file_name());
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        if file_type.is_dir() {
-            copy_dir_contents_recursive(&source_path, &target_path, skip_paths)?;
-        } else if file_type.is_file() {
-            if target_path.exists() {
-                return Err(format!(
-                    "Target already contains {}.",
-                    target_path.to_string_lossy()
-                ));
-            }
+        let target_path = target.join(entry.file_name());
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
             fs::copy(&source_path, &target_path).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
 }
 
-fn remove_dir_contents_recursive(
-    source_dir: &Path,
-    skip_paths: &HashSet<String>,
-) -> Result<(), String> {
-    if !source_dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(source_dir).map_err(|e| e.to_string())? {
+pub(crate) fn remove_dir_recursive(dir: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        let source_path = entry.path();
-        let source_key = crate::persist::normalize_root_path(&source_path.to_string_lossy());
-        if skip_paths.contains(&source_key) {
-            continue;
-        }
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        if file_type.is_dir() {
-            remove_dir_contents_recursive(&source_path, skip_paths)?;
-            let _ = fs::remove_dir(&source_path);
-        } else if file_type.is_file() {
-            fs::remove_file(&source_path).map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            remove_dir_recursive(&path)?;
+            fs::remove_dir(&path).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
     }
+    fs::remove_dir(dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 

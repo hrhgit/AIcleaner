@@ -3,7 +3,6 @@
  * 应用入口 — 路由管理与页面切换
  */
 import { renderAdvisor } from './pages/advisor.js';
-import { renderOrganizer, renderOrganizerResults } from './pages/organizer.js';
 import { browseFolder, getSettings, moveDataDir, openExternalUrl } from './utils/api.js';
 import { emitLangChange, registerLangChangeHandler, setLang, getLang, t } from './utils/i18n.js';
 import { initProviderManager } from './components/provider-manager.js';
@@ -11,8 +10,6 @@ import { showToast } from './utils/toast.js';
 
 const pages = {
     advisor: renderAdvisor,
-    organizer: renderOrganizer,
-    'organizer-results': renderOrganizerResults,
 };
 
 let currentPage = null;
@@ -26,6 +23,9 @@ function hideBootSplash() {
 }
 
 function normalizePageName(pageName) {
+    if (pageName === 'organizer' || pageName === 'organizer-results') {
+        return 'advisor';
+    }
     return pageName;
 }
 
@@ -72,13 +72,9 @@ function getPageFromHash() {
 function updateShellCopy() {
     const currentLang = getLang();
     const advisorLabel = document.getElementById('nav-advisor-label');
-    const organizerLabel = document.getElementById('nav-organizer-label');
-    const organizerResultsLabel = document.getElementById('nav-organizer-results-label');
     const bootSubtitle = document.getElementById('boot-subtitle');
     const bootHint = document.getElementById('boot-hint');
     if (advisorLabel) advisorLabel.textContent = currentLang === 'en' ? 'Advisor' : '顾问';
-    if (organizerLabel) organizerLabel.textContent = t('nav.organizer');
-    if (organizerResultsLabel) organizerResultsLabel.textContent = t('nav.organizer_results');
     if (bootSubtitle) bootSubtitle.textContent = currentLang === 'en' ? 'Loading workspace...' : '正在加载工作台...';
     if (bootHint) bootHint.textContent = '';
 }

@@ -471,7 +471,7 @@ mod tests {
             }),
         )
         .expect("write settings");
-        fs::write(state.data_dir().join("marker.txt"), b"marker").expect("write marker");
+        fs::write(state.data_dir().join("other-file.txt"), b"other").expect("write other file");
 
         let response =
             migrate_data_dir(&state, &target_dir.to_string_lossy()).expect("migrate data dir");
@@ -479,7 +479,10 @@ mod tests {
         assert!(same_path(&state.data_dir(), &target_dir));
         assert!(state.settings_path().exists());
         assert!(state.db_path().exists());
-        assert!(state.data_dir().join("marker.txt").exists());
+        // Only settings.json and scan-cache.sqlite are migrated, not other files
+        assert!(target_dir.join("settings.json").exists());
+        assert!(target_dir.join("scan-cache.sqlite").exists());
+        assert!(!target_dir.join("other-file.txt").exists());
         assert_eq!(
             response["settings"]["storage"]["dataDir"],
             Value::String(target_dir.to_string_lossy().to_string())

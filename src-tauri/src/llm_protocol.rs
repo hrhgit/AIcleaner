@@ -576,12 +576,80 @@ fn parse_arguments_value(value: Option<&Value>) -> Result<Value, String> {
             if trimmed.is_empty() {
                 Ok(json!({}))
             } else {
-                serde_json::from_str::<Value>(trimmed)
-                    .map_err(|e| format!("tool call arguments are not valid JSON: {e}"))
+                parse_tool_arguments_string(trimmed)
             }
         }
         Some(other) => Ok(other.clone()),
     }
+}
+
+fn parse_tool_arguments_string(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => Ok(value),
+        Err(original_err) => {
+            let repaired = escape_likely_unescaped_string_quotes(raw);
+            if repaired == raw {
+                return Err(format!(
+                    "tool call arguments are not valid JSON: {original_err}"
+                ));
+            }
+            serde_json::from_str::<Value>(&repaired).map_err(|repair_err| {
+                format!(
+                    "tool call arguments are not valid JSON: {original_err}; repair failed: {repair_err}"
+                )
+            })
+        }
+    }
+}
+
+fn escape_likely_unescaped_string_quotes(raw: &str) -> String {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in chars.iter().enumerate() {
+        if escaped {
+            out.push(*ch);
+            escaped = false;
+            continue;
+        }
+
+        if !in_string {
+            out.push(*ch);
+            if *ch == '"' {
+                in_string = true;
+            }
+            continue;
+        }
+
+        match *ch {
+            '\\' => {
+                out.push('\\');
+                escaped = true;
+            }
+            '"' => {
+                if looks_like_json_string_end(&chars, idx) {
+                    out.push('"');
+                    in_string = false;
+                } else {
+                    out.push('\\');
+                    out.push('"');
+                }
+            }
+            _ => out.push(*ch),
+        }
+    }
+
+    out
+}
+
+fn looks_like_json_string_end(chars: &[char], quote_idx: usize) -> bool {
+    chars[quote_idx + 1..]
+        .iter()
+        .find(|ch| !ch.is_whitespace())
+        .map(|ch| matches!(ch, ':' | ',' | '}' | ']'))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -687,5 +755,38 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "find_files");
         assert_eq!(parsed.usage.total, 15);
+    }
+
+    #[test]
+    fn parses_openai_tool_call_with_unescaped_quotes_in_arguments_string() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_organize_result",
+                            "arguments": "{\"assignments\":[{\"itemId\":\"batch12_1\",\"reason\":\".exe文件名含\"Installer\"，表明是安装包\"}]}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "submit_organize_result");
+        assert_eq!(
+            parsed.tool_calls[0].arguments["assignments"][0]["reason"],
+            ".exe文件名含\"Installer\"，表明是安装包"
+        );
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
     }
 }

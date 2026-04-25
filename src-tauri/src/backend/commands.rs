@@ -108,12 +108,28 @@ fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String
     validate_data_dir_target(&current_data_dir, &target_data_dir)?;
     fs::create_dir_all(&target_data_dir).map_err(|e| e.to_string())?;
 
-    let bootstrap_key =
-        crate::persist::normalize_root_path(&state.bootstrap_path.to_string_lossy());
-    let mut skip_paths = HashSet::new();
-    skip_paths.insert(bootstrap_key);
+    // Migrate specific cache files (only move existing ones, skip if not found)
+    let files_to_migrate = ["settings.json", "scan-cache.sqlite"];
+    for filename in files_to_migrate {
+        let source_file = current_data_dir.join(filename);
+        if source_file.exists() {
+            let target_file = target_data_dir.join(filename);
+            if target_file.exists() {
+                return Err(format!("Target already contains {}.", filename));
+            }
+            fs::copy(&source_file, &target_file).map_err(|e| e.to_string())?;
+        }
+    }
 
-    copy_dir_contents_recursive(&current_data_dir, &target_data_dir, &skip_paths)?;
+    // Migrate logs/ directory if it exists
+    let logs_source = current_data_dir.join("logs");
+    if logs_source.exists() && logs_source.is_dir() {
+        let logs_target = target_data_dir.join("logs");
+        if logs_target.exists() {
+            return Err("Target already contains logs/.".to_string());
+        }
+        copy_dir_recursive(&logs_source, &logs_target)?;
+    }
 
     let target_paths = AppPaths::from_data_dir(target_data_dir.clone());
     if !target_paths.settings_path.exists() {
@@ -133,7 +149,26 @@ fn migrate_data_dir(state: &AppState, target_path: &str) -> Result<Value, String
     )?;
     state.set_data_dir(target_data_dir.clone());
 
-    let cleanup_warning = remove_dir_contents_recursive(&current_data_dir, &skip_paths).err();
+    // Cleanup migrated files from old location (only existing ones)
+    let files_to_cleanup = ["settings.json", "scan-cache.sqlite"];
+    let mut cleanup_warning = None;
+    for filename in files_to_cleanup {
+        let source_file = current_data_dir.join(filename);
+        if source_file.exists() {
+            if let Err(e) = fs::remove_file(&source_file) {
+                cleanup_warning = Some(e.to_string());
+            }
+        }
+    }
+
+    // Cleanup logs/ directory if it exists
+    let logs_source = current_data_dir.join("logs");
+    if logs_source.exists() && logs_source.is_dir() {
+        if let Err(e) = remove_dir_recursive(&logs_source) {
+            cleanup_warning = Some(e.to_string());
+        }
+    }
+
     let settings = read_settings(&target_paths.settings_path);
     Ok(json!({
         "success": true,

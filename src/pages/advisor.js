@@ -5,6 +5,7 @@ import {
   advisorSessionStart,
   browseFolder,
   connectOrganizeStream,
+  getLatestOrganizeResult,
   getOrganizeResult,
   getSettings,
   saveSettings,
@@ -69,7 +70,7 @@ function createInitialState() {
     messageDraft: readPersisted(PERSIST_KEYS.messageDraft, ''),
     sessionData: null,
     organizeTaskId: String(readPersisted(ORGANIZER_PERSIST_KEYS.lastTaskId, '') || ''),
-    organizeSnapshot: sanitizeSnapshot(readPersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot, null)),
+    organizeSnapshot: null,
     organizeStream: null,
     loading: false,
     sending: false,
@@ -633,6 +634,23 @@ async function hydrateOrganizeSnapshot(taskId, { reconnect = true } = {}) {
   }
 }
 
+async function hydrateLatestOrganizeSnapshot({ reconnect = true } = {}) {
+  const rootPath = String(state.rootPath || '').trim();
+  if (!rootPath) return false;
+  try {
+    const snapshot = sanitizeSnapshot(await getLatestOrganizeResult(rootPath));
+    if (!snapshot) return false;
+    applyOrganizeSnapshot(snapshot);
+    if (reconnect && isOrganizeRunning(snapshot)) {
+      connectTaskStream(snapshot.id || state.organizeTaskId);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[Advisor] Failed to hydrate latest organize snapshot:', err);
+    return false;
+  }
+}
+
 async function syncWorkflowSearchSetting(nextValue) {
   state.syncingSearch = true;
   renderPage();
@@ -878,9 +896,10 @@ async function bootstrap() {
   } catch {
     // keep persisted fallback
   }
-  if (state.organizeTaskId) {
-    await hydrateOrganizeSnapshot(state.organizeTaskId, { reconnect: true });
-  } else {
+  const refreshedLatest = await hydrateLatestOrganizeSnapshot({ reconnect: true });
+  if (!refreshedLatest) {
+    state.organizeTaskId = '';
+    state.organizeSnapshot = null;
     renderPage();
   }
   if (state.sessionId) {

@@ -1,4 +1,5 @@
 mod advisor_runtime;
+mod agent_runtime;
 mod backend;
 mod diagnostics;
 mod file_representation;
@@ -38,6 +39,7 @@ pub fn run() {
             backend::organize_start,
             backend::organize_stop,
             backend::organize_get_result,
+            backend::organize_get_latest_result,
             backend::organize_apply,
             backend::organize_rollback,
             backend::advisor_session_start,

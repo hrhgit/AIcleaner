@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "root": "E:\\_workSpace\\wipeout",
+  "updated_at": "2026-04-25T18:19:32+00:00",
+  "terms": [
+    {
+      "term": "顾问页分类树",
+      "aliases": [],
+      "targets": [
+        {
+          "path": "src/pages/advisor.js",
+          "line": 346,
+          "symbol": "renderOrganizeSummary",
+          "kind": "component",
+          "note": "顾问页顶部前置归类面板渲染分类树"
+        }
+      ]
+    },
+    {
+      "term": "顾问页最新归类结果",
+      "aliases": [],
+      "targets": [
+        {
+          "path": "src-tauri/src/organizer_runtime/commands.rs",
+          "line": 194,
+          "symbol": "organize_get_latest_result",
+          "kind": "function",
+          "note": "按 rootPath 读取最新 organize snapshot 供顾问页刷新"
+        }
+      ]
+    }
+  ]
+}

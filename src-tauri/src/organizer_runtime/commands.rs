@@ -192,6 +192,22 @@ pub async fn organize_get_result(
     serde_json::to_value(planner::hydrate_loaded_snapshot(snapshot)).map_err(|e| e.to_string())
 }
 
+pub async fn organize_get_latest_result(
+    state: State<'_, AppState>,
+    root_path: String,
+) -> Result<Value, String> {
+    let root_path = root_path.trim().to_string();
+    if root_path.is_empty() {
+        return Ok(Value::Null);
+    }
+    persist::prepare_organizer_module_access(&state.db_path())?;
+    let Some(task_id) = persist::find_latest_organize_task_id_for_root(&state.db_path(), &root_path)?
+    else {
+        return Ok(Value::Null);
+    };
+    organize_get_result(state, task_id).await
+}
+
 pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Result<Value, String> {
     let mut snapshot = planner::hydrate_loaded_snapshot(
         persist::load_organize_snapshot(&state.db_path(), &task_id)?

@@ -634,15 +634,75 @@ async fn run_summary_scheduler(
 }
 
 fn summary_system_prompt(lang: &str, level: RepresentationLevel) -> String {
-    let target = if level == RepresentationLevel::Short {
-        "Return one short summary sentence and one longer summary sentence."
+    let is_zh = lang.trim().to_ascii_lowercase().starts_with("zh");
+    if is_zh {
+        if level == RepresentationLevel::Short {
+            r#"你负责为文件整理系统生成 summaryText。
+
+summaryText 用于为后续文件归类提供内容证据。
+你的任务是概括当前输入中可读或可解析的信息，不是最终归类，也不是生成分类树。
+
+请简洁总结：
+1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
+2. 对分类有帮助的类型、命名或路径线索。
+3. 如果信息不足，请说明具体不确定点。
+
+不要编造未提供的内容。
+
+输出语言使用中文。
+
+只返回 JSON：{"summaryShort":"...","summaryLong":"..."}"#.to_string()
+        } else {
+            r#"你负责为文件整理系统生成 summaryText。
+
+summaryText 用于为后续文件归类提供内容证据。
+你的任务是概括当前输入中可读或可解析的信息，不是最终归类，也不是生成分类树。
+
+请简洁总结：
+1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
+2. 对分类有帮助的类型、命名或路径线索。
+3. 如果信息不足，请说明具体不确定点。
+
+不要编造未提供的内容。
+
+输出语言使用中文。
+
+只返回 JSON：{"summaryShort":"...","summaryLong":"..."}"#.to_string()
+        }
     } else {
-        "Return one concise short summary sentence and one richer long summary sentence."
-    };
-    if lang.eq_ignore_ascii_case("en") {
-        format!("{target} Return JSON only: {{\"summaryShort\":\"...\",\"summaryLong\":\"...\"}}")
-    } else {
-        format!("{target} 只返回 JSON：{{\"summaryShort\":\"...\",\"summaryLong\":\"...\"}}")
+        if level == RepresentationLevel::Short {
+            r#"You are responsible for generating summaryText for a file organization system.
+
+summaryText provides content evidence for subsequent file classification.
+Your task is to summarize readable or parseable information from the current input, not to perform final classification or generate a category tree.
+
+Please concisely summarize:
+1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
+2. Type, naming, or path clues that help with classification.
+3. If information is insufficient, specify the exact uncertainty.
+
+Do not fabricate content not provided.
+
+Write summaries in English only.
+
+Return JSON only: {"summaryShort":"...","summaryLong":"..."}"#.to_string()
+        } else {
+            r#"You are responsible for generating summaryText for a file organization system.
+
+summaryText provides content evidence for subsequent file classification.
+Your task is to summarize readable or parseable information from the current input, not to perform final classification or generate a category tree.
+
+Please concisely summarize:
+1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
+2. Type, naming, or path clues that help with classification.
+3. If information is insufficient, specify the exact uncertainty.
+
+Do not fabricate content not provided.
+
+Write summaries in English only.
+
+Return JSON only: {"summaryShort":"...","summaryLong":"..."}"#.to_string()
+        }
     }
 }
 

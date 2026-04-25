@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;

@@ -200,11 +200,18 @@ async fn run_organize_task<R: Runtime>(
 
         let mut summary_usage = TokenUsage::default();
         if summary_strategy == SUMMARY_MODE_AGENT_SUMMARY {
+            // Filter to only non-degraded items for agent summary
+            let batch_rows_for_agent: Vec<Value> = batch_rows
+                .iter()
+                .filter(|row| !row.get("summaryDegraded").and_then(Value::as_bool).unwrap_or(false))
+                .cloned()
+                .collect();
+
             let output = summary::summarize_batch_with_agent(
                 &text_route,
                 &task.response_language,
                 &task.stop,
-                &batch_rows,
+                &batch_rows_for_agent,
                 Some(&task.diagnostics),
                 "summary_agent",
             )
@@ -217,6 +224,12 @@ async fn run_organize_task<R: Runtime>(
             for (idx, row) in batch_rows.iter_mut().enumerate() {
                 let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
                 let local_result = local_results.get(idx).cloned().unwrap_or_default();
+
+                // If degraded, keep local result as-is without warnings
+                if row.get("summaryDegraded").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+
                 let mut warnings = row
                     .get("summaryWarnings")
                     .and_then(Value::as_array)
@@ -277,12 +290,21 @@ async fn run_organize_task<R: Runtime>(
         let mut assignment_map: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
 
         if !text_route.api_key.trim().is_empty() {
+            let category_inventory = {
+                let snap = task.snapshot.lock();
+                summary::build_category_inventory(
+                    &tree,
+                    &snap.results,
+                    CATEGORY_INVENTORY_FILES_PER_CATEGORY,
+                )
+            };
             match summary::classify_organize_batch(
                 &text_route,
                 &task.response_language,
                 &task.stop,
                 &tree,
                 &batch_rows,
+                &category_inventory,
                 max_cluster_depth,
                 reference_structure.as_ref(),
                 use_web_search,

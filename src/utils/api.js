@@ -120,6 +120,10 @@ export async function getOrganizeResult(taskId) {
   return call('organize_get_result', { taskId });
 }
 
+export async function getLatestOrganizeResult(rootPath) {
+  return call('organize_get_latest_result', { rootPath });
+}
+
 export async function applyOrganize(taskId) {
   return call('organize_apply', { taskId });
 }
