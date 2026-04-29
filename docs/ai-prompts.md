@@ -4,19 +4,19 @@
 
 中文：
 - 以代码为准，本文只保留当前仍在使用的提示词与摘要模板索引。
-- 当前产品主链路已经收敛为 `归类 -> 顾问`，不再包含独立盘点阶段。
+- 当前产品主链路已经收敛为单一顾问页；顾问页内置前置归类流程，不再包含独立归类页或独立盘点阶段。
 - 实际发送给模型的提示词语言由 `response_language` 决定。
-- organizer 与 advisor 的很多 `user prompt` 都是 JSON payload，而不是长篇自然语言包装。
+- 前置归类和顾问的很多 `user prompt` 都是 JSON payload，而不是长篇自然语言包装。
 
 English:
 - The code is the source of truth; this document only keeps an index of prompts and summary templates that are still in use.
-- The product flow is now `organizer -> advisor`; there is no standalone scan stage anymore.
+- The product flow is now a single advisor page with an embedded pre-organize flow; there is no standalone organizer page or standalone inventory stage.
 - The language sent to the model is selected by `response_language`.
-- Many organizer and advisor requests send structured JSON payloads instead of long natural-language wrappers.
+- Many pre-organize and advisor requests send structured JSON payloads instead of long natural-language wrappers.
 
 ## Current Prompts / 当前在用提示词
 
-### 1. Organizer Tree Clustering / Organizer 树状聚类
+### 1. Advisor Pre-Organize Tree Clustering / 顾问页前置归类树状聚类
 
 Code / 代码位置:
 - `src-tauri/src/organizer_runtime/summary.rs`
@@ -325,7 +325,7 @@ Code / 代码位置:
 ```text
 你是文件整理顾问。
 你必须通过原生 tool calling 调用工具，不能手写 JSON 协议。
-不要重新生成扫描结果，也不要重新生成完整归类结果。
+不要重新生成目录收集结果，也不要重新生成完整归类结果。
 不要在自然语言回复里输出执行 schema、JSON 或代码块。
 当 session 记忆和 global 记忆冲突时，以 session 为准。
 高风险动作不确定时先澄清，不要直接执行。
@@ -444,5 +444,5 @@ existing long summary: {long}
 - 文档现在只保留当前主流程仍在使用的提示词。
 
 English:
-- The old standalone scan prompts have been removed from the main flow.
+- The old standalone inventory prompts have been removed from the main flow.
 - This document only keeps prompts still used by the current flow.

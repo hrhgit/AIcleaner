@@ -24,6 +24,17 @@ mod tests {
         fs::write(path, content.as_bytes()).expect("write text file");
     }
 
+    fn assess_directory(
+        path: &Path,
+        stop: &AtomicBool,
+        prefer_whole: bool,
+    ) -> DirectoryAssessment {
+        let excluded = normalize_excluded(None);
+        let mut report = CollectionReport::default();
+        evaluate_directory_assessment(path, &excluded, stop, prefer_whole, &mut report)
+            .expect("assessment exists")
+    }
+
     fn make_test_unit(path: &Path) -> OrganizeUnit {
         let name = path
             .file_name()
@@ -112,7 +123,6 @@ mod tests {
             excluded_patterns: Vec::new(),
             batch_size: 20,
             summary_strategy: SUMMARY_MODE_FILENAME_ONLY.to_string(),
-            max_cluster_depth: None,
             use_web_search: false,
             web_search_enabled: false,
             selected_model: "deepseek-chat".to_string(),
@@ -474,7 +484,13 @@ mod tests {
         write_file(&root.join("image.png"));
 
         let stop = AtomicBool::new(false);
-        assert!(is_collection_root(&root, &normalize_excluded(None), &stop));
+        let mut report = CollectionReport::default();
+        assert!(is_collection_root(
+            &root,
+            &normalize_excluded(None),
+            &stop,
+            &mut report
+        ));
 
         let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
     }
@@ -489,7 +505,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -505,7 +521,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -520,7 +536,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+            assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -538,7 +554,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -555,7 +571,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&shell, &stop, true).expect("assessment exists");
+            assess_directory(&shell, &stop, true);
         assert_eq!(
             assessment.result_kind,
             DirectoryResultKind::WholeWrapperPassthrough
@@ -565,7 +581,7 @@ mod tests {
             Some(target.to_string_lossy().as_ref())
         );
 
-        let units = collect_units(&root, true, &normalize_excluded(None), &stop);
+        let units = collect_units(&root, true, &normalize_excluded(None), &stop).units;
         assert!(units
             .iter()
             .any(|unit| unit.item_type == "directory"
@@ -592,7 +608,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+            assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::MixedSplit);
 
         let _ = fs::remove_dir_all(&root);
@@ -609,7 +625,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, false).expect("assessment exists");
+            assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::StagingJunk);
 
         let _ = fs::remove_dir_all(&root);
@@ -635,7 +651,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -655,7 +671,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -694,7 +710,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "theme_pack");
 
@@ -733,7 +749,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "doc_bundle");
 
@@ -749,7 +765,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -766,7 +782,7 @@ mod tests {
 
         let stop = AtomicBool::new(false);
         let assessment =
-            evaluate_directory_assessment(&root, &stop, true).expect("assessment exists");
+            assess_directory(&root, &stop, true);
         assert_ne!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);

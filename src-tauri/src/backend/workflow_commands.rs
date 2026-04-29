@@ -65,7 +65,6 @@ pub async fn organize_start<R: Runtime>(
         "excludedPatterns": input.excluded_patterns.clone(),
         "batchSize": input.batch_size,
         "summaryStrategy": input.summary_strategy.clone(),
-        "maxClusterDepth": input.max_cluster_depth,
         "useWebSearch": input.use_web_search,
         "modelRouting": input.model_routing.clone(),
         "searchApiKeyProvided": input.search_api_key.is_some(),

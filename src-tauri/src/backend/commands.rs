@@ -588,7 +588,6 @@ pub struct OrganizeStartInput {
     pub batch_size: Option<u32>,
     #[serde(alias = "summaryMode")]
     pub summary_strategy: Option<String>,
-    pub max_cluster_depth: Option<u32>,
     pub use_web_search: Option<bool>,
     pub model_routing: Option<Value>,
     pub search_api_key: Option<String>,

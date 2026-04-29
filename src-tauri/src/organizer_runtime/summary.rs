@@ -1073,7 +1073,6 @@ pub(super) async fn classify_organize_batch(
     existing_tree: &CategoryTreeNode,
     batch_rows: &[Value],
     category_inventory: &[Value],
-    max_cluster_depth: Option<u32>,
     reference_structure: Option<&String>,
     use_web_search: bool,
     search_api_key: &str,
@@ -1246,7 +1245,7 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     }
 
     fn allow_multiple_tool_calls(&self) -> bool {
-        true
+        false
     }
 
     fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
@@ -1471,6 +1470,36 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
             None,
             Some("classification tool loop exhausted without submit_organize_result".to_string()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::*;
+
+    #[test]
+    fn organizer_batch_disallows_multiple_tool_calls() {
+        let route = RouteConfig {
+            endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+        };
+        let spec = OrganizerBatchSpec {
+            route: &route,
+            response_language: "zh",
+            search_enabled: true,
+            search_api_key: "search-key",
+            diagnostics: None,
+            stage: "classification_batch_1",
+            initial_messages: Vec::new(),
+            search_calls: 0,
+            budget_exhausted_prompt_sent: false,
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+        };
+
+        assert!(!spec.allow_multiple_tool_calls());
     }
 }
 

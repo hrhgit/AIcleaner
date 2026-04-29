@@ -129,7 +129,7 @@ pub fn mark_stale_organize_tasks(db_path: &Path) -> Result<(), String> {
         .prepare(
             "SELECT task_id, snapshot_json
              FROM organize_tasks
-             WHERE status IN ('idle', 'scanning', 'classifying', 'moving')",
+             WHERE status IN ('idle', 'collecting', 'classifying', 'moving')",
         )
         .map_err(|e| e.to_string())?;
     let stale_rows = stmt

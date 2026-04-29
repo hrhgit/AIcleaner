@@ -4,7 +4,7 @@
 
 ## 1. 目标
 
-1. 扫描文件和目录，拿到基础信息。
+1. 在顾问页内置前置归类区收集文件和目录基础信息。
 2. 为文件和目录生成摘要。
 3. 基于基础信息和摘要生成完整归类结果。
 4. 基于完整归类结果生成树视图。
@@ -21,7 +21,7 @@
 
 ## 2. 各阶段职责
 
-### 2.1 扫描
+### 2.1 目录收集
 
 要做的事：
 
@@ -48,7 +48,7 @@
 2. 为目录生成摘要。
 3. 统一输出 `representation` 对象，包含 `metadata`、`short`、`long`、`source`、`degraded`、`confidence`、`keywords`。
 4. `summarize_files` 与 `read_only_file_summaries` 使用 `representationLevel` 控制返回层级，取值为 `metadata`、`short`、`long`。
-5. 归类页的摘要策略另行使用 `filename_only`、`local_summary`、`agent_summary`，其结果同样落到 `representation`。
+5. 顾问页内置前置归类流程使用 `filename_only`、`local_summary`、`agent_summary`，其结果同样落到 `representation`。
 6. 摘要结果写入数据库。
 7. 支持系统流程调用，也支持顾问对话中按需调用。
 8. 支持批量输入。
@@ -552,156 +552,15 @@
    - `failed`
 3. `entries`
 
-### 6.10 `apply_reclassification`
+### 6.10 归类修订边界
 
-作用：
-
-1. 接收模型直接输出的固定 `reclassificationRequest JSON`。
-2. 支持局部修订，不要求整棵树重跑。
-3. 直接应用归类修订。
-4. 让后续顾问和筛选基于新的分类继续工作。
-
-什么时候调：
-
-1. 用户明确表示当前分类不满意时。
-2. 用户已经说明希望怎么改分类时。
-3. AI 已经把用户意图整理成固定格式的归类修订请求时。
-
-输入：
-
-1. `sessionId`
-2. `request`
-   - `intentSummary`
-   - `change`
-     - `type`
-     - `selectionId`
-     - `sourceCategoryId`
-     - `targetCategoryId`
-     - `newCategoryName`
-3. `applyPreferenceCapture`
-
-输出：
-
-1. `reclassificationJobId`
-2. `message`
-3. `changeSummary`
-4. `updatedTreeText`
-5. `change`
-   - `type`
-   - `sourceCategoryId`
-   - `targetCategoryId`
-   - `newCategoryName`
-   - `selectionId`
-   - `fileCount`
-6. `invalidated`
-   - `selection`
-   - `preview`
+当前用户入口不提供“直接应用归类修订”或“回滚归类修订”的独立操作。用户如果想改变整理方式，应继续通过顾问对话缩小文件集合，并生成新的计划、预览和执行卡片。
 
 说明：
 
-1. `change` 是统一入口，内部通过 `change.type` 分派到不同修改模板。
-2. 这个工具优先做局部归类修订，不默认全量重跑。
-3. 模型不直接提交整棵新树，而是提交结构化归类修订请求。
-4. 这个工具不负责再做一次自然语言理解，不要求在 tool 内再调用模型。
-5. 这个工具直接应用归类 patch，不要求先 preview。
-6. 应用成功后当前活跃的 `selection` 和 `preview` 都要失效。
-
-支持的 `change.type`：
-
-1. `rename_category`
-   - 必填：`sourceCategoryId`、`newCategoryName`
-2. `move_selection_to_category`
-   - 必填：`selectionId`、`targetCategoryId`
-3. `split_selection_to_new_category`
-   - 必填：`selectionId`、`sourceCategoryId`、`newCategoryName`
-4. `merge_category_into_category`
-   - 必填：`sourceCategoryId`、`targetCategoryId`
-5. `delete_empty_category`
-   - 必填：`sourceCategoryId`
-
-模型输出的 `reclassificationRequest JSON` 结构：
-
-```json
-{
-  "intentSummary": "把安装包和压缩包分开，当前这一批压缩文件不要放在安装包里。",
-  "change": {
-    "type": "split_selection_to_new_category",
-    "selectionId": "selection_003",
-    "sourceCategoryId": "installers",
-    "newCategoryName": "压缩包"
-  }
-}
-```
-
-典型工具输入示例：
-
-```json
-{
-  "sessionId": "session_001",
-  "request": {
-    "intentSummary": "把安装包和压缩包分开，当前这一批压缩文件不要放在安装包里。",
-    "change": {
-      "type": "split_selection_to_new_category",
-      "selectionId": "selection_003",
-      "sourceCategoryId": "installers",
-      "newCategoryName": "压缩包"
-    }
-  },
-  "applyPreferenceCapture": true
-}
-```
-
-典型输出示例：
-
-```json
-{
-  "reclassificationJobId": "reclass_job_001",
-  "message": "已应用归类修订。",
-  "changeSummary": "已把 12 个压缩文件从“安装包”中拆出，形成新分类“压缩包”。",
-  "updatedTreeText": "安装包 (42 -> 30)\\n新增: 压缩包 (12)",
-  "change": {
-    "type": "split_selection_to_new_category",
-    "sourceCategoryId": "installers",
-    "targetCategoryId": "archives",
-    "newCategoryName": "压缩包",
-    "selectionId": "selection_003",
-    "fileCount": 12
-  },
-  "invalidated": ["selection", "preview"]
-}
-```
-
-### 6.11 `rollback_reclassification`
-
-作用：
-
-1. 回滚最近一次可回滚的归类修订。
-2. 恢复归类主结果和树视图。
-3. 让用户可以在直接应用后撤回归类修改。
-
-什么时候调：
-
-1. 用户要求撤回最近一次归类修改时。
-2. 已有有效 `reclassificationJobId` 且该修改可回滚时。
-
-输入：
-
-1. `sessionId`
-2. `reclassificationJobId`
-
-输出：
-
-1. `message`
-2. `updatedTreeText`
-3. `rolledBack`
-4. `invalidated`
-   - `selection`
-   - `preview`
-
-说明：
-
-1. 归类修订回滚不影响执行类回滚。
-2. 回滚成功后当前活跃的 `selection` 和 `preview` 都要失效。
+1. 前置归类产物用于建立上下文和分类树。
+2. 真实文件移动只通过 `find_files -> preview_plan -> execute_plan` 主流程落地。
+3. 执行后的撤回能力属于 `rollback_plan`，不再混入前置归类流程语义。
 
 ## 7. Tool 错误返回
 
@@ -724,12 +583,8 @@
    - `当前计划缺少 selectionId，请先调用 find_files 生成筛选结果，再继续生成预览。`
 2. `execute_plan`
    - `当前预览不存在或已过期，请先重新生成 preview，再执行。`
-3. `apply_reclassification`
-   - `当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。`
-4. `rollback_plan`
+3. `rollback_plan`
    - `当前执行记录不可回滚，请不要继续尝试回滚这个任务。`
-5. `rollback_reclassification`
-   - `当前归类修改记录不存在或不可回滚，请先确认最近一次归类修改是否成功。`
 
 ## 8. 页面结构
 
@@ -973,7 +828,7 @@
 3. 当用户意图足够明确时，通过 tool use 生成计划和预览。
 
 行为规则：
-1. 不重新生成扫描结果。
+1. 不重新生成目录收集结果。
 2. 不重新生成归类结果。
 3. 不在聊天文本中输出执行 schema。
 4. 读取信息优先使用已有上下文；信息不足时再调用工具。
@@ -1177,15 +1032,8 @@
    - `activePreviewCard` 失效
    - `latestExecutionCard` 更新
    - `rollbackAvailable=true`
-5. `apply_reclassification` 成功后：
-   - `workflowStage` 回到 `understand`
-   - `activeSelectionCard` 失效
-   - `activePreviewCard` 失效
-   - 后续筛选和预览必须基于新的分类结果重新生成
-6. `rollback_plan` 不属于主流程阶段切换条件。
-7. `rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
-8. `rollback_reclassification` 不属于主流程阶段切换条件。
-9. `rollback_reclassification` 默认可用，但只有存在可回滚的归类修改记录时才允许真正调用成功。
+5. `rollback_plan` 不属于主流程阶段切换条件。
+6. `rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
 
 工具暴露规则：
 
@@ -1199,8 +1047,6 @@
    - `read_only_file_summaries`
    - `capture_preference`
    - `list_preferences`
-   - `apply_reclassification`
-   - `rollback_reclassification`
    - `rollback_plan`
 3. `rollback_plan` 默认可见，但只有 `rollbackAvailable=true` 时才允许真正调用成功。
 
@@ -1266,7 +1112,7 @@
 
 ## 12. 目标流程
 
-1. 扫描基础信息。
+1. 收集基础目录信息。
 2. 生成摘要。
 3. 生成完整归类结果。
 4. 基于完整归类结果生成树视图。

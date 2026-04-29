@@ -341,16 +341,6 @@ a {
   }
 }
 
-@keyframes scanLine {
-  0% {
-    transform: translateY(-100%);
-  }
-
-  100% {
-    transform: translateY(100%);
-  }
-}
-
 .animate-in {
   animation: slideUp 0.28s var(--ease-out) both;
 }

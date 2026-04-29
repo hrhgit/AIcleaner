@@ -1,7 +1,7 @@
 {
   "version": 1,
   "root": "E:\\_workSpace\\wipeout",
-  "updated_at": "2026-04-25T18:19:32+00:00",
+  "updated_at": "2026-04-25T18:27:24+00:00",
   "terms": [
     {
       "term": "顾问页分类树",
@@ -26,6 +26,32 @@
           "symbol": "organize_get_latest_result",
           "kind": "function",
           "note": "按 rootPath 读取最新 organize snapshot 供顾问页刷新"
+        }
+      ]
+    },
+    {
+      "term": "路由收口",
+      "aliases": [],
+      "targets": [
+        {
+          "path": "src/main.js",
+          "line": 8,
+          "symbol": "pages",
+          "kind": "constant",
+          "note": "pages只注册真实存在的advisor入口，不再保留organizer软跳转"
+        }
+      ]
+    },
+    {
+      "term": "顾问页主入口",
+      "aliases": [],
+      "targets": [
+        {
+          "path": "src/pages/advisor.js",
+          "line": 391,
+          "symbol": "renderOrganizePanel",
+          "kind": "function",
+          "note": "当前单页入口中前置归类和顾问对话面板"
         }
       ]
     }

@@ -10,7 +10,6 @@ async fn run_organize_task<R: Runtime>(
         excluded,
         batch_size,
         summary_strategy,
-        max_cluster_depth,
         use_web_search,
     ) = {
         let snap = task.snapshot.lock();
@@ -20,7 +19,6 @@ async fn run_organize_task<R: Runtime>(
             snap.excluded_patterns.clone(),
             snap.batch_size,
             snap.summary_strategy.clone(),
-            snap.max_cluster_depth,
             snap.use_web_search,
         )
     };
@@ -30,24 +28,28 @@ async fn run_organize_task<R: Runtime>(
             "excludedPatterns": excluded.clone(),
             "batchSize": batch_size,
             "summaryStrategy": summary_strategy.clone(),
-            "maxClusterDepth": max_cluster_depth,
             "useWebSearch": use_web_search,
         }));
     {
         let mut snap = task.snapshot.lock();
-        snap.status = "scanning".to_string();
+        snap.status = "collecting".to_string();
     }
-    let scan_started_at = Instant::now();
-    task.diagnostics.scan_started(&root_path);
+    let collection_started_at = Instant::now();
+    task.diagnostics.collection_started(&root_path);
     emit_snapshot(app, state, task).await?;
 
-    let units = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
-    task.diagnostics
-        .scan_completed(&root_path, units.len(), scan_started_at.elapsed());
+    let collection = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
+    let units = collection.units;
+    task.diagnostics.collection_completed(
+        &root_path,
+        units.len(),
+        &collection.report,
+        collection_started_at.elapsed(),
+    );
     if task.stop.load(Ordering::Relaxed) {
         task.diagnostics.task_stopped(
-            "organize task stopped after scan",
-            json!({ "stage": "scan" }),
+            "organize task stopped after directory collection",
+            json!({ "stage": "directory_collection" }),
             Some(task_started_at.elapsed()),
         );
         return Ok(());
@@ -305,7 +307,6 @@ async fn run_organize_task<R: Runtime>(
                 &tree,
                 &batch_rows,
                 &category_inventory,
-                max_cluster_depth,
                 reference_structure.as_ref(),
                 use_web_search,
                 &task.search_api_key,

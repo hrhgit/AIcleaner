@@ -47,11 +47,12 @@ impl<'a> ConversationOrchestrator<'a> {
                 self.store_trace(&mut session, &agent_result.trace);
                 super::save_session(self.state, &mut session)?;
 
-                let assistant_turn = persist::create_advisor_turn(
+                let assistant_turn = persist::create_advisor_turn_with_agent_trace(
                     &self.state.db_path(),
                     &session_id,
                     "assistant",
                     &agent_result.reply,
+                    Some(&agent_result.trace),
                 )?;
                 let assistant_turn_id = assistant_turn
                     .get("turnId")

@@ -1,6 +1,12 @@
+const DIRECTORY_ASSESSMENT_MAX_FILES: u64 = 5_000;
+const DIRECTORY_ASSESSMENT_MAX_DIRS: u64 = 1_500;
+const DIRECTORY_ASSESSMENT_MAX_DEPTH: usize = 8;
+
 fn summarize_directory_tree(
     path: &Path,
+    excluded: &[String],
     stop: &AtomicBool,
+    report: &mut CollectionReport,
 ) -> (u64, u64, u64, HashMap<String, u64>, u32) {
     let mut total_size = 0_u64;
     let mut file_count = 0_u64;
@@ -9,19 +15,41 @@ fn summarize_directory_tree(
     let mut max_depth = 0_u32;
     for entry in WalkDir::new(path)
         .min_depth(1)
+        .max_depth(DIRECTORY_ASSESSMENT_MAX_DEPTH)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| !should_exclude(name, excluded))
+                    .unwrap_or(true)
+        })
         .filter_map(Result::ok)
     {
         if stop.load(Ordering::Relaxed) {
+            report.stopped = true;
             break;
         }
         let entry_path = entry.path();
         max_depth = max_depth.max(entry.depth() as u32);
         if entry.file_type().is_dir() {
+            if dir_count >= DIRECTORY_ASSESSMENT_MAX_DIRS {
+                report.assessment_dir_cap_hits =
+                    report.assessment_dir_cap_hits.saturating_add(1);
+                continue;
+            }
             dir_count = dir_count.saturating_add(1);
             continue;
         }
         if !entry.file_type().is_file() {
+            report.non_file_entries = report.non_file_entries.saturating_add(1);
+            continue;
+        }
+        if file_count >= DIRECTORY_ASSESSMENT_MAX_FILES {
+            report.assessment_file_cap_hits = report
+                .assessment_file_cap_hits
+                .saturating_add(1);
             continue;
         }
         file_count = file_count.saturating_add(1);
@@ -31,13 +59,26 @@ fn summarize_directory_tree(
         let key = extension_key(entry_path);
         *ext_counts.entry(key).or_insert(0) += 1;
     }
+    if max_depth as usize >= DIRECTORY_ASSESSMENT_MAX_DEPTH {
+        report.assessment_depth_cap_hits = report
+            .assessment_depth_cap_hits
+            .saturating_add(1);
+    }
     (total_size, file_count, dir_count, ext_counts, max_depth)
 }
 
-fn is_collection_root(path: &Path, excluded: &[String], stop: &AtomicBool) -> bool {
+fn is_collection_root(
+    path: &Path,
+    excluded: &[String],
+    stop: &AtomicBool,
+    report: &mut CollectionReport,
+) -> bool {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(_) => return false,
+        Err(_) => {
+            report.read_dir_errors = report.read_dir_errors.saturating_add(1);
+            return false;
+        }
     };
     let root_name = path
         .file_name()
@@ -53,10 +94,12 @@ fn is_collection_root(path: &Path, excluded: &[String], stop: &AtomicBool) -> bo
 
     for entry in entries.filter_map(Result::ok) {
         if stop.load(Ordering::Relaxed) {
+            report.stopped = true;
             break;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         if should_exclude(&name, excluded) {
+            report.excluded_entries = report.excluded_entries.saturating_add(1);
             continue;
         }
         let entry_path = entry.path();
@@ -78,8 +121,10 @@ fn is_collection_root(path: &Path, excluded: &[String], stop: &AtomicBool) -> bo
 
 fn evaluate_directory_assessment(
     path: &Path,
+    excluded: &[String],
     stop: &AtomicBool,
     prefer_whole: bool,
+    report: &mut CollectionReport,
 ) -> Option<DirectoryAssessment> {
     let mut marker_files = Vec::new();
     let mut evidence = Vec::new();
@@ -123,13 +168,24 @@ fn evaluate_directory_assessment(
     let mut direct_inf_count = 0_u32;
     let mut metadata_marker_count = 0_u32;
 
-    let entries = fs::read_dir(path).ok()?;
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            report.read_dir_errors = report.read_dir_errors.saturating_add(1);
+            return None;
+        }
+    };
     for entry in entries.filter_map(Result::ok) {
         if stop.load(Ordering::Relaxed) {
+            report.stopped = true;
             break;
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let lower = name.to_ascii_lowercase();
+        if should_exclude(&name, excluded) {
+            report.excluded_entries = report.excluded_entries.saturating_add(1);
+            continue;
+        }
         if top_level_entries.len() < 18 {
             top_level_entries.push(name.clone());
         }
@@ -215,7 +271,7 @@ fn evaluate_directory_assessment(
     }
 
     let (total_size, file_count, dir_count, ext_counts, max_depth) =
-        summarize_directory_tree(path, stop);
+        summarize_directory_tree(path, excluded, stop, report);
     let dominant_extensions = format_ranked_entries(ext_counts.clone(), 8);
     let (name_families, max_family_count) = summarize_name_families(&direct_file_names, 5);
     let paired_sidecars = summarize_sidecars(&direct_file_names, 5);

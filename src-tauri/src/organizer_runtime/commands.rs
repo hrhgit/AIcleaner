@@ -65,7 +65,6 @@ pub async fn organize_start<R: Runtime>(
         excluded_patterns: normalize_excluded(input.excluded_patterns.clone()),
         batch_size: normalize_batch_size(input.batch_size),
         summary_strategy: normalized_summary_strategy,
-        max_cluster_depth: input.max_cluster_depth.filter(|value| *value > 0),
         use_web_search: input.use_web_search.unwrap_or(false),
         web_search_enabled: input.use_web_search.unwrap_or(false)
             && input.search_api_key.as_deref().unwrap_or("").trim().len() > 0,
@@ -170,7 +169,7 @@ pub async fn organize_stop<R: Runtime>(
     task.stop.store(true, Ordering::Relaxed);
     {
         let mut snapshot = task.snapshot.lock();
-        if matches!(snapshot.status.as_str(), "scanning" | "classifying") {
+        if matches!(snapshot.status.as_str(), "collecting" | "classifying") {
             snapshot.status = "stopping".to_string();
         }
     }
@@ -325,7 +324,6 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         "rootPath": snapshot.root_path,
         "createdAt": now_iso(),
         "batchSize": snapshot.batch_size,
-        "maxClusterDepth": snapshot.max_cluster_depth,
         "recursive": snapshot.recursive,
         "entries": entries,
         "summary": {

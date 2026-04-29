@@ -184,3 +184,144 @@ fn tool_error_message(tool_call_id: &str, message: String) -> Value {
         "content": message,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_runtime::llm::AgentLlm;
+    use crate::backend::TokenUsage;
+    use crate::llm_tools::ToolWorkflow;
+    use async_trait::async_trait;
+
+    struct MultiToolLlm;
+
+    #[async_trait]
+    impl AgentLlm for MultiToolLlm {
+        async fn complete(
+            &self,
+            _messages: &[Value],
+            _tools: &[Value],
+            _trace_key: Option<&str>,
+        ) -> Result<AgentCompletion, AgentLlmError> {
+            Ok(AgentCompletion {
+                raw_body: "{}".to_string(),
+                assistant_text: String::new(),
+                tool_calls: vec![
+                    ParsedToolCall {
+                        id: "call_1".to_string(),
+                        name: "web_search".to_string(),
+                        arguments: json!({ "query": "a" }),
+                    },
+                    ParsedToolCall {
+                        id: "call_2".to_string(),
+                        name: "submit_organize_result".to_string(),
+                        arguments: json!({ "tree": {}, "assignments": [] }),
+                    },
+                ],
+                raw_message: json!({
+                    "role": "assistant",
+                    "tool_calls": []
+                }),
+                finish_reason: None,
+                usage: TokenUsage::default(),
+                route: None,
+            })
+        }
+    }
+
+    struct SingleToolOnlySpec {
+        on_tool_success_called: bool,
+    }
+
+    impl AgentTurnSpec for SingleToolOnlySpec {
+        type Output = String;
+
+        fn max_steps(&self) -> usize {
+            1
+        }
+
+        fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+            AgentToolPolicy {
+                workflow: ToolWorkflow::Organizer,
+                stage: "classification_batch_1",
+                session: None,
+                bootstrap_turn: false,
+                response_language: "zh",
+                web_search_allowed: true,
+                search_remaining: 1,
+            }
+        }
+
+        fn allow_multiple_tool_calls(&self) -> bool {
+            false
+        }
+
+        fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+            Ok(vec![json!({ "role": "user", "content": "classify" })])
+        }
+
+        fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+            ToolExecutionContext {
+                workflow: ToolWorkflow::Organizer,
+                stage: "classification_batch_1",
+                session: None,
+                bootstrap_turn: false,
+                response_language: "zh",
+                web_search_allowed: true,
+                search_remaining: 1,
+                state: None,
+                search_api_key: Some("search-key"),
+                diagnostics: None,
+            }
+        }
+
+        fn on_no_tool_calls(
+            &mut self,
+            _completion: AgentCompletion,
+            _trace: &AgentLoopTrace,
+        ) -> Result<Self::Output, String> {
+            Ok("no_tool".to_string())
+        }
+
+        fn on_multiple_tool_calls(
+            &mut self,
+            _completion: AgentCompletion,
+            _trace: &AgentLoopTrace,
+        ) -> Result<Self::Output, String> {
+            Ok("multiple_tool_calls".to_string())
+        }
+
+        fn on_tool_success(
+            &mut self,
+            _step: usize,
+            _tool_id: Option<ToolId>,
+            _call: &ParsedToolCall,
+            _result: ToolResult,
+            _trace: &AgentLoopTrace,
+        ) -> Result<ToolCallOutcome<Self::Output>, String> {
+            self.on_tool_success_called = true;
+            Ok(ToolCallOutcome::Finish("tool_executed".to_string()))
+        }
+
+        fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<Self::Output, String> {
+            Ok("exhausted".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn disallowed_multiple_tool_calls_are_not_dispatched() {
+        let llm = MultiToolLlm;
+        let registry = ToolRegistry::new();
+        let mut spec = SingleToolOnlySpec {
+            on_tool_success_called: false,
+        };
+
+        let output = AgentTurnLoop::new(&llm, &registry)
+            .run(&mut spec)
+            .await
+            .expect("loop output");
+
+        assert_eq!(output, "multiple_tool_calls");
+        assert!(!spec.on_tool_success_called);
+    }
+}

@@ -133,8 +133,8 @@ fn extension_key(path: &Path) -> String {
         .unwrap_or_else(|| "(no_ext)".to_string())
 }
 
-fn relative_path_string(scan_root: &Path, path: &Path) -> String {
-    path.strip_prefix(scan_root)
+fn relative_path_string(collection_root: &Path, path: &Path) -> String {
+    path.strip_prefix(collection_root)
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()

@@ -279,6 +279,16 @@ pub fn create_advisor_turn(
     role: &str,
     text: &str,
 ) -> Result<Value, String> {
+    create_advisor_turn_with_agent_trace(db_path, session_id, role, text, None)
+}
+
+pub fn create_advisor_turn_with_agent_trace(
+    db_path: &Path,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    agent_trace: Option<&Value>,
+) -> Result<Value, String> {
     let conn = open_db(db_path)?;
     let idx = conn
         .query_row(
@@ -288,7 +298,7 @@ pub fn create_advisor_turn(
         )
         .map_err(|e| e.to_string())?;
     let created_at = now_iso();
-    let turn = json!({
+    let mut turn = json!({
         "turnId": create_node_id(&format!("turn:{session_id}:{idx}:{created_at}")),
         "sessionId": session_id,
         "idx": idx,
@@ -296,6 +306,11 @@ pub fn create_advisor_turn(
         "text": text,
         "createdAt": created_at,
     });
+    if let Some(trace) = agent_trace.filter(|value| !value.is_null()) {
+        if let Some(obj) = turn.as_object_mut() {
+            obj.insert("agentTrace".to_string(), trace.clone());
+        }
+    }
     conn.execute(
         "INSERT INTO advisor_turns (turn_id, session_id, idx, role, text, turn_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

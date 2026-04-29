@@ -286,8 +286,62 @@ fn no_arg_tool_spec(id: ToolId, name: &'static str, description: &'static str) -
         id,
         name,
         description,
-        parameters: None,
+        parameters: Some(json!({
+            "type": "object",
+            "description": "此工具不需要参数，调用时传空对象。",
+            "properties": {},
+            "additionalProperties": false
+        })),
     }
+}
+
+fn category_tree_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "最终分类树根节点。复用、重命名或移动已有节点时必须保留原 nodeId；新增节点应使用稳定的新 nodeId。",
+        "properties": {
+            "nodeId": {
+                "type": "string",
+                "description": "分类节点的稳定 ID。根节点通常为 root；已有节点必须保留原值。"
+            },
+            "name": {
+                "type": "string",
+                "description": "分类节点展示名称。根节点可以为空字符串。"
+            },
+            "children": {
+                "type": "array",
+                "description": "子分类节点列表；叶子节点使用空数组。",
+                "maxItems": 80,
+                "items": { "$ref": "#/properties/tree/$defs/categoryNode" }
+            }
+        },
+        "required": ["nodeId", "name", "children"],
+        "additionalProperties": false,
+        "$defs": {
+            "categoryNode": {
+                "type": "object",
+                "description": "分类树中的一个节点。",
+                "properties": {
+                    "nodeId": {
+                        "type": "string",
+                        "description": "分类节点的稳定 ID。已有节点必须保留原值。"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "分类节点展示名称，应简短、实用。"
+                    },
+                    "children": {
+                        "type": "array",
+                        "description": "子分类节点列表；叶子节点使用空数组。",
+                        "maxItems": 80,
+                        "items": { "$ref": "#/properties/tree/$defs/categoryNode" }
+                    }
+                },
+                "required": ["nodeId", "name", "children"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 struct WebSearchTool;
@@ -302,14 +356,25 @@ impl LlmTool for WebSearchTool {
         tool_spec(
             self.id(),
             "web_search",
-            "Search the web for external context that is missing from local evidence.",
+            "当本地文件证据不足且确实需要外部背景时联网搜索。返回 formattedContext，后续判断仍应以本地证据为主。",
             json!({
                 "type": "object",
+                "description": "联网搜索请求。每次只提交一个简短查询。",
                 "properties": {
-                    "query": { "type": "string" },
-                    "reason": { "type": "string" }
+                    "query": {
+                        "type": "string",
+                        "description": "简短搜索查询，用来补足本地证据缺失的外部上下文；不要放入文件内容或长段文本。",
+                        "minLength": 1,
+                        "maxLength": 160
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "说明为什么本地证据不足、需要这次搜索；用于诊断和后续判断。",
+                        "maxLength": 240
+                    }
                 },
-                "required": ["query"]
+                "required": ["query"],
+                "additionalProperties": false
             }),
         )
     }
@@ -447,29 +512,50 @@ impl LlmTool for SubmitOrganizeResultTool {
         tool_spec(
             self.id(),
             "submit_organize_result",
-            "Submit the final category tree and assignments for this batch.",
+            "提交 organizer 当前批次的最终分类树和文件分配结果。准备完成时调用；这是分类批次的结束工具。",
             json!({
                 "type": "object",
+                "description": "最终分类结果。tree 描述分类树，assignments 将当前批次 itemId 分配到叶子分类。",
                 "properties": {
-                    "tree": { "type": "object" },
+                    "tree": category_tree_schema(),
                     "assignments": {
                         "type": "array",
+                        "description": "当前批次文件或目录项的分类分配列表；每个 itemId 至少出现一次。",
+                        "maxItems": 200,
                         "items": {
                             "type": "object",
+                            "description": "单个当前 item 的分类分配。",
                             "properties": {
-                                "reason": { "type": "string" },
-                                "itemId": { "type": "string" },
-                                "leafNodeId": { "type": "string" },
+                                "reason": {
+                                    "type": "string",
+                                    "description": "简短说明该 item 被分到此类的证据，优先引用 summaryText、类型、扩展名或路径线索。",
+                                    "maxLength": 300
+                                },
+                                "itemId": {
+                                    "type": "string",
+                                    "description": "当前批次 items/fileIndex 中的 itemId，必须原样填写。"
+                                },
+                                "leafNodeId": {
+                                    "type": "string",
+                                    "description": "目标叶子分类节点的 nodeId；复用已有类别时使用已有 nodeId。"
+                                },
                                 "categoryPath": {
                                     "type": "array",
-                                    "items": { "type": "string" }
+                                    "description": "从顶层分类到叶子分类的名称路径，用于兜底定位目标类别。",
+                                    "maxItems": 8,
+                                    "items": {
+                                        "type": "string",
+                                        "description": "分类路径中的一个节点名称。"
+                                    }
                                 }
                             },
-                            "required": ["itemId"]
+                            "required": ["itemId"],
+                            "additionalProperties": false
                         }
                     }
                 },
-                "required": ["tree", "assignments"]
+                "required": ["tree", "assignments"],
+                "additionalProperties": false
             }),
         )
     }
@@ -527,14 +613,28 @@ impl LlmTool for GetDirectoryOverviewTool {
         tool_spec(
             self.id(),
             "get_directory_overview",
-            "查看当前目录树视图和整体概览。",
+            "查看当前分类树或目录概览。用于理解现状，不会生成摘要、筛选文件或修改分类。",
             json!({
                 "type": "object",
+                "description": "目录概览读取参数。所有参数可选。",
                 "properties": {
-                    "viewType": { "type": "string", "enum": ["summaryTree", "sizeTree", "timeTree", "executionTree", "partialTree"] },
-                    "rootCategoryId": { "type": "string" },
-                    "maxDepth": { "type": "integer" }
-                }
+                    "viewType": {
+                        "type": "string",
+                        "description": "要读取的视图类型；默认由工具选择最适合当前上下文的概览。",
+                        "enum": ["summaryTree", "sizeTree", "timeTree", "executionTree", "partialTree"]
+                    },
+                    "rootCategoryId": {
+                        "type": "string",
+                        "description": "只查看某个分类节点下的子树；为空时查看根树。"
+                    },
+                    "maxDepth": {
+                        "type": "integer",
+                        "description": "返回树的最大深度；用于控制上下文大小。",
+                        "minimum": 1,
+                        "maximum": 8
+                    }
+                },
+                "additionalProperties": false
             }),
         )
     }
@@ -590,23 +690,84 @@ impl LlmTool for FindFilesTool {
         tool_spec(
             self.id(),
             "find_files",
-            "按类别、名称、路径、大小和时间筛选文件候选集，并返回 selectionId。",
+            "按类别、名称、路径、扩展名、大小和时间筛选文件候选集，并返回 selectionId。后续 preview_plan 应使用这个 selectionId。",
             json!({
                 "type": "object",
+                "description": "文件筛选条件。通常先用较宽条件找到候选集，再用 selectionId 生成预览。",
                 "properties": {
-                    "categoryIds": { "type": "array", "items": { "type": "string" } },
-                    "nameQuery": { "type": "string" },
-                    "nameExact": { "type": "string" },
-                    "pathContains": { "type": "string" },
-                    "extensions": { "type": "array", "items": { "type": "string" } },
-                    "minSizeBytes": { "type": "integer" },
-                    "maxSizeBytes": { "type": "integer" },
-                    "olderThanDays": { "type": "integer" },
-                    "newerThanDays": { "type": "integer" },
-                    "sortBy": { "type": "string", "enum": ["name", "size", "modifiedAt"] },
-                    "sortOrder": { "type": "string", "enum": ["asc", "desc"] },
-                    "limit": { "type": "integer" }
-                }
+                    "categoryIds": {
+                        "type": "array",
+                        "description": "限定在这些分类节点内查找；不确定分类时不要填写。",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "string",
+                            "description": "分类节点 nodeId。"
+                        }
+                    },
+                    "nameQuery": {
+                        "type": "string",
+                        "description": "文件名模糊关键词，适合搜索一类文件。",
+                        "maxLength": 120
+                    },
+                    "nameExact": {
+                        "type": "string",
+                        "description": "精确文件名；只有用户明确给出完整名称时使用。",
+                        "maxLength": 260
+                    },
+                    "pathContains": {
+                        "type": "string",
+                        "description": "路径中应包含的片段；用于限定目录或来源。",
+                        "maxLength": 260
+                    },
+                    "extensions": {
+                        "type": "array",
+                        "description": "文件扩展名过滤，例如 pdf、zip、exe；不要包含点号。",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "string",
+                            "description": "不带点号的文件扩展名。"
+                        }
+                    },
+                    "minSizeBytes": {
+                        "type": "integer",
+                        "description": "最小文件大小，单位字节。",
+                        "minimum": 0
+                    },
+                    "maxSizeBytes": {
+                        "type": "integer",
+                        "description": "最大文件大小，单位字节。",
+                        "minimum": 0
+                    },
+                    "olderThanDays": {
+                        "type": "integer",
+                        "description": "只返回修改时间早于多少天前的文件。",
+                        "minimum": 0,
+                        "maximum": 36500
+                    },
+                    "newerThanDays": {
+                        "type": "integer",
+                        "description": "只返回修改时间晚于多少天内的文件。",
+                        "minimum": 0,
+                        "maximum": 36500
+                    },
+                    "sortBy": {
+                        "type": "string",
+                        "description": "候选文件排序字段。",
+                        "enum": ["name", "size", "modifiedAt"]
+                    },
+                    "sortOrder": {
+                        "type": "string",
+                        "description": "排序方向。",
+                        "enum": ["asc", "desc"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回候选数量；保持较小以便后续预览。",
+                        "minimum": 1,
+                        "maximum": 500
+                    }
+                },
+                "additionalProperties": false
             }),
         )
     }
@@ -661,17 +822,52 @@ impl LlmTool for SummarizeFilesTool {
         tool_spec(
             self.id(),
             "summarize_files",
-            "为一批文件补摘要或刷新摘要，并写入顾问摘要库。",
+            "为指定文件或分类补摘要或刷新摘要，并写入顾问摘要库。用于证据不足时补充本地摘要，不会直接移动文件。",
             json!({
                 "type": "object",
+                "description": "摘要生成请求。优先使用 paths 精确指定，或用 categoryIds 指定分类范围。",
                 "properties": {
-                    "paths": { "type": "array", "items": { "type": "string" } },
-                    "categoryIds": { "type": "array", "items": { "type": "string" } },
-                    "representationLevel": { "type": "string", "enum": ["metadata", "short", "long"] },
-                    "missingOnly": { "type": "boolean" },
-                    "batchSize": { "type": "integer" },
-                    "maxConcurrency": { "type": "integer" }
-                }
+                    "paths": {
+                        "type": "array",
+                        "description": "需要摘要的相对路径或已知路径；只放当前任务相关文件。",
+                        "maxItems": 100,
+                        "items": {
+                            "type": "string",
+                            "description": "文件路径。"
+                        }
+                    },
+                    "categoryIds": {
+                        "type": "array",
+                        "description": "需要补摘要的分类节点 ID；范围大时配合 missingOnly 使用。",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "string",
+                            "description": "分类节点 nodeId。"
+                        }
+                    },
+                    "representationLevel": {
+                        "type": "string",
+                        "description": "摘要粒度：metadata 只用元数据，short 生成短摘要，long 生成更详细摘要。",
+                        "enum": ["metadata", "short", "long"]
+                    },
+                    "missingOnly": {
+                        "type": "boolean",
+                        "description": "为 true 时只补缺失摘要，避免重复刷新已有摘要。"
+                    },
+                    "batchSize": {
+                        "type": "integer",
+                        "description": "每批处理数量。",
+                        "minimum": 1,
+                        "maximum": 50
+                    },
+                    "maxConcurrency": {
+                        "type": "integer",
+                        "description": "并发处理数量；保持较小以避免资源占用过高。",
+                        "minimum": 1,
+                        "maximum": 8
+                    }
+                },
+                "additionalProperties": false
             }),
         )
     }
@@ -711,15 +907,42 @@ impl LlmTool for ReadOnlyFileSummariesTool {
         tool_spec(
             self.id(),
             "read_only_file_summaries",
-            "只读取已有摘要，不触发生成。",
+            "只读取已有文件摘要，不触发生成或刷新。用于低成本查看证据。",
             json!({
                 "type": "object",
+                "description": "已有摘要读取请求。不会修改摘要库。",
                 "properties": {
-                    "paths": { "type": "array", "items": { "type": "string" } },
-                    "categoryIds": { "type": "array", "items": { "type": "string" } },
-                    "representationLevel": { "type": "string", "enum": ["metadata", "short", "long"] },
-                    "limit": { "type": "integer" }
-                }
+                    "paths": {
+                        "type": "array",
+                        "description": "要读取摘要的具体路径。",
+                        "maxItems": 100,
+                        "items": {
+                            "type": "string",
+                            "description": "文件路径。"
+                        }
+                    },
+                    "categoryIds": {
+                        "type": "array",
+                        "description": "要读取摘要的分类节点 ID。",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "string",
+                            "description": "分类节点 nodeId。"
+                        }
+                    },
+                    "representationLevel": {
+                        "type": "string",
+                        "description": "期望读取的摘要粒度。",
+                        "enum": ["metadata", "short", "long"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回摘要数量。",
+                        "minimum": 1,
+                        "maximum": 300
+                    }
+                },
+                "additionalProperties": false
             }),
         )
     }
@@ -759,15 +982,31 @@ impl LlmTool for CapturePreferenceTool {
         tool_spec(
             self.id(),
             "capture_preference",
-            "提炼并暂存用户偏好，后续由卡片动作确认保存。",
+            "从用户消息中提炼可复用偏好并暂存，后续由卡片动作确认保存。只在用户明确表达偏好或规则时使用。",
             json!({
                 "type": "object",
+                "description": "偏好草稿。工具只创建待确认卡片，不直接静默写入长期偏好。",
                 "properties": {
-                    "scope": { "type": "string", "enum": ["session", "global"] },
-                    "text": { "type": "string" },
-                    "sourceMessage": { "type": "string" }
+                    "scope": {
+                        "type": "string",
+                        "description": "偏好建议保存范围：session 只影响当前会话，global 可复用于后续会话。",
+                        "enum": ["session", "global"]
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "提炼后的偏好正文，应简短、可执行，不要包含敏感信息。",
+                        "minLength": 1,
+                        "maxLength": 500
+                    },
+                    "sourceMessage": {
+                        "type": "string",
+                        "description": "触发偏好提炼的用户原始表述或摘要，便于用户确认。",
+                        "minLength": 1,
+                        "maxLength": 1000
+                    }
                 },
-                "required": ["text", "sourceMessage"]
+                "required": ["text", "sourceMessage"],
+                "additionalProperties": false
             }),
         )
     }
@@ -828,7 +1067,11 @@ impl LlmTool for ListPreferencesTool {
     }
 
     fn spec(&self) -> ToolSpec {
-        no_arg_tool_spec(self.id(), "list_preferences", "读取当前会话和全局偏好。")
+        no_arg_tool_spec(
+            self.id(),
+            "list_preferences",
+            "读取当前会话和全局偏好。用于回答偏好相关问题或在计划前确认约束。",
+        )
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
@@ -867,30 +1110,50 @@ impl LlmTool for PreviewPlanTool {
         tool_spec(
             self.id(),
             "preview_plan",
-            "根据 plan JSON 和 selectionId 生成文件级预览。",
+            "根据 plan JSON 和 selectionId 生成文件级预览。返回 previewId，后续 execute_plan 必须使用该 previewId。",
             json!({
                 "type": "object",
+                "description": "执行前预览请求。必须先有 find_files 返回的 selectionId。",
                 "properties": {
                     "plan": {
                         "type": "object",
+                        "description": "待预览的计划。预览只计算影响范围，不直接执行文件操作。",
                         "properties": {
-                            "intentSummary": { "type": "string" },
+                            "intentSummary": {
+                                "type": "string",
+                                "description": "用户意图的简短摘要，用于预览卡说明。",
+                                "maxLength": 300
+                            },
                             "targets": {
                                 "type": "array",
+                                "description": "要对一个或多个 selectionId 执行的动作。",
+                                "minItems": 1,
+                                "maxItems": 20,
                                 "items": {
                                     "type": "object",
+                                    "description": "单个 selectionId 的预览动作。",
                                     "properties": {
-                                        "selectionId": { "type": "string" },
-                                        "action": { "type": "string", "enum": ["archive", "move", "keep", "review", "delete"] }
+                                        "selectionId": {
+                                            "type": "string",
+                                            "description": "find_files 返回的候选集 ID。"
+                                        },
+                                        "action": {
+                                            "type": "string",
+                                            "description": "要预览的处理动作；delete 属高风险动作，只在用户明确要求时使用。",
+                                            "enum": ["archive", "move", "keep", "review", "delete"]
+                                        }
                                     },
-                                    "required": ["selectionId", "action"]
+                                    "required": ["selectionId", "action"],
+                                    "additionalProperties": false
                                 }
                             }
                         },
-                        "required": ["targets"]
+                        "required": ["targets"],
+                        "additionalProperties": false
                     }
                 },
-                "required": ["plan"]
+                "required": ["plan"],
+                "additionalProperties": false
             }),
         )
     }
@@ -975,14 +1238,23 @@ impl LlmTool for ExecutePlanTool {
         tool_spec(
             self.id(),
             "execute_plan",
-            "执行已经通过预览的计划。",
+            "执行已经通过预览的计划。必须使用 preview_plan 返回的 previewId；执行后会返回结果卡，并可能提供 rollback_plan 可用状态。",
             json!({
                 "type": "object",
+                "description": "计划执行请求。只执行已经生成预览且仍有效的 previewId。",
                 "properties": {
-                    "previewId": { "type": "string" },
-                    "intentSummary": { "type": "string" }
+                    "previewId": {
+                        "type": "string",
+                        "description": "preview_plan 返回的预览 ID。"
+                    },
+                    "intentSummary": {
+                        "type": "string",
+                        "description": "执行意图摘要，用于结果卡展示。",
+                        "maxLength": 300
+                    }
                 },
-                "required": ["previewId"]
+                "required": ["previewId"],
+                "additionalProperties": false
             }),
         )
     }
@@ -1073,13 +1345,18 @@ impl LlmTool for RollbackPlanTool {
         tool_spec(
             self.id(),
             "rollback_plan",
-            "回滚最近一次可回滚的执行计划。",
+            "回滚最近一次可回滚的执行计划。只在 execute_plan 返回可回滚状态或用户明确要求撤销时使用。",
             json!({
                 "type": "object",
+                "description": "计划回滚请求。",
                 "properties": {
-                    "jobId": { "type": "string" }
+                    "jobId": {
+                        "type": "string",
+                        "description": "要回滚的执行任务 ID，通常来自 execute_plan 返回结果。"
+                    }
                 },
-                "required": ["jobId"]
+                "required": ["jobId"],
+                "additionalProperties": false
             }),
         )
     }
@@ -1145,31 +1422,61 @@ impl LlmTool for ApplyReclassificationTool {
         tool_spec(
             self.id(),
             "apply_reclassification",
-            "按结构化 reclassificationRequest 应用局部分类修正。",
+            "按结构化 reclassificationRequest 应用局部分类修正。用于重命名、移动、拆分、合并或删除空分类，执行后会更新当前分类树。",
             json!({
                 "type": "object",
+                "description": "局部分类修正请求。只修改分类结构或选中项归类，不执行文件移动。",
                 "properties": {
                     "request": {
                         "type": "object",
+                        "description": "重分类请求主体。",
                         "properties": {
-                            "intentSummary": { "type": "string" },
+                            "intentSummary": {
+                                "type": "string",
+                                "description": "用户希望调整分类的简短意图摘要。",
+                                "maxLength": 300
+                            },
                             "change": {
                                 "type": "object",
+                                "description": "具体分类修改动作及其必要目标。",
                                 "properties": {
-                                    "type": { "type": "string", "enum": ["rename_category", "move_selection_to_category", "split_selection_to_new_category", "merge_category_into_category", "delete_empty_category"] },
-                                    "selectionId": { "type": "string" },
-                                    "sourceCategoryId": { "type": "string" },
-                                    "targetCategoryId": { "type": "string" },
-                                    "newCategoryName": { "type": "string" }
+                                    "type": {
+                                        "type": "string",
+                                        "description": "分类修改类型。根据用户意图选择一个最小动作。",
+                                        "enum": ["rename_category", "move_selection_to_category", "split_selection_to_new_category", "merge_category_into_category", "delete_empty_category"]
+                                    },
+                                    "selectionId": {
+                                        "type": "string",
+                                        "description": "需要移动或拆分的候选集 ID，通常来自 find_files。"
+                                    },
+                                    "sourceCategoryId": {
+                                        "type": "string",
+                                        "description": "源分类节点 ID，用于重命名、合并或删除空分类。"
+                                    },
+                                    "targetCategoryId": {
+                                        "type": "string",
+                                        "description": "目标分类节点 ID，用于移动或合并。"
+                                    },
+                                    "newCategoryName": {
+                                        "type": "string",
+                                        "description": "新分类名称或重命名后的名称，应简短实用。",
+                                        "maxLength": 120
+                                    }
                                 },
-                                "required": ["type"]
+                                "required": ["type"],
+                                "additionalProperties": false
                             }
                         },
-                        "required": ["change"]
+                        "required": ["change"],
+                        "additionalProperties": false
                     },
-                    "applyPreferenceCapture": { "type": "boolean" }
+                    "applyPreferenceCapture": {
+                        "type": "boolean",
+                        "description": "是否同时应用刚捕获的偏好；只有用户明确确认相关偏好时才设为 true。"
+                    }
                 },
-                "required": ["request"]
+                "required": ["request"],
+                "additionalProperties": false
             }),
         )
     }
@@ -1263,13 +1570,18 @@ impl LlmTool for RollbackReclassificationTool {
         tool_spec(
             self.id(),
             "rollback_reclassification",
-            "回滚最近一次可回滚的分类修正。",
+            "回滚最近一次可回滚的分类修正。执行后会恢复分类树并返回更新后的树结果卡。",
             json!({
                 "type": "object",
+                "description": "分类修正回滚请求。",
                 "properties": {
-                    "reclassificationJobId": { "type": "string" }
+                    "reclassificationJobId": {
+                        "type": "string",
+                        "description": "要回滚的分类修正任务 ID，通常来自 apply_reclassification 返回结果。"
+                    }
                 },
-                "required": ["reclassificationJobId"]
+                "required": ["reclassificationJobId"],
+                "additionalProperties": false
             }),
         )
     }
@@ -1413,6 +1725,76 @@ mod tests {
     }
 
     #[test]
+    fn tool_definitions_include_descriptions_and_closed_object_schemas() {
+        let registry = ToolRegistry::new();
+        for tool in registry.tools.iter() {
+            let spec = tool.spec();
+            assert!(
+                !spec.description.trim().is_empty(),
+                "{} is missing tool description",
+                spec.name
+            );
+            let definition = spec.definition();
+            let function = definition
+                .get("function")
+                .expect("function wrapper is present");
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !description.trim().is_empty(),
+                "{} definition is missing description",
+                spec.name
+            );
+            let parameters = function
+                .get("parameters")
+                .unwrap_or_else(|| panic!("{} is missing parameters schema", spec.name));
+            assert_object_schemas_are_closed(parameters, spec.name);
+            assert_property_schemas_are_described(parameters, spec.name);
+        }
+    }
+
+    #[test]
+    fn list_preferences_has_explicit_empty_parameters_schema() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext {
+            workflow: ToolWorkflow::Advisor,
+            stage: WORKFLOW_UNDERSTAND,
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let definition = registry
+            .definitions(&ctx)
+            .into_iter()
+            .find(|definition| {
+                definition.pointer("/function/name").and_then(Value::as_str)
+                    == Some("list_preferences")
+            })
+            .expect("list_preferences is available");
+        let parameters = definition
+            .pointer("/function/parameters")
+            .expect("list_preferences parameters");
+        assert_eq!(
+            parameters.get("type").and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            parameters
+                .get("additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|properties| properties.is_empty()));
+    }
+
+    #[test]
     fn submit_organize_result_validates_shape() {
         let parsed = parse_submit_organize_result_arguments(&json!({
             "tree": {},
@@ -1425,5 +1807,55 @@ mod tests {
             "assignments": []
         }))
         .is_err());
+    }
+
+    fn assert_object_schemas_are_closed(schema: &Value, path: &str) {
+        if schema.get("type").and_then(Value::as_str) == Some("object") {
+            assert_eq!(
+                schema.get("additionalProperties").and_then(Value::as_bool),
+                Some(false),
+                "{} object schema must set additionalProperties=false",
+                path
+            );
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, value) in properties {
+                assert_object_schemas_are_closed(value, &format!("{path}.properties.{name}"));
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            assert_object_schemas_are_closed(items, &format!("{path}.items"));
+        }
+        if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+            for (name, value) in defs {
+                assert_object_schemas_are_closed(value, &format!("{path}.$defs.{name}"));
+            }
+        }
+    }
+
+    fn assert_property_schemas_are_described(schema: &Value, path: &str) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, value) in properties {
+                let description = value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    !description.trim().is_empty(),
+                    "{}.properties.{} is missing description",
+                    path,
+                    name
+                );
+                assert_property_schemas_are_described(value, &format!("{path}.properties.{name}"));
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            assert_property_schemas_are_described(items, &format!("{path}.items"));
+        }
+        if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+            for (name, value) in defs {
+                assert_property_schemas_are_described(value, &format!("{path}.$defs.{name}"));
+            }
+        }
     }
 }

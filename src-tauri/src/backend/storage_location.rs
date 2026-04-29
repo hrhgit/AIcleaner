@@ -115,7 +115,6 @@ pub struct OrganizeSnapshot {
     pub batch_size: u32,
     #[serde(default = "default_organize_summary_strategy", alias = "summaryMode")]
     pub summary_strategy: String,
-    pub max_cluster_depth: Option<u32>,
     pub use_web_search: bool,
     pub web_search_enabled: bool,
     pub selected_model: String,

@@ -163,7 +163,6 @@ mod tests {
             "recursive": true,
             "excludedPatterns": [],
             "batchSize": 20,
-            "maxClusterDepth": null,
             "useWebSearch": false,
             "webSearchEnabled": false,
             "selectedModel": "deepseek-chat",

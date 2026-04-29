@@ -56,6 +56,7 @@ pub(super) fn build_session_payload(state: &AppState, session: &Value) -> Result
                 "role": turn.get("role").cloned().unwrap_or_else(|| Value::String("assistant".to_string())),
                 "text": turn.get("text").cloned().unwrap_or_else(|| Value::String(String::new())),
                 "createdAt": turn.get("createdAt").cloned().unwrap_or(Value::Null),
+                "agentTrace": turn.get("agentTrace").cloned().unwrap_or(Value::Null),
                 "cards": cards_by_turn.remove(&turn_id).unwrap_or_default(),
             })
         })

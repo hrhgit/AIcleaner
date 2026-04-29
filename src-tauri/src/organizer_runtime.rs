@@ -35,7 +35,6 @@ const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
-const SUMMARY_AGENT_LONG_CHARS: usize = 720;
 const CATEGORY_INVENTORY_FILES_PER_CATEGORY: usize = 3;
 pub(crate) const ORGANIZER_WEB_SEARCH_BUDGET: usize = 8;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
@@ -310,25 +309,32 @@ impl OrganizerDiagnostics {
         );
     }
 
-    fn scan_started(&self, root_path: &str) {
+    fn collection_started(&self, root_path: &str) {
         self.record(
             "info",
-            "organize_scan_start",
-            "organize scan started",
+            "organize_collection_start",
+            "organize directory collection started",
             json!({ "rootPath": root_path }),
             None,
             None,
         );
     }
 
-    fn scan_completed(&self, root_path: &str, unit_count: usize, duration: Duration) {
+    fn collection_completed(
+        &self,
+        root_path: &str,
+        unit_count: usize,
+        report: &CollectionReport,
+        duration: Duration,
+    ) {
         self.record(
             "info",
-            "organize_scan_done",
-            "organize scan completed",
+            "organize_collection_done",
+            "organize directory collection completed",
             json!({
                 "rootPath": root_path,
                 "unitCount": unit_count,
+                "report": report,
             }),
             None,
             Some(duration),

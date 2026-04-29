@@ -155,7 +155,6 @@ mod tests {
             excluded_patterns: vec!["node_modules".to_string()],
             batch_size: 20,
             summary_strategy: default_organize_summary_strategy(),
-            max_cluster_depth: None,
             use_web_search: false,
             web_search_enabled: false,
             selected_model: "gpt-4o-mini".to_string(),

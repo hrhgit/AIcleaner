@@ -1,6 +1,5 @@
 use super::llm::AdvisorLlm;
-use super::tools::ToolService;
-use super::types::{local_text, now_iso, CARD_EXECUTION, WORKFLOW_UNDERSTAND};
+use super::types::{local_text, now_iso, WORKFLOW_UNDERSTAND};
 use crate::agent_runtime::{
     AgentCompletion, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop, AgentTurnSpec,
     ToolCallErrorOutcome, ToolCallOutcome,
@@ -22,7 +21,6 @@ pub(super) struct AgentTurnResult {
 
 pub(super) struct AdvisorAgentRunner<'a> {
     state: &'a AppState,
-    tools: ToolService<'a>,
     llm: AdvisorLlm<'a>,
     tool_registry: ToolRegistry,
 }
@@ -31,7 +29,6 @@ impl<'a> AdvisorAgentRunner<'a> {
     pub(super) fn new(state: &'a AppState) -> Self {
         Self {
             state,
-            tools: ToolService::new(state),
             llm: AdvisorLlm::new(state),
             tool_registry: ToolRegistry::new(),
         }
@@ -56,36 +53,25 @@ impl<'a> AdvisorAgentRunner<'a> {
             .unwrap_or("zh")
             .to_string();
         let bootstrap_turn = user_message.is_none();
-        let context_payload = self.build_context_payload(session)?;
-        let mut messages = vec![
-            json!({
-                "role": "system",
-                "content": self.build_system_prompt(
-                    &lang,
-                    bootstrap_turn,
-                    session
-                        .get("webSearchEnabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                ),
-            }),
-            json!({
-                "role": "user",
-                "content": self.build_user_prompt(&lang, user_message, &context_payload),
-            }),
-        ];
         let session_id = session
             .get("sessionId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let messages = self.build_transcript_messages(
+            session,
+            &session_id,
+            &lang,
+            bootstrap_turn,
+            user_message,
+        )?;
         let mut spec = AdvisorTurnSpec {
             state: self.state,
             session,
             session_id,
             lang,
             bootstrap_turn,
-            initial_messages: std::mem::take(&mut messages),
+            initial_messages: messages,
             cards: Vec::new(),
             dispatch_stage: WORKFLOW_UNDERSTAND.to_string(),
         };
@@ -110,6 +96,9 @@ impl<'a> AdvisorAgentRunner<'a> {
             "你必须通过原生 tool calling 调用工具，不能手写 JSON 协议。".to_string(),
             "不要重新生成扫描结果，也不要重新生成完整归类结果。".to_string(),
             "不要在自然语言回复里输出执行 schema、JSON 或代码块。".to_string(),
+            "你会收到本会话完整 transcript，包含历史用户消息、顾问回复、工具调用和工具结果；必须把它作为连续对话上下文。".to_string(),
+            "不要假设上一轮自然语言方案会被压缩成额外状态；确认、继续、执行等短指令应优先回看完整 transcript。".to_string(),
+            "需要当前目录、筛选、预览或执行证据时，继续通过工具读取或操作。".to_string(),
             "当 session 记忆和 global 记忆冲突时，以 session 为准。".to_string(),
             "高风险动作不确定时先澄清，不要直接执行。".to_string(),
             format!("最终自然语言回复必须使用 {language_name}。"),
@@ -128,126 +117,221 @@ impl<'a> AdvisorAgentRunner<'a> {
         lines.join("\n")
     }
 
-    fn build_user_prompt(
+    fn build_transcript_messages(
         &self,
+        session: &Value,
+        session_id: &str,
         lang: &str,
+        bootstrap_turn: bool,
         user_message: Option<&str>,
-        context_payload: &Value,
-    ) -> String {
-        let current_message = user_message
+    ) -> Result<Vec<Value>, String> {
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": self.build_system_prompt(
+                lang,
+                bootstrap_turn,
+                session
+                    .get("webSearchEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        })];
+
+        let turns = persist::load_advisor_turns(&self.state.db_path(), session_id)?;
+        for turn in turns {
+            append_turn_messages(&mut messages, &turn);
+        }
+
+        if messages.len() == 1 {
+            messages.push(json!({
+                "role": "user",
+                "content": user_message
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if lang.eq_ignore_ascii_case("en") {
+                            "Please give the first-turn advice for this directory.".to_string()
+                        } else {
+                            "请基于当前目录给出首轮建议。".to_string()
+                        }
+                    }),
+            }));
+        } else if let Some(message) = user_message
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if lang.eq_ignore_ascii_case("en") {
-                    "Please give the first-turn advice for this directory.".to_string()
-                } else {
-                    "请基于当前目录给出首轮建议。".to_string()
-                }
+        {
+            let last_user_matches = messages.last().is_some_and(|row| {
+                row.get("role").and_then(Value::as_str) == Some("user")
+                    && row.get("content").and_then(Value::as_str) == Some(message)
             });
-        format!(
-            "context payload:\n{}\n\n当前轮用户消息:\n{}\n\n请按需要调用工具；若信息已经足够，再给最终自然语言回复。",
-            serde_json::to_string_pretty(context_payload).unwrap_or_else(|_| "{}".to_string()),
-            current_message
-        )
+            if !last_user_matches {
+                messages.push(json!({
+                    "role": "user",
+                    "content": message,
+                }));
+            }
+        }
+
+        Ok(messages)
+    }
+}
+
+fn append_turn_messages(messages: &mut Vec<Value>, turn: &Value) {
+    let role = turn
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    let text = turn.get("text").and_then(Value::as_str).unwrap_or_default();
+
+    if role == "assistant" {
+        if append_agent_trace_messages(messages, turn) {
+            return;
+        }
     }
 
-    fn build_context_payload(&self, session: &Value) -> Result<Value, String> {
-        let session_id = session
-            .get("sessionId")
-            .and_then(Value::as_str)
+    messages.push(json!({
+        "role": role,
+        "content": text,
+    }));
+}
+
+fn append_agent_trace_messages(messages: &mut Vec<Value>, turn: &Value) -> bool {
+    let Some(steps) = turn.pointer("/agentTrace/steps").and_then(Value::as_array) else {
+        return false;
+    };
+    if steps.is_empty() {
+        return false;
+    }
+
+    let mut appended = false;
+    for step in steps {
+        let tool_calls = step
+            .get("toolCalls")
+            .and_then(Value::as_array)
+            .cloned()
             .unwrap_or_default();
-        let memories = self.tools.list_preferences_tool(Some(session_id))?;
-        let overview =
-            self.tools
-                .get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
-        let active_selection_card = session
-            .get("activeSelectionId")
+        let assistant_text = step
+            .get("assistantText")
             .and_then(Value::as_str)
-            .map(|selection_id| self.selection_card_summary(selection_id))
-            .transpose()?
-            .flatten();
-        let active_preview_card = session
-            .get("activePreviewId")
-            .and_then(Value::as_str)
-            .map(|preview_id| self.preview_card_summary(preview_id))
-            .transpose()?
-            .flatten();
-        let latest_execution_card = self.latest_execution_summary(session_id)?;
-        Ok(json!({
-            "sessionId": session.get("sessionId").cloned().unwrap_or(Value::Null),
-            "workflowStage": session.get("workflowStage").cloned().unwrap_or(Value::String(WORKFLOW_UNDERSTAND.to_string())),
-            "rollbackAvailable": session.get("rollbackAvailable").cloned().unwrap_or(Value::Bool(false)),
-            "rootPath": session.get("rootPath").cloned().unwrap_or(Value::Null),
-            "webSearch": {
-                "useWebSearch": session.get("useWebSearch").cloned().unwrap_or(Value::Bool(false)),
-                "webSearchEnabled": session.get("webSearchEnabled").cloned().unwrap_or(Value::Bool(false)),
-            },
-            "memory": {
-                "session": memories.get("sessionPreferences").cloned().unwrap_or_else(|| json!([])),
-                "global": memories.get("globalPreferences").cloned().unwrap_or_else(|| json!([])),
-            },
-            "overview": {
-                "viewType": overview.get("viewType").cloned().unwrap_or(Value::String("summaryTree".to_string())),
-                "treeText": overview.get("treeText").cloned().unwrap_or(Value::String(String::new())),
-            },
-            "activeSelectionCard": active_selection_card,
-            "activePreviewCard": active_preview_card,
-            "latestExecutionCard": latest_execution_card,
-        }))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if !tool_calls.is_empty() {
+            let mut assistant = json!({
+                "role": "assistant",
+                "content": assistant_text,
+                "tool_calls": tool_calls.iter().map(trace_tool_call_to_message).collect::<Vec<_>>(),
+            });
+            if let Some(raw_reasoning) = step
+                .pointer("/rawMessage/reasoning_content")
+                .or_else(|| step.pointer("/rawBody/choices/0/message/reasoning_content"))
+            {
+                assistant["reasoning_content"] = raw_reasoning.clone();
+            }
+            messages.push(assistant);
+            appended = true;
+
+            let results = step
+                .get("toolResults")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for result in results {
+                let tool_call_id = result.get("id").and_then(Value::as_str).unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": serde_json::to_string_pretty(
+                        &result.get("payload").cloned().unwrap_or(Value::Null)
+                    )
+                    .unwrap_or_else(|_| String::new()),
+                }));
+            }
+        } else if !assistant_text.is_empty() {
+            messages.push(json!({
+                "role": "assistant",
+                "content": assistant_text,
+            }));
+            appended = true;
+        }
     }
 
-    fn selection_card_summary(&self, selection_id: &str) -> Result<Option<Value>, String> {
-        let Some(selection) = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(json!({
-            "selectionId": selection.get("selectionId").cloned().unwrap_or(Value::Null),
-            "querySummary": selection.get("querySummary").cloned().unwrap_or(Value::String(String::new())),
-            "total": selection.get("total").cloned().unwrap_or(Value::from(0)),
-        })))
+    if !appended {
+        let text = turn.get("text").and_then(Value::as_str).unwrap_or_default();
+        if !text.trim().is_empty() {
+            messages.push(json!({
+                "role": "assistant",
+                "content": text,
+            }));
+            return true;
+        }
     }
+    appended
+}
 
-    fn preview_card_summary(&self, preview_id: &str) -> Result<Option<Value>, String> {
-        let Some(job) = persist::load_advisor_plan_job(&self.state.db_path(), preview_id)? else {
-            return Ok(None);
-        };
-        Ok(Some(json!({
-            "previewId": preview_id,
-            "planId": preview_id,
-            "intentSummary": job.pointer("/preview/intentSummary").cloned().unwrap_or(Value::String(String::new())),
-            "topActions": job.pointer("/preview/entries").and_then(Value::as_array).map(|rows| {
-                rows.iter().take(3).map(|row| format!(
-                    "{} -> {}",
-                    row.get("name").and_then(Value::as_str).or_else(|| row.get("sourcePath").and_then(Value::as_str)).unwrap_or("-"),
-                    row.get("action").and_then(Value::as_str).unwrap_or("-")
-                )).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-            "summary": job.pointer("/preview/summary").cloned().unwrap_or_else(|| json!({})),
-            "topBlockedReasons": job.pointer("/preview/entries").and_then(Value::as_array).map(|rows| {
-                rows.iter()
-                    .flat_map(|row| row.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default())
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .take(3)
-                    .collect::<Vec<_>>()
-            }).unwrap_or_default(),
-        })))
-    }
+fn trace_tool_call_to_message(call: &Value) -> Value {
+    json!({
+        "id": call.get("id").cloned().unwrap_or(Value::String(String::new())),
+        "type": "function",
+        "function": {
+            "name": call.get("name").cloned().unwrap_or(Value::String(String::new())),
+            "arguments": call.get("arguments").cloned().unwrap_or_else(|| json!({})).to_string(),
+        },
+    })
+}
 
-    fn latest_execution_summary(&self, session_id: &str) -> Result<Option<Value>, String> {
-        let cards = persist::load_advisor_cards(&self.state.db_path(), session_id)?;
-        let latest = cards
-            .into_iter()
-            .rev()
-            .find(|card| card.get("cardType").and_then(Value::as_str) == Some(CARD_EXECUTION));
-        Ok(latest.map(|card| {
-            json!({
-                "jobId": card.pointer("/body/jobId").cloned().unwrap_or(Value::Null),
-                "intentSummary": card.pointer("/body/intentSummary").cloned().unwrap_or(Value::String(String::new())),
-                "summary": card.pointer("/body/result/summary").cloned().unwrap_or_else(|| json!({})),
-            })
-        }))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_trace_expands_tool_messages_and_final_reply() {
+        let turn = json!({
+            "role": "assistant",
+            "text": "最终方案",
+            "agentTrace": {
+                "steps": [
+                    {
+                        "assistantText": "我先查一下。",
+                        "toolCalls": [
+                            {
+                                "id": "call_1",
+                                "name": "find_files",
+                                "arguments": { "categoryIds": ["安装包与可执行文件"] }
+                            }
+                        ],
+                        "toolResults": [
+                            {
+                                "id": "call_1",
+                                "name": "find_files",
+                                "status": "ok",
+                                "payload": { "result": { "total": 99 } }
+                            }
+                        ]
+                    },
+                    {
+                        "assistantText": "最终方案",
+                        "toolCalls": []
+                    }
+                ]
+            }
+        });
+
+        let mut messages = Vec::new();
+        append_turn_messages(&mut messages, &turn);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["name"],
+            "find_files"
+        );
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "最终方案");
     }
 }
 

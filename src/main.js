@@ -23,9 +23,6 @@ function hideBootSplash() {
 }
 
 function normalizePageName(pageName) {
-    if (pageName === 'organizer' || pageName === 'organizer-results') {
-        return 'advisor';
-    }
     return pageName;
 }
 
@@ -66,7 +63,7 @@ function navigate(pageName) {
 
 function getPageFromHash() {
     const hash = normalizePageName(window.location.hash.replace('#/', ''));
-    return pages[hash] ? hash : 'advisor';
+    return hash || 'advisor';
 }
 
 function updateShellCopy() {

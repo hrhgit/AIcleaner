@@ -18,9 +18,9 @@ import {
   DEFAULT_BATCH_SIZE,
   DEFAULT_EXCLUSIONS,
   DEFAULT_SUMMARY_MODE,
-  PERSIST_KEYS as ORGANIZER_PERSIST_KEYS,
+  PERSIST_KEYS as WORKFLOW_PERSIST_KEYS,
   SUMMARY_MODES,
-} from './organizer-storage.js';
+} from './advisor-workflow-storage.js';
 import { showToast } from '../utils/toast.js';
 
 const PERSIST_KEYS = {
@@ -69,7 +69,7 @@ function createInitialState() {
     sessionId: readPersisted(PERSIST_KEYS.sessionId, ''),
     messageDraft: readPersisted(PERSIST_KEYS.messageDraft, ''),
     sessionData: null,
-    organizeTaskId: String(readPersisted(ORGANIZER_PERSIST_KEYS.lastTaskId, '') || ''),
+    organizeTaskId: String(readPersisted(WORKFLOW_PERSIST_KEYS.lastTaskId, '') || ''),
     organizeSnapshot: null,
     organizeStream: null,
     loading: false,
@@ -88,16 +88,16 @@ function sanitizeSnapshot(snapshot) {
 function resolveInitialRootPath() {
   const persisted = String(readPersisted(PERSIST_KEYS.rootPath, '') || '').trim();
   if (persisted) return persisted;
-  return String(readPersisted(ORGANIZER_PERSIST_KEYS.rootPath, '') || '').trim();
+  return String(readPersisted(WORKFLOW_PERSIST_KEYS.rootPath, '') || '').trim();
 }
 
 function resolveInitialSummaryStrategy() {
-  const persisted = String(readPersisted(ORGANIZER_PERSIST_KEYS.summaryStrategy, DEFAULT_SUMMARY_MODE) || '').trim();
+  const persisted = String(readPersisted(WORKFLOW_PERSIST_KEYS.summaryStrategy, DEFAULT_SUMMARY_MODE) || '').trim();
   return SUMMARY_MODES.includes(persisted) ? persisted : DEFAULT_SUMMARY_MODE;
 }
 
 function resolveInitialUseWebSearch() {
-  return !!readPersisted(ORGANIZER_PERSIST_KEYS.useWebSearch, false);
+  return !!readPersisted(WORKFLOW_PERSIST_KEYS.useWebSearch, false);
 }
 
 function escapeHtml(value) {
@@ -111,6 +111,51 @@ function formatDateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
   return date.toLocaleString(getLang() === 'en' ? 'en-US' : 'zh-CN');
+}
+
+function createLocalTimelineTurn(role, textValue, extra = {}) {
+  const createdAt = new Date().toISOString();
+  return {
+    turnId: `local-${role}-${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+    role,
+    text: textValue,
+    createdAt,
+    cards: [],
+    localPending: true,
+    ...extra,
+  };
+}
+
+function appendPendingMessage(message) {
+  const currentData = state.sessionData && typeof state.sessionData === 'object'
+    ? state.sessionData
+    : { sessionId: state.sessionId, timeline: [] };
+  const timeline = Array.isArray(currentData.timeline) ? currentData.timeline : [];
+  state.sessionData = {
+    ...currentData,
+    sessionId: currentData.sessionId || state.sessionId,
+    timeline: [
+      ...timeline,
+      createLocalTimelineTurn('user', message),
+      createLocalTimelineTurn('assistant', '', { loading: true }),
+    ],
+  };
+}
+
+function markPendingAssistantFailed(message) {
+  if (!state.sessionData || typeof state.sessionData !== 'object') return;
+  const timeline = Array.isArray(state.sessionData.timeline) ? state.sessionData.timeline : [];
+  state.sessionData = {
+    ...state.sessionData,
+    timeline: timeline.map((turn) => (turn?.loading
+      ? {
+          ...turn,
+          loading: false,
+          failed: true,
+          text: message,
+        }
+      : turn)),
+  };
 }
 
 function normalizePath(value) {
@@ -142,7 +187,7 @@ function getOrganizeStatus(snapshot = getCurrentSnapshot()) {
 }
 
 function isOrganizeRunning(snapshot = getCurrentSnapshot()) {
-  return ['idle', 'scanning', 'classifying', 'stopping', 'moving'].includes(getOrganizeStatus(snapshot));
+  return ['idle', 'collecting', 'classifying', 'stopping', 'moving'].includes(getOrganizeStatus(snapshot));
 }
 
 function isOrganizeFinished(snapshot = getCurrentSnapshot()) {
@@ -151,7 +196,7 @@ function isOrganizeFinished(snapshot = getCurrentSnapshot()) {
 
 function getOrganizeStatusLabel(snapshot = getCurrentSnapshot()) {
   const status = getOrganizeStatus(snapshot);
-  if (status === 'scanning') return text('扫描中', 'Scanning');
+  if (status === 'collecting') return text('收集中', 'Collecting');
   if (status === 'classifying') return text('归类中', 'Classifying');
   if (status === 'stopping') return text('停止中', 'Stopping');
   if (status === 'moving') return text('执行中', 'Applying');
@@ -267,6 +312,121 @@ function renderCard(card) {
   `;
 }
 
+function renderAdvisorLoading() {
+  return `
+    <div class="advisor-loading-reply" role="status" aria-live="polite">
+      <span class="advisor-loading-dots" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
+      <span>${escapeHtml(text('正在生成回复', 'Generating reply'))}</span>
+    </div>
+  `;
+}
+
+function formatJsonBlock(value) {
+  if (value === null || value === undefined) return '-';
+  if (typeof value === 'string') return value.trim() || '-';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return '';
+  const total = usage.total ?? '-';
+  const prompt = usage.prompt ?? '-';
+  const completion = usage.completion ?? '-';
+  return text(
+    `Token: ${total} / 输入 ${prompt} / 输出 ${completion}`,
+    `Tokens: ${total} / prompt ${prompt} / completion ${completion}`,
+  );
+}
+
+function getToolCallRows(turn) {
+  const steps = Array.isArray(turn?.agentTrace?.steps) ? turn.agentTrace.steps : [];
+  return steps.flatMap((step) => {
+    const calls = Array.isArray(step?.toolCalls) ? step.toolCalls : [];
+    const results = Array.isArray(step?.toolResults) ? step.toolResults : [];
+    return calls.map((call) => {
+      const result = results.find((row) => row?.id === call?.id)
+        || results.find((row) => row?.name === call?.name)
+        || null;
+      return {
+        step: step?.step,
+        route: step?.route,
+        usage: step?.usage,
+        assistantText: step?.assistantText,
+        id: call?.id,
+        name: call?.name,
+        arguments: call?.arguments,
+        status: result?.status || text('无结果', 'no result'),
+        payload: result?.payload,
+      };
+    });
+  });
+}
+
+function renderToolCallDetails(turn) {
+  const rows = getToolCallRows(turn);
+  if (!rows.length) return '';
+  const title = text(`工具调用明细 ${rows.length} 次`, `${rows.length} tool call${rows.length > 1 ? 's' : ''}`);
+  return `
+    <details class="advisor-tool-details">
+      <summary>
+        <span>${escapeHtml(title)}</span>
+        <span class="advisor-tool-summary-hint">${escapeHtml(text('默认折叠', 'Collapsed by default'))}</span>
+      </summary>
+      <div class="advisor-tool-list">
+        ${rows.map((row, index) => {
+          const status = String(row.status || '').toLowerCase();
+          const statusClass = status === 'ok' ? 'ok' : status === 'error' ? 'error' : 'neutral';
+          const route = row.route && typeof row.route === 'object'
+            ? [row.route.model, row.route.endpoint].filter(Boolean).join(' / ')
+            : '';
+          const usage = summarizeUsage(row.usage);
+          return `
+            <section class="advisor-tool-item">
+              <div class="advisor-tool-item-head">
+                <div class="advisor-tool-title">
+                  <span class="advisor-tool-step">${escapeHtml(`#${index + 1}`)}</span>
+                  <span>${escapeHtml(row.name || text('未知工具', 'Unknown tool'))}</span>
+                </div>
+                <span class="advisor-tool-status advisor-tool-status-${escapeHtml(statusClass)}">${escapeHtml(row.status || '-')}</span>
+              </div>
+              <div class="advisor-tool-meta">
+                <span>${escapeHtml(text('步骤', 'Step'))}: ${escapeHtml(row.step ?? '-')}</span>
+                <span>${escapeHtml(text('调用 ID', 'Call ID'))}: ${escapeHtml(row.id || '-')}</span>
+                ${route ? `<span>${escapeHtml(route)}</span>` : ''}
+                ${usage ? `<span>${escapeHtml(usage)}</span>` : ''}
+              </div>
+              ${String(row.assistantText || '').trim() ? `
+                <div class="advisor-tool-field">
+                  <div class="advisor-tool-field-label">${escapeHtml(text('模型文本', 'Assistant text'))}</div>
+                  <pre>${escapeHtml(row.assistantText)}</pre>
+                </div>
+              ` : ''}
+              <div class="advisor-tool-grid">
+                <div class="advisor-tool-field">
+                  <div class="advisor-tool-field-label">${escapeHtml(text('参数', 'Arguments'))}</div>
+                  <pre>${escapeHtml(formatJsonBlock(row.arguments))}</pre>
+                </div>
+                <div class="advisor-tool-field">
+                  <div class="advisor-tool-field-label">${escapeHtml(text('结果', 'Result'))}</div>
+                  <pre>${escapeHtml(formatJsonBlock(row.payload))}</pre>
+                </div>
+              </div>
+            </section>
+          `;
+        }).join('')}
+      </div>
+    </details>
+  `;
+}
+
 function renderTimeline() {
   const timeline = Array.isArray(state.sessionData?.timeline) ? state.sessionData.timeline : [];
   const snapshot = getCurrentSnapshot();
@@ -283,18 +443,18 @@ function renderTimeline() {
     `;
   }
   return timeline.map((turn) => `
-    <section class="advisor-message-section advisor-message-section-${escapeHtml(turn?.role || 'assistant')}">
+    <section class="advisor-message-section advisor-message-section-${escapeHtml(turn?.role || 'assistant')} ${turn?.loading ? 'advisor-message-section-loading' : ''} ${turn?.failed ? 'advisor-message-section-failed' : ''}">
       <div class="advisor-message-rail" aria-hidden="true">
         <span class="advisor-message-node"></span>
       </div>
       <div class="advisor-message-stack">
-        ${(turn?.text || '').trim() ? `
-          <article class="advisor-message-bubble">
+        ${(turn?.text || '').trim() || turn?.loading ? `
+          <article class="advisor-message-bubble ${turn?.loading ? 'advisor-message-bubble-loading' : ''} ${turn?.failed ? 'advisor-message-bubble-failed' : ''}">
             <div class="advisor-message-meta">
               <span class="advisor-message-role">${escapeHtml(turn?.role === 'user' ? text('你', 'You') : text('顾问', 'Advisor'))}</span>
               <span class="advisor-message-time">${escapeHtml(formatDateTime(turn?.createdAt))}</span>
             </div>
-            <div class="advisor-message-text">${escapeHtml(turn?.text || '')}</div>
+            ${turn?.loading ? renderAdvisorLoading() : `<div class="advisor-message-text">${escapeHtml(turn?.text || '')}</div>`}
           </article>
         ` : `
           <div class="advisor-message-meta advisor-message-meta-inline">
@@ -303,6 +463,7 @@ function renderTimeline() {
           </div>
         `}
         <div class="advisor-turn-cards">${(Array.isArray(turn?.cards) ? turn.cards : []).map(renderCard).join('')}</div>
+        ${renderToolCallDetails(turn)}
       </div>
     </section>
   `).join('');
@@ -528,34 +689,34 @@ function persistRootPath(rootPath) {
   const value = String(rootPath || '').trim();
   state.rootPath = value;
   writePersisted(PERSIST_KEYS.rootPath, value);
-  writePersisted(ORGANIZER_PERSIST_KEYS.rootPath, value);
+  writePersisted(WORKFLOW_PERSIST_KEYS.rootPath, value);
 }
 
 function persistSummaryStrategy(summaryStrategy) {
   state.summaryStrategy = SUMMARY_MODES.includes(summaryStrategy) ? summaryStrategy : DEFAULT_SUMMARY_MODE;
-  writePersisted(ORGANIZER_PERSIST_KEYS.summaryStrategy, state.summaryStrategy);
+  writePersisted(WORKFLOW_PERSIST_KEYS.summaryStrategy, state.summaryStrategy);
 }
 
 function persistUseWebSearch(useWebSearch) {
   state.useWebSearch = !!useWebSearch;
-  writePersisted(ORGANIZER_PERSIST_KEYS.useWebSearch, state.useWebSearch);
+  writePersisted(WORKFLOW_PERSIST_KEYS.useWebSearch, state.useWebSearch);
 }
 
 function persistOrganizeSnapshot(snapshot) {
   state.organizeSnapshot = sanitizeSnapshot(snapshot);
   if (state.organizeSnapshot) {
-    writePersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot, state.organizeSnapshot);
+    writePersisted(WORKFLOW_PERSIST_KEYS.lastSnapshot, state.organizeSnapshot);
   } else {
-    removePersisted(ORGANIZER_PERSIST_KEYS.lastSnapshot);
+    removePersisted(WORKFLOW_PERSIST_KEYS.lastSnapshot);
   }
 }
 
 function persistOrganizeTaskId(taskId) {
   state.organizeTaskId = String(taskId || '').trim();
   if (state.organizeTaskId) {
-    writePersisted(ORGANIZER_PERSIST_KEYS.lastTaskId, state.organizeTaskId);
+    writePersisted(WORKFLOW_PERSIST_KEYS.lastTaskId, state.organizeTaskId);
   } else {
-    removePersisted(ORGANIZER_PERSIST_KEYS.lastTaskId);
+    removePersisted(WORKFLOW_PERSIST_KEYS.lastTaskId);
   }
 }
 
@@ -710,7 +871,6 @@ async function handleStartOrganize() {
       excludedPatterns: DEFAULT_EXCLUSIONS,
       batchSize: DEFAULT_BATCH_SIZE,
       summaryStrategy: state.summaryStrategy,
-      maxClusterDepth: null,
       useWebSearch: state.useWebSearch,
       responseLanguage: getLang(),
     });
@@ -723,7 +883,6 @@ async function handleStartOrganize() {
       excludedPatterns: DEFAULT_EXCLUSIONS,
       batchSize: DEFAULT_BATCH_SIZE,
       summaryStrategy: state.summaryStrategy,
-      maxClusterDepth: null,
       useWebSearch: state.useWebSearch,
       webSearchEnabled: state.useWebSearch,
       totalFiles: 0,
@@ -781,19 +940,29 @@ async function handleStartSession() {
 }
 
 async function handleSend() {
-  if (!state.sessionId || !state.messageDraft.trim()) return;
+  if (state.sending || !state.sessionId || !state.messageDraft.trim()) return;
+  const message = state.messageDraft.trim();
   state.sending = true;
+  state.messageDraft = '';
+  writePersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
+  appendPendingMessage(message);
   renderPage();
+  scrollComposerIntoView();
   try {
     const payload = await advisorMessageSend({
       sessionId: state.sessionId,
-      message: state.messageDraft.trim(),
+      message,
     });
     state.sessionData = payload;
-    state.messageDraft = '';
-    writePersisted(PERSIST_KEYS.messageDraft, state.messageDraft);
   } catch (err) {
-    showToast(`${text('发送失败: ', 'Send failed: ')}${err?.message || err}`, 'error');
+    const errorMessage = err?.message || String(err);
+    showToast(`${text('发送失败: ', 'Send failed: ')}${errorMessage}`, 'error');
+    try {
+      state.sessionData = await advisorSessionGet(state.sessionId);
+    } catch (hydrateErr) {
+      console.warn('[Advisor] Failed to refresh session after send failure:', hydrateErr);
+      markPendingAssistantFailed(`${text('回复生成失败: ', 'Reply failed: ')}${errorMessage}`);
+    }
   } finally {
     state.sending = false;
     renderPage();
