@@ -597,6 +597,20 @@ fn deferred_assignment_schema() -> Value {
     })
 }
 
+fn reconciled_assignment_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "reconciliation 阶段仅为 pending item 提交的最终落位；不要重复直接 assignments。",
+        "properties": {
+            "itemId": { "type": "string", "description": "pendingAssignments 中的 itemId，必须原样填写。" },
+            "leafNodeId": { "type": "string", "description": "finalTree 中已存在叶子节点的 nodeId。" },
+            "reason": { "type": "string", "description": "可选的极短说明。", "maxLength": 120 }
+        },
+        "required": ["itemId", "leafNodeId"],
+        "additionalProperties": false
+    })
+}
+
 fn tree_proposal_schema() -> Value {
     json!({
         "type": "object",
@@ -811,14 +825,14 @@ organizer_submit_tool!(
     SubmitReconciledTreeTool,
     SubmitReconciledTree,
     "submit_reconciled_tree",
-    "提交通过审查后的最终分类树和最终文件分配。只有 runtime 校验通过后才会生成 preview/apply。",
+    "提交通过审查后的最终分类树，以及仅 pending item 的最终分配。直接 assignments 已由 runtime 合并，不要重复输出。",
     json!({
         "type": "object",
         "description": "最终 reconciliation 结果。",
         "properties": {
             "finalTree": category_tree_schema(),
             "proposalMappings": { "type": "array", "description": "所有 proposal 的处理结果。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 的最终处理结果。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "status": { "type": "string", "description": "proposal 的处理状态。", "enum": ["accepted", "merged", "rejected"] }, "leafNodeId": { "type": "string", "description": "接受或合并后的 leafNodeId。" }, "categoryPath": category_path_schema("最终分类路径。") }, "required": ["proposalId", "status"], "additionalProperties": false } },
-            "finalAssignments": { "type": "array", "description": "所有有效文件的最终分配。", "maxItems": 2000, "items": assignment_schema() },
+            "finalAssignments": { "type": "array", "description": "仅 pendingAssignments 的最终分配；不要重复直接 assignments。", "maxItems": 500, "items": reconciled_assignment_schema() },
             "unresolvedItemIds": string_array_schema("仍无法稳定分类的 itemId。")
         },
         "required": ["finalTree", "proposalMappings", "finalAssignments"],

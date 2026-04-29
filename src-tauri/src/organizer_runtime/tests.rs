@@ -1043,11 +1043,15 @@ mod tests {
             }],
             "treeProposals": [{
                 "proposalId": "proposal_1",
+                "operation": "add_node",
+                "targetNodeId": "documents",
                 "suggestedPath": ["Documents", "Receipts"]
             }],
             "deferredAssignments": [{
                 "itemId": "batch1_2",
                 "proposalId": "proposal_1",
+                "suggestedPath": ["Documents", "Receipts"],
+                "categoryPath": ["Should", "Drop"],
                 "reason": "needs proposed category"
             }]
         });
@@ -1063,10 +1067,14 @@ mod tests {
             input["treeProposals"][0]["proposalId"],
             json!("proposal_1")
         );
+        assert_eq!(input["treeProposals"][0]["targetNodeId"], json!("documents"));
+        assert!(input["treeProposals"][0].get("reason").is_none());
         assert_eq!(
             input["deferredAssignments"][0]["itemId"],
             json!("batch1_2")
         );
+        assert!(input["deferredAssignments"][0].get("reason").is_none());
+        assert!(input["deferredAssignments"][0].get("categoryPath").is_none());
     }
 
     #[tokio::test]
@@ -1074,25 +1082,43 @@ mod tests {
         let mut tree = default_tree();
         let report_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]);
         let initial_tree = category_tree_to_value(&tree);
+        let compact_tree = json!({
+            "nodeId": "root",
+            "name": "",
+            "children": [{
+                "nodeId": "n1",
+                "name": "Documents",
+                "children": [{
+                    "nodeId": "n2",
+                    "name": "Reports",
+                    "children": []
+                }]
+            }]
+        });
         let classification_results = vec![json!({
             "batchIndex": 1,
             "baseTreeVersion": 4,
-            "output": {
-                "baseTreeVersion": 4,
-                "assignments": [{
-                    "itemId": "batch1_1",
-                    "leafNodeId": report_leaf,
-                    "categoryPath": ["Documents", "Reports"],
-                    "reason": "classified in isolated batch"
-                }],
-                "treeProposals": [],
-                "deferredAssignments": []
-            },
+            "treeProposals": [{
+                "proposalId": "proposal_1",
+                "operation": "add_node",
+                "targetNodeId": report_leaf,
+                "reason": "should be stripped",
+                "suggestedPath": ["Documents", "Reports", "Invoices"]
+            }],
+            "deferredAssignments": [{
+                "itemId": "batch1_1",
+                "proposalId": "proposal_1",
+                "reason": "should be stripped",
+                "suggestedPath": ["Documents", "Reports", "Invoices"]
+            }],
             "error": ""
         })];
         let revise_args = json!({
-            "draftTree": initial_tree,
-            "proposalMappings": [],
+            "draftTree": compact_tree,
+            "proposalMappings": [{
+                "proposalId": "proposal_1",
+                "leafNodeId": "n2"
+            }],
             "rejectedProposalIds": []
         });
         let review_args = json!({
@@ -1101,13 +1127,15 @@ mod tests {
             "needsRevision": false
         });
         let submit_args = json!({
-            "finalTree": initial_tree,
-            "proposalMappings": [],
+            "finalTree": compact_tree,
+            "proposalMappings": [{
+                "proposalId": "proposal_1",
+                "status": "merged",
+                "leafNodeId": "n2"
+            }],
             "finalAssignments": [{
                 "itemId": "batch1_1",
-                "leafNodeId": report_leaf,
-                "categoryPath": ["Documents", "Reports"],
-                "reason": "classified in isolated batch"
+                "leafNodeId": "n2"
             }]
         });
         let responses = vec![
@@ -1179,6 +1207,14 @@ mod tests {
         .await
         .expect("reconcile output");
         assert!(output.error.is_none());
+        assert_eq!(
+            output
+                .parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/finalAssignments/0/leafNodeId"))
+                .and_then(Value::as_str),
+            Some(report_leaf.as_str())
+        );
 
         let requests = server.join().expect("mock server joined");
         let first_request = request_json_body(&requests[0]);
@@ -1196,13 +1232,55 @@ mod tests {
 
         assert!(user_payload.get("initialTree").is_some());
         assert!(user_payload.get("classificationResults").is_some());
+        assert_eq!(
+            user_payload.pointer("/initialTree/children/0/children/0/nodeId"),
+            Some(&json!("n2"))
+        );
+        assert_eq!(
+            user_payload.pointer("/classificationResults/0/treeProposals/0/targetNodeId"),
+            Some(&json!("n2"))
+        );
         assert!(user_payload.get("fileIndex").is_none());
         assert!(user_payload.get("batchOutputs").is_none());
         assert!(!messages[1]
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default()
+            .contains(&report_leaf));
+        assert!(!messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
             .contains("modelRawOutput"));
+        assert!(!messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("should be stripped"));
+
+        let second_request = request_json_body(&requests[1]);
+        let second_messages = second_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("second messages");
+        assert_eq!(second_messages.len(), 2);
+        assert!(!second_messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("classificationResults"));
+
+        let third_request = request_json_body(&requests[2]);
+        let third_messages = third_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("third messages");
+        assert_eq!(third_messages.len(), 2);
+        assert!(!third_messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("classificationResults"));
     }
 
     #[tokio::test]
@@ -1219,6 +1297,13 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(8);
+        let chunk_size = env::var("WIPEOUT_CLASSIFICATION_SMOKE_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(max_items)
+            .min(max_items)
+            .max(1);
 
         assert!(root.is_dir(), "smoke root must be a directory: {:?}", root);
         assert!(
@@ -1234,8 +1319,9 @@ mod tests {
         let collect_started_at = Instant::now();
         let collection = collect_units(&root, true, &normalize_excluded(None), &stop);
         let collect_elapsed = collect_started_at.elapsed();
-        let units = collection
-            .units
+        let collected_units = collection.units;
+        let collected_count = collected_units.len();
+        let units = collected_units
             .into_iter()
             .take(max_items)
             .collect::<Vec<_>>();
@@ -1253,36 +1339,108 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert("text".to_string(), route.clone());
         let task = make_summary_test_runtime(&root, routes);
-        let summary_started_at = Instant::now();
-        let prepared = prepare_summary_batch(task, route.clone(), summary_strategy, 0, units)
+        let mut summary_elapsed = Duration::default();
+        let mut classify_elapsed = Duration::default();
+        let mut total_usage = TokenUsage::default();
+        let mut total_rows = 0usize;
+        let mut total_assigned = 0usize;
+        let mut last_parsed = Value::Null;
+
+        for (chunk_idx, chunk) in units.chunks(chunk_size).enumerate() {
+            let summary_started_at = Instant::now();
+            let prepared = prepare_summary_batch(
+                task.clone(),
+                route.clone(),
+                summary_strategy.clone(),
+                chunk_idx,
+                chunk.to_vec(),
+            )
             .await
             .expect("prepare real folder smoke summary batch");
-        let summary_elapsed = summary_started_at.elapsed();
-        let tree = deterministic_initial_tree(&prepared.batch_rows);
-        let classify_started_at = Instant::now();
-        let output = summary::classify_organize_batch(
-            &route,
-            "zh-CN",
-            &stop,
-            &tree,
-            1,
-            &prepared.batch_rows,
-            &[],
-            None,
-            false,
-            "",
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            None,
-            "real_folder_classification_smoke",
-        )
-        .await
-        .expect("run real folder classification smoke");
-        let classify_elapsed = classify_started_at.elapsed();
+            let batch_summary_elapsed = summary_started_at.elapsed();
+            summary_elapsed += batch_summary_elapsed;
+
+            let tree = deterministic_initial_tree(&prepared.batch_rows);
+            let classify_started_at = Instant::now();
+            let output = summary::classify_organize_batch(
+                &route,
+                "zh-CN",
+                &stop,
+                &tree,
+                1,
+                &prepared.batch_rows,
+                &[],
+                None,
+                false,
+                "",
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                None,
+                "real_folder_classification_smoke",
+            )
+            .await
+            .expect("run real folder classification smoke");
+            let batch_classify_elapsed = classify_started_at.elapsed();
+            classify_elapsed += batch_classify_elapsed;
+
+            println!(
+                "batch={} items={} timing=summary:{}ms,classify_model:{}ms usage=prompt:{},completion:{},total:{}",
+                chunk_idx + 1,
+                prepared.batch_rows.len(),
+                batch_summary_elapsed.as_millis(),
+                batch_classify_elapsed.as_millis(),
+                output.usage.prompt,
+                output.usage.completion,
+                output.usage.total
+            );
+
+            assert!(
+                output.error.is_none(),
+                "real model classification failed in batch {}: {:?}\n{}",
+                chunk_idx + 1,
+                output.error,
+                output.raw_output
+            );
+            let parsed = output.parsed.expect("real model submitted classification");
+            assert_eq!(
+                parsed.get("baseTreeVersion").and_then(Value::as_u64),
+                Some(1)
+            );
+            let direct = parsed
+                .get("assignments")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let deferred = parsed
+                .get("deferredAssignments")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let assigned = direct + deferred;
+            assert!(
+                assigned >= prepared.batch_rows.len(),
+                "real model did not assign all smoke items in batch {}: direct={}, deferred={}, items={}",
+                chunk_idx + 1,
+                direct,
+                deferred,
+                prepared.batch_rows.len()
+            );
+
+            total_rows += prepared.batch_rows.len();
+            total_assigned += assigned;
+            total_usage.prompt += output.usage.prompt;
+            total_usage.completion += output.usage.completion;
+            total_usage.total += output.usage.total;
+            last_parsed = parsed;
+        }
+
         let total_elapsed = smoke_started_at.elapsed();
 
         println!("root={}", root.display());
-        println!("items={}", prepared.batch_rows.len());
+        println!("items={}", total_rows);
+        println!("collected_items={}", collected_count);
+        println!("chunk_size={}", chunk_size);
+        println!("chunks={}", units.chunks(chunk_size).len());
         println!(
             "timing=collect:{}ms,summary:{}ms,classify_model:{}ms,total:{}ms",
             collect_elapsed.as_millis(),
@@ -1292,38 +1450,12 @@ mod tests {
         );
         println!(
             "usage=prompt:{},completion:{},total:{}",
-            output.usage.prompt, output.usage.completion, output.usage.total
+            total_usage.prompt, total_usage.completion, total_usage.total
         );
-
-        assert!(
-            output.error.is_none(),
-            "real model classification failed: {:?}\n{}",
-            output.error,
-            output.raw_output
-        );
-        let parsed = output.parsed.expect("real model submitted classification");
-        println!("parsed={}", parsed);
-        assert_eq!(
-            parsed.get("baseTreeVersion").and_then(Value::as_u64),
-            Some(1)
-        );
-        let direct = parsed
-            .get("assignments")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0);
-        let deferred = parsed
-            .get("deferredAssignments")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0);
-        assert!(
-            direct + deferred >= prepared.batch_rows.len(),
-            "real model did not assign all smoke items: direct={}, deferred={}, items={}",
-            direct,
-            deferred,
-            prepared.batch_rows.len()
-        );
+        println!("assigned={}", total_assigned);
+        if total_rows <= 16 {
+            println!("parsed={}", last_parsed);
+        }
     }
 
     #[test]

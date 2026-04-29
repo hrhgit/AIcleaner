@@ -26,16 +26,20 @@ fn pending_reconcile_input(
     parsed: &Value,
     batch_error: Option<&str>,
 ) -> Option<Value> {
-    let tree_proposals = parsed
-        .get("treeProposals")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let deferred_assignments = parsed
-        .get("deferredAssignments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let tree_proposals = compact_reconcile_tree_proposals(
+        parsed
+            .get("treeProposals")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let deferred_assignments = compact_reconcile_deferred_assignments(
+        parsed
+            .get("deferredAssignments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
     let error = batch_error.unwrap_or("").trim();
 
     if tree_proposals.is_empty() && deferred_assignments.is_empty() && error.is_empty() {
@@ -51,6 +55,54 @@ fn pending_reconcile_input(
     }))
 }
 
+fn compact_reconcile_tree_proposals(values: &[Value]) -> Vec<Value> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let proposal_id = value.get("proposalId").and_then(Value::as_str)?.trim();
+            if proposal_id.is_empty() {
+                return None;
+            }
+            let mut out = json!({ "proposalId": proposal_id });
+            for key in [
+                "operation",
+                "targetNodeId",
+                "sourceNodeIds",
+                "suggestedName",
+                "suggestedPath",
+                "evidenceItemIds",
+            ] {
+                if let Some(field) = value.get(key) {
+                    if !field.is_null() {
+                        out[key] = field.clone();
+                    }
+                }
+            }
+            Some(out)
+        })
+        .collect()
+}
+
+fn compact_reconcile_deferred_assignments(values: &[Value]) -> Vec<Value> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let item_id = value.get("itemId").and_then(Value::as_str)?.trim();
+            if item_id.is_empty() {
+                return None;
+            }
+            let mut out = json!({ "itemId": item_id });
+            for key in ["proposalId", "suggestedPath", "confidence"] {
+                if let Some(field) = value.get(key) {
+                    if !field.is_null() {
+                        out[key] = field.clone();
+                    }
+                }
+            }
+            Some(out)
+        })
+        .collect()
+}
 fn refresh_assignment_paths(
     assignments: &mut HashMap<String, (String, Vec<String>, String)>,
     tree: &CategoryTreeNode,

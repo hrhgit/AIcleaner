@@ -4,6 +4,7 @@ use crate::agent_runtime::{
     AgentTurnSpec, ToolCallErrorOutcome, ToolCallOutcome,
 };
 use crate::llm_tools::{ToolExecutionContext, ToolId, ToolRegistry, ToolResult, ToolWorkflow};
+use serde_json::Map;
 
 fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -1084,13 +1085,207 @@ fn build_reconcile_system_prompt(response_language: &str, stage: &str) -> String
         .to_ascii_lowercase()
         .starts_with("zh");
     match (zh, stage) {
-        (true, "reconcile_tree") => "你负责统一处理并行分类阶段提交的结构化 classificationResults，包括 treeProposals 和 deferredAssignments。只能使用初始树和这些分类结果；不要依赖上一阶段提示词、原始模型输出、文件抽取上下文或隐藏元数据。提交一版 draftTree、proposalMappings 和 rejectedProposalIds；不要输出自然语言结果，只调用 revise_tree_draft。".to_string(),
+        (true, "reconcile_tree") => "你负责统一处理并行分类阶段提交的待处理结果，只处理 treeProposals 和 deferredAssignments。直接 assignments 已由 runtime 合并，不会提供，也不要重新输出。nodeId 使用本轮短别名，必须原样保留这些别名。提交一版 draftTree、proposalMappings 和 rejectedProposalIds；不要输出自然语言结果，只调用 revise_tree_draft。".to_string(),
         (true, "review_tree") => "你负责对 runtime 指定的局部范围做审查。只提交 issues、recommendedOperations 和 needsRevision；不要直接改树，只调用 review_organize_draft。".to_string(),
-        (true, "submit_reconciled_tree") => "你负责提交最终分类树和最终文件分配。必须确保每个有效文件 exactly once，所有 leafNodeId 存在；只调用 submit_reconciled_tree。".to_string(),
-        (false, "reconcile_tree") => "Reconcile structured classificationResults from parallel classification, including treeProposals and deferredAssignments. Use only the initial tree and those classification results; do not rely on prior prompts, raw model traces, file extraction context, or hidden metadata. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
+        (true, "submit_reconciled_tree") => "你负责提交通过审查后的最终分类树，以及仅待处理 item 的最终分配。直接 assignments 已由 runtime 持有，不要重新输出所有文件。所有 leafNodeId 必须存在于 finalTree；只调用 submit_reconciled_tree。".to_string(),
+        (false, "reconcile_tree") => "Reconcile only pending structured classification results: treeProposals and deferredAssignments. Direct assignments are already merged by the runtime and are not provided; do not restate them. nodeId values use prompt-local short aliases and must be preserved exactly. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
         (false, "review_tree") => "Review only the runtime-provided local scopes. Submit issues, recommendedOperations, and needsRevision; do not modify the tree; call review_organize_draft only.".to_string(),
-        _ => "Submit the final category tree and final file assignments. Ensure each valid file appears exactly once and all leafNodeId values exist; call submit_reconciled_tree only.".to_string(),
+        _ => "Submit the reviewed final tree and only the pending item assignments. Direct assignments are already held by the runtime; do not restate every file. Ensure all leafNodeId values exist in finalTree; call submit_reconciled_tree only.".to_string(),
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReconcileNodeAliases {
+    to_alias: HashMap<String, String>,
+    to_real: HashMap<String, String>,
+}
+
+impl ReconcileNodeAliases {
+    fn from_tree(value: &Value) -> Self {
+        fn visit(value: &Value, out: &mut Vec<String>) {
+            let Some(obj) = value.as_object() else {
+                return;
+            };
+            if let Some(node_id) = obj.get("nodeId").and_then(Value::as_str) {
+                let node_id = node_id.trim();
+                if !node_id.is_empty() && node_id != "root" && !out.iter().any(|id| id == node_id) {
+                    out.push(node_id.to_string());
+                }
+            }
+            if let Some(children) = obj.get("children").and_then(Value::as_array) {
+                for child in children {
+                    visit(child, out);
+                }
+            }
+        }
+
+        let mut ids = Vec::new();
+        visit(value, &mut ids);
+        let mut aliases = Self::default();
+        for (idx, real) in ids.into_iter().enumerate() {
+            let alias = format!("n{}", idx + 1);
+            aliases.to_alias.insert(real.clone(), alias.clone());
+            aliases.to_real.insert(alias, real);
+        }
+        aliases
+    }
+
+    fn compact_value(&self, value: &Value) -> Value {
+        self.rewrite_value(value, true)
+    }
+
+    fn expand_value(&self, value: &Value) -> Value {
+        self.rewrite_value(value, false)
+    }
+
+    fn rewrite_value(&self, value: &Value, compact: bool) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.rewrite_value(item, compact))
+                    .collect(),
+            ),
+            Value::Object(obj) => {
+                let mut out = Map::new();
+                for (key, field) in obj {
+                    out.insert(key.clone(), self.rewrite_field(key, field, compact));
+                }
+                Value::Object(out)
+            }
+            _ => value.clone(),
+        }
+    }
+
+    fn rewrite_field(&self, key: &str, value: &Value, compact: bool) -> Value {
+        match key {
+            "nodeId" | "leafNodeId" | "targetNodeId" => value
+                .as_str()
+                .map(|id| Value::String(self.rewrite_id(id, compact)))
+                .unwrap_or_else(|| self.rewrite_value(value, compact)),
+            "sourceNodeIds" | "nodeIds" => Value::Array(
+                value
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(|id| Value::String(self.rewrite_id(id, compact)))
+                            .unwrap_or_else(|| self.rewrite_value(item, compact))
+                    })
+                    .collect(),
+            ),
+            _ => self.rewrite_value(value, compact),
+        }
+    }
+
+    fn rewrite_id(&self, id: &str, compact: bool) -> String {
+        let trimmed = id.trim();
+        if compact {
+            self.to_alias
+                .get(trimmed)
+                .cloned()
+                .unwrap_or_else(|| trimmed.to_string())
+        } else {
+            self.to_real
+                .get(trimmed)
+                .cloned()
+                .unwrap_or_else(|| trimmed.to_string())
+        }
+    }
+}
+
+fn pending_deferred_assignments(classification_results: &[Value]) -> Vec<Value> {
+    classification_results
+        .iter()
+        .flat_map(|result| {
+            result
+                .get("deferredAssignments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn compact_classification_result_for_reconcile(value: &Value) -> Value {
+    let source = value
+        .get("output")
+        .filter(|field| field.is_object())
+        .unwrap_or(value);
+    json!({
+        "batchIndex": value.get("batchIndex").and_then(Value::as_u64).unwrap_or(0),
+        "baseTreeVersion": value
+            .get("baseTreeVersion")
+            .or_else(|| source.get("baseTreeVersion"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        "treeProposals": compact_tree_proposals_for_reconcile(
+            source
+                .get("treeProposals")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ),
+        "deferredAssignments": compact_deferred_assignments_for_reconcile(
+            source
+                .get("deferredAssignments")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ),
+        "error": value.get("error").and_then(Value::as_str).unwrap_or(""),
+    })
+}
+
+fn compact_tree_proposals_for_reconcile(values: &[Value]) -> Vec<Value> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let proposal_id = value.get("proposalId").and_then(Value::as_str)?.trim();
+            if proposal_id.is_empty() {
+                return None;
+            }
+            let mut out = json!({ "proposalId": proposal_id });
+            for key in [
+                "operation",
+                "targetNodeId",
+                "sourceNodeIds",
+                "suggestedName",
+                "suggestedPath",
+                "evidenceItemIds",
+            ] {
+                if let Some(field) = value.get(key) {
+                    if !field.is_null() {
+                        out[key] = field.clone();
+                    }
+                }
+            }
+            Some(out)
+        })
+        .collect()
+}
+
+fn compact_deferred_assignments_for_reconcile(values: &[Value]) -> Vec<Value> {
+    values
+        .iter()
+        .filter_map(|value| {
+            let item_id = value.get("itemId").and_then(Value::as_str)?.trim();
+            if item_id.is_empty() {
+                return None;
+            }
+            let mut out = json!({ "itemId": item_id });
+            for key in ["proposalId", "suggestedPath", "confidence"] {
+                if let Some(field) = value.get(key) {
+                    if !field.is_null() {
+                        out[key] = field.clone();
+                    }
+                }
+            }
+            Some(out)
+        })
+        .collect()
 }
 
 pub(super) async fn generate_initial_tree(
@@ -1328,17 +1523,13 @@ pub(super) async fn reconcile_organize_batches(
     classification_results: &[Value],
     diagnostics: Option<&OrganizerDiagnostics>,
 ) -> Result<ReconcileOrganizeOutput, String> {
-    let messages = vec![
-        json!({ "role": "system", "content": build_reconcile_system_prompt(response_language, "reconcile_tree") }),
-        json!({
-            "role": "user",
-            "content": json!({
-                "initialTree": initial_tree,
-                "classificationResults": classification_results,
-                "instruction": "Use only initialTree and classificationResults from previous stages. Do not infer from prior prompts, raw model traces, file extraction context, or hidden file metadata. First call revise_tree_draft. After runtime validation, call review_organize_draft for the provided scope. When clean, call submit_reconciled_tree."
-            }).to_string(),
-        }),
-    ];
+    let aliases = ReconcileNodeAliases::from_tree(initial_tree);
+    let compact_initial_tree = aliases.compact_value(initial_tree);
+    let compact_classification_results = classification_results
+        .iter()
+        .map(compact_classification_result_for_reconcile)
+        .map(|value| aliases.compact_value(&value))
+        .collect::<Vec<_>>();
     let llm = OrganizerBatchLlm {
         route: text_route,
         stop,
@@ -1350,7 +1541,9 @@ pub(super) async fn reconcile_organize_batches(
         route: text_route,
         response_language,
         stage: "reconcile_tree",
-        initial_messages: messages,
+        initial_tree: compact_initial_tree,
+        classification_results: compact_classification_results,
+        aliases,
         total_usage: TokenUsage::default(),
         round_trace: Vec::new(),
         available_tool_names: Vec::new(),
@@ -1364,7 +1557,9 @@ struct ReconcileSpec<'a> {
     route: &'a RouteConfig,
     response_language: &'a str,
     stage: &'static str,
-    initial_messages: Vec<Value>,
+    initial_tree: Value,
+    classification_results: Vec<Value>,
+    aliases: ReconcileNodeAliases,
     total_usage: TokenUsage,
     round_trace: Vec<String>,
     available_tool_names: Vec<&'static str>,
@@ -1375,10 +1570,58 @@ struct ReconcileSpec<'a> {
 impl ReconcileSpec<'_> {
     fn output(&self, parsed: Option<Value>, error: Option<String>) -> ReconcileOrganizeOutput {
         ReconcileOrganizeOutput {
-            parsed,
+            parsed: parsed.map(|value| self.aliases.expand_value(&value)),
             usage: self.total_usage.clone(),
             raw_output: self.round_trace.join("\n\n====================\n\n"),
             error,
+        }
+    }
+
+    fn stage_messages(&self) -> Vec<Value> {
+        vec![
+            json!({
+                "role": "system",
+                "content": build_reconcile_system_prompt(self.response_language, self.stage),
+            }),
+            json!({
+                "role": "user",
+                "content": self.stage_user_payload().to_string(),
+            }),
+        ]
+    }
+
+    fn stage_user_payload(&self) -> Value {
+        match self.stage {
+            "review_tree" => json!({
+                "draft": self.latest_draft.clone(),
+                "reviewScope": { "type": "changed_nodes" },
+                "instruction": "Review only this draft and proposal mappings. Return issues and needsRevision; do not restate classification input."
+            }),
+            "submit_reconciled_tree" => json!({
+                "draft": self.latest_draft.clone(),
+                "review": self.latest_review.clone(),
+                "pendingAssignments": pending_deferred_assignments(&self.classification_results),
+                "instruction": "Submit finalTree plus proposalMappings. finalAssignments must include only pendingAssignments that still need placement; direct assignments are already merged by runtime."
+            }),
+            _ => {
+                let mut payload = json!({
+                    "initialTree": self.initial_tree.clone(),
+                    "classificationResults": self.classification_results.clone(),
+                    "inputContract": {
+                        "pendingOnly": true,
+                        "nodeIds": "prompt-local aliases; preserve aliases exactly in tool calls",
+                        "omitted": ["direct assignments", "reasons", "raw model output", "file extraction context"]
+                    },
+                    "instruction": "Use only initialTree and pending classificationResults. First call revise_tree_draft. Runtime will review the draft; when clean, submit only pending finalAssignments."
+                });
+                if !self.latest_draft.is_null() {
+                    payload["previousDraft"] = self.latest_draft.clone();
+                }
+                if !self.latest_review.is_null() {
+                    payload["reviewFeedback"] = self.latest_review.clone();
+                }
+                payload
+            }
         }
     }
 }
@@ -1407,16 +1650,11 @@ impl AgentTurnSpec for ReconcileSpec<'_> {
     }
 
     fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
-        Ok(std::mem::take(&mut self.initial_messages))
+        Ok(Vec::new())
     }
 
     fn before_step(&mut self, _step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
-        if let Some(system_message) = messages.get_mut(0) {
-            system_message["content"] = Value::String(build_reconcile_system_prompt(
-                self.response_language,
-                self.stage,
-            ));
-        }
+        *messages = self.stage_messages();
         self.available_tool_names = match self.stage {
             "reconcile_tree" => vec!["revise_tree_draft"],
             "review_tree" => vec!["review_organize_draft"],
