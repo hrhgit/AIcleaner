@@ -1014,6 +1014,61 @@ mod tests {
         assert!(!output.raw_output.contains(CATEGORY_OTHER_PENDING));
     }
 
+    #[test]
+    fn pending_reconcile_input_omits_confirmed_assignments() {
+        let parsed = json!({
+            "baseTreeVersion": 7,
+            "assignments": [{
+                "itemId": "batch1_1",
+                "leafNodeId": "documents",
+                "categoryPath": ["Documents"],
+                "reason": "already classified"
+            }],
+            "treeProposals": [],
+            "deferredAssignments": []
+        });
+
+        assert!(pending_reconcile_input(1, 7, &parsed, None).is_none());
+    }
+
+    #[test]
+    fn pending_reconcile_input_keeps_only_pending_fields() {
+        let parsed = json!({
+            "baseTreeVersion": 7,
+            "assignments": [{
+                "itemId": "batch1_1",
+                "leafNodeId": "documents",
+                "categoryPath": ["Documents"],
+                "reason": "already classified"
+            }],
+            "treeProposals": [{
+                "proposalId": "proposal_1",
+                "suggestedPath": ["Documents", "Receipts"]
+            }],
+            "deferredAssignments": [{
+                "itemId": "batch1_2",
+                "proposalId": "proposal_1",
+                "reason": "needs proposed category"
+            }]
+        });
+
+        let input = pending_reconcile_input(1, 7, &parsed, Some(""))
+            .expect("pending reconcile input");
+
+        assert_eq!(input["batchIndex"], json!(1));
+        assert_eq!(input["baseTreeVersion"], json!(7));
+        assert!(input.get("output").is_none());
+        assert!(input.get("assignments").is_none());
+        assert_eq!(
+            input["treeProposals"][0]["proposalId"],
+            json!("proposal_1")
+        );
+        assert_eq!(
+            input["deferredAssignments"][0]["itemId"],
+            json!("batch1_2")
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_receives_only_tree_and_classification_results() {
         let mut tree = default_tree();

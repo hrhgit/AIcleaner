@@ -20,6 +20,52 @@ fn token_usage_json(usage: &TokenUsage) -> Value {
     })
 }
 
+fn pending_reconcile_input(
+    batch_index: usize,
+    base_tree_version: u64,
+    parsed: &Value,
+    batch_error: Option<&str>,
+) -> Option<Value> {
+    let tree_proposals = parsed
+        .get("treeProposals")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let deferred_assignments = parsed
+        .get("deferredAssignments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let error = batch_error.unwrap_or("").trim();
+
+    if tree_proposals.is_empty() && deferred_assignments.is_empty() && error.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "batchIndex": batch_index,
+        "baseTreeVersion": base_tree_version,
+        "treeProposals": tree_proposals,
+        "deferredAssignments": deferred_assignments,
+        "error": error,
+    }))
+}
+
+fn refresh_assignment_paths(
+    assignments: &mut HashMap<String, (String, Vec<String>, String)>,
+    tree: &CategoryTreeNode,
+) -> Result<(), String> {
+    for (item_id, (leaf_node_id, category_path, _reason)) in assignments.iter_mut() {
+        let Some(path) = category_path_for_id(tree, leaf_node_id) else {
+            return Err(format!(
+                "reconcile_failed:existing assignment for {item_id} references missing leafNodeId:{leaf_node_id}"
+            ));
+        };
+        *category_path = path;
+    }
+    Ok(())
+}
+
 fn spawn_summary_prefetch(
     task: &Arc<OrganizeTaskRuntime>,
     text_route: &RouteConfig,
@@ -807,12 +853,14 @@ async fn run_organize_task<R: Runtime>(
             "modelRawOutput": output.raw_output,
         });
         batch_outputs.push(batch_record);
-        reconcile_inputs.push(json!({
-            "batchIndex": prepared.batch_idx + 1,
-            "baseTreeVersion": base_tree_version,
-            "output": parsed,
-            "error": batch_error.clone().unwrap_or_default(),
-        }));
+        if let Some(input) = pending_reconcile_input(
+            prepared.batch_idx + 1,
+            base_tree_version,
+            &parsed,
+            batch_error.as_deref(),
+        ) {
+            reconcile_inputs.push(input);
+        }
         {
             let mut snap = task.snapshot.lock();
             set_organize_progress(
@@ -984,7 +1032,8 @@ async fn run_organize_task<R: Runtime>(
         );
     }
     emit_snapshot(app, state, task).await?;
-    if !text_route.api_key.trim().is_empty() && !rows_by_id.is_empty() {
+    let reconcile_used_model = !text_route.api_key.trim().is_empty() && !reconcile_inputs.is_empty();
+    if reconcile_used_model {
         match summary::reconcile_organize_batches(
             &text_route,
             &task.response_language,
@@ -1054,7 +1103,8 @@ async fn run_organize_task<R: Runtime>(
                         );
                     }
                     tree = reconciled_tree;
-                    final_assignment_inputs = reconciled_assignments;
+                    refresh_assignment_paths(&mut final_assignment_inputs, &tree)?;
+                    final_assignment_inputs.extend(reconciled_assignments);
                     proposal_map.clear();
                     for mapping in parsed
                         .get("proposalMappings")
@@ -1091,8 +1141,9 @@ async fn run_organize_task<R: Runtime>(
     task.diagnostics.stage_completed(
         "reconcile",
         json!({
-            "usedModel": !text_route.api_key.trim().is_empty() && !rows_by_id.is_empty(),
+            "usedModel": reconcile_used_model,
             "rowCount": rows_by_id.len(),
+            "pendingBatchCount": reconcile_inputs.len(),
             "tokenUsage": token_usage_json(&reconcile_token_usage),
         }),
         reconcile_elapsed,
