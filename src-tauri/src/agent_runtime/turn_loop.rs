@@ -135,7 +135,7 @@ where
                 };
                 match dispatch_result {
                     Ok(result) => {
-                        trace.record_tool_result(step, &call, "ok", result.envelope());
+                        trace.record_tool_result(step, &call, "ok", result.result.clone());
                         match spec.on_tool_success(step, tool_id, &call, result, &trace)? {
                             ToolCallOutcome::Continue { result } => {
                                 messages.push(tool_result_message(&call.id, result));

@@ -729,20 +729,17 @@ mod tests {
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(
-            item.get("summaryText").and_then(Value::as_str),
+            item.get("evidence").and_then(Value::as_str),
             Some("季度财务报告，包含季度财务指标与结论。")
         );
         assert_eq!(
-            item.pointer("/representation/keywords")
+            item.get("keywords")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(2),
         );
-        assert_eq!(
-            item.pointer("/representation/source")
-                .and_then(Value::as_str),
-            Some("agent_summary")
-        );
+        assert!(item.get("summaryText").is_none());
+        assert!(item.get("representation").is_none());
         assert!(item.get("createdAge").is_some());
         assert!(item.get("modifiedAge").is_some());
         assert!(item.get("localExtraction").is_none());
@@ -750,6 +747,45 @@ mod tests {
         assert!(item.get("size").is_none());
         assert!(item.get("createdAt").is_none());
         assert!(item.get("modifiedAt").is_none());
+    }
+
+    #[test]
+    fn classification_file_index_only_includes_paths_for_duplicate_names() {
+        let file_index = summary::build_classification_file_index(&[
+            json!({
+                "itemId": "batch1_1",
+                "name": "report.pdf",
+                "relativePath": "finance\\report.pdf",
+                "itemType": "file",
+                "modality": "text",
+                "representation": { "metadata": "should not be copied" }
+            }),
+            json!({
+                "itemId": "batch1_2",
+                "name": "report.pdf",
+                "relativePath": "sales\\report.pdf",
+                "itemType": "file",
+                "modality": "text"
+            }),
+            json!({
+                "itemId": "batch1_3",
+                "name": "cover.png",
+                "relativePath": "images\\cover.png",
+                "itemType": "file",
+                "modality": "image"
+            }),
+        ]);
+
+        assert_eq!(file_index.len(), 3);
+        assert_eq!(file_index[0]["relativePath"], Value::from("finance\\report.pdf"));
+        assert_eq!(file_index[1]["relativePath"], Value::from("sales\\report.pdf"));
+        assert!(file_index[2].get("relativePath").is_none());
+        for row in file_index {
+            assert!(row.get("itemType").is_none());
+            assert!(row.get("modality").is_none());
+            assert!(row.get("representation").is_none());
+            assert!(row.get("summaryText").is_none());
+        }
     }
 
     #[tokio::test]
@@ -819,7 +855,7 @@ mod tests {
             "baseTreeVersion": 7,
             "assignments": [{
                 "itemId": "batch1_1",
-                "leafNodeId": report_leaf,
+                "leafNodeId": "n2",
                 "reason": "financial report"
             }],
             "treeProposals": [{
@@ -919,31 +955,65 @@ mod tests {
         .expect("parse classification payload");
         assert_eq!(user_payload["baseTreeVersion"], Value::from(7));
         assert_eq!(
-            user_payload["categoryInventory"],
-            Value::Array(category_inventory)
+            user_payload
+                .pointer("/categoryInventory/0/nodeId")
+                .and_then(Value::as_str),
+            Some("n2")
+        );
+        assert_ne!(
+            user_payload
+                .pointer("/categoryInventory/0/nodeId")
+                .and_then(Value::as_str),
+            Some(report_leaf.as_str())
         );
 
-        for section in ["items", "fileIndex"] {
-            let rows = user_payload
-                .get(section)
+        let items = user_payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("payload items");
+        assert_eq!(items.len(), 2);
+        for row in items {
+            assert!(row.get("path").is_none(), "items leaked path");
+            assert!(row.get("size").is_none(), "items leaked size");
+            assert!(
+                row.get("localExtraction").is_none(),
+                "items leaked localExtraction"
+            );
+            assert!(row.get("createdAt").is_none(), "items leaked createdAt");
+            assert!(row.get("modifiedAt").is_none(), "items leaked modifiedAt");
+            assert!(row.get("summaryText").is_none());
+            assert!(row.get("representation").is_none());
+            assert!(row.get("evidence").is_some());
+            assert!(row.get("relativePath").is_some());
+        }
+        assert_eq!(
+            items[0].get("evidence").and_then(Value::as_str),
+            Some("Quarterly finance report with budget and revenue notes.")
+        );
+        assert_eq!(
+            items[0]
+                .get("keywords")
                 .and_then(Value::as_array)
-                .expect("payload rows");
-            assert_eq!(rows.len(), 2);
-            for row in rows {
-                assert!(row.get("path").is_none(), "{section} leaked path");
-                assert!(row.get("size").is_none(), "{section} leaked size");
-                assert!(
-                    row.get("localExtraction").is_none(),
-                    "{section} leaked localExtraction"
-                );
-                assert!(row.get("createdAt").is_none(), "{section} leaked createdAt");
-                assert!(
-                    row.get("modifiedAt").is_none(),
-                    "{section} leaked modifiedAt"
-                );
-                assert!(row.get("summaryText").is_some());
-                assert!(row.get("relativePath").is_some());
-            }
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let file_index = user_payload
+            .get("fileIndex")
+            .and_then(Value::as_array)
+            .expect("payload file index");
+        assert_eq!(file_index.len(), 2);
+        for row in file_index {
+            assert!(row.get("itemId").is_some());
+            assert!(row.get("name").is_some());
+            assert!(row.get("relativePath").is_none());
+            assert!(row.get("path").is_none());
+            assert!(row.get("size").is_none());
+            assert!(row.get("itemType").is_none());
+            assert!(row.get("modality").is_none());
+            assert!(row.get("summaryText").is_none());
+            assert!(row.get("representation").is_none());
+            assert!(row.get("evidence").is_none());
         }
     }
 

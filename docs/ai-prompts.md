@@ -37,8 +37,9 @@ Code / 代码位置:
 当你准备好时，调用 submit_organize_result。
 每次回复最多调用一个工具。
 
-已有节点已经拥有稳定的 nodeId。
-当你复用、重命名或移动已有节点时，必须保留原 nodeId。
+已有节点在本轮输入中使用 prompt-local 短 nodeId，例如 n1、n2。
+当你复用、重命名或移动已有节点时，必须原样保留这些短 nodeId。
+不要生成 UUID 或后端真实 ID；新增分类请使用 treeProposals 的 suggestedPath 表达。
 
 assignment 中的 reason 字段必须放在最前面，格式为 reason、itemId、leafNodeId、categoryPath。
 
@@ -50,28 +51,28 @@ assignment 中的 reason 字段必须放在最前面，格式为 reason、itemId
 不要在顶层优先按业务用途分类，除非文件的基础类型已经清楚。
 
 证据优先级：
-1. 如果存在 summaryText，优先使用 summaryText。
+1. 如果存在 evidence，优先使用 evidence。
 2. 其次使用 itemType 和 modality。
 3. 再参考文件扩展名和 MIME 类型。
 4. 再参考文件名关键词和路径模式。
 5. 最后参考大小、时间和其他元数据。
 
-当 summaryText 存在时，优先依据 summaryText 判断。
-当 summaryText 不存在时，使用 name、relativePath、itemType、modality 和 representation metadata 判断。
-不要因为缺少 summaryText 就假设文件内容未知或无法分类。
+当 evidence 存在时，优先依据 evidence 判断。
+当 evidence 较少时，使用 name、relativePath、itemType、modality 判断。
+不要因为 evidence 很短就假设文件内容未知或无法分类。
 
 类型优先规则：
 如果文件的扩展名、文件名模式、MIME 类型或 itemType 能明确指向某个基础类别，即使具体用途不明，也应按该基础类型分类。
 不要仅仅因为不知道文件的业务用途、来源应用或具体内容，就归入"其他待定"。
 
-只有当无法根据 name、extension、MIME type、relativePath、size、time metadata、itemType、modality 或 representation metadata 判断文件基础类型时，才使用"其他待定"。
+只有当无法根据 name、extension、MIME type、relativePath、size、time metadata、itemType、modality 或 evidence 判断文件基础类型时，才使用"其他待定"。
 
 冲突处理：
-如果语义推断结果与强文件类型证据冲突，优先相信文件类型证据，除非 summaryText 明确证明该文件应归入其他类别。
+如果语义推断结果与强文件类型证据冲突，优先相信文件类型证据，除非 evidence 明确证明该文件应归入其他类别。
 如果置信度较低，但文件基础类型仍然可以判断，应归入最接近的类型类别，并在 reason 中简要说明不确定性。
 
 目录整体归类规则：
-当 item representation 或 summaryText 中包含 resultKind=whole 时，将其视为目录整体候选。
+当 item evidence 中包含 resultKind=whole 时，将其视为目录整体候选。
 如果该目录内容看起来具有一致的类型或用途，优先将目录作为一个整体分配到分类树中。
 只有当证据明确显示该目录包含无关的混合内容时，才拆分目录中的内容分别归类。
 
@@ -101,8 +102,9 @@ Do not return the final tree as plain assistant text.
 When you are ready, call submit_organize_result.
 Call at most one tool per reply.
 
-Existing nodes already have stable nodeId values.
-Keep nodeId when you reuse, rename, or move existing nodes.
+Existing nodes use prompt-local short nodeId values in this request, such as n1 and n2.
+Keep those short nodeId values exactly when you reuse, rename, or move existing nodes.
+Do not generate UUIDs or backend real IDs; use treeProposals suggestedPath for new categories.
 
 The assignment "reason" field must come first, in the order: reason, itemId, leafNodeId, categoryPath.
 
@@ -114,28 +116,28 @@ Top-level categories should be based primarily on the file's fundamental type, s
 Do not classify primarily by business purpose at the top level unless the fundamental file type is already clear.
 
 Evidence priority:
-1. Prefer summaryText when it exists.
+1. Prefer evidence when it exists.
 2. Then use itemType and modality.
 3. Then use file extension and MIME type.
 4. Then use filename keywords and path patterns.
 5. Finally use size, time, and other metadata.
 
-When summaryText exists, prefer it.
-When summaryText is missing, classify using name, relativePath, itemType, modality, and representation metadata.
-Do not assume missing summaryText means the content is unknown or unclassifiable.
+When evidence exists, prefer it.
+When evidence is sparse, classify using name, relativePath, itemType, and modality.
+Do not assume short evidence means the content is unknown or unclassifiable.
 
 Type-first rule:
 If a file's extension, filename pattern, MIME type, or itemType clearly indicates a fundamental category, classify it by that type even if its specific purpose is unclear.
 Do not use "其他待定" merely because the file's business purpose, source application, or exact content is unknown.
 
-Only use "其他待定" when the file's fundamental type cannot be determined from name, extension, MIME type, relativePath, size, time metadata, itemType, modality, or representation metadata.
+Only use "其他待定" when the file's fundamental type cannot be determined from name, extension, MIME type, relativePath, size, time metadata, itemType, modality, or evidence.
 
 Conflict rule:
-If semantic inference conflicts with strong file-type evidence, prefer the file-type evidence unless summaryText clearly proves the file belongs elsewhere.
+If semantic inference conflicts with strong file-type evidence, prefer the file-type evidence unless evidence clearly proves the file belongs elsewhere.
 If confidence is low but the fundamental type is still identifiable, assign the file to the closest type-based category and briefly explain the uncertainty in the reason.
 
 Bundle rule:
-When an item representation or summaryText includes resultKind=whole, treat it as a whole-directory bundle candidate.
+When item evidence includes resultKind=whole, treat it as a whole-directory bundle candidate.
 If the directory appears coherent in type or purpose, prefer assigning the directory as one whole unit.
 Only split the directory when the evidence clearly shows unrelated mixed content.
 
@@ -166,8 +168,8 @@ Available tools: `submit_organize_result` (required, final result), `web_search`
     "nodeId": "root",
     "name": "",
     "children": [
-      { "nodeId": "...", "name": "学术教育", "children": [] },
-      { "nodeId": "...", "name": "其他待定", "children": [] },
+      { "nodeId": "n1", "name": "学术教育", "children": [] },
+      { "nodeId": "n2", "name": "其他待定", "children": [] },
       ...
     ]
   },
@@ -180,8 +182,7 @@ Available tools: `submit_organize_result` (required, final result), `web_search`
       "modality": "text|image|video|audio|directory",
       "createdAge": "10mo",
       "modifiedAge": "2d",
-      "summaryText": "name=...\nrelativePath=...\nitemType=...\nmodality=...",
-      "representationSource": "filename_only|local_summary|agent_summary"
+      "evidence": "name=...\nrelativePath=...\nitemType=...\nmodality=..."
     }
   ],
   "items": [
@@ -193,24 +194,15 @@ Available tools: `submit_organize_result` (required, final result), `web_search`
       "modality": "text|image|video|audio|directory",
       "createdAge": "10mo",
       "modifiedAge": "2d",
-      "summaryText": "...",
-      "representation": {
-        "metadata": "...",
-        "short": "...",
-        "long": "...",
-        "source": "filename_only|local_summary|agent_summary",
-        "degraded": false,
-        "confidence": "high|medium|low",
-        "keywords": ["..."]
-      },
-      "summaryWarnings": ["..."]
+      "evidence": "...",
+      "keywords": ["..."]
     }
   ],
   "useWebSearch": true
 }
 ```
 
-Note: `fileIndex` is lightweight (for LLM context window), `items` is full (for classification result). `referenceStructure` is optional string field for directory tree.
+Note: `fileIndex` is a quick filename index only. `items` is the model-facing classification view, not the backend row JSON. Backend fields such as absolute `path`, raw extraction, provider/model, and full `representation` are intentionally omitted. `nodeId` values are prompt-local short IDs and are expanded back to real backend IDs after tool return.
 
 ### 2. Directory Summary Template / 目录摘要模板
 

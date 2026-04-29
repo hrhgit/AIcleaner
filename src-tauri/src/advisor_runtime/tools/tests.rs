@@ -145,6 +145,112 @@ mod tests {
     }
 
     #[test]
+    fn advisor_model_view_compacts_tree_and_expands_category_args() {
+        let real_category_id = category_id_from_path(&["文档".to_string()]);
+        let session = json!({
+            "derivedTree": {
+                "nodeId": "root",
+                "categoryId": "root",
+                "categoryPath": [],
+                "name": "root",
+                "children": [{
+                    "nodeId": real_category_id,
+                    "categoryId": real_category_id,
+                    "categoryPath": ["文档"],
+                    "name": "文档",
+                    "children": []
+                }]
+            }
+        });
+
+        let model_tree = compact_advisor_model_value(&session, &session["derivedTree"]);
+        assert_eq!(model_tree["children"][0]["nodeId"], "n1");
+        assert_eq!(model_tree["children"][0]["categoryId"], "n1");
+        assert_ne!(model_tree["children"][0]["categoryId"], real_category_id);
+
+        let expanded = expand_advisor_model_args(
+            &session,
+            &json!({
+                "categoryIds": ["n1"],
+                "request": {
+                    "change": {
+                        "sourceCategoryId": "n1",
+                        "targetCategoryId": "n1"
+                    }
+                }
+            }),
+        );
+        assert_eq!(expanded["categoryIds"][0], real_category_id);
+        assert_eq!(
+            expanded["request"]["change"]["sourceCategoryId"],
+            real_category_id
+        );
+        assert_eq!(
+            expanded["request"]["change"]["targetCategoryId"],
+            real_category_id
+        );
+    }
+
+    #[test]
+    fn apply_reclassification_accepts_model_short_category_id_after_expansion() {
+        let state = make_test_state();
+        let service = ToolService::new(&state);
+        let source_path = vec!["文档".to_string()];
+        let real_category_id = category_id_from_path(&source_path);
+        let path_key = persist::create_root_path_key(r"C:\test\report.pdf");
+        let mut session = json!({
+            "sessionId": "session_1",
+            "rootPath": r"C:\test",
+            "responseLanguage": "zh",
+            "derivedTree": {
+                "nodeId": "root",
+                "categoryId": "root",
+                "categoryPath": [],
+                "name": "root",
+                "children": [{
+                    "nodeId": real_category_id,
+                    "categoryId": real_category_id,
+                    "categoryPath": source_path,
+                    "name": "文档",
+                    "children": []
+                }]
+            },
+            "sessionMeta": {
+                "inventoryOverrides": {}
+            }
+        });
+        session["sessionMeta"]["inventoryOverrides"]
+            .as_object_mut()
+            .expect("inventory overrides object")
+            .insert(path_key.clone(), json!(["文档"]));
+        let backend_args = expand_advisor_model_args(
+            &session,
+            &json!({
+                "request": {
+                    "change": {
+                        "type": "rename_category",
+                        "sourceCategoryId": "n1",
+                        "newCategoryName": "资料"
+                    }
+                }
+            }),
+        );
+
+        service
+            .apply_reclassification_request(
+                &mut session,
+                backend_args.get("request").unwrap(),
+                false,
+            )
+            .expect("apply reclassification with expanded short id");
+
+        assert_eq!(
+            session["sessionMeta"]["inventoryOverrides"][path_key],
+            json!(["资料"])
+        );
+    }
+
+    #[test]
     fn list_preferences_returns_global_and_session_records() {
         let state = make_test_state();
         let service = ToolService::new(&state);

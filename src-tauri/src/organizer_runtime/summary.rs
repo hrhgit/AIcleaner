@@ -4,8 +4,6 @@ use crate::agent_runtime::{
     AgentTurnSpec, ToolCallErrorOutcome, ToolCallOutcome,
 };
 use crate::llm_tools::{ToolExecutionContext, ToolId, ToolRegistry, ToolResult, ToolWorkflow};
-use serde_json::Map;
-
 fn collect_name_keywords(unit: &OrganizeUnit, limit: usize) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -802,18 +800,25 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
 当你准备好时，调用 submit_classification_batch。
 每次回复最多调用一个工具。
 
-已有节点已经拥有稳定的 nodeId。
-当你复用、重命名或移动已有节点时，必须保留原 nodeId。
+已有节点在本轮输入中使用 prompt-local 短 nodeId，例如 n1、n2。
+当你复用、重命名或移动已有节点时，必须原样保留这些短 nodeId。
+不要生成 UUID 或后端真实 ID；新增分类请使用 treeProposals 的 suggestedPath 表达。
 
 assignment 中的 reason 字段必须放在最前面，格式为 reason、itemId、leafNodeId、categoryPath。
+reason 保持简短，只写足以解释分类的证据或不确定性。
 
 分类目标：
 构建一个实用的文件整理层级分类树。
 
+fileIndex 字段：
+fileIndex 只是当前批次的快速文件名索引，用于先扫一眼文件列表。
+每项只包含 itemId、name，必要时包含 relativePath 用于重名消歧。
+不要把 fileIndex 当作完整证据；分类判断应以 items 中的 evidence 和结构化字段为准。
+
 categoryInventory 字段：
 categoryInventory 是已有分类节点下的历史文件轻量清单，用于理解类别边界。
 每一项包含 nodeId、path、count、files、truncated。
-nodeId 是已有分类节点 ID，复用该类别时应保留这个 nodeId。
+nodeId 是本轮短 ID，复用该类别时应保留这个 nodeId。
 path 是该类别在分类树中的路径。
 count 是该类别下已归类文件总数。
 files 是该类别下的部分或全部历史文件名/短路径，只是文件名和路径线索，不是文件内容或 summary。
@@ -828,28 +833,28 @@ categoryInventory 只能作为历史参考，当前 items 的文件证据优先�
 不要在顶层优先按业务用途分类，除非文件的基础类型已经清楚。
 
 证据优先级：
-1. 如果存在 summaryText，优先使用 summaryText。
+1. 如果存在 evidence，优先使用 evidence。
 2. 其次使用 itemType 和 modality。
 3. 再参考文件扩展名和 MIME 类型。
 4. 再参考文件名关键词和路径模式。
 5. 最后参考大小、时间和其他元数据。
 
-当 summaryText 存在时，优先依据 summaryText 判断。
-当 summaryText 不存在时，使用 name、relativePath、itemType、modality 和 representation metadata 判断。
-不要因为缺少 summaryText 就假设文件内容未知或无法分类。
+当 evidence 存在时，优先依据 evidence 判断。
+当 evidence 较少时，使用 name、relativePath、itemType、modality 判断。
+不要因为 evidence 很短就假设文件内容未知或无法分类。
 
 类型优先规则：
 如果文件的扩展名、文件名模式、MIME 类型或 itemType 能明确指向某个基础类别，即使具体用途不明，也应按该基础类型分类。
 不要仅仅因为不知道文件的业务用途、来源应用或具体内容，就归入"其他待定"。
 
-只有当无法根据 name、extension、MIME type、relativePath、size、time metadata、itemType、modality 或 representation metadata 判断文件基础类型时，才使用"其他待定"。
+只有当无法根据 name、extension、MIME type、relativePath、size、time metadata、itemType、modality 或 evidence 判断文件基础类型时，才使用"其他待定"。
 
 冲突处理：
-如果语义推断结果与强文件类型证据冲突，优先相信文件类型证据，除非 summaryText 明确证明该文件应归入其他类别。
+如果语义推断结果与强文件类型证据冲突，优先相信文件类型证据，除非 evidence 明确证明该文件应归入其他类别。
 如果置信度较低，但文件基础类型仍然可以判断，应归入最接近的类型类别，并在 reason 中简要说明不确定性。
 
 目录整体归类规则：
-当 item representation 或 summaryText 中包含 resultKind=whole 时，将其视为目录整体候选。
+当 item evidence 中包含 resultKind=whole 时，将其视为目录整体候选。
 如果该目录内容看起来具有一致的类型或用途，优先将目录作为一个整体分配到分类树中。
 只有当证据明确显示该目录包含无关的混合内容时，才拆分目录中的内容分别归类。
 
@@ -873,18 +878,25 @@ Do not return the final tree as plain assistant text.
 When you are ready, call submit_classification_batch.
 Call at most one tool per reply.
 
-Existing nodes already have stable nodeId values.
-Keep nodeId when you reuse, rename, or move existing nodes.
+Existing nodes use prompt-local short nodeId values in this request, such as n1 and n2.
+Keep those short nodeId values exactly when you reuse, rename, or move existing nodes.
+Do not generate UUIDs or backend real IDs; use treeProposals suggestedPath for new categories.
 
 The assignment "reason" field must come first, in the order: reason, itemId, leafNodeId, categoryPath.
+Keep reason concise; include only the evidence or uncertainty needed to explain the assignment.
 
 Classification goal:
 Build a practical hierarchical category tree for file organization.
 
+fileIndex field:
+fileIndex is only a quick filename index for the current batch.
+Each entry contains itemId and name, and may include relativePath only to disambiguate duplicate names.
+Do not treat fileIndex as full evidence; classify from each item's evidence and structured fields.
+
 categoryInventory field:
 categoryInventory is a lightweight list of historical files under existing category nodes. Use it to understand category boundaries.
 Each entry contains nodeId, path, count, files, and truncated.
-nodeId is the existing category node ID. Keep this nodeId when reusing the category.
+nodeId is a prompt-local short ID. Keep this nodeId when reusing the category.
 path is the category path in the tree.
 count is the total number of already-classified files under that category.
 files contains some or all historical filenames or short paths for that category. They are filename/path clues only, not file content or summaries.
@@ -899,28 +911,28 @@ Top-level categories should be based primarily on the file's fundamental type, s
 Do not classify primarily by business purpose at the top level unless the fundamental file type is already clear.
 
 Evidence priority:
-1. Prefer summaryText when it exists.
+1. Prefer evidence when it exists.
 2. Then use itemType and modality.
 3. Then use file extension and MIME type.
 4. Then use filename keywords and path patterns.
 5. Finally use size, time, and other metadata.
 
-When summaryText exists, prefer it.
-When summaryText is missing, classify using name, relativePath, itemType, modality, and representation metadata.
-Do not assume missing summaryText means the content is unknown or unclassifiable.
+When evidence exists, prefer it.
+When evidence is sparse, classify using name, relativePath, itemType, and modality.
+Do not assume short evidence means the content is unknown or unclassifiable.
 
 Type-first rule:
 If a file's extension, filename pattern, MIME type, or itemType clearly indicates a fundamental category, classify it by that type even if its specific purpose is unclear.
 Do not use "其他待定" merely because the file's business purpose, source application, or exact content is unknown.
 
-Only use "其他待定" when the file's fundamental type cannot be determined from name, extension, MIME type, relativePath, size, time metadata, itemType, modality, or representation metadata.
+Only use "其他待定" when the file's fundamental type cannot be determined from name, extension, MIME type, relativePath, size, time metadata, itemType, modality, or evidence.
 
 Conflict rule:
-If semantic inference conflicts with strong file-type evidence, prefer the file-type evidence unless summaryText clearly proves the file belongs elsewhere.
+If semantic inference conflicts with strong file-type evidence, prefer the file-type evidence unless evidence clearly proves the file belongs elsewhere.
 If confidence is low but the fundamental type is still identifiable, assign the file to the closest type-based category and briefly explain the uncertainty in the reason.
 
 Bundle rule:
-When an item representation or summaryText includes resultKind=whole, treat it as a whole-directory bundle candidate.
+When item evidence includes resultKind=whole, treat it as a whole-directory bundle candidate.
 If the directory appears coherent in type or purpose, prefer assigning the directory as one whole unit.
 Only split the directory when the evidence clearly shows unrelated mixed content.
 
@@ -937,6 +949,62 @@ If the file type is identifiable but the specific purpose is unclear, assign it 
     }
 }
 
+pub(super) fn build_classification_file_index(batch_rows: &[Value]) -> Vec<Value> {
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for row in batch_rows {
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        *name_counts.entry(name).or_insert(0) += 1;
+    }
+
+    batch_rows
+        .iter()
+        .map(|row| {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or("");
+            let name_key = name.trim().to_string();
+            let mut item = json!({
+                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+            });
+            if name_counts.get(&name_key).copied().unwrap_or(0) > 1 {
+                item["relativePath"] = Value::String(
+                    row.get("relativePath")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            }
+            item
+        })
+        .collect()
+}
+
+fn classification_evidence(row: &Value, representation: &FileRepresentation) -> String {
+    let source = representation.source.trim();
+    let best_text = representation.best_text();
+    if !best_text.is_empty() && source != SUMMARY_SOURCE_FILENAME_ONLY {
+        return best_text;
+    }
+
+    let relative_path = row
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !relative_path.is_empty() {
+        return relative_path.to_string();
+    }
+    row.get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Value> {
     batch_rows
         .iter()
@@ -945,7 +1013,7 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
             let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
             let representation =
                 FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
-            json!({
+            let mut item = json!({
                 "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
                 "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
                 "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
@@ -953,18 +1021,26 @@ pub(super) fn build_classification_batch_items(batch_rows: &[Value]) -> Vec<Valu
                 "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
                 "createdAge": created_age,
                 "modifiedAge": modified_age,
-                "summaryText": representation.best_text(),
-                "representation": representation.to_value(),
-                "summaryWarnings": row
-                    .get("summaryWarnings")
-                    .cloned()
-                    .unwrap_or(Value::Array(Vec::new())),
-            })
+                "evidence": classification_evidence(row, &representation),
+            });
+            if !representation.keywords.is_empty()
+                && representation.source != SUMMARY_SOURCE_FILENAME_ONLY
+            {
+                item["keywords"] = Value::Array(
+                    representation
+                        .keywords
+                        .iter()
+                        .map(|keyword| Value::String(keyword.clone()))
+                        .collect(),
+                );
+            }
+            item
         })
         .collect()
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct CategoryInventoryEntry {
     node_id: String,
     path: Vec<String>,
@@ -973,6 +1049,7 @@ struct CategoryInventoryEntry {
     seen_files: HashSet<String>,
 }
 
+#[allow(dead_code)]
 fn compact_history_file_label(row: &Value) -> Option<String> {
     let relative_path = row
         .get("relativePath")
@@ -990,6 +1067,7 @@ fn compact_history_file_label(row: &Value) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+#[allow(dead_code)]
 pub(super) fn build_category_inventory(
     existing_tree: &CategoryTreeNode,
     previous_results: &[Value],
@@ -1091,108 +1169,6 @@ fn build_reconcile_system_prompt(response_language: &str, stage: &str) -> String
         (false, "reconcile_tree") => "Reconcile only pending structured classification results: treeProposals and deferredAssignments. Direct assignments are already merged by the runtime and are not provided; do not restate them. nodeId values use prompt-local short aliases and must be preserved exactly. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
         (false, "review_tree") => "Review only the runtime-provided local scopes. Submit issues, recommendedOperations, and needsRevision; do not modify the tree; call review_organize_draft only.".to_string(),
         _ => "Submit the reviewed final tree and only the pending item assignments. Direct assignments are already held by the runtime; do not restate every file. Ensure all leafNodeId values exist in finalTree; call submit_reconciled_tree only.".to_string(),
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ReconcileNodeAliases {
-    to_alias: HashMap<String, String>,
-    to_real: HashMap<String, String>,
-}
-
-impl ReconcileNodeAliases {
-    fn from_tree(value: &Value) -> Self {
-        fn visit(value: &Value, out: &mut Vec<String>) {
-            let Some(obj) = value.as_object() else {
-                return;
-            };
-            if let Some(node_id) = obj.get("nodeId").and_then(Value::as_str) {
-                let node_id = node_id.trim();
-                if !node_id.is_empty() && node_id != "root" && !out.iter().any(|id| id == node_id) {
-                    out.push(node_id.to_string());
-                }
-            }
-            if let Some(children) = obj.get("children").and_then(Value::as_array) {
-                for child in children {
-                    visit(child, out);
-                }
-            }
-        }
-
-        let mut ids = Vec::new();
-        visit(value, &mut ids);
-        let mut aliases = Self::default();
-        for (idx, real) in ids.into_iter().enumerate() {
-            let alias = format!("n{}", idx + 1);
-            aliases.to_alias.insert(real.clone(), alias.clone());
-            aliases.to_real.insert(alias, real);
-        }
-        aliases
-    }
-
-    fn compact_value(&self, value: &Value) -> Value {
-        self.rewrite_value(value, true)
-    }
-
-    fn expand_value(&self, value: &Value) -> Value {
-        self.rewrite_value(value, false)
-    }
-
-    fn rewrite_value(&self, value: &Value, compact: bool) -> Value {
-        match value {
-            Value::Array(items) => Value::Array(
-                items
-                    .iter()
-                    .map(|item| self.rewrite_value(item, compact))
-                    .collect(),
-            ),
-            Value::Object(obj) => {
-                let mut out = Map::new();
-                for (key, field) in obj {
-                    out.insert(key.clone(), self.rewrite_field(key, field, compact));
-                }
-                Value::Object(out)
-            }
-            _ => value.clone(),
-        }
-    }
-
-    fn rewrite_field(&self, key: &str, value: &Value, compact: bool) -> Value {
-        match key {
-            "nodeId" | "leafNodeId" | "targetNodeId" => value
-                .as_str()
-                .map(|id| Value::String(self.rewrite_id(id, compact)))
-                .unwrap_or_else(|| self.rewrite_value(value, compact)),
-            "sourceNodeIds" | "nodeIds" => Value::Array(
-                value
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|item| {
-                        item.as_str()
-                            .map(|id| Value::String(self.rewrite_id(id, compact)))
-                            .unwrap_or_else(|| self.rewrite_value(item, compact))
-                    })
-                    .collect(),
-            ),
-            _ => self.rewrite_value(value, compact),
-        }
-    }
-
-    fn rewrite_id(&self, id: &str, compact: bool) -> String {
-        let trimmed = id.trim();
-        if compact {
-            self.to_alias
-                .get(trimmed)
-                .cloned()
-                .unwrap_or_else(|| trimmed.to_string())
-        } else {
-            self.to_real
-                .get(trimmed)
-                .cloned()
-                .unwrap_or_else(|| trimmed.to_string())
-        }
     }
 }
 
@@ -1523,7 +1499,7 @@ pub(super) async fn reconcile_organize_batches(
     classification_results: &[Value],
     diagnostics: Option<&OrganizerDiagnostics>,
 ) -> Result<ReconcileOrganizeOutput, String> {
-    let aliases = ReconcileNodeAliases::from_tree(initial_tree);
+    let aliases = ModelIdMap::from_values(&[initial_tree]);
     let compact_initial_tree = aliases.compact_value(initial_tree);
     let compact_classification_results = classification_results
         .iter()
@@ -1559,7 +1535,7 @@ struct ReconcileSpec<'a> {
     stage: &'static str,
     initial_tree: Value,
     classification_results: Vec<Value>,
-    aliases: ReconcileNodeAliases,
+    aliases: ModelIdMap,
     total_usage: TokenUsage,
     round_trace: Vec<String>,
     available_tool_names: Vec<&'static str>,
@@ -1853,30 +1829,14 @@ pub(super) async fn classify_organize_batch(
 ) -> Result<ClassifyOrganizeBatchOutput, String> {
     let search_enabled = use_web_search && !search_api_key.trim().is_empty();
     let classification_items = build_classification_batch_items(batch_rows);
-    let file_index = batch_rows
-        .iter()
-        .map(|row| {
-            let created_age = compute_relative_age(row.get("createdAt").and_then(Value::as_str));
-            let modified_age = compute_relative_age(row.get("modifiedAt").and_then(Value::as_str));
-            let representation =
-                FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
-            json!({
-                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
-                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
-                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
-                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
-                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
-                "createdAge": created_age,
-                "modifiedAge": modified_age,
-                "summaryText": representation.best_text(),
-                "representationSource": representation.source,
-            })
-        })
-        .collect::<Vec<_>>();
+    let file_index = build_classification_file_index(batch_rows);
+    let existing_tree_value = category_tree_to_value(existing_tree);
+    let category_inventory_value = Value::Array(category_inventory.to_vec());
+    let aliases = ModelIdMap::from_values(&[&existing_tree_value, &category_inventory_value]);
     let mut payload = json!({
-        "existingTree": category_tree_to_value(existing_tree),
+        "existingTree": aliases.compact_value(&existing_tree_value),
         "baseTreeVersion": base_tree_version,
-        "categoryInventory": category_inventory,
+        "categoryInventory": aliases.compact_value(&category_inventory_value),
         "fileIndex": file_index,
         "items": classification_items,
         "useWebSearch": use_web_search,
@@ -1917,6 +1877,7 @@ pub(super) async fn classify_organize_batch(
         total_usage: TokenUsage::default(),
         round_trace: Vec::new(),
         available_tool_names: Vec::new(),
+        aliases,
     };
 
     AgentTurnLoop::new(&llm, &tool_registry)
@@ -1979,6 +1940,7 @@ struct OrganizerBatchSpec<'a> {
     total_usage: TokenUsage,
     round_trace: Vec<String>,
     available_tool_names: Vec<&'static str>,
+    aliases: ModelIdMap,
 }
 
 impl OrganizerBatchSpec<'_> {
@@ -1988,7 +1950,7 @@ impl OrganizerBatchSpec<'_> {
 
     fn output(&self, parsed: Option<Value>, error: Option<String>) -> ClassifyOrganizeBatchOutput {
         ClassifyOrganizeBatchOutput {
-            parsed,
+            parsed: parsed.map(|value| self.aliases.expand_value(&value)),
             usage: self.total_usage.clone(),
             raw_output: self.round_trace.join("\n\n====================\n\n"),
             error,
@@ -2277,6 +2239,7 @@ mod tool_policy_tests {
             total_usage: TokenUsage::default(),
             round_trace: Vec::new(),
             available_tool_names: Vec::new(),
+            aliases: ModelIdMap::default(),
         };
 
         assert!(!spec.allow_multiple_tool_calls());

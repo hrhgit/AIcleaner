@@ -1,4 +1,6 @@
-use crate::advisor_runtime::tools::ToolService;
+use crate::advisor_runtime::tools::{
+    compact_advisor_model_value, compact_value_with_tree, expand_advisor_model_args, ToolService,
+};
 use crate::advisor_runtime::types::{
     local_text, CARD_EXECUTION, CARD_PLAN_PREVIEW, CARD_PREFERENCE, CARD_RECLASS, CARD_TREE,
     WORKFLOW_EXECUTE_READY, WORKFLOW_PREVIEW_READY, WORKFLOW_UNDERSTAND,
@@ -309,11 +311,11 @@ fn no_arg_tool_spec(id: ToolId, name: &'static str, description: &'static str) -
 fn category_tree_schema() -> Value {
     json!({
         "type": "object",
-        "description": "最终分类树根节点。复用、重命名或移动已有节点时必须保留原 nodeId；新增节点应使用稳定的新 nodeId。",
+        "description": "模型可见分类树根节点。nodeId 是 prompt-local 短 ID；复用、重命名或移动已有节点时必须保留原短 ID。",
         "properties": {
             "nodeId": {
                 "type": "string",
-                "description": "分类节点的稳定 ID。根节点通常为 root；已有节点必须保留原值。"
+                "description": "分类节点的 prompt-local 短 ID。根节点通常为 root；已有节点必须保留原值。"
             },
             "name": {
                 "type": "string",
@@ -335,7 +337,7 @@ fn category_tree_schema() -> Value {
                 "properties": {
                     "nodeId": {
                         "type": "string",
-                        "description": "分类节点的稳定 ID。已有节点必须保留原值。"
+                        "description": "分类节点的 prompt-local 短 ID。已有节点必须保留原值。"
                     },
                     "name": {
                         "type": "string",
@@ -571,7 +573,7 @@ fn assignment_schema() -> Value {
         "properties": {
             "reason": { "type": "string", "description": "分类证据和不确定性说明。", "maxLength": 300 },
             "itemId": { "type": "string", "description": "当前 batch 输入中的 itemId，必须原样填写。" },
-            "leafNodeId": { "type": "string", "description": "目标已有叶子节点的 nodeId。" },
+            "leafNodeId": { "type": "string", "description": "目标已有叶子节点的 prompt-local 短 nodeId。" },
             "categoryPath": category_path_schema("目标分类路径，用于校验和兜底。"),
             "confidence": { "type": "string", "description": "分类置信度。", "enum": ["high", "medium", "low"] },
             "needsReview": { "type": "boolean", "description": "该分配是否需要 reconciliation 阶段局部审查。" }
@@ -603,7 +605,7 @@ fn reconciled_assignment_schema() -> Value {
         "description": "reconciliation 阶段仅为 pending item 提交的最终落位；不要重复直接 assignments。",
         "properties": {
             "itemId": { "type": "string", "description": "pendingAssignments 中的 itemId，必须原样填写。" },
-            "leafNodeId": { "type": "string", "description": "finalTree 中已存在叶子节点的 nodeId。" },
+            "leafNodeId": { "type": "string", "description": "finalTree 中已存在叶子节点的 prompt-local 短 nodeId。" },
             "reason": { "type": "string", "description": "可选的极短说明。", "maxLength": 120 }
         },
         "required": ["itemId", "leafNodeId"],
@@ -618,8 +620,8 @@ fn tree_proposal_schema() -> Value {
         "properties": {
             "proposalId": { "type": "string", "description": "当前 batch 内稳定 proposal ID。" },
             "operation": { "type": "string", "description": "建议操作。", "enum": ["add_node", "merge_nodes", "split_node", "rename_node"] },
-            "targetNodeId": { "type": "string", "description": "被修改或作为父节点的现有 nodeId，可为空。" },
-            "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的现有节点。", "maxItems": 20, "items": { "type": "string" } },
+            "targetNodeId": { "type": "string", "description": "被修改或作为父节点的现有 prompt-local 短 nodeId，可为空。" },
+            "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的现有 prompt-local 短节点 ID。", "maxItems": 20, "items": { "type": "string" } },
             "suggestedName": { "type": "string", "description": "建议节点名称。" },
             "suggestedPath": category_path_schema("建议的新路径。"),
             "evidenceItemIds": { "type": "array", "description": "支持该建议的当前 itemId。", "maxItems": 200, "items": { "type": "string" } },
@@ -809,7 +811,7 @@ organizer_submit_tool!(
         "type": "object",
         "description": "局部审查结果。",
         "properties": {
-            "issues": { "type": "array", "description": "审查发现的问题。", "maxItems": 100, "items": { "type": "object", "description": "单个审查问题。", "properties": { "type": { "type": "string", "description": "问题类型。" }, "nodeIds": string_array_schema("相关 nodeId。"), "itemIds": string_array_schema("相关 itemId。"), "severity": { "type": "string", "description": "问题严重程度。", "enum": ["low", "medium", "high"] }, "reason": { "type": "string", "description": "问题原因。", "maxLength": 500 } }, "required": ["type", "reason"], "additionalProperties": false } },
+            "issues": { "type": "array", "description": "审查发现的问题。", "maxItems": 100, "items": { "type": "object", "description": "单个审查问题。", "properties": { "type": { "type": "string", "description": "问题类型。" }, "nodeIds": string_array_schema("相关 prompt-local 短 nodeId。"), "itemIds": string_array_schema("相关 itemId。"), "severity": { "type": "string", "description": "问题严重程度。", "enum": ["low", "medium", "high"] }, "reason": { "type": "string", "description": "问题原因。", "maxLength": 500 } }, "required": ["type", "reason"], "additionalProperties": false } },
             "recommendedOperations": { "type": "array", "description": "建议后续 revise_tree_draft 采用的操作。", "maxItems": 100, "items": tree_proposal_schema() },
             "needsRevision": { "type": "boolean", "description": "是否需要回到 revise_tree_draft。" },
             "notes": { "type": "string", "description": "审查说明。", "maxLength": 1000 }
@@ -866,7 +868,7 @@ impl LlmTool for GetDirectoryOverviewTool {
                     },
                     "rootCategoryId": {
                         "type": "string",
-                        "description": "只查看某个分类节点下的子树；为空时查看根树。"
+                        "description": "只查看某个分类节点下的子树；使用 get_directory_overview 返回的短 ID，留空时查看根树。"
                     },
                     "maxDepth": {
                         "type": "integer",
@@ -897,18 +899,20 @@ impl LlmTool for GetDirectoryOverviewTool {
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
         let service = ToolService::new(state);
-        let result = service.get_directory_overview_tool(
+        let backend_result = service.get_directory_overview_tool(
             session,
             args.get("viewType").and_then(Value::as_str),
             args.get("rootCategoryId").and_then(Value::as_str),
             args.get("maxDepth").and_then(Value::as_u64),
         )?;
+        let tree = backend_result.get("tree").cloned().unwrap_or(Value::Null);
+        let result = compact_value_with_tree(&tree, &backend_result);
         let card = json!({
             "cardType": CARD_TREE,
             "status": "ready",
             "title": local_text(ctx.response_language, "当前分类树", "Current Tree"),
             "body": {
-                "tree": result.get("tree").cloned().unwrap_or(Value::Null),
+                "tree": tree,
                 "stats": {
                     "itemCount": session.pointer("/contextBar/directorySummary/itemCount").cloned().unwrap_or(Value::from(0))
                 }
@@ -942,7 +946,7 @@ impl LlmTool for FindFilesTool {
                         "maxItems": 20,
                         "items": {
                             "type": "string",
-                            "description": "分类节点 nodeId。"
+                            "description": "get_directory_overview 返回的 prompt-local 短分类 ID。"
                         }
                     },
                     "nameQuery": {
@@ -1035,11 +1039,16 @@ impl LlmTool for FindFilesTool {
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
         let service = ToolService::new(state);
-        let result = service.find_files_by_args(session, args)?;
+        let backend_args = expand_advisor_model_args(session, args);
+        let backend_result = service.find_files_by_args(session, &backend_args)?;
+        let result = compact_advisor_model_value(session, &backend_result);
         if let Some(obj) = session.as_object_mut() {
             obj.insert(
                 "activeSelectionId".to_string(),
-                result.get("selectionId").cloned().unwrap_or(Value::Null),
+                backend_result
+                    .get("selectionId")
+                    .cloned()
+                    .unwrap_or(Value::Null),
             );
             obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert(
@@ -1079,11 +1088,11 @@ impl LlmTool for SummarizeFilesTool {
                     },
                     "categoryIds": {
                         "type": "array",
-                        "description": "需要补摘要的分类节点 ID；范围大时配合 missingOnly 使用。",
+                        "description": "需要补摘要的分类节点短 ID；范围大时配合 missingOnly 使用。",
                         "maxItems": 20,
                         "items": {
                             "type": "string",
-                            "description": "分类节点 nodeId。"
+                            "description": "get_directory_overview 返回的 prompt-local 短分类 ID。"
                         }
                     },
                     "representationLevel": {
@@ -1130,9 +1139,12 @@ impl LlmTool for SummarizeFilesTool {
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
         let service = ToolService::new(state);
-        Ok(ToolResult::result(
-            service.summarize_files_tool(session, args).await?,
-        ))
+        let backend_args = expand_advisor_model_args(session, args);
+        let backend_result = service.summarize_files_tool(session, &backend_args).await?;
+        Ok(ToolResult::result(compact_advisor_model_value(
+            session,
+            &backend_result,
+        )))
     }
 }
 
@@ -1164,11 +1176,11 @@ impl LlmTool for ReadOnlyFileSummariesTool {
                     },
                     "categoryIds": {
                         "type": "array",
-                        "description": "要读取摘要的分类节点 ID。",
+                        "description": "要读取摘要的分类节点短 ID。",
                         "maxItems": 20,
                         "items": {
                             "type": "string",
-                            "description": "分类节点 nodeId。"
+                            "description": "get_directory_overview 返回的 prompt-local 短分类 ID。"
                         }
                     },
                     "representationLevel": {
@@ -1205,9 +1217,12 @@ impl LlmTool for ReadOnlyFileSummariesTool {
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
         let service = ToolService::new(state);
-        Ok(ToolResult::result(
-            service.read_only_file_summaries_tool(session, args)?,
-        ))
+        let backend_args = expand_advisor_model_args(session, args);
+        let backend_result = service.read_only_file_summaries_tool(session, &backend_args)?;
+        Ok(ToolResult::result(compact_advisor_model_value(
+            session,
+            &backend_result,
+        )))
     }
 }
 
@@ -1692,11 +1707,11 @@ impl LlmTool for ApplyReclassificationTool {
                                     },
                                     "sourceCategoryId": {
                                         "type": "string",
-                                        "description": "源分类节点 ID，用于重命名、合并或删除空分类。"
+                                        "description": "源分类节点短 ID，用于重命名、合并或删除空分类。"
                                     },
                                     "targetCategoryId": {
                                         "type": "string",
-                                        "description": "目标分类节点 ID，用于移动或合并。"
+                                        "description": "目标分类节点短 ID，用于移动或合并。"
                                     },
                                     "newCategoryName": {
                                         "type": "string",
@@ -1739,12 +1754,15 @@ impl LlmTool for ApplyReclassificationTool {
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
         let service = ToolService::new(state);
+        let backend_args = expand_advisor_model_args(session, args);
         let job = service.apply_reclassification_request(
             session,
-            args.get("request").unwrap_or(args),
-            args.get("applyPreferenceCapture")
+            backend_args.get("request").unwrap_or(&backend_args),
+            backend_args
+                .get("applyPreferenceCapture")
                 .or_else(|| {
-                    args.get("request")
+                    backend_args
+                        .get("request")
                         .and_then(|request| request.get("applyPreferenceCapture"))
                 })
                 .and_then(Value::as_bool)
@@ -1792,10 +1810,11 @@ impl LlmTool for ApplyReclassificationTool {
                 "actions": []
             }),
         ];
-        Ok(
-            ToolResult::result(job.pointer("/result").cloned().unwrap_or(Value::Null))
-                .with_cards(cards),
-        )
+        Ok(ToolResult::result(compact_advisor_model_value(
+            session,
+            &job.pointer("/result").cloned().unwrap_or(Value::Null),
+        ))
+        .with_cards(cards))
     }
 }
 

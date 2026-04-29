@@ -9,6 +9,7 @@ use crate::llm_protocol::{
     apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
     parse_completion_response, DEFAULT_MAX_TOKENS,
 };
+use crate::model_boundary::ModelIdMap;
 use crate::persist;
 use crate::system_ops;
 use reqwest::StatusCode;
@@ -66,6 +67,25 @@ struct SummaryFailedItem {
 
 pub(crate) struct ToolService<'a> {
     state: &'a AppState,
+}
+
+pub(crate) fn advisor_model_id_map(session: &Value) -> ModelIdMap {
+    session
+        .get("derivedTree")
+        .map(|tree| ModelIdMap::from_values(&[tree]))
+        .unwrap_or_default()
+}
+
+pub(crate) fn compact_advisor_model_value(session: &Value, value: &Value) -> Value {
+    advisor_model_id_map(session).compact_value(value)
+}
+
+pub(crate) fn expand_advisor_model_args(session: &Value, args: &Value) -> Value {
+    advisor_model_id_map(session).expand_value(args)
+}
+
+pub(crate) fn compact_value_with_tree(tree: &Value, value: &Value) -> Value {
+    ModelIdMap::from_values(&[tree]).compact_value(value)
 }
 
 // Utility free functions (define first so tools can reference them)

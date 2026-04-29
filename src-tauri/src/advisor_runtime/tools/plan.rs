@@ -346,7 +346,9 @@ fn category_path_from_category_id(
 
 fn find_category_path_in_tree(tree: &Value, category_id: &str) -> Option<Vec<String>> {
     let obj = tree.as_object()?;
-    if obj.get("categoryId").and_then(Value::as_str) == Some(category_id) {
+    if obj.get("categoryId").and_then(Value::as_str) == Some(category_id)
+        || obj.get("nodeId").and_then(Value::as_str) == Some(category_id)
+    {
         return Some(array_of_strings(obj.get("categoryPath")));
     }
     obj.get("children")

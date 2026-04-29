@@ -10,6 +10,7 @@ use crate::llm_protocol::{
     build_llm_http_client, build_messages_url, detect_api_format, parse_completion_response,
     ParsedToolCall, DEFAULT_MAX_TOKENS,
 };
+use crate::model_boundary::ModelIdMap;
 use crate::persist;
 use parking_lot::Mutex;
 use reqwest::{StatusCode, Url};

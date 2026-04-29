@@ -94,11 +94,15 @@ fn tree_insert(node: &mut TreeDraftNode, path: &[String]) {
     }
 }
 
-fn tree_to_value(prefix: &str, node: &TreeDraftNode) -> Value {
+fn tree_to_value(prefix: &str, path: &[String], node: &TreeDraftNode) -> Value {
     let mut children = node
         .children
         .values()
-        .map(|child| tree_to_value(&format!("{prefix}/{}", child.name), child))
+        .map(|child| {
+            let mut child_path = path.to_vec();
+            child_path.push(child.name.clone());
+            tree_to_value(&format!("{prefix}/{}", child.name), &child_path, child)
+        })
         .collect::<Vec<_>>();
     children.sort_by(|left, right| {
         right["itemCount"]
@@ -112,8 +116,16 @@ fn tree_to_value(prefix: &str, node: &TreeDraftNode) -> Value {
                     .cmp(right["name"].as_str().unwrap_or_default())
             })
     });
+    let node_id = if path.is_empty() {
+        "root".to_string()
+    } else {
+        category_id_from_path(path)
+    };
     json!({
-        "nodeId": persist::create_node_id(&format!("advisor-tree:{prefix}")),
+        "nodeId": node_id,
+        "categoryId": node_id,
+        "parentCategoryId": parent_category_id_from_path(path),
+        "categoryPath": path,
         "name": node.name,
         "itemCount": node.item_count,
         "children": children,
@@ -136,7 +148,7 @@ fn build_derived_tree(root_path: &str, inventory: &[InventoryItem]) -> Option<Va
         };
         tree_insert(&mut root, &category_path);
     }
-    Some(tree_to_value(root_path, &root))
+    Some(tree_to_value(root_path, &[], &root))
 }
 
 fn tree_stats(inventory: &[InventoryItem]) -> Value {

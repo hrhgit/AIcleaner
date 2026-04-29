@@ -240,11 +240,17 @@ fn append_agent_trace_messages(messages: &mut Vec<Value>, turn: &Value) -> bool 
                 .unwrap_or_default();
             for result in results {
                 let tool_call_id = result.get("id").and_then(Value::as_str).unwrap_or_default();
+                let payload = result.get("payload").cloned().unwrap_or(Value::Null);
+                let model_payload = payload
+                    .get("result")
+                    .cloned()
+                    .filter(|_| payload.get("card").is_some() || payload.get("cards").is_some())
+                    .unwrap_or(payload);
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": serde_json::to_string_pretty(
-                        &result.get("payload").cloned().unwrap_or(Value::Null)
+                        &model_payload
                     )
                     .unwrap_or_else(|_| String::new()),
                 }));
@@ -307,7 +313,16 @@ mod tests {
                                 "id": "call_1",
                                 "name": "find_files",
                                 "status": "ok",
-                                "payload": { "result": { "total": 99 } }
+                                "payload": {
+                                    "result": { "total": 99 },
+                                    "card": {
+                                        "body": {
+                                            "tree": {
+                                                "categoryId": "real-category-id"
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         ]
                     },
@@ -330,6 +345,9 @@ mod tests {
         );
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
+        let tool_content = messages[1]["content"].as_str().unwrap_or_default();
+        assert!(tool_content.contains("\"total\": 99"));
+        assert!(!tool_content.contains("real-category-id"));
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "最终方案");
     }
