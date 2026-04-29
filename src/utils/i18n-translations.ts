@@ -39,7 +39,6 @@ export const translations = {
     'settings.toast_cache_dir_moved': '缓存目录已迁移到: ',
     'settings.toast_cache_dir_move_failed': '迁移缓存目录失败: ',
     'settings.browsing': '选择中...',
-    'settings.elevation_reload_hint': '管理员实例启动中，页面将在数秒后自动刷新。',
   },
   en: {
     'app.title': 'AIcleaner',
@@ -81,6 +80,8 @@ export const translations = {
     'settings.toast_cache_dir_moved': 'Cache directory moved to: ',
     'settings.toast_cache_dir_move_failed': 'Failed to move cache directory: ',
     'settings.browsing': 'Browsing...',
-    'settings.elevation_reload_hint': 'The elevated instance is starting. This page will refresh automatically in a few seconds.',
   },
-};
+} as const;
+
+export type TranslationKey = keyof typeof translations.zh;
+

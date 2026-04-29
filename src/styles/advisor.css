@@ -1,0 +1,1178 @@
+/* Advisor */
+.advisor-shell {
+    display: grid;
+    gap: 24px;
+}
+
+.advisor-hero {
+    padding: 0;
+    background:
+        radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 34%),
+        radial-gradient(circle at right center, rgba(16, 185, 129, 0.14), transparent 30%),
+        linear-gradient(145deg, rgba(2, 6, 23, 0.96), rgba(15, 23, 42, 0.92));
+}
+
+.advisor-hero-grid {
+    display: grid;
+    gap: 24px;
+    padding: 28px;
+}
+
+.advisor-config-grid {
+    display: grid;
+    gap: 16px;
+}
+
+.advisor-main-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 24px;
+    align-items: start;
+}
+
+.advisor-path-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+}
+
+.advisor-inline-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.advisor-inline-actions .btn {
+    min-height: 42px;
+}
+
+.advisor-action-hint {
+    margin-top: -4px;
+}
+
+
+.advisor-message {
+    padding: 14px 16px;
+    border-radius: 16px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.56);
+}
+
+.advisor-message-user {
+    border-color: rgba(6, 182, 212, 0.24);
+}
+
+.advisor-message-assistant {
+    border-color: rgba(16, 185, 129, 0.24);
+}
+
+.advisor-message-head,
+.advisor-suggestion-head,
+.advisor-preview-head,
+.advisor-draft-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.advisor-message-body,
+.advisor-suggestion-summary {
+    margin-top: 10px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+
+.advisor-split-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    margin-top: 20px;
+}
+
+.advisor-draft-card,
+.advisor-suggestion-card,
+.advisor-preview-row {
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.58);
+}
+
+.advisor-suggestion-card {
+    box-shadow: 0 12px 24px rgba(2, 6, 23, 0.18);
+}
+
+.advisor-suggestion-title-wrap {
+    display: grid;
+    gap: 8px;
+}
+
+.advisor-badge-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.advisor-path-block,
+.advisor-list-block {
+    display: grid;
+    gap: 8px;
+}
+
+.advisor-path {
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(2, 6, 23, 0.58);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+}
+
+.advisor-list-row {
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    overflow-wrap: anywhere;
+}
+
+.advisor-pref-chip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 12px 14px;
+    border-radius: 14px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.52);
+}
+
+.advisor-json {
+    margin: 0;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(2, 6, 23, 0.62);
+    color: #cbd5e1;
+    font-size: 0.76rem;
+    line-height: 1.6;
+    overflow: auto;
+}
+
+.advisor-empty-compact {
+    padding: 24px 12px;
+}
+
+@media (max-width: 1040px) {
+    .advisor-main-grid,
+    .advisor-split-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 720px) {
+    .advisor-hero-grid {
+        padding: 20px;
+    }
+
+    .advisor-path-actions {
+        grid-template-columns: 1fr;
+    }
+}
+
+.advisor-v2-shell {
+    display: grid;
+    gap: 18px;
+    padding-bottom: 20px;
+}
+
+.advisor-v2-init,
+.advisor-v2-context,
+.advisor-v2-composer {
+    padding: 20px;
+}
+
+.advisor-v2-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.advisor-v2-header h1 {
+    margin: 0 0 8px;
+}
+
+.advisor-v2-header p {
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.advisor-v2-context.collapsed {
+    padding-bottom: 16px;
+}
+
+.advisor-context-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.advisor-context-chip {
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    color: var(--text-secondary);
+}
+
+.advisor-v2-timeline-wrap {
+    min-height: 200px;
+}
+
+.advisor-v2-timeline {
+    display: grid;
+    gap: 14px;
+}
+
+.advisor-turn {
+    display: grid;
+    gap: 10px;
+    padding: 18px;
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(15, 23, 42, 0.58);
+}
+
+.advisor-turn-user {
+    border-color: rgba(6, 182, 212, 0.2);
+}
+
+.advisor-turn-assistant {
+    border-color: rgba(16, 185, 129, 0.2);
+}
+
+.advisor-turn-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.advisor-turn-text {
+    white-space: pre-wrap;
+    line-height: 1.75;
+    color: var(--text-secondary);
+}
+
+.advisor-turn-cards {
+    display: grid;
+    gap: 12px;
+}
+
+.advisor-card {
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(2, 6, 23, 0.5);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.advisor-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.advisor-card-copy {
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.advisor-entry-list {
+    display: grid;
+    gap: 10px;
+}
+
+.advisor-entry-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-tree-shell {
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-tree-list,
+.advisor-tree-list ul {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 8px;
+}
+
+.advisor-tree-list li {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 12px;
+    align-items: start;
+}
+
+.advisor-tree-count {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.advisor-v2-composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    backdrop-filter: blur(16px);
+}
+
+@media (max-width: 1040px) {
+    .advisor-context-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 720px) {
+    .advisor-v2-header,
+    .advisor-entry-row,
+    .advisor-turn-head,
+    .advisor-card-head {
+        grid-template-columns: 1fr;
+        display: grid;
+    }
+
+    .advisor-context-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ── Workflow Layout Refresh ── */
+.workflow-shell {
+    display: grid;
+    gap: 18px;
+}
+
+.workflow-hero-panel {
+    padding: 24px;
+    background:
+        linear-gradient(180deg, rgba(13, 24, 31, 0.96), rgba(9, 18, 24, 0.9)),
+        linear-gradient(135deg, rgba(20, 184, 166, 0.05), transparent 52%);
+}
+
+.workflow-hero-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 22px;
+    margin-bottom: 20px;
+}
+
+.workflow-hero-copy {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+}
+
+.workflow-hero-copy h1 {
+    font-size: clamp(1.6rem, 2vw, 2.2rem);
+    line-height: 1.12;
+    letter-spacing: -0.04em;
+}
+
+.workflow-hero-copy p {
+    color: var(--text-secondary);
+    max-width: 70ch;
+}
+
+.workflow-hero-actions {
+    display: grid;
+    gap: 10px;
+    justify-items: end;
+    min-width: 220px;
+}
+
+.workflow-kicker {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    min-height: 26px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(20, 184, 166, 0.18);
+    background: rgba(20, 184, 166, 0.08);
+    color: #8ef2e7;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.workflow-kicker-subtle {
+    color: var(--text-secondary);
+    border-color: rgba(148, 163, 184, 0.14);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-source-note,
+.advisor-context-summary,
+.advisor-composer-panel {
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.025);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+.advisor-path-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+}
+}
+
+/* ── Advisor Refresh ── */
+.advisor-workspace {
+    gap: 16px;
+}
+
+.advisor-hero-actions {
+    min-width: 200px;
+}
+
+.advisor-stage-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: fit-content;
+    min-height: 34px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(20, 184, 166, 0.16);
+    background: rgba(20, 184, 166, 0.08);
+    color: #8ef2e7;
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+
+.advisor-stage-chip-muted {
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.03);
+    border-color: rgba(148, 163, 184, 0.14);
+}
+
+.advisor-source-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+    gap: 16px;
+    align-items: start;
+}
+
+.advisor-source-field {
+    min-width: 0;
+}
+
+.advisor-source-note {
+    padding: 16px 18px;
+    display: grid;
+    gap: 10px;
+}
+
+.advisor-hero-stat {
+    display: grid;
+    gap: 4px;
+}
+
+.advisor-hero-stat-label {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 700;
+}
+
+.advisor-organize-panel {
+    display: grid;
+    gap: 16px;
+    padding: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.028);
+}
+
+.advisor-organize-actions {
+    justify-content: flex-end;
+}
+
+.advisor-organize-config-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+    gap: 16px;
+    align-items: start;
+}
+
+.advisor-organize-fields {
+    display: grid;
+    gap: 14px;
+}
+
+.advisor-organize-toggle {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    padding: 14px 16px;
+    border-radius: 16px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-organize-toggle input {
+    margin-top: 4px;
+}
+
+.advisor-organize-toggle-copy {
+    display: grid;
+    gap: 4px;
+}
+
+.advisor-organize-toggle-title {
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.advisor-organize-toggle-hint {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    line-height: 1.55;
+}
+
+.advisor-organize-summary {
+    display: grid;
+    gap: 12px;
+}
+
+.advisor-organize-summary-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.advisor-organize-summary-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.advisor-organize-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+}
+
+.advisor-organize-progress {
+    display: grid;
+    gap: 8px;
+}
+
+.advisor-organize-progress-track {
+    position: relative;
+    height: 10px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.14);
+}
+
+.advisor-organize-progress-fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    min-width: 0;
+    border-radius: inherit;
+    background: linear-gradient(90deg, rgba(20, 184, 166, 0.92), rgba(56, 189, 248, 0.9));
+}
+
+
+.advisor-context-summary {
+    padding: 18px 20px;
+}
+
+.advisor-context-summary.collapsed {
+    padding-bottom: 18px;
+}
+
+.advisor-context-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.advisor-context-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.advisor-context-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.advisor-context-chip {
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.5;
+}
+
+.advisor-context-notes {
+    display: grid;
+    gap: 6px;
+    margin-top: 12px;
+}
+
+.advisor-timeline-shell {
+    min-height: 260px;
+}
+
+.advisor-timeline {
+    display: grid;
+    gap: 14px;
+}
+
+.advisor-empty-panel {
+    padding: 18px;
+}
+
+.advisor-message-section {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+}
+
+.advisor-message-rail {
+    position: relative;
+    min-height: 100%;
+    display: flex;
+    justify-content: center;
+}
+
+.advisor-message-rail::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: -14px;
+    left: 50%;
+    width: 1px;
+    transform: translateX(-50%);
+    background: linear-gradient(180deg, rgba(148, 163, 184, 0.28), rgba(148, 163, 184, 0.06));
+}
+
+.advisor-message-node {
+    position: relative;
+    z-index: 1;
+    width: 12px;
+    height: 12px;
+    margin-top: 12px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.28);
+    border: 2px solid rgba(7, 16, 21, 0.92);
+}
+
+.advisor-message-section-user .advisor-message-node {
+    background: var(--accent-info);
+}
+
+.advisor-message-section-assistant .advisor-message-node {
+    background: var(--accent-primary);
+}
+
+.advisor-message-stack {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+}
+
+.advisor-message-bubble {
+    display: grid;
+    gap: 10px;
+    padding: 16px 18px;
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(255, 255, 255, 0.025);
+    min-width: 0;
+}
+
+.advisor-message-section-user .advisor-message-bubble {
+    border-color: rgba(56, 189, 248, 0.16);
+    background: rgba(56, 189, 248, 0.06);
+}
+
+.advisor-message-section-assistant .advisor-message-bubble {
+    border-color: rgba(20, 184, 166, 0.16);
+    background: rgba(20, 184, 166, 0.045);
+}
+
+.advisor-message-bubble-loading {
+    border-color: rgba(20, 184, 166, 0.22);
+    background: rgba(20, 184, 166, 0.065);
+}
+
+.advisor-message-bubble-failed {
+    border-color: rgba(248, 113, 113, 0.28);
+    background: rgba(127, 29, 29, 0.14);
+}
+
+.advisor-message-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.advisor-message-meta-inline {
+    padding: 0 2px;
+}
+
+.advisor-message-role {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+}
+
+.advisor-message-time {
+    color: var(--text-muted);
+    font-size: 0.76rem;
+    font-family: "JetBrains Mono", monospace;
+}
+
+.advisor-message-text {
+    white-space: pre-wrap;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+
+.advisor-loading-reply {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    width: fit-content;
+    max-width: 100%;
+    color: var(--text-secondary);
+    font-size: 0.86rem;
+    line-height: 1.5;
+}
+
+.advisor-loading-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+}
+
+.advisor-loading-dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--accent-primary);
+    animation: pulse 1.1s ease-in-out infinite;
+}
+
+.advisor-loading-dots span:nth-child(2) {
+    animation-delay: 0.14s;
+}
+
+.advisor-loading-dots span:nth-child(3) {
+    animation-delay: 0.28s;
+}
+
+.advisor-turn-cards {
+    display: grid;
+    gap: 10px;
+}
+
+.advisor-tool-details {
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 14px;
+    background: rgba(5, 12, 17, 0.28);
+    overflow: hidden;
+}
+
+.advisor-tool-details summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 42px;
+    padding: 10px 14px;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
+}
+
+.advisor-tool-details summary::-webkit-details-marker {
+    display: none;
+}
+
+.advisor-tool-details summary::before {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform var(--transition-fast);
+    flex: 0 0 auto;
+}
+
+.advisor-tool-details[open] summary::before {
+    transform: rotate(45deg);
+}
+
+.advisor-tool-summary-hint {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+}
+
+.advisor-tool-list {
+    display: grid;
+    gap: 10px;
+    padding: 0 12px 12px;
+}
+
+.advisor-tool-item {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    background: rgba(255, 255, 255, 0.025);
+    min-width: 0;
+}
+
+.advisor-tool-item-head,
+.advisor-tool-title,
+.advisor-tool-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.advisor-tool-item-head {
+    justify-content: space-between;
+}
+
+.advisor-tool-title {
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.advisor-tool-step,
+.advisor-tool-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 24px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    font-family: "JetBrains Mono", monospace;
+}
+
+.advisor-tool-step {
+    color: var(--text-muted);
+    background: rgba(148, 163, 184, 0.08);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.advisor-tool-status-ok {
+    color: #72f2ba;
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.18);
+}
+
+.advisor-tool-status-error {
+    color: #fda4af;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.18);
+}
+
+.advisor-tool-status-neutral {
+    color: var(--text-muted);
+    background: rgba(148, 163, 184, 0.08);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.advisor-tool-meta {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    line-height: 1.5;
+}
+
+.advisor-tool-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.advisor-tool-field {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+}
+
+.advisor-tool-field-label {
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.advisor-tool-field pre {
+    margin: 0;
+    max-height: 260px;
+    overflow: auto;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    background: rgba(2, 6, 23, 0.52);
+    color: #cbd5e1;
+    font-size: 0.74rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.advisor-card {
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(5, 12, 17, 0.32);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.advisor-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.advisor-card-title-group {
+    min-width: 0;
+}
+
+.advisor-card-copy {
+    color: var(--text-secondary);
+    line-height: 1.7;
+}
+
+.advisor-entry-list {
+    display: grid;
+    gap: 10px;
+}
+
+.advisor-entry-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-entry-copy {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.advisor-tree-shell {
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-tree-list,
+.advisor-tree-list ul {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 8px;
+}
+
+.advisor-tree-list li {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 12px;
+    align-items: start;
+}
+
+.advisor-tree-count {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+}
+
+.advisor-composer-panel {
+    position: sticky;
+    bottom: 14px;
+    z-index: 3;
+    padding: 18px;
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+}
+
+.advisor-composer-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 220px;
+    gap: 16px;
+    align-items: end;
+}
+
+.advisor-composer-main {
+    min-width: 0;
+}
+
+.advisor-composer-input {
+    min-height: 120px;
+}
+
+.advisor-composer-side {
+    display: grid;
+    gap: 12px;
+}
+
+.advisor-composer-stage {
+    display: grid;
+    gap: 6px;
+}
+
+.advisor-composer-stage-value {
+    font-size: 1.2rem;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+}
+
+.advisor-send-btn {
+    width: 100%;
+}
+
+.advisor-inline-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.advisor-inline-actions .btn {
+    min-height: 40px;
+}
+
+/* ── Responsive Refresh ── */
+@media (max-width: 1040px) {
+    .advisor-organize-config-grid,
+    .advisor-source-grid,
+    .advisor-composer-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .advisor-context-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .workflow-hero-actions {
+        min-width: 0;
+        justify-items: start;
+    }
+}
+
+@media (max-width: 720px) {
+    .workflow-hero-panel,
+    .advisor-context-summary,
+    .advisor-composer-panel {
+        padding: 18px;
+    }
+
+    .workflow-hero-row,
+    .advisor-organize-summary-head,
+    .advisor-context-head,
+    .advisor-card-head,
+    .advisor-message-meta {
+        display: grid;
+        grid-template-columns: 1fr;
+    }
+
+    .advisor-path-actions,
+    .advisor-context-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .advisor-message-section {
+        grid-template-columns: 18px minmax(0, 1fr);
+        gap: 10px;
+    }
+
+    .advisor-entry-row {
+        display: grid;
+        grid-template-columns: 1fr;
+    }
+
+    .advisor-tool-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 480px) {
+    .workflow-hero-copy h1 {
+        font-size: 1.38rem;
+    }
+
+    .advisor-composer-input {
+        min-height: 110px;
+    }
+
+    .advisor-message-bubble,
+    .advisor-card {
+        padding: 14px;
+    }
+}
+

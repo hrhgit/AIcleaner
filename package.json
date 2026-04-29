@@ -5,6 +5,9 @@
     "type": "module",
     "scripts": {
         "dev": "vite",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "check:frontend": "npm run typecheck && npm test && npm run build",
         "build": "vite build",
         "tauri": "tauri",
         "tauri:dev": "node scripts/tauri-dev.mjs",
@@ -14,10 +17,18 @@
     "dependencies": {
         "@tauri-apps/api": "^2.8.0",
         "@tauri-apps/plugin-dialog": "^2.6.0",
-        "@tauri-apps/plugin-stronghold": "^2.3.1"
+        "@tauri-apps/plugin-stronghold": "^2.3.1",
+        "react": "^19.2.5",
+        "react-dom": "^19.2.5"
     },
     "devDependencies": {
         "@tauri-apps/cli": "^2.10.1",
-        "vite": "^6.0.0"
+        "@types/react": "^19.2.14",
+        "@types/react-dom": "^19.2.3",
+        "@vitejs/plugin-react": "^5.2.0",
+        "jsdom": "^29.1.0",
+        "typescript": "^6.0.3",
+        "vite": "^6.0.0",
+        "vitest": "^4.1.5"
     }
 }

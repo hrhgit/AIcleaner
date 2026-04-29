@@ -8,6 +8,7 @@ bin/*
 !.env.example
 .DS_Store
 .codex-candidates.json
+.codex-install-jobs/
 AGENTS.md
 .encoding-policy.json
 src-tauri/target/
