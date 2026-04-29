@@ -4,8 +4,9 @@ mod summary;
 use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
 use crate::file_representation::FileRepresentation;
 use crate::llm_protocol::{
-    apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
-    parse_completion_response, ParsedToolCall, DEFAULT_MAX_TOKENS,
+    apply_auth_headers, apply_llm_transport_headers, build_completion_payload,
+    build_llm_http_client, build_messages_url, detect_api_format, parse_completion_response,
+    ParsedToolCall, DEFAULT_MAX_TOKENS,
 };
 use crate::persist;
 use parking_lot::Mutex;
@@ -16,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::async_runtime::JoinHandle;
@@ -35,8 +36,10 @@ const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
-const CATEGORY_INVENTORY_FILES_PER_CATEGORY: usize = 3;
-pub(crate) const ORGANIZER_WEB_SEARCH_BUDGET: usize = 8;
+const SUMMARY_PREFETCH_BATCHES: usize = 2;
+const CLASSIFICATION_BATCH_CONCURRENCY: usize = 4;
+const ORGANIZER_SEARCH_CONCURRENCY: usize = 2;
+pub(crate) const ORGANIZER_WEB_SEARCH_BUDGET: usize = 20;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_TIKA_URL: &str = "http://127.0.0.1:9998";
@@ -91,6 +94,27 @@ struct ClassifyOrganizeBatchOutput {
     usage: TokenUsage,
     raw_output: String,
     error: Option<String>,
+    search_calls: usize,
+}
+
+struct InitialTreeOutput {
+    parsed: Option<Value>,
+    usage: TokenUsage,
+    raw_output: String,
+    error: Option<String>,
+}
+
+struct ReconcileOrganizeOutput {
+    parsed: Option<Value>,
+    usage: TokenUsage,
+    raw_output: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreparedClassificationBatch {
+    batch_idx: usize,
+    batch_rows: Vec<Value>,
 }
 
 struct SummaryAgentBatchOutput {

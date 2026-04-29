@@ -469,10 +469,8 @@ async fn chat_completion_with_messages(
 ) -> Result<ChatCompletionOutput, ChatCompletionError> {
     let api_format = detect_api_format(&route.endpoint);
     let url = build_messages_url(&route.endpoint, api_format);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(CHAT_COMPLETION_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| ChatCompletionError {
+    let client =
+        build_llm_http_client(CHAT_COMPLETION_TIMEOUT_SECS).map_err(|e| ChatCompletionError {
             message: e.to_string(),
             raw_body: String::new(),
         })?;
@@ -492,11 +490,13 @@ async fn chat_completion_with_messages(
     if let Some(diagnostics) = diagnostics {
         diagnostics.model_request(stage, route, &url, messages, tools.unwrap_or(&[]), &payload);
     }
-    let req = client
-        .post(url.clone())
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&payload);
+    let req = apply_llm_transport_headers(
+        client
+            .post(url.clone())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&payload),
+    );
     let req = apply_auth_headers(req, api_format, &route.api_key);
     let diagnostics_for_request = diagnostics.cloned();
     let endpoint_for_request = route.endpoint.clone();
@@ -526,8 +526,8 @@ async fn chat_completion_with_messages(
             }
         };
         let status = resp.status();
-        let raw_body = match resp.text().await {
-            Ok(raw_body) => raw_body,
+        let raw_body = match resp.bytes().await {
+            Ok(raw_body) => String::from_utf8_lossy(&raw_body).into_owned(),
             Err(e) => {
                 if let Some(diagnostics) = diagnostics_for_request.as_ref() {
                     diagnostics.model_error(
@@ -785,9 +785,9 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
         }
     } else {
         if is_zh {
-            "web_search 当前不可用。请基于已收集的证据完成判断，并调用 submit_organize_result。"
+            "web_search 当前不可用。请基于已收集的证据完成判断，并调用 submit_classification_batch。"
         } else {
-            "web_search is unavailable for the current step. Base your answer on the evidence already collected and call submit_organize_result."
+            "web_search is unavailable for the current step. Base your answer on the evidence already collected and call submit_classification_batch."
         }
     };
 
@@ -798,7 +798,7 @@ fn build_organize_system_prompt(response_language: &str, allow_web_search: bool)
 你必须使用原生 tool calling。
 不要在 assistant 文本中手写 JSON 协议。
 不要用普通自然语言返回最终分类树。
-当你准备好时，调用 submit_organize_result。
+当你准备好时，调用 submit_classification_batch。
 每次回复最多调用一个工具。
 
 已有节点已经拥有稳定的 nodeId。
@@ -869,7 +869,7 @@ categoryInventory 只能作为历史参考，当前 items 的文件证据优先�
 You must use native tool calling.
 Do not hand-write JSON protocol in assistant text.
 Do not return the final tree as plain assistant text.
-When you are ready, call submit_organize_result.
+When you are ready, call submit_classification_batch.
 Call at most one tool per reply.
 
 Existing nodes already have stable nodeId values.
@@ -1060,9 +1060,542 @@ fn search_budget_exhausted_message(response_language: &str) -> &'static str {
         .to_ascii_lowercase()
         .starts_with("zh")
     {
-        "联网搜索额度已用完，不能再调用 web_search。请基于当前已有证据立即调用 submit_organize_result 提交最终聚类结果。"
+        "联网搜索额度已用完，不能再调用 web_search。请基于当前已有证据立即调用 submit_classification_batch 提交最终聚类结果。"
     } else {
-        "Web search budget is exhausted. You can no longer call web_search. Based on the evidence already collected, call submit_organize_result now."
+        "Web search budget is exhausted. You can no longer call web_search. Based on the evidence already collected, call submit_classification_batch now."
+    }
+}
+
+fn build_initial_tree_system_prompt(response_language: &str) -> String {
+    if response_language
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("zh")
+    {
+        "你负责为文件整理任务生成初始分类树。只基于文件名、后缀、itemType/modality 和统计信息建树；不要分配文件；顶层优先按基础文件类型分类；准备好后调用 submit_initial_tree。".to_string()
+    } else {
+        "Generate the initial category tree for a file organization task. Use only filenames, extensions, itemType/modality, and stats; do not assign files; keep top-level nodes primarily type-based; call submit_initial_tree when ready.".to_string()
+    }
+}
+
+fn build_reconcile_system_prompt(response_language: &str, stage: &str) -> String {
+    let zh = response_language
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("zh");
+    match (zh, stage) {
+        (true, "reconcile_tree") => "你负责统一处理并行分类产生的 treeProposals 和 deferredAssignments。提交一版 draftTree、proposalMappings 和 rejectedProposalIds；不要输出自然语言结果，只调用 revise_tree_draft。".to_string(),
+        (true, "review_tree") => "你负责对 runtime 指定的局部范围做审查。只提交 issues、recommendedOperations 和 needsRevision；不要直接改树，只调用 review_organize_draft。".to_string(),
+        (true, "submit_reconciled_tree") => "你负责提交最终分类树和最终文件分配。必须确保每个有效文件 exactly once，所有 leafNodeId 存在；只调用 submit_reconciled_tree。".to_string(),
+        (false, "reconcile_tree") => "Reconcile treeProposals and deferredAssignments from parallel classification. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
+        (false, "review_tree") => "Review only the runtime-provided local scopes. Submit issues, recommendedOperations, and needsRevision; do not modify the tree; call review_organize_draft only.".to_string(),
+        _ => "Submit the final category tree and final file assignments. Ensure each valid file appears exactly once and all leafNodeId values exist; call submit_reconciled_tree only.".to_string(),
+    }
+}
+
+pub(super) async fn generate_initial_tree(
+    text_route: &RouteConfig,
+    response_language: &str,
+    stop: &AtomicBool,
+    batch_rows: &[Value],
+    diagnostics: Option<&OrganizerDiagnostics>,
+) -> Result<InitialTreeOutput, String> {
+    let file_index = batch_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "itemId": row.get("itemId").and_then(Value::as_str).unwrap_or(""),
+                "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
+                "relativePath": row.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+                "itemType": row.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+                "modality": row.get("modality").and_then(Value::as_str).unwrap_or("text"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let messages = vec![
+        json!({ "role": "system", "content": build_initial_tree_system_prompt(response_language) }),
+        json!({ "role": "user", "content": json!({ "fileIndex": file_index }).to_string() }),
+    ];
+    let llm = OrganizerBatchLlm {
+        route: text_route,
+        stop,
+        diagnostics,
+        stage: "initial_tree",
+    };
+    let registry = ToolRegistry::new();
+    let mut spec = InitialTreeSpec {
+        route: text_route,
+        response_language,
+        initial_messages: messages,
+        total_usage: TokenUsage::default(),
+        round_trace: Vec::new(),
+        available_tool_names: Vec::new(),
+    };
+    AgentTurnLoop::new(&llm, &registry).run(&mut spec).await
+}
+
+struct InitialTreeSpec<'a> {
+    route: &'a RouteConfig,
+    response_language: &'a str,
+    initial_messages: Vec<Value>,
+    total_usage: TokenUsage,
+    round_trace: Vec<String>,
+    available_tool_names: Vec<&'static str>,
+}
+
+impl InitialTreeSpec<'_> {
+    fn output(&self, parsed: Option<Value>, error: Option<String>) -> InitialTreeOutput {
+        InitialTreeOutput {
+            parsed,
+            usage: self.total_usage.clone(),
+            raw_output: self.round_trace.join("\n\n====================\n\n"),
+            error,
+        }
+    }
+}
+
+impl AgentTurnSpec for InitialTreeSpec<'_> {
+    type Output = InitialTreeOutput;
+
+    fn max_steps(&self) -> usize {
+        2
+    }
+
+    fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+        AgentToolPolicy {
+            workflow: ToolWorkflow::Organizer,
+            stage: "initial_tree",
+            session: None,
+            bootstrap_turn: false,
+            response_language: self.response_language,
+            web_search_allowed: false,
+            search_remaining: 0,
+        }
+    }
+
+    fn allow_multiple_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+        Ok(std::mem::take(&mut self.initial_messages))
+    }
+
+    fn before_step(&mut self, _step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
+        self.available_tool_names = vec!["submit_initial_tree"];
+        if let Some(system_message) = messages.get_mut(0) {
+            system_message["content"] =
+                Value::String(build_initial_tree_system_prompt(self.response_language));
+        }
+        Ok(())
+    }
+
+    fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+        ToolExecutionContext {
+            workflow: ToolWorkflow::Organizer,
+            stage: "initial_tree",
+            session: None,
+            bootstrap_turn: false,
+            response_language: self.response_language,
+            web_search_allowed: false,
+            search_remaining: 0,
+            state: None,
+            search_api_key: None,
+            diagnostics: None,
+            organizer_search_counter: None,
+            organizer_search_gate: None,
+        }
+    }
+
+    fn on_model_success(
+        &mut self,
+        step: usize,
+        completion: &AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<(), String> {
+        self.total_usage.prompt = self
+            .total_usage
+            .prompt
+            .saturating_add(completion.usage.prompt);
+        self.total_usage.completion = self
+            .total_usage
+            .completion
+            .saturating_add(completion.usage.completion);
+        self.total_usage.total = self
+            .total_usage
+            .total
+            .saturating_add(completion.usage.total);
+        append_batch_trace(
+            &mut self.round_trace,
+            step + 1,
+            self.route,
+            "http_ok",
+            &completion.raw_body,
+            Some(&completion.assistant_text),
+            None,
+            &self.available_tool_names,
+            0,
+        );
+        Ok(())
+    }
+
+    fn on_model_error(
+        &mut self,
+        step: usize,
+        err: AgentLlmError,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Option<Self::Output>, String> {
+        append_batch_trace(
+            &mut self.round_trace,
+            step + 1,
+            self.route,
+            "http_error",
+            &err.raw_body,
+            None,
+            Some(&err.message),
+            &self.available_tool_names,
+            0,
+        );
+        Ok(Some(self.output(None, Some(err.message))))
+    }
+
+    fn on_no_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Self::Output, String> {
+        Ok(self.output(
+            None,
+            Some("initial tree response did not call submit_initial_tree".to_string()),
+        ))
+    }
+
+    fn on_multiple_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Self::Output, String> {
+        Ok(self.output(
+            None,
+            Some("initial tree response used multiple tool calls".to_string()),
+        ))
+    }
+
+    fn on_tool_success(
+        &mut self,
+        _step: usize,
+        tool_id: Option<ToolId>,
+        call: &ParsedToolCall,
+        result: ToolResult,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallOutcome<Self::Output>, String> {
+        match tool_id {
+            Some(ToolId::SubmitInitialTree) => {
+                append_batch_trace_note(&mut self.round_trace, "submit_initial_tree", vec![]);
+                Ok(ToolCallOutcome::Finish(
+                    self.output(Some(result.result), None),
+                ))
+            }
+            _ => Ok(ToolCallOutcome::Finish(self.output(
+                None,
+                Some(format!("unsupported initial tree tool: {}", call.name)),
+            ))),
+        }
+    }
+
+    fn on_tool_error(
+        &mut self,
+        _step: usize,
+        _call: &ParsedToolCall,
+        message: String,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallErrorOutcome<Self::Output>, String> {
+        Ok(ToolCallErrorOutcome::Finish(
+            self.output(None, Some(message)),
+        ))
+    }
+
+    fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<Self::Output, String> {
+        Ok(self.output(None, Some("initial tree tool loop exhausted".to_string())))
+    }
+}
+
+pub(super) async fn reconcile_organize_batches(
+    text_route: &RouteConfig,
+    response_language: &str,
+    stop: &AtomicBool,
+    initial_tree: &Value,
+    batch_outputs: &[Value],
+    file_index: &[Value],
+    diagnostics: Option<&OrganizerDiagnostics>,
+) -> Result<ReconcileOrganizeOutput, String> {
+    let messages = vec![
+        json!({ "role": "system", "content": build_reconcile_system_prompt(response_language, "reconcile_tree") }),
+        json!({
+            "role": "user",
+            "content": json!({
+                "initialTree": initial_tree,
+                "batchOutputs": batch_outputs,
+                "fileIndex": file_index,
+                "instruction": "First call revise_tree_draft. After runtime validation, call review_organize_draft for the provided scope. When clean, call submit_reconciled_tree."
+            }).to_string(),
+        }),
+    ];
+    let llm = OrganizerBatchLlm {
+        route: text_route,
+        stop,
+        diagnostics,
+        stage: "reconcile_tree",
+    };
+    let registry = ToolRegistry::new();
+    let mut spec = ReconcileSpec {
+        route: text_route,
+        response_language,
+        stage: "reconcile_tree",
+        initial_messages: messages,
+        total_usage: TokenUsage::default(),
+        round_trace: Vec::new(),
+        available_tool_names: Vec::new(),
+        latest_draft: Value::Null,
+        latest_review: Value::Null,
+    };
+    AgentTurnLoop::new(&llm, &registry).run(&mut spec).await
+}
+
+struct ReconcileSpec<'a> {
+    route: &'a RouteConfig,
+    response_language: &'a str,
+    stage: &'static str,
+    initial_messages: Vec<Value>,
+    total_usage: TokenUsage,
+    round_trace: Vec<String>,
+    available_tool_names: Vec<&'static str>,
+    latest_draft: Value,
+    latest_review: Value,
+}
+
+impl ReconcileSpec<'_> {
+    fn output(&self, parsed: Option<Value>, error: Option<String>) -> ReconcileOrganizeOutput {
+        ReconcileOrganizeOutput {
+            parsed,
+            usage: self.total_usage.clone(),
+            raw_output: self.round_trace.join("\n\n====================\n\n"),
+            error,
+        }
+    }
+}
+
+impl AgentTurnSpec for ReconcileSpec<'_> {
+    type Output = ReconcileOrganizeOutput;
+
+    fn max_steps(&self) -> usize {
+        8
+    }
+
+    fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+        AgentToolPolicy {
+            workflow: ToolWorkflow::Organizer,
+            stage: self.stage,
+            session: None,
+            bootstrap_turn: false,
+            response_language: self.response_language,
+            web_search_allowed: false,
+            search_remaining: 0,
+        }
+    }
+
+    fn allow_multiple_tool_calls(&self) -> bool {
+        false
+    }
+
+    fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+        Ok(std::mem::take(&mut self.initial_messages))
+    }
+
+    fn before_step(&mut self, _step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
+        if let Some(system_message) = messages.get_mut(0) {
+            system_message["content"] = Value::String(build_reconcile_system_prompt(
+                self.response_language,
+                self.stage,
+            ));
+        }
+        self.available_tool_names = match self.stage {
+            "reconcile_tree" => vec!["revise_tree_draft"],
+            "review_tree" => vec!["review_organize_draft"],
+            _ => vec!["submit_reconciled_tree"],
+        };
+        Ok(())
+    }
+
+    fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+        ToolExecutionContext {
+            workflow: ToolWorkflow::Organizer,
+            stage: self.stage,
+            session: None,
+            bootstrap_turn: false,
+            response_language: self.response_language,
+            web_search_allowed: false,
+            search_remaining: 0,
+            state: None,
+            search_api_key: None,
+            diagnostics: None,
+            organizer_search_counter: None,
+            organizer_search_gate: None,
+        }
+    }
+
+    fn on_model_success(
+        &mut self,
+        step: usize,
+        completion: &AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<(), String> {
+        self.total_usage.prompt = self
+            .total_usage
+            .prompt
+            .saturating_add(completion.usage.prompt);
+        self.total_usage.completion = self
+            .total_usage
+            .completion
+            .saturating_add(completion.usage.completion);
+        self.total_usage.total = self
+            .total_usage
+            .total
+            .saturating_add(completion.usage.total);
+        append_batch_trace(
+            &mut self.round_trace,
+            step + 1,
+            self.route,
+            "http_ok",
+            &completion.raw_body,
+            Some(&completion.assistant_text),
+            None,
+            &self.available_tool_names,
+            0,
+        );
+        Ok(())
+    }
+
+    fn on_model_error(
+        &mut self,
+        step: usize,
+        err: AgentLlmError,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Option<Self::Output>, String> {
+        append_batch_trace(
+            &mut self.round_trace,
+            step + 1,
+            self.route,
+            "http_error",
+            &err.raw_body,
+            None,
+            Some(&err.message),
+            &self.available_tool_names,
+            0,
+        );
+        Ok(Some(self.output(None, Some(err.message))))
+    }
+
+    fn on_no_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Self::Output, String> {
+        Ok(self.output(
+            None,
+            Some(format!(
+                "reconcile stage {} did not call a required tool",
+                self.stage
+            )),
+        ))
+    }
+
+    fn on_multiple_tool_calls(
+        &mut self,
+        _completion: AgentCompletion,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Self::Output, String> {
+        Ok(self.output(
+            None,
+            Some("reconcile response used multiple tool calls".to_string()),
+        ))
+    }
+
+    fn on_tool_success(
+        &mut self,
+        _step: usize,
+        tool_id: Option<ToolId>,
+        call: &ParsedToolCall,
+        result: ToolResult,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallOutcome<Self::Output>, String> {
+        match tool_id {
+            Some(ToolId::ReviseTreeDraft) => {
+                self.latest_draft = result.result.clone();
+                self.stage = "review_tree";
+                append_batch_trace_note(&mut self.round_trace, "revise_tree_draft", vec![]);
+                Ok(ToolCallOutcome::Continue {
+                    result: json!({
+                        "ok": true,
+                        "nextStage": "review_tree",
+                        "reviewScope": { "type": "changed_nodes" },
+                        "validation": []
+                    }),
+                })
+            }
+            Some(ToolId::ReviewOrganizeDraft) => {
+                self.latest_review = result.result.clone();
+                let needs_revision = result
+                    .result
+                    .get("needsRevision")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.stage = if needs_revision {
+                    "reconcile_tree"
+                } else {
+                    "submit_reconciled_tree"
+                };
+                append_batch_trace_note(
+                    &mut self.round_trace,
+                    "review_organize_draft",
+                    vec![format!("Needs Revision: {needs_revision}")],
+                );
+                Ok(ToolCallOutcome::Continue {
+                    result: json!({
+                        "ok": true,
+                        "nextStage": self.stage,
+                        "draft": self.latest_draft,
+                        "review": self.latest_review,
+                    }),
+                })
+            }
+            Some(ToolId::SubmitReconciledTree) => {
+                append_batch_trace_note(&mut self.round_trace, "submit_reconciled_tree", vec![]);
+                Ok(ToolCallOutcome::Finish(
+                    self.output(Some(result.result), None),
+                ))
+            }
+            _ => Ok(ToolCallOutcome::Finish(self.output(
+                None,
+                Some(format!("unsupported reconcile tool: {}", call.name)),
+            ))),
+        }
+    }
+
+    fn on_tool_error(
+        &mut self,
+        _step: usize,
+        _call: &ParsedToolCall,
+        message: String,
+        _trace: &AgentLoopTrace,
+    ) -> Result<ToolCallErrorOutcome<Self::Output>, String> {
+        Ok(ToolCallErrorOutcome::Finish(
+            self.output(None, Some(message)),
+        ))
+    }
+
+    fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<Self::Output, String> {
+        Ok(self.output(None, Some("reconcile tool loop exhausted".to_string())))
     }
 }
 
@@ -1071,11 +1604,14 @@ pub(super) async fn classify_organize_batch(
     response_language: &str,
     stop: &AtomicBool,
     existing_tree: &CategoryTreeNode,
+    base_tree_version: u64,
     batch_rows: &[Value],
     category_inventory: &[Value],
     reference_structure: Option<&String>,
     use_web_search: bool,
     search_api_key: &str,
+    shared_search_calls: Arc<AtomicUsize>,
+    shared_search_gate: Arc<tokio::sync::Semaphore>,
     diagnostics: Option<&OrganizerDiagnostics>,
     stage: &str,
 ) -> Result<ClassifyOrganizeBatchOutput, String> {
@@ -1103,6 +1639,7 @@ pub(super) async fn classify_organize_batch(
         .collect::<Vec<_>>();
     let mut payload = json!({
         "existingTree": category_tree_to_value(existing_tree),
+        "baseTreeVersion": base_tree_version,
         "categoryInventory": category_inventory,
         "fileIndex": file_index,
         "items": classification_items,
@@ -1134,8 +1671,10 @@ pub(super) async fn classify_organize_batch(
         response_language,
         search_enabled,
         search_api_key,
+        shared_search_calls,
+        shared_search_gate,
         diagnostics,
-        stage,
+        stage: "classification_batch",
         initial_messages: messages,
         search_calls: 0,
         budget_exhausted_prompt_sent: false,
@@ -1194,6 +1733,8 @@ struct OrganizerBatchSpec<'a> {
     response_language: &'a str,
     search_enabled: bool,
     search_api_key: &'a str,
+    shared_search_calls: Arc<AtomicUsize>,
+    shared_search_gate: Arc<tokio::sync::Semaphore>,
     diagnostics: Option<&'a OrganizerDiagnostics>,
     stage: &'a str,
     initial_messages: Vec<Value>,
@@ -1206,7 +1747,7 @@ struct OrganizerBatchSpec<'a> {
 
 impl OrganizerBatchSpec<'_> {
     fn search_remaining(&self) -> usize {
-        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(self.search_calls)
+        ORGANIZER_WEB_SEARCH_BUDGET.saturating_sub(self.shared_search_calls.load(Ordering::Relaxed))
     }
 
     fn output(&self, parsed: Option<Value>, error: Option<String>) -> ClassifyOrganizeBatchOutput {
@@ -1215,6 +1756,7 @@ impl OrganizerBatchSpec<'_> {
             usage: self.total_usage.clone(),
             raw_output: self.round_trace.join("\n\n====================\n\n"),
             error,
+            search_calls: self.search_calls,
         }
     }
 }
@@ -1231,8 +1773,7 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     }
 
     fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
-        let allow_web_search =
-            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        let allow_web_search = self.search_enabled && self.search_remaining() > 0;
         AgentToolPolicy {
             workflow: ToolWorkflow::Organizer,
             stage: self.stage,
@@ -1253,8 +1794,7 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     }
 
     fn before_step(&mut self, step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
-        let allow_web_search =
-            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        let allow_web_search = self.search_enabled && self.search_remaining() > 0;
         if let Some(system_message) = messages.get_mut(0) {
             system_message["content"] = Value::String(build_organize_system_prompt(
                 self.response_language,
@@ -1262,14 +1802,12 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
             ));
         }
         self.available_tool_names = if allow_web_search {
-            vec!["web_search", "submit_organize_result"]
+            vec!["web_search", "submit_classification_batch"]
         } else {
-            vec!["submit_organize_result"]
+            vec!["submit_classification_batch"]
         };
 
-        if self.search_enabled
-            && self.search_calls >= ORGANIZER_WEB_SEARCH_BUDGET
-            && !self.budget_exhausted_prompt_sent
+        if self.search_enabled && self.search_remaining() == 0 && !self.budget_exhausted_prompt_sent
         {
             let prompt = search_budget_exhausted_message(self.response_language).to_string();
             messages.push(json!({
@@ -1287,8 +1825,7 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     }
 
     fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
-        let allow_web_search =
-            self.search_enabled && self.search_calls < ORGANIZER_WEB_SEARCH_BUDGET;
+        let allow_web_search = self.search_enabled && self.search_remaining() > 0;
         let search_remaining = self.search_remaining();
         ToolExecutionContext {
             workflow: ToolWorkflow::Organizer,
@@ -1301,6 +1838,8 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
             state: None,
             search_api_key: Some(self.search_api_key),
             diagnostics: self.diagnostics,
+            organizer_search_counter: Some(&self.shared_search_calls),
+            organizer_search_gate: Some(&self.shared_search_gate),
         }
     }
 
@@ -1424,11 +1963,11 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
                     result: result.result,
                 })
             }
-            Some(ToolId::SubmitOrganizeResult) => {
+            Some(ToolId::SubmitClassificationBatch) => {
                 let parsed = result.result;
                 append_batch_trace_note(
                     &mut self.round_trace,
-                    "submit_organize_result",
+                    "submit_classification_batch",
                     vec![
                         format!(
                             "Assignment Count: {}",
@@ -1468,7 +2007,10 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     ) -> Result<ClassifyOrganizeBatchOutput, String> {
         Ok(self.output(
             None,
-            Some("classification tool loop exhausted without submit_organize_result".to_string()),
+            Some(
+                "classification tool loop exhausted without submit_classification_batch"
+                    .to_string(),
+            ),
         ))
     }
 }
@@ -1489,8 +2031,10 @@ mod tool_policy_tests {
             response_language: "zh",
             search_enabled: true,
             search_api_key: "search-key",
+            shared_search_calls: Arc::new(AtomicUsize::new(0)),
+            shared_search_gate: Arc::new(tokio::sync::Semaphore::new(ORGANIZER_SEARCH_CONCURRENCY)),
             diagnostics: None,
-            stage: "classification_batch_1",
+            stage: "classification_batch",
             initial_messages: Vec::new(),
             search_calls: 0,
             budget_exhausted_prompt_sent: false,

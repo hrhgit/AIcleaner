@@ -1,9 +1,11 @@
 use crate::backend::TokenUsage;
-use reqwest::{RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
+use std::time::Duration;
 use uuid::Uuid;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const LLM_ACCEPT_ENCODING: &str = "identity";
 pub const DEFAULT_MAX_TOKENS: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +74,17 @@ pub fn apply_auth_headers(req: RequestBuilder, format: ApiFormat, api_key: &str)
             .header("x-api-key", api_key)
             .header("anthropic-version", ANTHROPIC_VERSION),
     }
+}
+
+pub fn build_llm_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .http1_only()
+        .build()
+}
+
+pub fn apply_llm_transport_headers(req: RequestBuilder) -> RequestBuilder {
+    req.header(reqwest::header::ACCEPT_ENCODING, LLM_ACCEPT_ENCODING)
 }
 
 pub fn build_completion_payload(
@@ -768,8 +781,8 @@ mod tests {
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "submit_organize_result",
-                            "arguments": "{\"assignments\":[{\"itemId\":\"batch12_1\",\"reason\":\".exe文件名含\"Installer\"，表明是安装包\"}]}"
+                            "name": "submit_classification_batch",
+                            "arguments": "{\"baseTreeVersion\":1,\"assignments\":[{\"itemId\":\"batch12_1\",\"leafNodeId\":\"node_1\",\"reason\":\".exe文件名含\"Installer\"，表明是安装包\"}]}"
                         }
                     }]
                 },
@@ -782,7 +795,7 @@ mod tests {
         let parsed =
             parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].name, "submit_organize_result");
+        assert_eq!(parsed.tool_calls[0].name, "submit_classification_batch");
         assert_eq!(
             parsed.tool_calls[0].arguments["assignments"][0]["reason"],
             ".exe文件名含\"Installer\"，表明是安装包"

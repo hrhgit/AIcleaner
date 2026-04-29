@@ -1,4 +1,5 @@
-import type { AdvisorCard, AdvisorSessionData, AdvisorCardAction, JsonRecord, OrganizeSnapshot, TimelineTurn, TreeNode } from '../../types';
+import { useMemo, useState } from 'react';
+import type { AdvisorCard, AdvisorSessionData, AdvisorCardAction, JsonRecord, OrganizeResultRow, OrganizeSnapshot, TimelineTurn, TreeNode } from '../../types';
 import { text } from '../../utils/i18n';
 import {
   formatDateTime,
@@ -13,6 +14,12 @@ import {
   type AdvisorWorkflowState,
 } from './model';
 import { SUMMARY_MODES } from './constants';
+import {
+  buildOrganizeBrowserTree,
+  findOrganizeBrowserFolder,
+  type OrganizeBrowserFile,
+  type OrganizeBrowserFolder,
+} from './organizeBrowser';
 
 export function TreeList({ childrenNodes, limit = 12 }: { childrenNodes: TreeNode[]; limit?: number }) {
   if (!childrenNodes.length) return null;
@@ -247,6 +254,84 @@ function AdvisorLoading() {
   );
 }
 
+function countLabel(count: number): string {
+  return text(`${count} 项`, `${count} item${count === 1 ? '' : 's'}`);
+}
+
+function FolderRow({ folder, onOpen }: { folder: OrganizeBrowserFolder; onOpen: (path: string[]) => void }) {
+  return (
+    <button className="advisor-browser-row advisor-browser-folder-row" type="button" onClick={() => onOpen(folder.path)}>
+      <span className="advisor-browser-icon advisor-browser-icon-folder" aria-hidden="true" />
+      <span className="advisor-browser-row-copy">
+        <span className="advisor-browser-row-title">{folder.name || '-'}</span>
+        <span className="advisor-browser-row-meta">{countLabel(folder.fileCount)}</span>
+      </span>
+      <span className="advisor-browser-chevron" aria-hidden="true" />
+    </button>
+  );
+}
+
+function FileRow({ file }: { file: OrganizeBrowserFile }) {
+  const error = file.classificationError.trim();
+  return (
+    <div className={`advisor-browser-row advisor-browser-file-row ${error ? 'advisor-browser-file-error' : ''}`}>
+      <span className="advisor-browser-icon advisor-browser-icon-file" aria-hidden="true" />
+      <span className="advisor-browser-row-copy">
+        <span className="advisor-browser-row-title">{file.name || '-'}</span>
+        <span className="advisor-browser-path">{file.path || '-'}</span>
+        {error ? <span className="advisor-browser-error-text">{error}</span> : null}
+      </span>
+      <span className="advisor-browser-type">{file.itemType || 'file'}</span>
+    </div>
+  );
+}
+
+function OrganizeResultBrowser({ rows }: { rows: OrganizeResultRow[] }) {
+  const root = useMemo(() => buildOrganizeBrowserTree(rows), [rows]);
+  const [activePath, setActivePath] = useState<string[]>([]);
+  const current = findOrganizeBrowserFolder(root, activePath) || root;
+  const crumbs = [
+    { label: text('根目录', 'Root'), path: [] as string[] },
+    ...current.path.map((segment, index) => ({
+      label: segment,
+      path: current.path.slice(0, index + 1),
+    })),
+  ];
+  const parentPath = current.path.slice(0, Math.max(0, current.path.length - 1));
+  const empty = current.folders.length === 0 && current.files.length === 0;
+
+  return (
+    <section className="advisor-browser-shell" aria-label={text('归类结果浏览', 'Organize result browser')}>
+      <div className="advisor-browser-toolbar">
+        <button className="btn btn-secondary advisor-browser-back" type="button" disabled={!current.path.length} onClick={() => setActivePath(parentPath)}>
+          {text('返回上级', 'Back')}
+        </button>
+        <nav className="advisor-browser-breadcrumbs" aria-label={text('当前位置', 'Current location')}>
+          {crumbs.map((crumb, index) => (
+            <button
+              className={`advisor-browser-crumb ${index === crumbs.length - 1 ? 'active' : ''}`}
+              type="button"
+              key={crumb.path.join('/') || 'root'}
+              onClick={() => setActivePath(crumb.path)}
+            >
+              {crumb.label}
+            </button>
+          ))}
+        </nav>
+      </div>
+      <div className="advisor-browser-list">
+        {current.folders.map((folder) => (
+          <FolderRow key={folder.id} folder={folder} onOpen={setActivePath} />
+        ))}
+        {current.files.map((file) => (
+          <FileRow key={file.id} file={file} />
+        ))}
+        {empty ? <div className="advisor-browser-empty">{text('当前层级没有文件。', 'No files in this level.')}</div> : null}
+      </div>
+    </section>
+  );
+}
+
 export function AdvisorTimeline({
   state,
   onCardAction,
@@ -365,6 +450,7 @@ export function OrganizeSummary({
   const processedFiles = Number(snapshot.processedFiles || snapshot.processed_files || 0);
   const error = String(snapshot.error || '').trim();
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
+  const resultRows = Array.isArray(snapshot.results) ? snapshot.results : [];
   return (
     <section className="advisor-organize-summary">
       <div className="advisor-organize-summary-head">
@@ -390,7 +476,14 @@ export function OrganizeSummary({
         </div>
       </div>
       {error ? <div className="form-hint">{text('错误: ', 'Error: ')}{error}</div> : null}
-      {treeChildren.length ? <div className="advisor-tree-shell"><TreeList childrenNodes={treeChildren} limit={18} /></div> : null}
+      {resultRows.length ? (
+        <OrganizeResultBrowser rows={resultRows} />
+      ) : treeChildren.length ? (
+        <div className="advisor-browser-readonly">
+          <div className="form-hint">{text('当前只有分类树，文件列表会在结果明细返回后显示。', 'Only the category tree is available now. Files appear after result details load.')}</div>
+          <div className="advisor-tree-shell"><TreeList childrenNodes={treeChildren} limit={18} /></div>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -486,4 +579,3 @@ export function OrganizePanel({
     </section>
   );
 }
-

@@ -412,6 +412,8 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
             state: Some(self.state),
             search_api_key: None,
             diagnostics: None,
+            organizer_search_counter: None,
+            organizer_search_gate: None,
         }
     }
 

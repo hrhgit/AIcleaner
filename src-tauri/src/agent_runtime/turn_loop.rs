@@ -214,8 +214,8 @@ mod tests {
                     },
                     ParsedToolCall {
                         id: "call_2".to_string(),
-                        name: "submit_organize_result".to_string(),
-                        arguments: json!({ "tree": {}, "assignments": [] }),
+                        name: "submit_classification_batch".to_string(),
+                        arguments: json!({ "baseTreeVersion": 1, "assignments": [] }),
                     },
                 ],
                 raw_message: json!({
@@ -272,6 +272,8 @@ mod tests {
                 state: None,
                 search_api_key: Some("search-key"),
                 diagnostics: None,
+                organizer_search_counter: None,
+                organizer_search_gate: None,
             }
         }
 

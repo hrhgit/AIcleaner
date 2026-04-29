@@ -3,12 +3,13 @@ use crate::backend::{
     resolve_provider_api_key, resolve_provider_endpoint_and_model, AppState, TokenUsage,
 };
 use crate::llm_protocol::{
-    apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
-    parse_completion_response, DEFAULT_MAX_TOKENS,
+    apply_auth_headers, apply_llm_transport_headers, build_completion_payload,
+    build_llm_http_client, build_messages_url, detect_api_format, parse_completion_response,
+    DEFAULT_MAX_TOKENS,
 };
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(test)]
 use serde_json::json as test_json;
@@ -194,10 +195,8 @@ async fn chat_completion(
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
     let api_format = detect_api_format(&route.endpoint);
     let url = build_messages_url(&route.endpoint, api_format);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(CHAT_COMPLETION_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| ChatCompletionError {
+    let client =
+        build_llm_http_client(CHAT_COMPLETION_TIMEOUT_SECS).map_err(|e| ChatCompletionError {
             message: e.to_string(),
             raw_body: String::new(),
         })?;
@@ -235,11 +234,13 @@ async fn chat_completion(
         None,
     );
 
-    let req = client
-        .post(url.clone())
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&payload);
+    let req = apply_llm_transport_headers(
+        client
+            .post(url.clone())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&payload),
+    );
     let req = apply_auth_headers(req, api_format, &route.api_key);
     let resp = match req.send().await {
         Ok(resp) => resp,
@@ -267,8 +268,8 @@ async fn chat_completion(
         }
     };
     let status = resp.status();
-    let raw_body = match resp.text().await {
-        Ok(raw_body) => raw_body,
+    let raw_body = match resp.bytes().await {
+        Ok(raw_body) => String::from_utf8_lossy(&raw_body).into_owned(),
         Err(e) => {
             crate::diagnostics::record_state_event(
                 state,

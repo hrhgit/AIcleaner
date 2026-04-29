@@ -76,6 +76,18 @@ export type TreeNode = {
   children?: TreeNode[];
 };
 
+export type OrganizeResultRow = {
+  index?: number;
+  path?: string;
+  name?: string;
+  itemType?: string;
+  categoryPath?: string[];
+  leafNodeId?: string;
+  classificationError?: string;
+  reason?: string;
+  [key: string]: unknown;
+};
+
 export type OrganizeSnapshot = {
   id?: string;
   status?: string;
@@ -91,6 +103,7 @@ export type OrganizeSnapshot = {
   useWebSearch?: boolean;
   webSearchEnabled?: boolean;
   tree?: TreeNode;
+  results?: OrganizeResultRow[];
   [key: string]: unknown;
 };
 
@@ -180,4 +193,3 @@ export type PersistPolicy<T> = {
   serializer?: (value: T) => string;
   deserializer?: (raw: string) => T;
 };
-

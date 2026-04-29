@@ -10,6 +10,7 @@ use crate::persist;
 use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ToolId {
@@ -25,7 +26,11 @@ pub(crate) enum ToolId {
     RollbackPlan,
     ApplyReclassification,
     RollbackReclassification,
-    SubmitOrganizeResult,
+    SubmitInitialTree,
+    SubmitClassificationBatch,
+    ReviseTreeDraft,
+    ReviewOrganizeDraft,
+    SubmitReconciledTree,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +84,8 @@ pub(crate) struct ToolExecutionContext<'a> {
     pub state: Option<&'a AppState>,
     pub search_api_key: Option<&'a str>,
     pub diagnostics: Option<&'a OrganizerDiagnostics>,
+    pub organizer_search_counter: Option<&'a AtomicUsize>,
+    pub organizer_search_gate: Option<&'a tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +180,11 @@ impl ToolRegistry {
         self.register(RollbackPlanTool);
         self.register(ApplyReclassificationTool);
         self.register(RollbackReclassificationTool);
-        self.register(SubmitOrganizeResultTool);
+        self.register(SubmitInitialTreeTool);
+        self.register(SubmitClassificationBatchTool);
+        self.register(ReviseTreeDraftTool);
+        self.register(ReviewOrganizeDraftTool);
+        self.register(SubmitReconciledTreeTool);
     }
 
     fn register<T>(&mut self, tool: T)
@@ -382,7 +393,11 @@ impl LlmTool for WebSearchTool {
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
         match ctx.workflow {
             ToolWorkflow::Advisor => ctx.web_search_allowed && advisor_session_enabled(ctx),
-            ToolWorkflow::Organizer => ctx.web_search_allowed && ctx.search_remaining > 0,
+            ToolWorkflow::Organizer => {
+                ctx.stage == "classification_batch"
+                    && ctx.web_search_allowed
+                    && ctx.search_remaining > 0
+            }
         }
     }
 
@@ -452,6 +467,46 @@ impl LlmTool for WebSearchTool {
             )));
         }
 
+        let _organizer_search_permit = if ctx.workflow == ToolWorkflow::Organizer {
+            let Some(gate) = ctx.organizer_search_gate else {
+                return Ok(ToolResult::blocked(
+                    "organizer web_search is missing task-level search concurrency gate.",
+                ));
+            };
+            Some(gate.acquire().await.map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+
+        if ctx.workflow == ToolWorkflow::Organizer {
+            let Some(counter) = ctx.organizer_search_counter else {
+                return Ok(ToolResult::blocked(
+                    "organizer web_search is missing task-level search budget counter.",
+                ));
+            };
+            loop {
+                let current = counter.load(Ordering::Relaxed);
+                if current >= crate::organizer_runtime::ORGANIZER_WEB_SEARCH_BUDGET {
+                    return Ok(ToolResult::blocked(local_text(
+                        ctx.response_language,
+                        "联网搜索额度已用完，请基于已有证据提交最终结果。",
+                        "Web search budget is exhausted. Submit the final result from existing evidence.",
+                    )));
+                }
+                if counter
+                    .compare_exchange(
+                        current,
+                        current.saturating_add(1),
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+
         match tavily_search(&key, &request).await {
             Ok(trace) => {
                 if ctx.workflow == ToolWorkflow::Organizer {
@@ -500,106 +555,278 @@ impl LlmTool for WebSearchTool {
     }
 }
 
-struct SubmitOrganizeResultTool;
-
-#[async_trait]
-impl LlmTool for SubmitOrganizeResultTool {
-    fn id(&self) -> ToolId {
-        ToolId::SubmitOrganizeResult
-    }
-
-    fn spec(&self) -> ToolSpec {
-        tool_spec(
-            self.id(),
-            "submit_organize_result",
-            "提交 organizer 当前批次的最终分类树和文件分配结果。准备完成时调用；这是分类批次的结束工具。",
-            json!({
-                "type": "object",
-                "description": "最终分类结果。tree 描述分类树，assignments 将当前批次 itemId 分配到叶子分类。",
-                "properties": {
-                    "tree": category_tree_schema(),
-                    "assignments": {
-                        "type": "array",
-                        "description": "当前批次文件或目录项的分类分配列表；每个 itemId 至少出现一次。",
-                        "maxItems": 200,
-                        "items": {
-                            "type": "object",
-                            "description": "单个当前 item 的分类分配。",
-                            "properties": {
-                                "reason": {
-                                    "type": "string",
-                                    "description": "简短说明该 item 被分到此类的证据，优先引用 summaryText、类型、扩展名或路径线索。",
-                                    "maxLength": 300
-                                },
-                                "itemId": {
-                                    "type": "string",
-                                    "description": "当前批次 items/fileIndex 中的 itemId，必须原样填写。"
-                                },
-                                "leafNodeId": {
-                                    "type": "string",
-                                    "description": "目标叶子分类节点的 nodeId；复用已有类别时使用已有 nodeId。"
-                                },
-                                "categoryPath": {
-                                    "type": "array",
-                                    "description": "从顶层分类到叶子分类的名称路径，用于兜底定位目标类别。",
-                                    "maxItems": 8,
-                                    "items": {
-                                        "type": "string",
-                                        "description": "分类路径中的一个节点名称。"
-                                    }
-                                }
-                            },
-                            "required": ["itemId"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["tree", "assignments"],
-                "additionalProperties": false
-            }),
-        )
-    }
-
-    fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        ctx.workflow == ToolWorkflow::Organizer
-    }
-
-    async fn execute(
-        &self,
-        ctx: &mut ToolExecutionContext<'_>,
-        args: &Value,
-    ) -> Result<ToolResult, String> {
-        if ctx.workflow != ToolWorkflow::Organizer {
-            return Ok(ToolResult::blocked(
-                "submit_organize_result 只能在 organizer workflow 中使用。",
-            ));
-        }
-        Ok(ToolResult::result(parse_submit_organize_result_arguments(
-            args,
-        )?))
-    }
+fn category_path_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "maxItems": 8,
+        "items": { "type": "string", "description": "分类路径中的一个节点名称。" }
+    })
 }
 
-fn parse_submit_organize_result_arguments(value: &Value) -> Result<Value, String> {
-    let tree = value
-        .get("tree")
+fn assignment_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "把当前 item 分配到初始树中的已有叶子节点。",
+        "properties": {
+            "reason": { "type": "string", "description": "分类证据和不确定性说明。", "maxLength": 300 },
+            "itemId": { "type": "string", "description": "当前 batch 输入中的 itemId，必须原样填写。" },
+            "leafNodeId": { "type": "string", "description": "目标已有叶子节点的 nodeId。" },
+            "categoryPath": category_path_schema("目标分类路径，用于校验和兜底。"),
+            "confidence": { "type": "string", "description": "分类置信度。", "enum": ["high", "medium", "low"] },
+            "needsReview": { "type": "boolean", "description": "该分配是否需要 reconciliation 阶段局部审查。" }
+        },
+        "required": ["itemId", "leafNodeId", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn deferred_assignment_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "需要等待树结构 proposal 处理后才能稳定落位的 item。",
+        "properties": {
+            "reason": { "type": "string", "description": "为什么不能直接放入已有节点。", "maxLength": 300 },
+            "itemId": { "type": "string", "description": "当前 batch 输入中的 itemId，必须原样填写。" },
+            "proposalId": { "type": "string", "description": "该 item 依赖的 treeProposal proposalId。" },
+            "suggestedPath": category_path_schema("建议落位路径。"),
+            "confidence": { "type": "string", "description": "建议置信度。", "enum": ["high", "medium", "low"] }
+        },
+        "required": ["itemId", "proposalId", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn tree_proposal_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "并行分类阶段提出的树结构修改建议；不会直接修改全局树。",
+        "properties": {
+            "proposalId": { "type": "string", "description": "当前 batch 内稳定 proposal ID。" },
+            "operation": { "type": "string", "description": "建议操作。", "enum": ["add_node", "merge_nodes", "split_node", "rename_node"] },
+            "targetNodeId": { "type": "string", "description": "被修改或作为父节点的现有 nodeId，可为空。" },
+            "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的现有节点。", "maxItems": 20, "items": { "type": "string" } },
+            "suggestedName": { "type": "string", "description": "建议节点名称。" },
+            "suggestedPath": category_path_schema("建议的新路径。"),
+            "evidenceItemIds": { "type": "array", "description": "支持该建议的当前 itemId。", "maxItems": 200, "items": { "type": "string" } },
+            "reason": { "type": "string", "description": "简短说明建议原因。", "maxLength": 500 }
+        },
+        "required": ["proposalId", "operation", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn string_array_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "maxItems": 500,
+        "items": { "type": "string" }
+    })
+}
+
+fn ensure_object_field(value: &Value, field: &str, tool: &str) -> Result<Value, String> {
+    let field_value = value
+        .get(field)
         .cloned()
-        .ok_or_else(|| "submit_organize_result is missing tree".to_string())?;
-    if !tree.is_object() {
-        return Err("submit_organize_result tree must be an object".to_string());
+        .ok_or_else(|| format!("{tool} is missing {field}"))?;
+    if !field_value.is_object() {
+        return Err(format!("{tool} {field} must be an object"));
     }
-    let assignments = value
-        .get("assignments")
+    Ok(field_value)
+}
+
+fn ensure_array_field(value: &Value, field: &str, tool: &str) -> Result<Value, String> {
+    let field_value = value
+        .get(field)
         .cloned()
-        .ok_or_else(|| "submit_organize_result is missing assignments".to_string())?;
-    if !assignments.is_array() {
-        return Err("submit_organize_result assignments must be an array".to_string());
+        .ok_or_else(|| format!("{tool} is missing {field}"))?;
+    if !field_value.is_array() {
+        return Err(format!("{tool} {field} must be an array"));
     }
+    Ok(field_value)
+}
+
+fn parse_initial_tree_arguments(value: &Value) -> Result<Value, String> {
     Ok(json!({
-        "tree": tree,
-        "assignments": assignments,
+        "tree": ensure_object_field(value, "tree", "submit_initial_tree")?,
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
     }))
 }
+
+fn parse_classification_batch_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "baseTreeVersion": value.get("baseTreeVersion").and_then(Value::as_u64).unwrap_or(0),
+        "assignments": ensure_array_field(value, "assignments", "submit_classification_batch")?,
+        "deferredAssignments": value.get("deferredAssignments").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "treeProposals": value.get("treeProposals").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+    }))
+}
+
+fn parse_revise_tree_draft_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "draftTree": ensure_object_field(value, "draftTree", "revise_tree_draft")?,
+        "proposalMappings": value.get("proposalMappings").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "rejectedProposalIds": value.get("rejectedProposalIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
+    }))
+}
+
+fn parse_review_organize_draft_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "issues": ensure_array_field(value, "issues", "review_organize_draft")?,
+        "recommendedOperations": value.get("recommendedOperations").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "needsRevision": value.get("needsRevision").and_then(Value::as_bool).unwrap_or(false),
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
+    }))
+}
+
+fn parse_reconciled_tree_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "finalTree": ensure_object_field(value, "finalTree", "submit_reconciled_tree")?,
+        "proposalMappings": ensure_array_field(value, "proposalMappings", "submit_reconciled_tree")?,
+        "finalAssignments": ensure_array_field(value, "finalAssignments", "submit_reconciled_tree")?,
+        "unresolvedItemIds": value.get("unresolvedItemIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+    }))
+}
+
+macro_rules! organizer_submit_tool {
+    ($tool:ident, $id:ident, $name:literal, $description:literal, $schema:expr, $stage:expr, $parser:ident) => {
+        struct $tool;
+
+        #[async_trait]
+        impl LlmTool for $tool {
+            fn id(&self) -> ToolId {
+                ToolId::$id
+            }
+
+            fn spec(&self) -> ToolSpec {
+                tool_spec(self.id(), $name, $description, $schema)
+            }
+
+            fn available(&self, ctx: &ToolContext<'_>) -> bool {
+                ctx.workflow == ToolWorkflow::Organizer && ctx.stage == $stage
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut ToolExecutionContext<'_>,
+                args: &Value,
+            ) -> Result<ToolResult, String> {
+                if ctx.workflow != ToolWorkflow::Organizer || ctx.stage != $stage {
+                    return Ok(ToolResult::blocked(format!(
+                        "{} is only available during organizer stage {}.",
+                        $name, $stage
+                    )));
+                }
+                Ok(ToolResult::result($parser(args)?))
+            }
+        }
+    };
+}
+
+organizer_submit_tool!(
+    SubmitInitialTreeTool,
+    SubmitInitialTree,
+    "submit_initial_tree",
+    "提交 organizer 初始分类树。此阶段只生成树结构，不分配文件，不联网搜索。",
+    json!({
+        "type": "object",
+        "description": "初始树提交结果。",
+        "properties": {
+            "tree": category_tree_schema(),
+            "notes": { "type": "string", "description": "可选，说明主要分类依据。", "maxLength": 800 }
+        },
+        "required": ["tree"],
+        "additionalProperties": false
+    }),
+    "initial_tree",
+    parse_initial_tree_arguments
+);
+
+organizer_submit_tool!(
+    SubmitClassificationBatchTool,
+    SubmitClassificationBatch,
+    "submit_classification_batch",
+    "提交当前并行分类 batch 的一次性结果。只能引用已有节点或提出 treeProposals，不能返回完整 tree。",
+    json!({
+        "type": "object",
+        "description": "并行分类 batch 输出。",
+        "properties": {
+            "baseTreeVersion": { "type": "integer", "description": "当前 batch 使用的 baseTreeVersion。", "minimum": 0 },
+            "assignments": { "type": "array", "description": "可直接落入已有叶子节点的分配。", "maxItems": 200, "items": assignment_schema() },
+            "deferredAssignments": { "type": "array", "description": "依赖 tree proposal 的待定分配。", "maxItems": 200, "items": deferred_assignment_schema() },
+            "treeProposals": { "type": "array", "description": "树结构修改建议。", "maxItems": 100, "items": tree_proposal_schema() }
+        },
+        "required": ["baseTreeVersion", "assignments"],
+        "additionalProperties": false
+    }),
+    "classification_batch",
+    parse_classification_batch_arguments
+);
+
+organizer_submit_tool!(
+    ReviseTreeDraftTool,
+    ReviseTreeDraft,
+    "revise_tree_draft",
+    "提交 reconciliation 阶段的一版 draft tree 和 proposal 映射。程序会立即校验并返回下一步。",
+    json!({
+        "type": "object",
+        "description": "树结构草稿修订结果。",
+        "properties": {
+            "draftTree": category_tree_schema(),
+            "proposalMappings": { "type": "array", "description": "proposalId 到最终 leafNodeId/path 的映射。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 映射。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "leafNodeId": { "type": "string", "description": "映射后的 leafNodeId。" }, "categoryPath": category_path_schema("映射后的分类路径。") }, "required": ["proposalId"], "additionalProperties": false } },
+            "rejectedProposalIds": string_array_schema("明确拒绝的 proposalId。"),
+            "notes": { "type": "string", "description": "本轮调整说明。", "maxLength": 1000 }
+        },
+        "required": ["draftTree"],
+        "additionalProperties": false
+    }),
+    "reconcile_tree",
+    parse_revise_tree_draft_arguments
+);
+
+organizer_submit_tool!(
+    ReviewOrganizeDraftTool,
+    ReviewOrganizeDraft,
+    "review_organize_draft",
+    "提交局部审查结论。只审 runtime 给出的局部范围，不直接修改树。",
+    json!({
+        "type": "object",
+        "description": "局部审查结果。",
+        "properties": {
+            "issues": { "type": "array", "description": "审查发现的问题。", "maxItems": 100, "items": { "type": "object", "description": "单个审查问题。", "properties": { "type": { "type": "string", "description": "问题类型。" }, "nodeIds": string_array_schema("相关 nodeId。"), "itemIds": string_array_schema("相关 itemId。"), "severity": { "type": "string", "description": "问题严重程度。", "enum": ["low", "medium", "high"] }, "reason": { "type": "string", "description": "问题原因。", "maxLength": 500 } }, "required": ["type", "reason"], "additionalProperties": false } },
+            "recommendedOperations": { "type": "array", "description": "建议后续 revise_tree_draft 采用的操作。", "maxItems": 100, "items": tree_proposal_schema() },
+            "needsRevision": { "type": "boolean", "description": "是否需要回到 revise_tree_draft。" },
+            "notes": { "type": "string", "description": "审查说明。", "maxLength": 1000 }
+        },
+        "required": ["issues", "needsRevision"],
+        "additionalProperties": false
+    }),
+    "review_tree",
+    parse_review_organize_draft_arguments
+);
+
+organizer_submit_tool!(
+    SubmitReconciledTreeTool,
+    SubmitReconciledTree,
+    "submit_reconciled_tree",
+    "提交通过审查后的最终分类树和最终文件分配。只有 runtime 校验通过后才会生成 preview/apply。",
+    json!({
+        "type": "object",
+        "description": "最终 reconciliation 结果。",
+        "properties": {
+            "finalTree": category_tree_schema(),
+            "proposalMappings": { "type": "array", "description": "所有 proposal 的处理结果。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 的最终处理结果。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "status": { "type": "string", "description": "proposal 的处理状态。", "enum": ["accepted", "merged", "rejected"] }, "leafNodeId": { "type": "string", "description": "接受或合并后的 leafNodeId。" }, "categoryPath": category_path_schema("最终分类路径。") }, "required": ["proposalId", "status"], "additionalProperties": false } },
+            "finalAssignments": { "type": "array", "description": "所有有效文件的最终分配。", "maxItems": 2000, "items": assignment_schema() },
+            "unresolvedItemIds": string_array_schema("仍无法稳定分类的 itemId。")
+        },
+        "required": ["finalTree", "proposalMappings", "finalAssignments"],
+        "additionalProperties": false
+    }),
+    "submit_reconciled_tree",
+    parse_reconciled_tree_arguments
+);
 
 struct GetDirectoryOverviewTool;
 
@@ -1687,7 +1914,7 @@ mod tests {
         assert!(tools.contains(&"web_search"));
         assert!(tools.contains(&"find_files"));
         assert!(!tools.contains(&"execute_plan"));
-        assert!(!tools.contains(&"submit_organize_result"));
+        assert!(!tools.contains(&"submit_classification_batch"));
 
         let execute_ctx = ToolContext {
             stage: WORKFLOW_EXECUTE_READY,
@@ -1702,7 +1929,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let ctx = ToolContext {
             workflow: ToolWorkflow::Organizer,
-            stage: "classification_batch_1",
+            stage: "classification_batch",
             session: None,
             bootstrap_turn: false,
             response_language: "zh",
@@ -1711,7 +1938,7 @@ mod tests {
         };
         let tools = registry.available_names(&ctx);
         assert!(tools.contains(&"web_search"));
-        assert!(tools.contains(&"submit_organize_result"));
+        assert!(tools.contains(&"submit_classification_batch"));
         assert!(!tools.contains(&"execute_plan"));
 
         let exhausted_ctx = ToolContext {
@@ -1721,7 +1948,7 @@ mod tests {
         };
         let exhausted_tools = registry.available_names(&exhausted_ctx);
         assert!(!exhausted_tools.contains(&"web_search"));
-        assert!(exhausted_tools.contains(&"submit_organize_result"));
+        assert!(exhausted_tools.contains(&"submit_classification_batch"));
     }
 
     #[test]
@@ -1795,16 +2022,22 @@ mod tests {
     }
 
     #[test]
-    fn submit_organize_result_validates_shape() {
-        let parsed = parse_submit_organize_result_arguments(&json!({
-            "tree": {},
+    fn new_organizer_submit_tools_validate_shape() {
+        let parsed = parse_initial_tree_arguments(&json!({
+            "tree": {}
+        }))
+        .expect("valid initial tree");
+        assert!(parsed["tree"].is_object());
+        let parsed = parse_classification_batch_arguments(&json!({
+            "baseTreeVersion": 1,
             "assignments": []
         }))
-        .expect("valid submit");
-        assert!(parsed["tree"].is_object());
-        assert!(parse_submit_organize_result_arguments(&json!({
-            "tree": [],
-            "assignments": []
+        .expect("valid classification batch");
+        assert_eq!(parsed["baseTreeVersion"], Value::from(1));
+        assert!(parse_reconciled_tree_arguments(&json!({
+            "finalTree": [],
+            "proposalMappings": [],
+            "finalAssignments": []
         }))
         .is_err());
     }

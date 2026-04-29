@@ -123,6 +123,26 @@ pub struct OrganizeSnapshot {
     pub supports_multimodal: bool,
     pub tree: Value,
     pub tree_version: u64,
+    #[serde(default)]
+    pub initial_tree: Value,
+    #[serde(default)]
+    pub base_tree_version: u64,
+    #[serde(default)]
+    pub batch_outputs: Vec<Value>,
+    #[serde(default)]
+    pub tree_proposals: Vec<Value>,
+    #[serde(default)]
+    pub draft_tree: Value,
+    #[serde(default)]
+    pub proposal_mappings: Vec<Value>,
+    #[serde(default)]
+    pub review_issues: Vec<Value>,
+    #[serde(default)]
+    pub final_tree: Value,
+    #[serde(default)]
+    pub final_assignments: Vec<Value>,
+    #[serde(default)]
+    pub classification_errors: Vec<Value>,
     pub total_files: u64,
     pub processed_files: u64,
     pub total_batches: u64,

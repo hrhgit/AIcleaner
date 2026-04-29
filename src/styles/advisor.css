@@ -610,6 +610,235 @@
     background: linear-gradient(90deg, rgba(20, 184, 166, 0.92), rgba(56, 189, 248, 0.9));
 }
 
+.advisor-browser-shell,
+.advisor-browser-readonly {
+    display: grid;
+    gap: 12px;
+}
+
+.advisor-browser-shell {
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: rgba(5, 12, 17, 0.28);
+    min-width: 0;
+}
+
+.advisor-browser-toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+}
+
+.advisor-browser-back {
+    min-height: 38px;
+    white-space: nowrap;
+}
+
+.advisor-browser-breadcrumbs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.advisor-browser-crumb {
+    display: inline-flex;
+    align-items: center;
+    min-height: 34px;
+    max-width: 100%;
+    padding: 6px 10px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.035);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 0.8rem;
+    line-height: 1.35;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+
+.advisor-browser-crumb:not(:last-child)::after {
+    content: '';
+    width: 6px;
+    height: 6px;
+    margin-left: 8px;
+    border-right: 1px solid currentColor;
+    border-bottom: 1px solid currentColor;
+    transform: rotate(-45deg);
+    opacity: 0.5;
+    flex: 0 0 auto;
+}
+
+.advisor-browser-crumb.active {
+    color: var(--text-primary);
+    background: rgba(20, 184, 166, 0.08);
+    border-color: rgba(20, 184, 166, 0.2);
+}
+
+.advisor-browser-list {
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+}
+
+.advisor-browser-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: center;
+    min-width: 0;
+    min-height: 56px;
+    padding: 10px 12px;
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.advisor-browser-folder-row {
+    width: 100%;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.advisor-browser-folder-row:hover,
+.advisor-browser-folder-row:focus-visible {
+    border-color: rgba(20, 184, 166, 0.24);
+    background: rgba(20, 184, 166, 0.055);
+}
+
+.advisor-browser-file-row {
+    color: var(--text-secondary);
+}
+
+.advisor-browser-file-error {
+    border-color: rgba(248, 113, 113, 0.2);
+    background: rgba(127, 29, 29, 0.12);
+}
+
+.advisor-browser-icon {
+    position: relative;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: rgba(148, 163, 184, 0.12);
+    border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.advisor-browser-icon-folder {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: rgba(56, 189, 248, 0.2);
+}
+
+.advisor-browser-icon-folder::before {
+    content: '';
+    position: absolute;
+    left: 5px;
+    top: 6px;
+    width: 10px;
+    height: 5px;
+    border-radius: 4px 4px 0 0;
+    background: rgba(56, 189, 248, 0.72);
+}
+
+.advisor-browser-icon-folder::after {
+    content: '';
+    position: absolute;
+    left: 5px;
+    right: 5px;
+    bottom: 6px;
+    height: 12px;
+    border-radius: 4px;
+    background: rgba(56, 189, 248, 0.48);
+}
+
+.advisor-browser-icon-file::before,
+.advisor-browser-icon-file::after {
+    content: '';
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    height: 2px;
+    border-radius: 999px;
+    background: rgba(203, 213, 225, 0.72);
+}
+
+.advisor-browser-icon-file::before {
+    top: 10px;
+}
+
+.advisor-browser-icon-file::after {
+    top: 16px;
+}
+
+.advisor-browser-row-copy {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+}
+
+.advisor-browser-row-title {
+    color: var(--text-primary);
+    font-weight: 700;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.advisor-browser-row-meta,
+.advisor-browser-path,
+.advisor-browser-error-text {
+    font-size: 0.78rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.advisor-browser-row-meta,
+.advisor-browser-path {
+    color: var(--text-muted);
+}
+
+.advisor-browser-error-text {
+    color: #fda4af;
+}
+
+.advisor-browser-type {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    max-width: 140px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    color: var(--text-muted);
+    background: rgba(148, 163, 184, 0.08);
+    border: 1px solid rgba(148, 163, 184, 0.1);
+    font-size: 0.72rem;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+}
+
+.advisor-browser-chevron {
+    width: 9px;
+    height: 9px;
+    border-right: 2px solid rgba(203, 213, 225, 0.7);
+    border-bottom: 2px solid rgba(203, 213, 225, 0.7);
+    transform: rotate(-45deg);
+    justify-self: end;
+}
+
+.advisor-browser-empty {
+    padding: 18px;
+    border-radius: 12px;
+    border: 1px dashed rgba(148, 163, 184, 0.18);
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.02);
+}
+
 
 .advisor-context-summary {
     padding: 18px 20px;
@@ -1158,6 +1387,25 @@
 
     .advisor-tool-grid {
         grid-template-columns: 1fr;
+    }
+
+    .advisor-browser-toolbar,
+    .advisor-browser-row {
+        grid-template-columns: 1fr;
+    }
+
+    .advisor-browser-row {
+        gap: 8px;
+    }
+
+    .advisor-browser-icon,
+    .advisor-browser-chevron {
+        display: none;
+    }
+
+    .advisor-browser-type {
+        width: fit-content;
+        max-width: 100%;
     }
 }
 

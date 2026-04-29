@@ -1,9 +1,11 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -55,6 +57,71 @@ mod tests {
             item_type: "file".to_string(),
             modality: "text".to_string(),
             directory_assessment: None,
+        }
+    }
+
+    fn make_summary_test_runtime(
+        root: &Path,
+        routes: HashMap<String, RouteConfig>,
+    ) -> Arc<OrganizeTaskRuntime> {
+        Arc::new(OrganizeTaskRuntime {
+            stop: AtomicBool::new(false),
+            snapshot: Mutex::new(OrganizeSnapshot {
+                id: "summary_test_task".to_string(),
+                status: "idle".to_string(),
+                error: None,
+                root_path: root.to_string_lossy().to_string(),
+                recursive: true,
+                excluded_patterns: Vec::new(),
+                batch_size: 2,
+                summary_strategy: SUMMARY_MODE_LOCAL_SUMMARY.to_string(),
+                use_web_search: false,
+                web_search_enabled: false,
+                selected_model: "test-model".to_string(),
+                selected_models: json!({}),
+                selected_providers: json!({}),
+                supports_multimodal: false,
+                tree: json!({}),
+                tree_version: 0,
+                initial_tree: Value::Null,
+                base_tree_version: 0,
+                batch_outputs: Vec::new(),
+                tree_proposals: Vec::new(),
+                draft_tree: Value::Null,
+                proposal_mappings: Vec::new(),
+                review_issues: Vec::new(),
+                final_tree: Value::Null,
+                final_assignments: Vec::new(),
+                classification_errors: Vec::new(),
+                processed_files: 0,
+                total_files: 0,
+                processed_batches: 0,
+                total_batches: 0,
+                token_usage: TokenUsage::default(),
+                results: Vec::new(),
+                preview: Vec::new(),
+                created_at: "2026-04-29T00:00:00Z".to_string(),
+                completed_at: None,
+                job_id: None,
+            }),
+            routes,
+            search_api_key: String::new(),
+            response_language: "zh-CN".to_string(),
+            extraction_tool: ExtractionToolConfig::default(),
+            diagnostics: OrganizerDiagnostics {
+                data_dir: root.to_path_buf(),
+                operation_id: "summary_test_operation".to_string(),
+                task_id: "summary_test_task".to_string(),
+            },
+            job: Mutex::new(None),
+        })
+    }
+
+    fn text_route(endpoint: String) -> RouteConfig {
+        RouteConfig {
+            endpoint,
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
         }
     }
 
@@ -131,6 +198,16 @@ mod tests {
             supports_multimodal: false,
             tree: json!({}),
             tree_version: 0,
+            initial_tree: Value::Null,
+            base_tree_version: 0,
+            batch_outputs: Vec::new(),
+            tree_proposals: Vec::new(),
+            draft_tree: Value::Null,
+            proposal_mappings: Vec::new(),
+            review_issues: Vec::new(),
+            final_tree: Value::Null,
+            final_assignments: Vec::new(),
+            classification_errors: Vec::new(),
             processed_files: 1,
             total_files: 1,
             processed_batches: 1,
@@ -299,6 +376,147 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning == "filename_only_fallback"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn prepare_summary_batch_local_summary_preserves_contract() {
+        let root = temp_dir("summary-prefetch-local");
+        let path = root.join("notes.txt");
+        write_text_file(&path, "alpha beta gamma");
+        let unit = make_test_unit(&path);
+        let route = text_route("http://127.0.0.1:9/v1".to_string());
+        let mut routes = HashMap::new();
+        routes.insert("text".to_string(), route.clone());
+        let task = make_summary_test_runtime(&root, routes);
+
+        let prepared = prepare_summary_batch(
+            task,
+            route.clone(),
+            SUMMARY_MODE_LOCAL_SUMMARY.to_string(),
+            1,
+            vec![unit],
+        )
+        .await
+        .expect("prepare local summary batch");
+
+        assert_eq!(prepared.batch_idx, 1);
+        assert_eq!(prepared.summary_usage.total, 0);
+        assert_eq!(prepared.batch_rows.len(), 1);
+        let row = &prepared.batch_rows[0];
+        assert_eq!(row.get("itemId").and_then(Value::as_str), Some("batch2_1"));
+        assert_eq!(
+            row.get("summaryStrategy").and_then(Value::as_str),
+            Some(SUMMARY_MODE_LOCAL_SUMMARY)
+        );
+        assert_eq!(
+            row.pointer("/representation/source").and_then(Value::as_str),
+            Some(SUMMARY_SOURCE_LOCAL_SUMMARY)
+        );
+        assert_eq!(
+            row.pointer("/localExtraction/parser").and_then(Value::as_str),
+            Some("plain_text")
+        );
+        assert_eq!(row.get("provider").and_then(Value::as_str), Some(route.endpoint.as_str()));
+        assert_eq!(row.get("model").and_then(Value::as_str), Some("test-model"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn prepare_summary_batch_agent_summary_keeps_usage_with_current_batch() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": r#"{
+                            "items": [{
+                                "itemId": "batch3_1",
+                                "summaryShort": "short summary",
+                                "summaryLong": "long summary",
+                                "keywords": ["alpha"],
+                                "confidence": "high",
+                                "warnings": ["source_sparse"]
+                            }]
+                        }"#
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let root = temp_dir("summary-prefetch-agent");
+        let path = root.join("notes.txt");
+        write_text_file(&path, "alpha beta gamma");
+        let unit = make_test_unit(&path);
+        let route = text_route(format!("http://{addr}/v1"));
+        let mut routes = HashMap::new();
+        routes.insert("text".to_string(), route.clone());
+        let task = make_summary_test_runtime(&root, routes);
+
+        let prepared = prepare_summary_batch(
+            task,
+            route,
+            SUMMARY_MODE_AGENT_SUMMARY.to_string(),
+            2,
+            vec![unit],
+        )
+        .await
+        .expect("prepare agent summary batch");
+
+        server.join().expect("server joined");
+        assert_eq!(prepared.batch_idx, 2);
+        assert_eq!(prepared.summary_usage.prompt, 11);
+        assert_eq!(prepared.summary_usage.completion, 7);
+        assert_eq!(prepared.summary_usage.total, 18);
+        let row = &prepared.batch_rows[0];
+        assert_eq!(row.get("itemId").and_then(Value::as_str), Some("batch3_1"));
+        assert_eq!(
+            row.pointer("/representation/source").and_then(Value::as_str),
+            Some(SUMMARY_SOURCE_AGENT_SUMMARY)
+        );
+        assert_eq!(
+            row.pointer("/representation/long").and_then(Value::as_str),
+            Some("long summary")
+        );
+        assert_eq!(
+            row.pointer("/representation/confidence")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert!(row
+            .get("summaryWarnings")
+            .and_then(Value::as_array)
+            .map(|warnings| {
+                warnings
+                    .iter()
+                    .any(|value| value.as_str() == Some("source_sparse"))
+            })
+            .unwrap_or(false));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -842,8 +1060,8 @@ mod tests {
                     "id": "call_1",
                     "type": "function",
                     "function": {
-                      "name": "submit_organize_result",
-                      "arguments": "{\"tree\":{\"nodeId\":\"root\",\"name\":\"\",\"children\":[]},\"assignments\":[]}"
+                      "name": "submit_classification_batch",
+                      "arguments": "{\"baseTreeVersion\":1,\"assignments\":[]}"
                     }
                   }
                 ]
@@ -863,7 +1081,7 @@ mod tests {
         )
         .expect("parse success");
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].name, "submit_organize_result");
+        assert_eq!(parsed.tool_calls[0].name, "submit_classification_batch");
         assert_eq!(parsed.usage.total, 8);
     }
 }
