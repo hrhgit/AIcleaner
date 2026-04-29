@@ -98,6 +98,15 @@ pub async fn organize_start<R: Runtime>(
         processed_files: 0,
         total_batches: 0,
         processed_batches: 0,
+        progress: organize_progress(
+            "idle",
+            "Idle",
+            Some("Waiting to start organize task.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        ),
         token_usage: TokenUsage::default(),
         results: Vec::new(),
         preview: Vec::new(),
@@ -133,6 +142,16 @@ pub async fn organize_start<R: Runtime>(
         if runtime.stop.load(Ordering::Relaxed) {
             let mut snap = runtime.snapshot.lock();
             snap.status = "stopped".to_string();
+            set_organize_progress(
+                &mut snap,
+                "stopped",
+                "Stopped",
+                Some("Organize task stopped by request.".to_string()),
+                None,
+                None,
+                None,
+                true,
+            );
             snap.completed_at = Some(now_iso());
             let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = serde_json::to_value(&*snap).unwrap_or_else(|_| json!({}));
@@ -145,6 +164,16 @@ pub async fn organize_start<R: Runtime>(
             let mut snap = runtime.snapshot.lock();
             snap.status = "error".to_string();
             snap.error = Some(err.clone());
+            set_organize_progress(
+                &mut snap,
+                "error",
+                "Error",
+                Some(err.clone()),
+                None,
+                None,
+                None,
+                true,
+            );
             snap.completed_at = Some(now_iso());
             let _ = persist::save_organize_snapshot(&state_clone.db_path(), &snap);
             let payload = json!({ "taskId": task_id_clone, "message": err, "snapshot": &*snap });
@@ -182,6 +211,16 @@ pub async fn organize_stop<R: Runtime>(
         if matches!(snapshot.status.as_str(), "collecting" | "classifying") {
             snapshot.status = "stopping".to_string();
         }
+        set_organize_progress(
+            &mut snapshot,
+            "stopped",
+            "Stopping",
+            Some("Stop requested. Waiting for the current stage to exit.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
     }
     emit_snapshot(&app, state.inner(), &task).await?;
     Ok(json!({ "success": true }))
@@ -210,7 +249,8 @@ pub async fn organize_get_latest_result(
         return Ok(Value::Null);
     }
     persist::prepare_organizer_module_access(&state.db_path())?;
-    let Some(task_id) = persist::find_latest_organize_task_id_for_root(&state.db_path(), &root_path)?
+    let Some(task_id) =
+        persist::find_latest_organize_task_id_for_root(&state.db_path(), &root_path)?
     else {
         return Ok(Value::Null);
     };
@@ -228,10 +268,20 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             snapshot.status
         ));
     }
+    let plan = planner::build_apply_plan(&snapshot);
     snapshot.status = "moving".to_string();
+    set_organize_progress(
+        &mut snapshot,
+        "moving",
+        "Applying",
+        Some("Moving files according to the generated plan.".to_string()),
+        Some(0),
+        Some(plan.len() as u64),
+        Some("files"),
+        plan.is_empty(),
+    );
     persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
 
-    let plan = planner::build_apply_plan(&snapshot);
     let mut entries = Vec::new();
     for row in &plan {
         let source = PathBuf::from(row.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
@@ -328,6 +378,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
         .filter(|x| x.get("status").and_then(Value::as_str) == Some("failed"))
         .count();
     let job_id = format!("job_{}", Uuid::new_v4().simple());
+    let total_entries = entries.len() as u64;
     let manifest = json!({
         "jobId": job_id,
         "taskId": task_id,
@@ -340,7 +391,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             "moved": moved,
             "skipped": skipped,
             "failed": failed,
-            "total": entries.len()
+            "total": total_entries
         }
     });
     record_organizer_state_event(
@@ -356,6 +407,16 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
     );
     persist::save_organize_manifest(&state.db_path(), &manifest)?;
     snapshot.status = "done".to_string();
+    set_organize_progress(
+        &mut snapshot,
+        "completed",
+        "Completed",
+        Some("File move stage finished.".to_string()),
+        Some(total_entries),
+        Some(total_entries),
+        Some("files"),
+        false,
+    );
     snapshot.job_id = manifest
         .get("jobId")
         .and_then(Value::as_str)
@@ -498,6 +559,18 @@ pub async fn organize_rollback(
             {
                 snapshot = planner::hydrate_loaded_snapshot(snapshot);
                 snapshot.status = "completed".to_string();
+                let processed_batches = snapshot.processed_batches;
+                let total_batches = snapshot.total_batches;
+                set_organize_progress(
+                    &mut snapshot,
+                    "completed",
+                    "Completed",
+                    Some("Rollback finished. Organize result is available again.".to_string()),
+                    Some(processed_batches),
+                    Some(total_batches),
+                    Some("batches"),
+                    false,
+                );
                 snapshot.job_id = None;
                 persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
                 if let Some(task) = state.organize_tasks.lock().get(&task_id).cloned() {
@@ -513,4 +586,3 @@ pub async fn organize_rollback(
         "rollback": rollback
     }))
 }
-

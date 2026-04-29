@@ -1084,10 +1084,10 @@ fn build_reconcile_system_prompt(response_language: &str, stage: &str) -> String
         .to_ascii_lowercase()
         .starts_with("zh");
     match (zh, stage) {
-        (true, "reconcile_tree") => "你负责统一处理并行分类产生的 treeProposals 和 deferredAssignments。提交一版 draftTree、proposalMappings 和 rejectedProposalIds；不要输出自然语言结果，只调用 revise_tree_draft。".to_string(),
+        (true, "reconcile_tree") => "你负责统一处理并行分类阶段提交的结构化 classificationResults，包括 treeProposals 和 deferredAssignments。只能使用初始树和这些分类结果；不要依赖上一阶段提示词、原始模型输出、文件抽取上下文或隐藏元数据。提交一版 draftTree、proposalMappings 和 rejectedProposalIds；不要输出自然语言结果，只调用 revise_tree_draft。".to_string(),
         (true, "review_tree") => "你负责对 runtime 指定的局部范围做审查。只提交 issues、recommendedOperations 和 needsRevision；不要直接改树，只调用 review_organize_draft。".to_string(),
         (true, "submit_reconciled_tree") => "你负责提交最终分类树和最终文件分配。必须确保每个有效文件 exactly once，所有 leafNodeId 存在；只调用 submit_reconciled_tree。".to_string(),
-        (false, "reconcile_tree") => "Reconcile treeProposals and deferredAssignments from parallel classification. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
+        (false, "reconcile_tree") => "Reconcile structured classificationResults from parallel classification, including treeProposals and deferredAssignments. Use only the initial tree and those classification results; do not rely on prior prompts, raw model traces, file extraction context, or hidden metadata. Submit one draftTree with proposalMappings and rejectedProposalIds; call revise_tree_draft only.".to_string(),
         (false, "review_tree") => "Review only the runtime-provided local scopes. Submit issues, recommendedOperations, and needsRevision; do not modify the tree; call review_organize_draft only.".to_string(),
         _ => "Submit the final category tree and final file assignments. Ensure each valid file appears exactly once and all leafNodeId values exist; call submit_reconciled_tree only.".to_string(),
     }
@@ -1325,8 +1325,7 @@ pub(super) async fn reconcile_organize_batches(
     response_language: &str,
     stop: &AtomicBool,
     initial_tree: &Value,
-    batch_outputs: &[Value],
-    file_index: &[Value],
+    classification_results: &[Value],
     diagnostics: Option<&OrganizerDiagnostics>,
 ) -> Result<ReconcileOrganizeOutput, String> {
     let messages = vec![
@@ -1335,9 +1334,8 @@ pub(super) async fn reconcile_organize_batches(
             "role": "user",
             "content": json!({
                 "initialTree": initial_tree,
-                "batchOutputs": batch_outputs,
-                "fileIndex": file_index,
-                "instruction": "First call revise_tree_draft. After runtime validation, call review_organize_draft for the provided scope. When clean, call submit_reconciled_tree."
+                "classificationResults": classification_results,
+                "instruction": "Use only initialTree and classificationResults from previous stages. Do not infer from prior prompts, raw model traces, file extraction context, or hidden file metadata. First call revise_tree_draft. After runtime validation, call review_organize_draft for the provided scope. When clean, call submit_reconciled_tree."
             }).to_string(),
         }),
     ];

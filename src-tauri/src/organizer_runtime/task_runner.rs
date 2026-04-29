@@ -6,6 +6,20 @@ struct PreparedSummaryBatch {
 
 type SummaryPrefetchHandle = JoinHandle<Result<PreparedSummaryBatch, String>>;
 
+fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
+    total.prompt = total.prompt.saturating_add(usage.prompt);
+    total.completion = total.completion.saturating_add(usage.completion);
+    total.total = total.total.saturating_add(usage.total);
+}
+
+fn token_usage_json(usage: &TokenUsage) -> Value {
+    json!({
+        "prompt": usage.prompt,
+        "completion": usage.completion,
+        "total": usage.total,
+    })
+}
+
 fn spawn_summary_prefetch(
     task: &Arc<OrganizeTaskRuntime>,
     text_route: &RouteConfig,
@@ -147,7 +161,11 @@ async fn prepare_summary_batch(
     if summary_strategy == SUMMARY_MODE_AGENT_SUMMARY {
         let batch_rows_for_agent: Vec<Value> = batch_rows
             .iter()
-            .filter(|row| !row.get("summaryDegraded").and_then(Value::as_bool).unwrap_or(false))
+            .filter(|row| {
+                !row.get("summaryDegraded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect();
 
@@ -169,7 +187,11 @@ async fn prepare_summary_batch(
             let item_id = row.get("itemId").and_then(Value::as_str).unwrap_or("");
             let local_result = local_results.get(idx).cloned().unwrap_or_default();
 
-            if row.get("summaryDegraded").and_then(Value::as_bool).unwrap_or(false) {
+            if row
+                .get("summaryDegraded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -181,12 +203,12 @@ async fn prepare_summary_batch(
                 .into_iter()
                 .filter_map(|value| value.as_str().map(|item| item.to_string()))
                 .collect::<Vec<_>>();
-            let fallback_source = if local_result.representation.source == SUMMARY_SOURCE_FILENAME_ONLY
-            {
-                SUMMARY_SOURCE_FILENAME_ONLY
-            } else {
-                SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL
-            };
+            let fallback_source =
+                if local_result.representation.source == SUMMARY_SOURCE_FILENAME_ONLY {
+                    SUMMARY_SOURCE_FILENAME_ONLY
+                } else {
+                    SUMMARY_SOURCE_AGENT_FALLBACK_LOCAL
+                };
 
             if let Some(agent_item) = output
                 .error
@@ -331,14 +353,7 @@ async fn run_organize_task<R: Runtime>(
     task: &Arc<OrganizeTaskRuntime>,
 ) -> Result<(), String> {
     let task_started_at = Instant::now();
-    let (
-        root_path,
-        recursive,
-        excluded,
-        batch_size,
-        summary_strategy,
-        use_web_search,
-    ) = {
+    let (root_path, recursive, excluded, batch_size, summary_strategy, use_web_search) = {
         let snap = task.snapshot.lock();
         (
             snap.root_path.clone(),
@@ -350,16 +365,26 @@ async fn run_organize_task<R: Runtime>(
         )
     };
     task.diagnostics.task_started(json!({
-            "rootPath": root_path.clone(),
-            "recursive": recursive,
-            "excludedPatterns": excluded.clone(),
-            "batchSize": batch_size,
-            "summaryStrategy": summary_strategy.clone(),
-            "useWebSearch": use_web_search,
-        }));
+        "rootPath": root_path.clone(),
+        "recursive": recursive,
+        "excludedPatterns": excluded.clone(),
+        "batchSize": batch_size,
+        "summaryStrategy": summary_strategy.clone(),
+        "useWebSearch": use_web_search,
+    }));
     {
         let mut snap = task.snapshot.lock();
         snap.status = "collecting".to_string();
+        set_organize_progress(
+            &mut snap,
+            "collecting",
+            "Collecting files",
+            Some("Scanning the selected directory.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
     }
     let collection_started_at = Instant::now();
     task.diagnostics.collection_started(&root_path);
@@ -367,11 +392,12 @@ async fn run_organize_task<R: Runtime>(
 
     let collection = collect_units(Path::new(&root_path), recursive, &excluded, &task.stop);
     let units = collection.units;
+    let collection_elapsed = collection_started_at.elapsed();
     task.diagnostics.collection_completed(
         &root_path,
         units.len(),
         &collection.report,
-        collection_started_at.elapsed(),
+        collection_elapsed,
     );
     if task.stop.load(Ordering::Relaxed) {
         task.diagnostics.task_stopped(
@@ -397,6 +423,18 @@ async fn run_organize_task<R: Runtime>(
         snap.total_batches = total_batches;
         snap.processed_files = 0;
         snap.processed_batches = 0;
+        set_organize_progress(
+            &mut snap,
+            "summary",
+            "Preparing summaries",
+            Some(format!(
+                "Preparing {total_batches} batch(es) for classification."
+            )),
+            Some(0),
+            Some(total_batches),
+            Some("batches"),
+            total_batches == 0,
+        );
         snap.results.clear();
         snap.preview.clear();
     }
@@ -413,6 +451,8 @@ async fn run_organize_task<R: Runtime>(
         .chunks(batch_size as usize)
         .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>();
+    let summary_started_at = Instant::now();
+    let mut summary_token_usage = TokenUsage::default();
     let mut prefetch_handles = (0..batches.len()).map(|_| None).collect::<Vec<_>>();
     let mut next_prefetch_idx = 0usize;
     while next_prefetch_idx < batches.len() && next_prefetch_idx < SUMMARY_PREFETCH_BATCHES {
@@ -489,6 +529,7 @@ async fn run_organize_task<R: Runtime>(
 
         let batch_rows = prepared.batch_rows;
         let summary_usage = prepared.summary_usage;
+        add_token_usage(&mut summary_token_usage, &summary_usage);
         if summary_strategy == SUMMARY_MODE_LOCAL_SUMMARY
             || summary_strategy == SUMMARY_MODE_AGENT_SUMMARY
         {
@@ -499,18 +540,20 @@ async fn run_organize_task<R: Runtime>(
         {
             let mut snap = task.snapshot.lock();
             snap.processed_batches = (batch_idx + 1) as u64;
-            snap.token_usage.prompt = snap
-                .token_usage
-                .prompt
-                .saturating_add(summary_usage.prompt);
-            snap.token_usage.completion = snap
-                .token_usage
-                .completion
-                .saturating_add(summary_usage.completion);
-            snap.token_usage.total = snap
-                .token_usage
-                .total
-                .saturating_add(summary_usage.total);
+            set_organize_progress(
+                &mut snap,
+                "summary",
+                "Preparing summaries",
+                Some(format!(
+                    "Prepared summary batch {} of {total_batches}.",
+                    batch_idx + 1
+                )),
+                Some((batch_idx + 1) as u64),
+                Some(total_batches),
+                Some("batches"),
+                total_batches == 0,
+            );
+            add_token_usage(&mut snap.token_usage, &summary_usage);
         }
         prepared_batches.push(PreparedClassificationBatch {
             batch_idx,
@@ -522,25 +565,49 @@ async fn run_organize_task<R: Runtime>(
             json!({
                 "batchIndex": batch_idx + 1,
                 "summaryPreparedRows": prepared_batches.last().map(|batch| batch.batch_rows.len()).unwrap_or(0),
-                "summaryUsage": {
-                    "prompt": summary_usage.prompt,
-                    "completion": summary_usage.completion,
-                    "total": summary_usage.total,
-                },
+                "summaryUsage": token_usage_json(&summary_usage),
             }),
             batch_started_at.elapsed(),
         );
     }
+    let summary_elapsed = summary_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "summary_preparation",
+        json!({
+            "summaryStrategy": summary_strategy,
+            "totalBatches": total_batches,
+            "preparedBatches": prepared_batches.len(),
+            "preparedRows": prepared_batches.iter().map(|batch| batch.batch_rows.len()).sum::<usize>(),
+            "tokenUsage": token_usage_json(&summary_token_usage),
+        }),
+        summary_elapsed,
+    );
 
     let all_batch_rows = prepared_batches
         .iter()
         .flat_map(|batch| batch.batch_rows.iter().cloned())
         .collect::<Vec<_>>();
     let mut tree = deterministic_initial_tree(&all_batch_rows);
+    let initial_tree_started_at = Instant::now();
+    let mut initial_tree_token_usage = TokenUsage::default();
     let base_tree_version = {
         let snap = task.snapshot.lock();
         snap.tree_version.saturating_add(1)
     };
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "initial_tree",
+            "Building category tree",
+            Some("Generating the initial category tree.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
     if !text_route.api_key.trim().is_empty() && !all_batch_rows.is_empty() {
         match summary::generate_initial_tree(
             &text_route,
@@ -554,15 +621,9 @@ async fn run_organize_task<R: Runtime>(
             Ok(output) => {
                 {
                     let mut snap = task.snapshot.lock();
-                    snap.token_usage.prompt =
-                        snap.token_usage.prompt.saturating_add(output.usage.prompt);
-                    snap.token_usage.completion = snap
-                        .token_usage
-                        .completion
-                        .saturating_add(output.usage.completion);
-                    snap.token_usage.total =
-                        snap.token_usage.total.saturating_add(output.usage.total);
+                    add_token_usage(&mut snap.token_usage, &output.usage);
                 }
+                add_token_usage(&mut initial_tree_token_usage, &output.usage);
                 if let Some(err) = output.error {
                     return Err(format!("initial_tree_failed:{err}"));
                 }
@@ -581,6 +642,17 @@ async fn run_organize_task<R: Runtime>(
             Err(err) => return Err(format!("initial_tree_failed:{err}")),
         }
     }
+    let initial_tree_elapsed = initial_tree_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "initial_tree",
+        json!({
+            "usedModel": !text_route.api_key.trim().is_empty() && !all_batch_rows.is_empty(),
+            "rowCount": all_batch_rows.len(),
+            "baseTreeVersion": base_tree_version,
+            "tokenUsage": token_usage_json(&initial_tree_token_usage),
+        }),
+        initial_tree_elapsed,
+    );
     {
         let mut snap = task.snapshot.lock();
         snap.initial_tree = category_tree_to_value(&tree);
@@ -593,8 +665,26 @@ async fn run_organize_task<R: Runtime>(
 
     let shared_search_calls = Arc::new(AtomicUsize::new(0));
     let shared_search_gate = Arc::new(tokio::sync::Semaphore::new(ORGANIZER_SEARCH_CONCURRENCY));
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(CLASSIFICATION_BATCH_CONCURRENCY));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        CLASSIFICATION_BATCH_CONCURRENCY,
+    ));
     let mut handles = Vec::new();
+    let classification_started_at = Instant::now();
+    let mut classification_token_usage = TokenUsage::default();
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "classification",
+            "Classifying batches",
+            Some(format!("Classifying {total_batches} prepared batch(es).")),
+            Some(0),
+            Some(total_batches),
+            Some("batches"),
+            total_batches == 0,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
     for prepared in prepared_batches.into_iter() {
         let permit = semaphore
             .clone()
@@ -650,6 +740,7 @@ async fn run_organize_task<R: Runtime>(
     }
 
     let mut batch_outputs = Vec::new();
+    let mut reconcile_inputs = Vec::new();
     let mut proposal_map: HashMap<String, (String, Vec<String>)> = HashMap::new();
     let mut deferred = Vec::new();
     let mut final_assignment_inputs: HashMap<String, (String, Vec<String>, String)> =
@@ -657,6 +748,7 @@ async fn run_organize_task<R: Runtime>(
     let mut rows_by_id: HashMap<String, (usize, Value)> = HashMap::new();
     let mut classification_errors = Vec::new();
     let mut result_rows = Vec::new();
+    let mut completed_classification_batches = 0_u64;
 
     for handle in handles {
         let (prepared, output) = handle
@@ -664,13 +756,12 @@ async fn run_organize_task<R: Runtime>(
             .map_err(|e| format!("classification_join_failed:{e}"))?;
         {
             let mut snap = task.snapshot.lock();
-            snap.token_usage.prompt = snap.token_usage.prompt.saturating_add(output.usage.prompt);
-            snap.token_usage.completion = snap
-                .token_usage
-                .completion
-                .saturating_add(output.usage.completion);
-            snap.token_usage.total = snap.token_usage.total.saturating_add(output.usage.total);
+            add_token_usage(&mut snap.token_usage, &output.usage);
         }
+        add_token_usage(&mut classification_token_usage, &output.usage);
+        completed_classification_batches = completed_classification_batches
+            .saturating_add(1)
+            .min(total_batches);
         for row in &prepared.batch_rows {
             if let Some(item_id) = row.get("itemId").and_then(Value::as_str) {
                 rows_by_id.insert(item_id.to_string(), (prepared.batch_idx, row.clone()));
@@ -716,6 +807,28 @@ async fn run_organize_task<R: Runtime>(
             "modelRawOutput": output.raw_output,
         });
         batch_outputs.push(batch_record);
+        reconcile_inputs.push(json!({
+            "batchIndex": prepared.batch_idx + 1,
+            "baseTreeVersion": base_tree_version,
+            "output": parsed,
+            "error": batch_error.clone().unwrap_or_default(),
+        }));
+        {
+            let mut snap = task.snapshot.lock();
+            set_organize_progress(
+                &mut snap,
+                "classification",
+                "Classifying batches",
+                Some(format!(
+                    "Completed classification batch {completed_classification_batches} of {total_batches}."
+                )),
+                Some(completed_classification_batches),
+                Some(total_batches),
+                Some("batches"),
+                total_batches == 0,
+            );
+        }
+        emit_snapshot(app, state, task).await?;
         if let Some(err) = batch_error {
             classification_errors.push(json!({
                 "batchIndex": prepared.batch_idx + 1,
@@ -733,7 +846,11 @@ async fn run_organize_task<R: Runtime>(
                         .and_then(|value| value.get("message"))
                         .and_then(Value::as_str)
                         .unwrap_or("classification_error"),
-                    if row_offset == 0 { &output.raw_output } else { "" },
+                    if row_offset == 0 {
+                        &output.raw_output
+                    } else {
+                        ""
+                    },
                 ));
             }
             continue;
@@ -838,15 +955,42 @@ async fn run_organize_task<R: Runtime>(
             }));
         }
     }
+    let classification_elapsed = classification_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "classification",
+        json!({
+            "batchCount": total_batches,
+            "resultRows": result_rows.len(),
+            "classificationErrorCount": classification_errors.len(),
+            "searchCalls": shared_search_calls.load(Ordering::Relaxed),
+            "tokenUsage": token_usage_json(&classification_token_usage),
+        }),
+        classification_elapsed,
+    );
 
+    let reconcile_started_at = Instant::now();
+    let mut reconcile_token_usage = TokenUsage::default();
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "reconcile",
+            "Reconciling tree",
+            Some("Merging batch results into the final category tree.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
     if !text_route.api_key.trim().is_empty() && !rows_by_id.is_empty() {
         match summary::reconcile_organize_batches(
             &text_route,
             &task.response_language,
             &task.stop,
             &category_tree_to_value(&tree),
-            &batch_outputs,
-            &all_batch_rows,
+            &reconcile_inputs,
             Some(&task.diagnostics),
         )
         .await
@@ -854,15 +998,9 @@ async fn run_organize_task<R: Runtime>(
             Ok(output) => {
                 {
                     let mut snap = task.snapshot.lock();
-                    snap.token_usage.prompt =
-                        snap.token_usage.prompt.saturating_add(output.usage.prompt);
-                    snap.token_usage.completion = snap
-                        .token_usage
-                        .completion
-                        .saturating_add(output.usage.completion);
-                    snap.token_usage.total =
-                        snap.token_usage.total.saturating_add(output.usage.total);
+                    add_token_usage(&mut snap.token_usage, &output.usage);
                 }
+                add_token_usage(&mut reconcile_token_usage, &output.usage);
                 if let Some(err) = output.error {
                     return Err(format!("reconcile_failed:{err}"));
                 }
@@ -887,7 +1025,8 @@ async fn run_organize_task<R: Runtime>(
                         else {
                             continue;
                         };
-                        let fallback_path = category_path_from_value(assignment.get("categoryPath"));
+                        let fallback_path =
+                            category_path_from_value(assignment.get("categoryPath"));
                         let path = category_path_for_id(&reconciled_tree, leaf_node_id)
                             .or_else(|| {
                                 if fallback_path.is_empty() {
@@ -932,8 +1071,9 @@ async fn run_organize_task<R: Runtime>(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        let path = category_path_for_id(&tree, &leaf)
-                            .unwrap_or_else(|| category_path_from_value(mapping.get("categoryPath")));
+                        let path = category_path_for_id(&tree, &leaf).unwrap_or_else(|| {
+                            category_path_from_value(mapping.get("categoryPath"))
+                        });
                         proposal_map.insert(proposal_id.to_string(), (leaf, path));
                     }
                 }
@@ -947,7 +1087,32 @@ async fn run_organize_task<R: Runtime>(
             Err(err) => return Err(format!("reconcile_failed:{err}")),
         }
     }
+    let reconcile_elapsed = reconcile_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "reconcile",
+        json!({
+            "usedModel": !text_route.api_key.trim().is_empty() && !rows_by_id.is_empty(),
+            "rowCount": rows_by_id.len(),
+            "tokenUsage": token_usage_json(&reconcile_token_usage),
+        }),
+        reconcile_elapsed,
+    );
 
+    let finalize_started_at = Instant::now();
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "finalize",
+            "Finalizing results",
+            Some("Writing organize rows, preview, and category tree.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
     for (item_id, (batch_idx, row)) in rows_by_id.iter() {
         if result_rows.iter().any(|result| {
             result.get("itemId").and_then(Value::as_str) == Some(item_id.as_str())
@@ -989,6 +1154,16 @@ async fn run_organize_task<R: Runtime>(
         let mut snap = task.snapshot.lock();
         snap.processed_files = result_rows.len() as u64;
         snap.processed_batches = total_batches;
+        set_organize_progress(
+            &mut snap,
+            "finalize",
+            "Finalizing results",
+            Some(format!("Prepared {} result row(s).", result_rows.len())),
+            Some(result_rows.len() as u64),
+            Some(units.len() as u64),
+            Some("files"),
+            units.is_empty(),
+        );
         snap.results = result_rows.clone();
         snap.batch_outputs = batch_outputs;
         snap.tree_proposals = proposal_map
@@ -1029,6 +1204,18 @@ async fn run_organize_task<R: Runtime>(
         snap.preview = planner::build_preview(&snap.root_path, &snap.results);
         snap.tree = snap.final_tree.clone();
         snap.status = "completed".to_string();
+        let processed_batches = snap.processed_batches;
+        let total_batches = snap.total_batches;
+        set_organize_progress(
+            &mut snap,
+            "completed",
+            "Completed",
+            Some("Organize results are ready.".to_string()),
+            Some(processed_batches),
+            Some(total_batches),
+            Some("batches"),
+            false,
+        );
         snap.completed_at = Some(now_iso());
         snap.clone()
     };
@@ -1039,6 +1226,16 @@ async fn run_organize_task<R: Runtime>(
         &final_snapshot.tree,
         final_snapshot.tree_version,
     )?;
+    let finalize_elapsed = finalize_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "finalize",
+        json!({
+            "resultRows": final_snapshot.results.len(),
+            "previewCount": final_snapshot.preview.len(),
+            "classificationErrorCount": final_snapshot.classification_errors.len(),
+        }),
+        finalize_elapsed,
+    );
     app.emit(
         "organize_done",
         serde_json::to_value(final_snapshot.clone()).map_err(|e| e.to_string())?,
@@ -1051,14 +1248,24 @@ async fn run_organize_task<R: Runtime>(
             "totalBatches": final_snapshot.total_batches,
             "processedBatches": final_snapshot.processed_batches,
             "previewCount": final_snapshot.preview.len(),
-            "tokenUsage": {
-                "prompt": final_snapshot.token_usage.prompt,
-                "completion": final_snapshot.token_usage.completion,
-                "total": final_snapshot.token_usage.total,
+            "timingMs": {
+                "collection": collection_elapsed.as_millis() as u64,
+                "summaryPreparation": summary_elapsed.as_millis() as u64,
+                "initialTree": initial_tree_elapsed.as_millis() as u64,
+                "classification": classification_elapsed.as_millis() as u64,
+                "reconcile": reconcile_elapsed.as_millis() as u64,
+                "finalize": finalize_elapsed.as_millis() as u64,
+                "total": task_started_at.elapsed().as_millis() as u64,
+            },
+            "tokenUsage": token_usage_json(&final_snapshot.token_usage),
+            "tokenUsageByStage": {
+                "summaryPreparation": token_usage_json(&summary_token_usage),
+                "initialTree": token_usage_json(&initial_tree_token_usage),
+                "classification": token_usage_json(&classification_token_usage),
+                "reconcile": token_usage_json(&reconcile_token_usage),
             },
         }),
         task_started_at.elapsed(),
     );
     Ok(())
 }
-

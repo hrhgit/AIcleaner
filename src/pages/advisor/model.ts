@@ -193,6 +193,19 @@ export function getOrganizeStatus(snapshot: OrganizeSnapshot | null): string {
   return String(snapshot?.status || '').trim().toLowerCase();
 }
 
+export function getOrganizeProgressStage(snapshot: OrganizeSnapshot | null): string {
+  const stage = String(snapshot?.progress?.stage || '').trim().toLowerCase();
+  const status = getOrganizeStatus(snapshot);
+  if (stage && !(stage === 'idle' && status && status !== 'idle')) return stage;
+  if (status === 'classifying') {
+    const totalBatches = Number(snapshot?.totalBatches || snapshot?.total_batches || 0);
+    const processedBatches = Number(snapshot?.processedBatches || snapshot?.processed_batches || 0);
+    return totalBatches > 0 && processedBatches < totalBatches ? 'summary' : 'classification';
+  }
+  if (status === 'done') return 'completed';
+  return status || 'idle';
+}
+
 export function isOrganizeRunning(snapshot: OrganizeSnapshot | null): boolean {
   return ['idle', 'collecting', 'classifying', 'stopping', 'moving'].includes(getOrganizeStatus(snapshot));
 }
@@ -202,23 +215,56 @@ export function isOrganizeFinished(snapshot: OrganizeSnapshot | null): boolean {
 }
 
 export function getOrganizeStatusLabel(state: AdvisorWorkflowState, snapshot: OrganizeSnapshot | null): string {
-  const status = getOrganizeStatus(snapshot);
-  if (status === 'collecting') return text('收集中', 'Collecting');
-  if (status === 'classifying') return text('归类中', 'Classifying');
-  if (status === 'stopping') return text('停止中', 'Stopping');
-  if (status === 'moving') return text('执行中', 'Applying');
-  if (status === 'completed' || status === 'done') return text('归类完成', 'Completed');
-  if (status === 'stopped') return text('已停止', 'Stopped');
-  if (status === 'error') return text('出错', 'Error');
+  const stage = getOrganizeProgressStage(snapshot);
+  if (stage === 'collecting') return text('收集目录', 'Collecting Files');
+  if (stage === 'summary') return text('准备摘要', 'Preparing Summaries');
+  if (stage === 'initial_tree') return text('生成分类树', 'Building Category Tree');
+  if (stage === 'classification') return text('分类批次', 'Classifying Batches');
+  if (stage === 'reconcile') return text('合并校验', 'Reconciling Tree');
+  if (stage === 'finalize') return text('生成结果', 'Finalizing Results');
+  if (stage === 'moving') return text('执行移动', 'Applying Moves');
+  if (stage === 'completed') return text('归类完成', 'Completed');
+  if (stage === 'stopped') {
+    return getOrganizeStatus(snapshot) === 'stopping' ? text('停止中', 'Stopping') : text('已停止', 'Stopped');
+  }
+  if (stage === 'error') return text('出错', 'Error');
   if (state.organizeStarting) return text('启动中', 'Starting');
-  return text('待开始', 'Idle');
+  return String(snapshot?.progress?.label || '').trim() || text('待开始', 'Idle');
+}
+
+export function hasDeterminateOrganizeProgress(snapshot: OrganizeSnapshot | null): boolean {
+  const progress = snapshot?.progress;
+  const current = Number(progress?.current);
+  const total = Number(progress?.total);
+  return !progress?.indeterminate && Number.isFinite(current) && Number.isFinite(total) && total > 0;
 }
 
 export function getOrganizeProgress(snapshot: OrganizeSnapshot | null): number {
+  if (hasDeterminateOrganizeProgress(snapshot)) {
+    const current = Number(snapshot?.progress?.current || 0);
+    const total = Number(snapshot?.progress?.total || 0);
+    return Math.max(0, Math.min(100, Math.round((current / total) * 100)));
+  }
   const total = Number(snapshot?.totalFiles || snapshot?.total_files || 0);
   const processed = Number(snapshot?.processedFiles || snapshot?.processed_files || 0);
   if (total <= 0) return isOrganizeFinished(snapshot) ? 100 : 0;
   return Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
+}
+
+export function getOrganizeProgressUnitLabel(unit: string | undefined): string {
+  if (unit === 'batches') return text('批次', 'Batches');
+  if (unit === 'steps') return text('步骤', 'Steps');
+  return text('文件', 'Files');
+}
+
+export function getOrganizeProgressDetail(snapshot: OrganizeSnapshot | null): string {
+  if (!snapshot) return '';
+  if (hasDeterminateOrganizeProgress(snapshot)) {
+    const current = Number(snapshot.progress?.current || 0);
+    const total = Number(snapshot.progress?.total || 0);
+    return `${getOrganizeProgressUnitLabel(String(snapshot.progress?.unit || 'files'))} ${current}/${total}`;
+  }
+  return String(snapshot.progress?.detail || '').trim();
 }
 
 export function formatDateTime(value: string | undefined): string {
@@ -270,4 +316,3 @@ export function applyLocalWebSearchState(state: AdvisorWorkflowState): AdvisorWo
   };
   return { ...state, sessionData };
 }
-

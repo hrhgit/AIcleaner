@@ -1,5 +1,12 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { advisorReducer, createInitialAdvisorState, getOrganizeProgress, isOrganizeRunning } from './model';
+import {
+  advisorReducer,
+  createInitialAdvisorState,
+  getOrganizeProgress,
+  getOrganizeProgressDetail,
+  hasDeterminateOrganizeProgress,
+  isOrganizeRunning,
+} from './model';
 import { ADVISOR_PERSIST_KEYS, WORKFLOW_PERSIST_KEYS } from './constants';
 
 describe('advisor workflow model', () => {
@@ -33,5 +40,36 @@ describe('advisor workflow model', () => {
     expect(isOrganizeRunning(snapshot)).toBe(true);
     expect(getOrganizeProgress(snapshot)).toBe(30);
   });
-});
 
+  it('prefers backend progress over file counters', () => {
+    const snapshot = {
+      status: 'classifying',
+      totalFiles: 10,
+      processedFiles: 1,
+      progress: {
+        stage: 'classification',
+        label: 'Classifying batches',
+        current: 3,
+        total: 4,
+        unit: 'batches',
+        indeterminate: false,
+      },
+    };
+
+    expect(hasDeterminateOrganizeProgress(snapshot)).toBe(true);
+    expect(getOrganizeProgress(snapshot)).toBe(75);
+    expect(getOrganizeProgressDetail(snapshot)).toBe('批次 3/4');
+  });
+
+  it('handles indeterminate progress and completed fallback', () => {
+    expect(getOrganizeProgress({
+      status: 'classifying',
+      progress: { stage: 'initial_tree', label: 'Building tree', indeterminate: true },
+    })).toBe(0);
+    expect(hasDeterminateOrganizeProgress({
+      status: 'error',
+      progress: { stage: 'error', label: 'Error', detail: 'raw backend error', indeterminate: true },
+    })).toBe(false);
+    expect(getOrganizeProgress({ status: 'completed', totalFiles: 0, processedFiles: 0 })).toBe(100);
+  });
+});

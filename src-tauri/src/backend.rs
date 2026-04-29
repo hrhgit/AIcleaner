@@ -18,7 +18,7 @@ use tauri::{Runtime, State};
 
 #[cfg(test)]
 use credential_store::InMemoryCredentialStore;
-use credential_store::{CredentialStore, WindowsCredentialStore};
+use credential_store::{CachedCredentialStore, CredentialStore, WindowsCredentialStore};
 pub(crate) use provider_registry::{default_model_for_endpoint, provider_secret_key};
 pub(crate) use settings_store::{
     default_settings, legacy_provider_api_key_from_settings, legacy_search_api_key_from_settings,
@@ -83,7 +83,9 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         }
         Ok(Self {
-            credential_store: Arc::new(WindowsCredentialStore::new(CREDENTIAL_SERVICE)),
+            credential_store: Arc::new(CachedCredentialStore::new(Arc::new(
+                WindowsCredentialStore::new(CREDENTIAL_SERVICE),
+            ))),
             base_data_dir,
             bootstrap_path,
             paths: Arc::new(Mutex::new(paths)),

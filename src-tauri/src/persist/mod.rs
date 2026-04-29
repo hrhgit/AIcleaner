@@ -177,6 +177,15 @@ mod tests {
             processed_files: 2,
             total_batches: 1,
             processed_batches: 1,
+            progress: crate::backend::OrganizeProgress {
+                stage: "completed".to_string(),
+                label: "Completed".to_string(),
+                detail: Some("Organize results are ready.".to_string()),
+                current: Some(1),
+                total: Some(1),
+                unit: Some("batches".to_string()),
+                indeterminate: false,
+            },
             token_usage: TokenUsage {
                 prompt: 10,
                 completion: 5,

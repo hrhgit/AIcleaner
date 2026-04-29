@@ -105,6 +105,37 @@ pub struct TokenUsage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OrganizeProgress {
+    pub stage: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub indeterminate: bool,
+}
+
+impl Default for OrganizeProgress {
+    fn default() -> Self {
+        Self {
+            stage: "idle".to_string(),
+            label: "Idle".to_string(),
+            detail: None,
+            current: None,
+            total: None,
+            unit: None,
+            indeterminate: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizeSnapshot {
     pub id: String,
     pub status: String,
@@ -147,6 +178,8 @@ pub struct OrganizeSnapshot {
     pub processed_files: u64,
     pub total_batches: u64,
     pub processed_batches: u64,
+    #[serde(default)]
+    pub progress: OrganizeProgress,
     pub token_usage: TokenUsage,
     #[serde(default)]
     pub results: Vec<Value>,
@@ -167,4 +200,3 @@ pub struct CredentialsSaveInput {
     provider_secrets: Option<HashMap<String, String>>,
     search_api_key: Option<String>,
 }
-

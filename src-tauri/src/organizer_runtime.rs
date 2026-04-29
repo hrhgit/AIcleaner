@@ -1,7 +1,9 @@
 mod planner;
 mod summary;
 
-use crate::backend::{AppState, OrganizeSnapshot, OrganizeStartInput, TokenUsage};
+use crate::backend::{
+    AppState, OrganizeProgress, OrganizeSnapshot, OrganizeStartInput, TokenUsage,
+};
 use crate::file_representation::FileRepresentation;
 use crate::llm_protocol::{
     apply_auth_headers, apply_llm_transport_headers, build_completion_payload,
@@ -130,6 +132,40 @@ struct SummaryAgentItem {
     keywords: Vec<String>,
     confidence: Option<String>,
     warnings: Vec<String>,
+}
+
+fn organize_progress(
+    stage: &str,
+    label: &str,
+    detail: Option<String>,
+    current: Option<u64>,
+    total: Option<u64>,
+    unit: Option<&str>,
+    indeterminate: bool,
+) -> OrganizeProgress {
+    OrganizeProgress {
+        stage: stage.to_string(),
+        label: label.to_string(),
+        detail,
+        current,
+        total,
+        unit: unit.map(str::to_string),
+        indeterminate,
+    }
+}
+
+fn set_organize_progress(
+    snapshot: &mut OrganizeSnapshot,
+    stage: &str,
+    label: &str,
+    detail: Option<String>,
+    current: Option<u64>,
+    total: Option<u64>,
+    unit: Option<&str>,
+    indeterminate: bool,
+) {
+    snapshot.progress =
+        organize_progress(stage, label, detail, current, total, unit, indeterminate);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -386,6 +422,17 @@ impl OrganizerDiagnostics {
             "organize_batch_done",
             "organize batch completed",
             details,
+            None,
+            Some(duration),
+        );
+    }
+
+    fn stage_completed(&self, stage: &str, details: Value, duration: Duration) {
+        self.record(
+            "info",
+            "organize_stage_done",
+            "organize stage completed",
+            crate::diagnostics::merge_details(json!({ "stage": stage }), details),
             None,
             Some(duration),
         );

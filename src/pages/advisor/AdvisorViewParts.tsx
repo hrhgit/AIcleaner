@@ -5,8 +5,11 @@ import {
   formatDateTime,
   getCurrentSnapshot,
   getOrganizeProgress,
+  getOrganizeProgressDetail,
+  getOrganizeProgressStage,
   getOrganizeStatusLabel,
   getStageLabel,
+  hasDeterminateOrganizeProgress,
   isOrganizeFinished,
   isOrganizeRunning,
   summaryModeHint,
@@ -332,6 +335,42 @@ function OrganizeResultBrowser({ rows }: { rows: OrganizeResultRow[] }) {
   );
 }
 
+const ORGANIZE_STAGE_FLOW = [
+  { stage: 'collecting', label: () => text('收集', 'Collect') },
+  { stage: 'summary', label: () => text('摘要', 'Summary') },
+  { stage: 'initial_tree', label: () => text('建树', 'Tree') },
+  { stage: 'classification', label: () => text('分类', 'Classify') },
+  { stage: 'reconcile', label: () => text('合并', 'Merge') },
+  { stage: 'finalize', label: () => text('结果', 'Finalize') },
+  { stage: 'completed', label: () => text('完成', 'Done') },
+];
+
+function OrganizeStageStrip({ stage }: { stage: string }) {
+  const activeIndex = ORGANIZE_STAGE_FLOW.findIndex((item) => item.stage === stage);
+  const terminal = ['completed', 'error', 'stopped'].includes(stage);
+  return (
+    <div className={`advisor-organize-stage-strip advisor-organize-stage-${stage || 'idle'}`}>
+      {ORGANIZE_STAGE_FLOW.map((item, index) => {
+        const stateClass = terminal && stage !== 'completed'
+          ? 'pending'
+          : activeIndex < 0
+            ? 'pending'
+            : index < activeIndex
+              ? 'done'
+              : index === activeIndex
+                ? 'active'
+                : 'pending';
+        return (
+          <div className={`advisor-organize-stage-step ${stateClass}`} key={item.stage}>
+            <span className="advisor-organize-stage-dot" aria-hidden="true" />
+            <span>{item.label()}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function AdvisorTimeline({
   state,
   onCardAction,
@@ -447,8 +486,11 @@ export function OrganizeSummary({
 }) {
   if (!snapshot) return <div className="advisor-organize-summary" />;
   const totalFiles = Number(snapshot.totalFiles || snapshot.total_files || 0);
-  const processedFiles = Number(snapshot.processedFiles || snapshot.processed_files || 0);
   const error = String(snapshot.error || '').trim();
+  const stage = getOrganizeProgressStage(snapshot);
+  const stageDetail = getOrganizeProgressDetail(snapshot);
+  const progressValue = getOrganizeProgress(snapshot);
+  const determinate = hasDeterminateOrganizeProgress(snapshot);
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
   const resultRows = Array.isArray(snapshot.results) ? snapshot.results : [];
   return (
@@ -465,15 +507,27 @@ export function OrganizeSummary({
           </span>
         </div>
       </div>
+      <div className="advisor-organize-state-card" role="status" aria-live="polite">
+        <div className="advisor-organize-state-copy">
+          <div className="advisor-organize-state-label">{getOrganizeStatusLabel(state, snapshot)}</div>
+          {stageDetail ? <div className="advisor-organize-state-detail">{stageDetail}</div> : null}
+        </div>
+        <div className="advisor-organize-state-meter">
+          <div className={`advisor-organize-progress-track ${determinate ? '' : 'indeterminate'}`}>
+            {determinate ? (
+              <div className="advisor-organize-progress-fill" style={{ width: `${progressValue}%` }} />
+            ) : (
+              <div className="advisor-organize-progress-fill advisor-organize-progress-pulse" />
+            )}
+          </div>
+          {determinate ? <span className="advisor-organize-progress-percent">{progressValue}%</span> : null}
+        </div>
+        <OrganizeStageStrip stage={stage} />
+      </div>
       <div className="advisor-organize-stats">
         <div className="advisor-context-chip">{text('文件数', 'Files')}: {totalFiles}</div>
-        <div className="advisor-context-chip">{text('已处理', 'Processed')}: {processedFiles}</div>
+        <div className="advisor-context-chip">{text('当前阶段', 'Stage')}: {getOrganizeStatusLabel(state, snapshot)}</div>
         <div className="advisor-context-chip">{text('任务 ID', 'Task ID')}: {snapshot.id || '-'}</div>
-      </div>
-      <div className="advisor-organize-progress">
-        <div className="advisor-organize-progress-track">
-          <div className="advisor-organize-progress-fill" style={{ width: `${getOrganizeProgress(snapshot)}%` }} />
-        </div>
       </div>
       {error ? <div className="form-hint">{text('错误: ', 'Error: ')}{error}</div> : null}
       {resultRows.length ? (

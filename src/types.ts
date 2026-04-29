@@ -88,6 +88,31 @@ export type OrganizeResultRow = {
   [key: string]: unknown;
 };
 
+export type OrganizeProgressStage =
+  | 'idle'
+  | 'collecting'
+  | 'summary'
+  | 'initial_tree'
+  | 'classification'
+  | 'reconcile'
+  | 'finalize'
+  | 'moving'
+  | 'completed'
+  | 'stopped'
+  | 'error';
+
+export type OrganizeProgressUnit = 'files' | 'batches' | 'steps';
+
+export type OrganizeProgress = {
+  stage?: OrganizeProgressStage | string;
+  label?: string;
+  detail?: string;
+  current?: number;
+  total?: number;
+  unit?: OrganizeProgressUnit | string;
+  indeterminate?: boolean;
+};
+
 export type OrganizeSnapshot = {
   id?: string;
   status?: string;
@@ -102,6 +127,7 @@ export type OrganizeSnapshot = {
   summary_strategy?: SummaryMode | string;
   useWebSearch?: boolean;
   webSearchEnabled?: boolean;
+  progress?: OrganizeProgress;
   tree?: TreeNode;
   results?: OrganizeResultRow[];
   [key: string]: unknown;

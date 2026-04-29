@@ -1,8 +1,15 @@
 node_modules/
 dist/
+codex_asar/
+.codex/
+.codex-release/
+.codex-runtime/
+assets/
 bin/*
 !bin/
 *.exe
+tmp_aicleaner_window.png
+urls.txt
 .env
 .env.*
 !.env.example

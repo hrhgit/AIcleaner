@@ -2,10 +2,15 @@
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::env;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -26,11 +31,7 @@ mod tests {
         fs::write(path, content.as_bytes()).expect("write text file");
     }
 
-    fn assess_directory(
-        path: &Path,
-        stop: &AtomicBool,
-        prefer_whole: bool,
-    ) -> DirectoryAssessment {
+    fn assess_directory(path: &Path, stop: &AtomicBool, prefer_whole: bool) -> DirectoryAssessment {
         let excluded = normalize_excluded(None);
         let mut report = CollectionReport::default();
         evaluate_directory_assessment(path, &excluded, stop, prefer_whole, &mut report)
@@ -97,6 +98,15 @@ mod tests {
                 total_files: 0,
                 processed_batches: 0,
                 total_batches: 0,
+                progress: organize_progress(
+                    "idle",
+                    "Idle",
+                    Some("Waiting to start organize task.".to_string()),
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
                 token_usage: TokenUsage::default(),
                 results: Vec::new(),
                 preview: Vec::new(),
@@ -125,12 +135,135 @@ mod tests {
         }
     }
 
+    fn read_mock_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buffer.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn start_mock_chat_server(response_body: Value) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock chat server");
+        let addr = listener.local_addr().expect("mock chat server addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_mock_http_request(&mut stream);
+            let body = response_body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            request
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    fn start_mock_chat_server_sequence(
+        response_bodies: Vec<Value>,
+    ) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock chat server");
+        let addr = listener.local_addr().expect("mock chat server addr");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response_body in response_bodies {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_mock_http_request(&mut stream);
+                let body = response_body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                requests.push(request);
+            }
+            requests
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    fn request_json_body(request: &str) -> Value {
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        serde_json::from_str(body).expect("parse request json")
+    }
+
+    fn required_env(name: &str) -> String {
+        env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+    }
+
     #[test]
     fn ensure_path_creates_nested_tree() {
         let mut tree = default_tree();
         let leaf = ensure_path(&mut tree, &["group".to_string(), "leaf".to_string()]);
         let path = category_path_for_id(&tree, &leaf).expect("path");
         assert_eq!(path, vec!["group".to_string(), "leaf".to_string()]);
+    }
+
+    #[test]
+    fn organize_progress_contract_carries_stage_and_batch_counts() {
+        let mut progress = organize_progress(
+            "summary",
+            "Preparing summaries",
+            Some("Prepared summary batch 2 of 5.".to_string()),
+            Some(2),
+            Some(5),
+            Some("batches"),
+            false,
+        );
+        assert_eq!(progress.stage, "summary");
+        assert_eq!(progress.current, Some(2));
+        assert_eq!(progress.total, Some(5));
+        assert_eq!(progress.unit.as_deref(), Some("batches"));
+        assert!(!progress.indeterminate);
+
+        progress = organize_progress(
+            "error",
+            "Error",
+            Some("classification response missing assignments for 1 item(s)".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(progress.stage, "error");
+        assert!(progress
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("classification response missing assignments"));
+        assert!(progress.indeterminate);
     }
 
     #[test]
@@ -212,6 +345,15 @@ mod tests {
             total_files: 1,
             processed_batches: 1,
             total_batches: 1,
+            progress: organize_progress(
+                "completed",
+                "Completed",
+                Some("Organize results are ready.".to_string()),
+                Some(1),
+                Some(1),
+                Some("batches"),
+                false,
+            ),
             token_usage: TokenUsage::default(),
             results: vec![json!({
                 "name": "bad.txt",
@@ -411,14 +553,19 @@ mod tests {
             Some(SUMMARY_MODE_LOCAL_SUMMARY)
         );
         assert_eq!(
-            row.pointer("/representation/source").and_then(Value::as_str),
+            row.pointer("/representation/source")
+                .and_then(Value::as_str),
             Some(SUMMARY_SOURCE_LOCAL_SUMMARY)
         );
         assert_eq!(
-            row.pointer("/localExtraction/parser").and_then(Value::as_str),
+            row.pointer("/localExtraction/parser")
+                .and_then(Value::as_str),
             Some("plain_text")
         );
-        assert_eq!(row.get("provider").and_then(Value::as_str), Some(route.endpoint.as_str()));
+        assert_eq!(
+            row.get("provider").and_then(Value::as_str),
+            Some(route.endpoint.as_str())
+        );
         assert_eq!(row.get("model").and_then(Value::as_str), Some("test-model"));
 
         let _ = fs::remove_dir_all(&root);
@@ -496,7 +643,8 @@ mod tests {
         let row = &prepared.batch_rows[0];
         assert_eq!(row.get("itemId").and_then(Value::as_str), Some("batch3_1"));
         assert_eq!(
-            row.pointer("/representation/source").and_then(Value::as_str),
+            row.pointer("/representation/source")
+                .and_then(Value::as_str),
             Some(SUMMARY_SOURCE_AGENT_SUMMARY)
         );
         assert_eq!(
@@ -604,13 +752,529 @@ mod tests {
         assert!(item.get("modifiedAt").is_none());
     }
 
+    #[tokio::test]
+    async fn classification_batch_submits_assignments_and_preserves_reduced_payload() {
+        let mut tree = default_tree();
+        let report_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]);
+        let batch_rows = vec![
+            json!({
+                "itemId": "batch1_1",
+                "name": "quarterly-report.pdf",
+                "path": "E:\\raw\\quarterly-report.pdf",
+                "relativePath": "raw\\quarterly-report.pdf",
+                "size": 4096,
+                "createdAt": "2026-04-01T00:00:00Z",
+                "modifiedAt": "2026-04-05T00:00:00Z",
+                "itemType": "file",
+                "modality": "text",
+                "representation": {
+                    "metadata": "quarterly-report.pdf",
+                    "short": "Quarterly finance report",
+                    "long": "Quarterly finance report with budget and revenue notes.",
+                    "source": "agent_summary",
+                    "degraded": false,
+                    "confidence": "high",
+                    "keywords": ["finance", "quarterly"]
+                },
+                "summaryWarnings": ["source_sparse"],
+                "localExtraction": {
+                    "parser": "tika",
+                    "excerpt": "raw extracted body should never reach classification"
+                }
+            }),
+            json!({
+                "itemId": "batch1_2",
+                "name": "meeting-audio.wav",
+                "path": "E:\\raw\\meeting-audio.wav",
+                "relativePath": "raw\\meeting-audio.wav",
+                "size": 2048,
+                "createdAt": "2026-04-02T00:00:00Z",
+                "modifiedAt": "2026-04-06T00:00:00Z",
+                "itemType": "file",
+                "modality": "audio",
+                "representation": {
+                    "metadata": "meeting-audio.wav",
+                    "short": "Meeting audio recording",
+                    "long": "Meeting audio recording from the product review.",
+                    "source": "local_summary",
+                    "degraded": false,
+                    "confidence": "medium",
+                    "keywords": ["meeting", "audio"]
+                },
+                "summaryWarnings": [],
+                "localExtraction": {
+                    "parser": "audio_probe",
+                    "excerpt": "raw audio metadata should never reach classification"
+                }
+            }),
+        ];
+        let category_inventory = vec![json!({
+            "nodeId": report_leaf.clone(),
+            "path": ["Documents", "Reports"],
+            "count": 1,
+            "files": ["old-report.pdf"],
+            "truncated": false
+        })];
+        let submitted = json!({
+            "baseTreeVersion": 7,
+            "assignments": [{
+                "itemId": "batch1_1",
+                "leafNodeId": report_leaf,
+                "reason": "financial report"
+            }],
+            "treeProposals": [{
+                "proposalId": "p_audio",
+                "suggestedPath": ["Media", "Audio"]
+            }],
+            "deferredAssignments": [{
+                "itemId": "batch1_2",
+                "proposalId": "p_audio",
+                "reason": "audio recording"
+            }]
+        });
+        let response_body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_submit",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": submitted.to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 31,
+                "completion_tokens": 17,
+                "total_tokens": 48
+            }
+        });
+        let (endpoint, server) = start_mock_chat_server(response_body);
+        let output = summary::classify_organize_batch(
+            &text_route(endpoint),
+            "en-US",
+            &AtomicBool::new(false),
+            &tree,
+            7,
+            &batch_rows,
+            &category_inventory,
+            None,
+            false,
+            "",
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
+            "classification_batch_test",
+        )
+        .await
+        .expect("classify batch");
+
+        assert!(output.error.is_none());
+        assert_eq!(output.usage.total, 48);
+        assert!(output.raw_output.contains("submit_classification_batch"));
+        let parsed = output.parsed.expect("parsed classification output");
+        assert_eq!(
+            parsed.get("baseTreeVersion").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            parsed
+                .get("assignments")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .get("treeProposals")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            parsed
+                .get("deferredAssignments")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let request = server.join().expect("mock server joined");
+        let request_body = request_json_body(&request);
+        let messages = request_body
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        let user_payload: Value = serde_json::from_str(
+            messages[1]
+                .get("content")
+                .and_then(Value::as_str)
+                .expect("user payload content"),
+        )
+        .expect("parse classification payload");
+        assert_eq!(user_payload["baseTreeVersion"], Value::from(7));
+        assert_eq!(
+            user_payload["categoryInventory"],
+            Value::Array(category_inventory)
+        );
+
+        for section in ["items", "fileIndex"] {
+            let rows = user_payload
+                .get(section)
+                .and_then(Value::as_array)
+                .expect("payload rows");
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert!(row.get("path").is_none(), "{section} leaked path");
+                assert!(row.get("size").is_none(), "{section} leaked size");
+                assert!(
+                    row.get("localExtraction").is_none(),
+                    "{section} leaked localExtraction"
+                );
+                assert!(row.get("createdAt").is_none(), "{section} leaked createdAt");
+                assert!(
+                    row.get("modifiedAt").is_none(),
+                    "{section} leaked modifiedAt"
+                );
+                assert!(row.get("summaryText").is_some());
+                assert!(row.get("relativePath").is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn classification_batch_without_required_tool_returns_error() {
+        let mut tree = default_tree();
+        ensure_path(&mut tree, &["Documents".to_string()]);
+        let batch_rows = vec![json!({
+            "itemId": "batch1_1",
+            "name": "loose-note.txt",
+            "relativePath": "loose-note.txt",
+            "itemType": "file",
+            "modality": "text",
+            "representation": {
+                "metadata": "loose-note.txt",
+                "short": "Loose note",
+                "long": "Loose note with incomplete context.",
+                "source": "local_summary",
+                "degraded": false,
+                "keywords": []
+            },
+            "summaryWarnings": []
+        })];
+        let response_body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "I can classify this as a document, but I will not call the tool."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 5,
+                "total_tokens": 16
+            }
+        });
+        let (endpoint, server) = start_mock_chat_server(response_body);
+        let output = summary::classify_organize_batch(
+            &text_route(endpoint),
+            "en-US",
+            &AtomicBool::new(false),
+            &tree,
+            3,
+            &batch_rows,
+            &[],
+            None,
+            false,
+            "",
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
+            "classification_batch_test",
+        )
+        .await
+        .expect("classify batch");
+
+        server.join().expect("mock server joined");
+        assert!(output.parsed.is_none());
+        assert!(output
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not call a required organizer tool"));
+        assert!(output
+            .raw_output
+            .contains("I can classify this as a document"));
+        assert!(!output.raw_output.contains(CATEGORY_OTHER_PENDING));
+    }
+
+    #[tokio::test]
+    async fn reconcile_receives_only_tree_and_classification_results() {
+        let mut tree = default_tree();
+        let report_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]);
+        let initial_tree = category_tree_to_value(&tree);
+        let classification_results = vec![json!({
+            "batchIndex": 1,
+            "baseTreeVersion": 4,
+            "output": {
+                "baseTreeVersion": 4,
+                "assignments": [{
+                    "itemId": "batch1_1",
+                    "leafNodeId": report_leaf,
+                    "categoryPath": ["Documents", "Reports"],
+                    "reason": "classified in isolated batch"
+                }],
+                "treeProposals": [],
+                "deferredAssignments": []
+            },
+            "error": ""
+        })];
+        let revise_args = json!({
+            "draftTree": initial_tree,
+            "proposalMappings": [],
+            "rejectedProposalIds": []
+        });
+        let review_args = json!({
+            "issues": [],
+            "recommendedOperations": [],
+            "needsRevision": false
+        });
+        let submit_args = json!({
+            "finalTree": initial_tree,
+            "proposalMappings": [],
+            "finalAssignments": [{
+                "itemId": "batch1_1",
+                "leafNodeId": report_leaf,
+                "categoryPath": ["Documents", "Reports"],
+                "reason": "classified in isolated batch"
+            }]
+        });
+        let responses = vec![
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_revise",
+                            "type": "function",
+                            "function": {
+                                "name": "revise_tree_draft",
+                                "arguments": revise_args.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_review",
+                            "type": "function",
+                            "function": {
+                                "name": "review_organize_draft",
+                                "arguments": review_args.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 }
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_submit",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_reconciled_tree",
+                                "arguments": submit_args.to_string()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12 }
+            }),
+        ];
+        let (endpoint, server) = start_mock_chat_server_sequence(responses);
+
+        let output = summary::reconcile_organize_batches(
+            &text_route(endpoint),
+            "en-US",
+            &AtomicBool::new(false),
+            &initial_tree,
+            &classification_results,
+            None,
+        )
+        .await
+        .expect("reconcile output");
+        assert!(output.error.is_none());
+
+        let requests = server.join().expect("mock server joined");
+        let first_request = request_json_body(&requests[0]);
+        let messages = first_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        let user_payload: Value = serde_json::from_str(
+            messages[1]
+                .get("content")
+                .and_then(Value::as_str)
+                .expect("user payload content"),
+        )
+        .expect("parse reconcile payload");
+
+        assert!(user_payload.get("initialTree").is_some());
+        assert!(user_payload.get("classificationResults").is_some());
+        assert!(user_payload.get("fileIndex").is_none());
+        assert!(user_payload.get("batchOutputs").is_none());
+        assert!(!messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("modelRawOutput"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WIPEOUT_CLASSIFICATION_SMOKE_ROOT, ENDPOINT, API_KEY, and MODEL"]
+    async fn real_folder_classification_smoke_with_real_model() {
+        let root = PathBuf::from(required_env("WIPEOUT_CLASSIFICATION_SMOKE_ROOT"));
+        let endpoint = required_env("WIPEOUT_CLASSIFICATION_SMOKE_ENDPOINT");
+        let api_key = required_env("WIPEOUT_CLASSIFICATION_SMOKE_API_KEY");
+        let model = required_env("WIPEOUT_CLASSIFICATION_SMOKE_MODEL");
+        let summary_strategy = env::var("WIPEOUT_CLASSIFICATION_SMOKE_SUMMARY_STRATEGY")
+            .unwrap_or_else(|_| SUMMARY_MODE_FILENAME_ONLY.to_string());
+        let max_items = env::var("WIPEOUT_CLASSIFICATION_SMOKE_MAX_ITEMS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8);
+
+        assert!(root.is_dir(), "smoke root must be a directory: {:?}", root);
+        assert!(
+            matches!(
+                summary_strategy.as_str(),
+                SUMMARY_MODE_FILENAME_ONLY | SUMMARY_MODE_LOCAL_SUMMARY
+            ),
+            "real-model smoke supports filename_only or local_summary"
+        );
+
+        let smoke_started_at = Instant::now();
+        let stop = AtomicBool::new(false);
+        let collect_started_at = Instant::now();
+        let collection = collect_units(&root, true, &normalize_excluded(None), &stop);
+        let collect_elapsed = collect_started_at.elapsed();
+        let units = collection
+            .units
+            .into_iter()
+            .take(max_items)
+            .collect::<Vec<_>>();
+        assert!(
+            !units.is_empty(),
+            "real folder smoke found no classifiable units in {:?}",
+            root
+        );
+
+        let route = RouteConfig {
+            endpoint,
+            api_key,
+            model,
+        };
+        let mut routes = HashMap::new();
+        routes.insert("text".to_string(), route.clone());
+        let task = make_summary_test_runtime(&root, routes);
+        let summary_started_at = Instant::now();
+        let prepared = prepare_summary_batch(task, route.clone(), summary_strategy, 0, units)
+            .await
+            .expect("prepare real folder smoke summary batch");
+        let summary_elapsed = summary_started_at.elapsed();
+        let tree = deterministic_initial_tree(&prepared.batch_rows);
+        let classify_started_at = Instant::now();
+        let output = summary::classify_organize_batch(
+            &route,
+            "zh-CN",
+            &stop,
+            &tree,
+            1,
+            &prepared.batch_rows,
+            &[],
+            None,
+            false,
+            "",
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
+            "real_folder_classification_smoke",
+        )
+        .await
+        .expect("run real folder classification smoke");
+        let classify_elapsed = classify_started_at.elapsed();
+        let total_elapsed = smoke_started_at.elapsed();
+
+        println!("root={}", root.display());
+        println!("items={}", prepared.batch_rows.len());
+        println!(
+            "timing=collect:{}ms,summary:{}ms,classify_model:{}ms,total:{}ms",
+            collect_elapsed.as_millis(),
+            summary_elapsed.as_millis(),
+            classify_elapsed.as_millis(),
+            total_elapsed.as_millis()
+        );
+        println!(
+            "usage=prompt:{},completion:{},total:{}",
+            output.usage.prompt, output.usage.completion, output.usage.total
+        );
+
+        assert!(
+            output.error.is_none(),
+            "real model classification failed: {:?}\n{}",
+            output.error,
+            output.raw_output
+        );
+        let parsed = output.parsed.expect("real model submitted classification");
+        println!("parsed={}", parsed);
+        assert_eq!(
+            parsed.get("baseTreeVersion").and_then(Value::as_u64),
+            Some(1)
+        );
+        let direct = parsed
+            .get("assignments")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let deferred = parsed
+            .get("deferredAssignments")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert!(
+            direct + deferred >= prepared.batch_rows.len(),
+            "real model did not assign all smoke items: direct={}, deferred={}, items={}",
+            direct,
+            deferred,
+            prepared.batch_rows.len()
+        );
+    }
+
     #[test]
     fn category_inventory_groups_history_without_summaries() {
         let mut tree = default_tree();
-        let contract_node = ensure_path(
-            &mut tree,
-            &["文档".to_string(), "合同协议".to_string()],
-        );
+        let contract_node = ensure_path(&mut tree, &["文档".to_string(), "合同协议".to_string()]);
         let media_node = ensure_path(&mut tree, &["媒体".to_string(), "图片".to_string()]);
 
         let inventory = summary::build_category_inventory(
@@ -722,8 +1386,7 @@ mod tests {
         write_file(&root.join("Buzz-1.4.2-windows-2.bin"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -738,8 +1401,7 @@ mod tests {
         write_file(&root.join("QuickRestart.pck"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -753,8 +1415,7 @@ mod tests {
         write_file(&root.join("generica bold.otf"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, false);
+        let assessment = assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -771,8 +1432,7 @@ mod tests {
         write_file(&root.join("extras.zip"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);
@@ -788,8 +1448,7 @@ mod tests {
         write_file(&target.join("payload.bin"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&shell, &stop, true);
+        let assessment = assess_directory(&shell, &stop, true);
         assert_eq!(
             assessment.result_kind,
             DirectoryResultKind::WholeWrapperPassthrough
@@ -825,8 +1484,7 @@ mod tests {
         write_file(&root.join("notes.txt"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, false);
+        let assessment = assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::MixedSplit);
 
         let _ = fs::remove_dir_all(&root);
@@ -842,8 +1500,7 @@ mod tests {
         write_file(&root.join("session.dat"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, false);
+        let assessment = assess_directory(&root, &stop, false);
         assert_eq!(assessment.result_kind, DirectoryResultKind::StagingJunk);
 
         let _ = fs::remove_dir_all(&root);
@@ -868,8 +1525,7 @@ mod tests {
         write_file(&root.join("readme.txt"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -888,8 +1544,7 @@ mod tests {
         write_file(&root.join("Dism++x86 usage notes.txt"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -927,8 +1582,7 @@ mod tests {
         write_file(&root.join("install.inf"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "theme_pack");
 
@@ -966,8 +1620,7 @@ mod tests {
         }
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "doc_bundle");
 
@@ -982,8 +1635,7 @@ mod tests {
         write_file(&root.join("README.md"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_eq!(assessment.result_kind, DirectoryResultKind::Whole);
         assert_eq!(assessment.integrity_kind, "app_bundle");
 
@@ -999,8 +1651,7 @@ mod tests {
         write_file(&root.join("c.dll"));
 
         let stop = AtomicBool::new(false);
-        let assessment =
-            assess_directory(&root, &stop, true);
+        let assessment = assess_directory(&root, &stop, true);
         assert_ne!(assessment.result_kind, DirectoryResultKind::Whole);
 
         let _ = fs::remove_dir_all(&root);

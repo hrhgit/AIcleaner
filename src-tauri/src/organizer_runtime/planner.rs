@@ -47,6 +47,55 @@ pub(super) fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
 
 pub(super) fn hydrate_loaded_snapshot(mut snapshot: OrganizeSnapshot) -> OrganizeSnapshot {
     snapshot.preview = build_preview(&snapshot.root_path, &snapshot.results);
+    if snapshot.progress.stage == "idle" && snapshot.status != "idle" {
+        let processed_batches = snapshot.processed_batches;
+        let total_batches = snapshot.total_batches;
+        let error = snapshot.error.clone();
+        let stopping = snapshot.status == "stopping";
+        match snapshot.status.as_str() {
+            "completed" | "done" => set_organize_progress(
+                &mut snapshot,
+                "completed",
+                "Completed",
+                Some("Organize results are ready.".to_string()),
+                Some(processed_batches),
+                Some(total_batches),
+                Some("batches"),
+                false,
+            ),
+            "error" => set_organize_progress(
+                &mut snapshot,
+                "error",
+                "Error",
+                error,
+                None,
+                None,
+                None,
+                true,
+            ),
+            "stopped" | "stopping" => set_organize_progress(
+                &mut snapshot,
+                "stopped",
+                if stopping { "Stopping" } else { "Stopped" },
+                None,
+                None,
+                None,
+                None,
+                true,
+            ),
+            "moving" => set_organize_progress(
+                &mut snapshot,
+                "moving",
+                "Applying",
+                Some("Moving files according to the generated plan.".to_string()),
+                None,
+                None,
+                Some("files"),
+                true,
+            ),
+            _ => {}
+        }
+    }
     snapshot
 }
 
