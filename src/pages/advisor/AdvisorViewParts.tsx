@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import type { AdvisorCard, AdvisorSessionData, AdvisorCardAction, JsonRecord, OrganizeResultRow, OrganizeSnapshot, TimelineTurn, TreeNode } from '../../types';
+import type { AdvisorCard, AdvisorSessionData, AdvisorCardAction, JsonRecord, OrganizeResultRow, OrganizeViewSnapshot, TimelineTurn, TreeNode } from '../../types';
 import { text } from '../../utils/i18n';
 import {
   formatDateTime,
@@ -514,11 +514,11 @@ export function OrganizeSummary({
   snapshot,
   state,
 }: {
-  snapshot: OrganizeSnapshot | null;
+  snapshot: OrganizeViewSnapshot | null;
   state: AdvisorWorkflowState;
 }) {
   if (!snapshot) return <div className="advisor-organize-summary" />;
-  const totalFiles = Number(snapshot.totalFiles || snapshot.total_files || 0);
+  const totalFiles = Number(snapshot.totalFiles || 0);
   const error = String(snapshot.error || '').trim();
   const stage = getOrganizeProgressStage(snapshot);
   const stageDetail = getOrganizeProgressDetail(snapshot);
@@ -527,8 +527,8 @@ export function OrganizeSummary({
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
   const resultRows = Array.isArray(snapshot.results) ? snapshot.results : [];
   const timingMs = metricRecord(snapshot.timingMs);
-  const tokenUsage = snapshot.tokenUsage || snapshot.token_usage;
-  const tokenUsageByStage = metricRecord(snapshot.tokenUsageByStage || snapshot.token_usage_by_stage);
+  const tokenUsage = snapshot.tokenUsage;
+  const tokenUsageByStage = metricRecord(snapshot.tokenUsageByStage);
   return (
     <section className="advisor-organize-summary">
       <div className="advisor-organize-summary-head">
@@ -537,7 +537,7 @@ export function OrganizeSummary({
           <strong>{getOrganizeStatusLabel(state, snapshot)}</strong>
         </div>
         <div className="advisor-organize-summary-meta">
-          <span className="badge badge-info">{text('摘要模式', 'Summary')}: {snapshot.summaryStrategy || snapshot.summary_strategy || state.summaryStrategy}</span>
+          <span className="badge badge-info">{text('摘要模式', 'Summary')}: {snapshot.summaryStrategy || state.summaryStrategy}</span>
           <span className={`badge ${snapshot.webSearchEnabled ? 'badge-success' : (snapshot.useWebSearch ? 'badge-warning' : 'badge-info')}`}>
             {snapshot.webSearchEnabled ? text('联网可用', 'Web Search Ready') : (snapshot.useWebSearch ? text('联网未就绪', 'Web Search Unavailable') : text('联网关闭', 'Web Search Off'))}
           </span>

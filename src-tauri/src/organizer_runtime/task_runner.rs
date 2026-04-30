@@ -1529,6 +1529,20 @@ fn classification_error_row(
     result
 }
 
+fn build_organize_file_done_payload(task_id: &str, row: &Value) -> Value {
+    let mut payload = row.clone();
+    if !payload.is_object() {
+        return json!({
+            "taskId": task_id,
+            "row": payload,
+        });
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("taskId".to_string(), Value::String(task_id.to_string()));
+    }
+    payload
+}
+
 async fn run_organize_task<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -2430,7 +2444,10 @@ async fn run_organize_task<R: Runtime>(
     result_rows.sort_by_key(|row| row.get("index").and_then(Value::as_u64).unwrap_or(0));
     persist::upsert_organize_results(&state.db_path(), &task_id, &result_rows)?;
     for row in &result_rows {
-        app.emit("organize_file_done", row.clone())
+        app.emit(
+            "organize_file_done",
+            build_organize_file_done_payload(&task_id, row),
+        )
             .map_err(|e| e.to_string())?;
     }
     let classification_error_count = classification_errors.len();

@@ -17,7 +17,7 @@ import { getErrorMessage } from '../../utils/errors';
 import { getLang, text } from '../../utils/i18n';
 import { ensureRequiredCredentialsConfigured } from '../../utils/secret-ui';
 import { showToast } from '../../utils/toast';
-import type { OrganizeSnapshot, StreamHandle } from '../../types';
+import type { OrganizeSnapshot, OrganizeViewSnapshot, StreamHandle } from '../../types';
 import {
   ADVISOR_PERSIST_KEYS,
   DEFAULT_BATCH_SIZE,
@@ -55,7 +55,7 @@ export function AdvisorPage() {
     dispatch({ type: 'setOrganizeStream', stream: null });
   }, []);
 
-  const applyOrganizeSnapshot = useCallback((snapshot: OrganizeSnapshot | null) => {
+  const applyOrganizeSnapshot = useCallback((snapshot: OrganizeSnapshot | OrganizeViewSnapshot | null) => {
     const nextSnapshot = sanitizeSnapshot(snapshot);
     if (!nextSnapshot) return;
     dispatch({ type: 'setOrganizeSnapshot', snapshot: nextSnapshot });
@@ -422,4 +422,3 @@ export const advisorPersistenceReport = {
   scope: 'global',
   version: 'existing v1/v2 keys retained; no migration required',
 };
-

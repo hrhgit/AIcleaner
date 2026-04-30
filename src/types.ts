@@ -141,6 +141,61 @@ export type OrganizeSnapshot = {
   [key: string]: unknown;
 };
 
+export type OrganizeViewSnapshot = {
+  id: string;
+  status: string;
+  rootPath: string;
+  totalFiles: number;
+  processedFiles: number;
+  totalBatches: number;
+  processedBatches: number;
+  error?: string;
+  summaryStrategy: SummaryMode | string;
+  useWebSearch: boolean;
+  webSearchEnabled: boolean;
+  progress: OrganizeProgress;
+  durationMs?: number;
+  timingMs?: JsonRecord;
+  tokenUsage?: JsonRecord;
+  tokenUsageByStage?: JsonRecord;
+  requestCount?: number;
+  errorCount?: number;
+  tree: TreeNode;
+  results: OrganizeResultRow[];
+};
+
+export type OrganizeProgressEvent = OrganizeSnapshot;
+
+export type OrganizeSummaryReadyEvent = {
+  taskId: string;
+  batchIndex?: number;
+  name?: string;
+  path?: string;
+  relativePath?: string;
+  size?: number;
+  itemType?: string;
+  modality?: string;
+  summaryStrategy?: SummaryMode | string;
+  representation?: JsonRecord;
+  summaryWarnings?: unknown[];
+  warnings?: unknown[];
+  localExtraction?: unknown;
+  provider?: string;
+  model?: string;
+};
+
+export type OrganizeFileDoneEvent = OrganizeResultRow & {
+  taskId: string;
+};
+
+export type OrganizeTerminalEvent = OrganizeSnapshot;
+
+export type OrganizeErrorEvent = {
+  taskId?: string;
+  message?: string;
+  snapshot?: OrganizeSnapshot;
+};
+
 export type AdvisorCardAction = {
   action?: string;
   label?: string;
@@ -192,6 +247,7 @@ export type TimelineTurn = {
 
 export type AdvisorSessionData = {
   sessionId?: string;
+  rootPath?: string;
   timeline?: TimelineTurn[];
   workflowStage?: string;
   useWebSearch?: boolean;

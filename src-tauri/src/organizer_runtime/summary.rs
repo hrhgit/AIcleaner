@@ -1157,6 +1157,48 @@ fn build_initial_tree_system_prompt(response_language: &str) -> String {
     }
 }
 
+fn organizer_submit_tool_retry_message(
+    response_language: &str,
+    tool_name: &str,
+    message: &str,
+) -> Option<String> {
+    let guidance = match tool_name {
+        "submit_initial_tree" => Some((
+            "重新调用 submit_initial_tree，只提交合法参数。tree 必须是 JSON 对象，形如 {\"nodeId\":\"root\",\"name\":\"\",\"children\":[]}；不要把自然语言说明放进 tree，说明只能放 notes。",
+            "Re-call submit_initial_tree with valid arguments only. tree must be a JSON object shaped like {\"nodeId\":\"root\",\"name\":\"\",\"children\":[]}; do not put natural-language explanation in tree, use notes for explanation.",
+        )),
+        "submit_classification_batch" => Some((
+            "重新调用 submit_classification_batch，只提交合法参数。assignments 必须是数组；只能引用已有 leafNodeId，新增分类建议放 treeProposals。",
+            "Re-call submit_classification_batch with valid arguments only. assignments must be an array; reference existing leafNodeId values only, and put new category suggestions in treeProposals.",
+        )),
+        "revise_tree_draft" => Some((
+            "重新调用 revise_tree_draft，只提交合法参数。draftTree 必须是 JSON 对象，节点必须包含 nodeId、name、children。",
+            "Re-call revise_tree_draft with valid arguments only. draftTree must be a JSON object, and every node must include nodeId, name, and children.",
+        )),
+        "review_organize_draft" => Some((
+            "重新调用 review_organize_draft，只提交合法参数。issues 必须是数组，needsRevision 必须是布尔值。",
+            "Re-call review_organize_draft with valid arguments only. issues must be an array and needsRevision must be a boolean.",
+        )),
+        "submit_reconciled_tree" => Some((
+            "重新调用 submit_reconciled_tree，只提交合法参数。finalTree 必须是 JSON 对象；proposalMappings 和 finalAssignments 必须是数组。",
+            "Re-call submit_reconciled_tree with valid arguments only. finalTree must be a JSON object; proposalMappings and finalAssignments must be arrays.",
+        )),
+        _ => None,
+    }?;
+    let guidance = if response_language
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("zh")
+    {
+        guidance.0
+    } else {
+        guidance.1
+    };
+    Some(format!(
+        "{tool_name} arguments failed validation: {message}. {guidance}"
+    ))
+}
+
 fn build_reconcile_system_prompt(response_language: &str, stage: &str) -> String {
     let zh = response_language
         .trim()
@@ -1462,10 +1504,15 @@ impl AgentTurnSpec for InitialTreeSpec<'_> {
     fn on_tool_error(
         &mut self,
         _step: usize,
-        _call: &ParsedToolCall,
+        call: &ParsedToolCall,
         message: String,
         _trace: &AgentLoopTrace,
     ) -> Result<ToolCallErrorOutcome<Self::Output>, String> {
+        if let Some(message) =
+            organizer_submit_tool_retry_message(self.response_language, &call.name, &message)
+        {
+            return Ok(ToolCallErrorOutcome::Continue { message });
+        }
         Ok(ToolCallErrorOutcome::Finish(
             self.output(None, Some(message)),
         ))
@@ -1767,10 +1814,15 @@ impl AgentTurnSpec for ReconcileSpec<'_> {
     fn on_tool_error(
         &mut self,
         _step: usize,
-        _call: &ParsedToolCall,
+        call: &ParsedToolCall,
         message: String,
         _trace: &AgentLoopTrace,
     ) -> Result<ToolCallErrorOutcome<Self::Output>, String> {
+        if let Some(message) =
+            organizer_submit_tool_retry_message(self.response_language, &call.name, &message)
+        {
+            return Ok(ToolCallErrorOutcome::Continue { message });
+        }
         Ok(ToolCallErrorOutcome::Finish(
             self.output(None, Some(message)),
         ))
@@ -2145,10 +2197,15 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
     fn on_tool_error(
         &mut self,
         _step: usize,
-        _call: &ParsedToolCall,
+        call: &ParsedToolCall,
         message: String,
         _trace: &AgentLoopTrace,
     ) -> Result<ToolCallErrorOutcome<ClassifyOrganizeBatchOutput>, String> {
+        if let Some(message) =
+            organizer_submit_tool_retry_message(self.response_language, &call.name, &message)
+        {
+            return Ok(ToolCallErrorOutcome::Continue { message });
+        }
         Ok(ToolCallErrorOutcome::Finish(
             self.output(None, Some(message)),
         ))
@@ -2171,6 +2228,123 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
 #[cfg(test)]
 mod tool_policy_tests {
     use super::*;
+
+    fn tool_completion(id: &str, name: &str, arguments: Value) -> AgentCompletion {
+        AgentCompletion {
+            raw_body: String::new(),
+            assistant_text: String::new(),
+            tool_calls: vec![ParsedToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.clone(),
+            }],
+            raw_message: json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string(),
+                    }
+                }]
+            }),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: TokenUsage::default(),
+            route: None,
+        }
+    }
+
+    struct InitialTreeRepairLlm {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLlm for InitialTreeRepairLlm {
+        async fn complete(
+            &self,
+            messages: &[Value],
+            _tools: &[Value],
+            _trace_key: Option<&str>,
+        ) -> Result<AgentCompletion, AgentLlmError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(tool_completion(
+                    "call_bad",
+                    "submit_initial_tree",
+                    json!({ "tree": "bad natural-language tree" }),
+                ));
+            }
+
+            let saw_validation_feedback = messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|content| {
+                            content.contains("tree must be an object")
+                                && content.contains("submit_initial_tree")
+                        })
+                        .unwrap_or(false)
+            });
+            assert!(
+                saw_validation_feedback,
+                "model should receive tool validation feedback before retrying"
+            );
+
+            Ok(tool_completion(
+                "call_good",
+                "submit_initial_tree",
+                json!({
+                    "tree": {
+                        "nodeId": "root",
+                        "name": "",
+                        "children": []
+                    }
+                }),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_tree_tool_validation_error_is_returned_for_model_repair() {
+        let route = RouteConfig {
+            endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+        };
+        let llm = InitialTreeRepairLlm {
+            calls: AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let mut spec = InitialTreeSpec {
+            route: &route,
+            response_language: "zh",
+            initial_messages: vec![
+                json!({ "role": "system", "content": build_initial_tree_system_prompt("zh") }),
+                json!({ "role": "user", "content": "{\"fileIndex\":[]}" }),
+            ],
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+        };
+
+        let output = AgentTurnLoop::new(&llm, &registry)
+            .run(&mut spec)
+            .await
+            .expect("initial tree output");
+
+        assert!(output.error.is_none());
+        assert_eq!(
+            output
+                .parsed
+                .as_ref()
+                .and_then(|value| { value.pointer("/tree/nodeId").and_then(Value::as_str) }),
+            Some("root")
+        );
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn organizer_specs_allow_multiple_tool_calls() {
@@ -2230,7 +2404,18 @@ pub(super) fn emit_organize_summary_ready<R: Runtime>(
     batch_index: u64,
     row: &Value,
 ) {
-    let payload = json!({
+    let payload = build_organize_summary_ready_payload(task_id, batch_index, row);
+    if let Err(err) = app.emit("organize_summary_ready", payload) {
+        log::warn!("failed to emit organize_summary_ready for task {task_id}: {err}");
+    }
+}
+
+pub(super) fn build_organize_summary_ready_payload(
+    task_id: &str,
+    batch_index: u64,
+    row: &Value,
+) -> Value {
+    json!({
         "taskId": task_id,
         "batchIndex": batch_index,
         "name": row.get("name").and_then(Value::as_str).unwrap_or(""),
@@ -2255,10 +2440,7 @@ pub(super) fn emit_organize_summary_ready<R: Runtime>(
         "localExtraction": row.get("localExtraction").cloned().unwrap_or(Value::Null),
         "provider": row.get("provider").and_then(Value::as_str).unwrap_or(""),
         "model": row.get("model").and_then(Value::as_str).unwrap_or(""),
-    });
-    if let Err(err) = app.emit("organize_summary_ready", payload) {
-        log::warn!("failed to emit organize_summary_ready for task {task_id}: {err}");
-    }
+    })
 }
 
 #[cfg(test)]

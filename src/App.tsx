@@ -134,10 +134,10 @@ export function App() {
 
         <div className="sidebar-footer">
           <span className="version">v1.0.0</span>
-          <div className="lang-switch-container">
-            <button className={`lang-opt ${lang === 'zh' ? 'active' : ''}`} type="button" onClick={() => setLang('zh')}>中</button>
+          <div className="lang-switch-container" role="group" aria-label={text('语言', 'Language')}>
+            <button className={`lang-opt ${lang === 'zh' ? 'active' : ''}`} type="button" aria-pressed={lang === 'zh'} onClick={() => setLang('zh')}>中</button>
             <span className="lang-divider">/</span>
-            <button className={`lang-opt ${lang === 'en' ? 'active' : ''}`} type="button" onClick={() => setLang('en')}>EN</button>
+            <button className={`lang-opt ${lang === 'en' ? 'active' : ''}`} type="button" aria-pressed={lang === 'en'} onClick={() => setLang('en')}>EN</button>
           </div>
         </div>
       </nav>
@@ -153,4 +153,3 @@ export function App() {
     </div>
   );
 }
-

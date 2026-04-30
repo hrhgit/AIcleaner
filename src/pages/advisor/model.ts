@@ -1,4 +1,14 @@
-import type { AdvisorSessionData, OrganizeSnapshot, StreamHandle, SummaryMode, TimelineTurn } from '../../types';
+import type {
+  AdvisorSessionData,
+  JsonRecord,
+  OrganizeProgress,
+  OrganizeSnapshot,
+  OrganizeViewSnapshot,
+  StreamHandle,
+  SummaryMode,
+  TimelineTurn,
+  TreeNode,
+} from '../../types';
 import { getLang, text } from '../../utils/i18n';
 import { readPersisted, removePersisted, writePersisted } from '../../utils/storage';
 import {
@@ -16,7 +26,7 @@ export type AdvisorWorkflowState = {
   messageDraft: string;
   sessionData: AdvisorSessionData | null;
   organizeTaskId: string;
-  organizeSnapshot: OrganizeSnapshot | null;
+  organizeSnapshot: OrganizeViewSnapshot | null;
   organizeStream: StreamHandle | null;
   loading: boolean;
   sending: boolean;
@@ -35,13 +45,96 @@ export type AdvisorAction =
   | { type: 'setMessageDraft'; messageDraft: string }
   | { type: 'appendPendingMessage'; message: string }
   | { type: 'markPendingAssistantFailed'; message: string }
-  | { type: 'setOrganizeSnapshot'; snapshot: OrganizeSnapshot | null }
+  | { type: 'setOrganizeSnapshot'; snapshot: OrganizeSnapshot | OrganizeViewSnapshot | null }
   | { type: 'setOrganizeTaskId'; taskId: string }
   | { type: 'setOrganizeStream'; stream: StreamHandle | null }
   | { type: 'clearSession' };
 
-export function sanitizeSnapshot(snapshot: unknown): OrganizeSnapshot | null {
-  return snapshot && typeof snapshot === 'object' ? snapshot as OrganizeSnapshot : null;
+type OrganizeSnapshotInput = OrganizeSnapshot | OrganizeViewSnapshot | null;
+
+function snapshotNumber(snapshot: OrganizeSnapshotInput, primary: string, legacy: string): number {
+  const row = asRecord(snapshot);
+  return numberField(row?.[primary] ?? row?.[legacy]);
+}
+
+function asRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : null;
+}
+
+function stringField(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function numberField(value: unknown): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function booleanField(value: unknown): boolean {
+  return value === true;
+}
+
+function objectField<T extends object>(value: unknown, fallback: T): T {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as T : fallback;
+}
+
+function arrayField<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
+}
+
+function normalizeProgress(value: unknown, status: string): OrganizeProgress {
+  const progress = asRecord(value) || {};
+  const stage = stringField(progress.stage) || (status === 'done' ? 'completed' : status || 'idle');
+  return {
+    stage,
+    label: stringField(progress.label),
+    detail: stringField(progress.detail) || undefined,
+    current: progress.current === undefined ? undefined : numberField(progress.current),
+    total: progress.total === undefined ? undefined : numberField(progress.total),
+    unit: stringField(progress.unit) || undefined,
+    indeterminate: progress.indeterminate === undefined ? true : booleanField(progress.indeterminate),
+  };
+}
+
+export function normalizeOrganizeSnapshot(snapshot: unknown): OrganizeViewSnapshot | null {
+  const row = asRecord(snapshot);
+  if (!row) return null;
+  const id = stringField(row.id);
+  if (!id) return null;
+  const status = stringField(row.status) || 'idle';
+  const timingMs = objectField<JsonRecord>(row.timingMs || row.timing_ms, {});
+  const tokenUsage = objectField<JsonRecord>(row.tokenUsage || row.token_usage, {});
+  const tokenUsageByStage = objectField<JsonRecord>(row.tokenUsageByStage || row.token_usage_by_stage, {});
+  const view: OrganizeViewSnapshot = {
+    id,
+    status,
+    rootPath: stringField(row.rootPath) || stringField(row.root_path),
+    totalFiles: numberField(row.totalFiles ?? row.total_files),
+    processedFiles: numberField(row.processedFiles ?? row.processed_files),
+    totalBatches: numberField(row.totalBatches ?? row.total_batches),
+    processedBatches: numberField(row.processedBatches ?? row.processed_batches),
+    error: stringField(row.error) || undefined,
+    summaryStrategy: stringField(row.summaryStrategy) || stringField(row.summary_strategy) || DEFAULT_SUMMARY_MODE,
+    useWebSearch: booleanField(row.useWebSearch ?? row.use_web_search),
+    webSearchEnabled: booleanField(row.webSearchEnabled ?? row.web_search_enabled),
+    progress: normalizeProgress(row.progress, status),
+    tree: objectField<TreeNode>(row.tree, { children: [] }),
+    results: arrayField(row.results),
+  };
+  const durationMs = numberField(row.durationMs ?? row.duration_ms);
+  const requestCount = numberField(row.requestCount ?? row.request_count);
+  const errorCount = numberField(row.errorCount ?? row.error_count);
+  if (durationMs > 0) view.durationMs = durationMs;
+  if (Object.keys(timingMs).length) view.timingMs = timingMs;
+  if (Object.keys(tokenUsage).length) view.tokenUsage = tokenUsage;
+  if (Object.keys(tokenUsageByStage).length) view.tokenUsageByStage = tokenUsageByStage;
+  if (requestCount > 0) view.requestCount = requestCount;
+  if (errorCount > 0) view.errorCount = errorCount;
+  return view;
+}
+
+export function sanitizeSnapshot(snapshot: unknown): OrganizeViewSnapshot | null {
+  return normalizeOrganizeSnapshot(snapshot);
 }
 
 function resolveInitialRootPath(): string {
@@ -96,6 +189,10 @@ export function advisorReducer(state: AdvisorWorkflowState, action: AdvisorActio
       const rootPath = String(action.rootPath || '').trim();
       writePersisted(ADVISOR_PERSIST_KEYS.rootPath, rootPath);
       writePersisted(WORKFLOW_PERSIST_KEYS.rootPath, rootPath);
+      if (shouldClearSessionForRootChange(state, rootPath)) {
+        removePersisted(ADVISOR_PERSIST_KEYS.sessionId);
+        return { ...state, rootPath, sessionData: null, sessionId: '' };
+      }
       return { ...state, rootPath };
     }
     case 'setSummaryStrategy': {
@@ -169,11 +266,22 @@ function normalizePath(value: string): string {
   return String(value || '').trim().replace(/[\\/]+/g, '/').toLowerCase();
 }
 
-export function getCurrentSnapshot(state: AdvisorWorkflowState): OrganizeSnapshot | null {
+function getSessionRootPath(sessionData: AdvisorSessionData | null): string {
+  return String(sessionData?.rootPath || sessionData?.contextBar?.rootPath || '').trim();
+}
+
+function shouldClearSessionForRootChange(state: AdvisorWorkflowState, nextRootPath: string): boolean {
+  if (!state.sessionId && !state.sessionData) return false;
+  const sessionRootPath = getSessionRootPath(state.sessionData);
+  if (!sessionRootPath) return false;
+  return normalizePath(sessionRootPath) !== normalizePath(nextRootPath);
+}
+
+export function getCurrentSnapshot(state: AdvisorWorkflowState): OrganizeViewSnapshot | null {
   const snapshot = sanitizeSnapshot(state.organizeSnapshot);
   if (!snapshot) return null;
   const rootPath = String(state.rootPath || '').trim();
-  const snapshotRoot = String(snapshot.rootPath || snapshot.root_path || '').trim();
+  const snapshotRoot = String(snapshot.rootPath || '').trim();
   if (!rootPath || !snapshotRoot) return snapshot;
   return normalizePath(rootPath) === normalizePath(snapshotRoot) ? snapshot : null;
 }
@@ -189,32 +297,32 @@ export function getStageLabel(state: AdvisorWorkflowState): string {
   return text('理解中', 'Understanding');
 }
 
-export function getOrganizeStatus(snapshot: OrganizeSnapshot | null): string {
+export function getOrganizeStatus(snapshot: OrganizeSnapshotInput): string {
   return String(snapshot?.status || '').trim().toLowerCase();
 }
 
-export function getOrganizeProgressStage(snapshot: OrganizeSnapshot | null): string {
+export function getOrganizeProgressStage(snapshot: OrganizeSnapshotInput): string {
   const stage = String(snapshot?.progress?.stage || '').trim().toLowerCase();
   const status = getOrganizeStatus(snapshot);
   if (stage && !(stage === 'idle' && status && status !== 'idle')) return stage;
   if (status === 'classifying') {
-    const totalBatches = Number(snapshot?.totalBatches || snapshot?.total_batches || 0);
-    const processedBatches = Number(snapshot?.processedBatches || snapshot?.processed_batches || 0);
+    const totalBatches = snapshotNumber(snapshot, 'totalBatches', 'total_batches');
+    const processedBatches = snapshotNumber(snapshot, 'processedBatches', 'processed_batches');
     return totalBatches > 0 && processedBatches < totalBatches ? 'summary' : 'classification';
   }
   if (status === 'done') return 'completed';
   return status || 'idle';
 }
 
-export function isOrganizeRunning(snapshot: OrganizeSnapshot | null): boolean {
+export function isOrganizeRunning(snapshot: OrganizeSnapshotInput): boolean {
   return ['idle', 'collecting', 'classifying', 'stopping', 'moving'].includes(getOrganizeStatus(snapshot));
 }
 
-export function isOrganizeFinished(snapshot: OrganizeSnapshot | null): boolean {
+export function isOrganizeFinished(snapshot: OrganizeSnapshotInput): boolean {
   return ['completed', 'done'].includes(getOrganizeStatus(snapshot));
 }
 
-export function getOrganizeStatusLabel(state: AdvisorWorkflowState, snapshot: OrganizeSnapshot | null): string {
+export function getOrganizeStatusLabel(state: AdvisorWorkflowState, snapshot: OrganizeSnapshotInput): string {
   const stage = getOrganizeProgressStage(snapshot);
   if (stage === 'collecting') return text('收集目录', 'Collecting Files');
   if (stage === 'summary') return text('准备摘要', 'Preparing Summaries');
@@ -232,21 +340,21 @@ export function getOrganizeStatusLabel(state: AdvisorWorkflowState, snapshot: Or
   return String(snapshot?.progress?.label || '').trim() || text('待开始', 'Idle');
 }
 
-export function hasDeterminateOrganizeProgress(snapshot: OrganizeSnapshot | null): boolean {
+export function hasDeterminateOrganizeProgress(snapshot: OrganizeSnapshotInput): boolean {
   const progress = snapshot?.progress;
   const current = Number(progress?.current);
   const total = Number(progress?.total);
   return !progress?.indeterminate && Number.isFinite(current) && Number.isFinite(total) && total > 0;
 }
 
-export function getOrganizeProgress(snapshot: OrganizeSnapshot | null): number {
+export function getOrganizeProgress(snapshot: OrganizeSnapshotInput): number {
   if (hasDeterminateOrganizeProgress(snapshot)) {
     const current = Number(snapshot?.progress?.current || 0);
     const total = Number(snapshot?.progress?.total || 0);
     return Math.max(0, Math.min(100, Math.round((current / total) * 100)));
   }
-  const total = Number(snapshot?.totalFiles || snapshot?.total_files || 0);
-  const processed = Number(snapshot?.processedFiles || snapshot?.processed_files || 0);
+  const total = snapshotNumber(snapshot, 'totalFiles', 'total_files');
+  const processed = snapshotNumber(snapshot, 'processedFiles', 'processed_files');
   if (total <= 0) return isOrganizeFinished(snapshot) ? 100 : 0;
   return Math.max(0, Math.min(100, Math.round((processed / total) * 100)));
 }
@@ -257,7 +365,7 @@ export function getOrganizeProgressUnitLabel(unit: string | undefined): string {
   return text('文件', 'Files');
 }
 
-export function getOrganizeProgressDetail(snapshot: OrganizeSnapshot | null): string {
+export function getOrganizeProgressDetail(snapshot: OrganizeSnapshotInput): string {
   if (!snapshot) return '';
   if (hasDeterminateOrganizeProgress(snapshot)) {
     const current = Number(snapshot.progress?.current || 0);

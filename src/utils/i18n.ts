@@ -2,7 +2,31 @@ import { useEffect, useState } from 'react';
 import type { Lang } from '../types';
 import { translations, type TranslationKey } from './i18n-translations';
 
-let currentLang: Lang = localStorage.getItem('appLang') === 'en' ? 'en' : 'zh';
+const LANGUAGE_STORAGE_KEY = 'aicleaner.shell.global.language.v1';
+const LEGACY_LANGUAGE_STORAGE_KEY = 'appLang';
+
+function normalizeLang(value: string | null): Lang | null {
+  return value === 'en' || value === 'zh' ? value : null;
+}
+
+function readStoredLang(): Lang {
+  try {
+    const scopedLang = normalizeLang(localStorage.getItem(LANGUAGE_STORAGE_KEY));
+    if (scopedLang) return scopedLang;
+
+    const legacyLang = normalizeLang(localStorage.getItem(LEGACY_LANGUAGE_STORAGE_KEY));
+    if (legacyLang) {
+      localStorage.setItem(LANGUAGE_STORAGE_KEY, legacyLang);
+      localStorage.removeItem(LEGACY_LANGUAGE_STORAGE_KEY);
+      return legacyLang;
+    }
+  } catch {
+    // Language is a normal preference; rendering should continue if storage is unavailable.
+  }
+  return 'zh';
+}
+
+let currentLang: Lang = readStoredLang();
 
 export function getLang(): Lang {
   return currentLang;
@@ -11,7 +35,12 @@ export function getLang(): Lang {
 export function setLang(lang: Lang): void {
   if (!translations[lang]) return;
   currentLang = lang;
-  localStorage.setItem('appLang', lang);
+  try {
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, lang);
+    localStorage.removeItem(LEGACY_LANGUAGE_STORAGE_KEY);
+  } catch {
+    // Keep the in-memory language active even if persistence fails.
+  }
   document.documentElement.lang = currentLang;
   window.dispatchEvent(new Event('languageChanged'));
 }

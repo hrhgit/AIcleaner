@@ -6,7 +6,12 @@ import type {
   CredentialsPayload,
   CredentialsReadResult,
   CredentialsSaveResult,
+  OrganizeErrorEvent,
+  OrganizeFileDoneEvent,
+  OrganizeProgressEvent,
   OrganizeSnapshot,
+  OrganizeSummaryReadyEvent,
+  OrganizeTerminalEvent,
   Settings,
   StreamHandle,
   SummaryMode,
@@ -134,28 +139,28 @@ export async function getLatestOrganizeResult(rootPath: string): Promise<Organiz
 }
 
 export function connectOrganizeStream(taskId: string, handlers: {
-  onProgress?: (payload: OrganizeSnapshot) => void;
-  onSummaryReady?: (payload: OrganizeSnapshot) => void;
-  onFileDone?: (payload: OrganizeSnapshot) => void;
-  onDone?: (payload: OrganizeSnapshot) => void;
-  onError?: (payload: OrganizeSnapshot & { message?: string; snapshot?: OrganizeSnapshot }) => void;
-  onStopped?: (payload: OrganizeSnapshot) => void;
+  onProgress?: (payload: OrganizeProgressEvent) => void;
+  onSummaryReady?: (payload: OrganizeSummaryReadyEvent) => void;
+  onFileDone?: (payload: OrganizeFileDoneEvent) => void;
+  onDone?: (payload: OrganizeTerminalEvent) => void;
+  onError?: (payload: OrganizeErrorEvent) => void;
+  onStopped?: (payload: OrganizeTerminalEvent) => void;
 }): StreamHandle {
   let stream: StreamHandle;
   stream = createStream(taskId, [
-    ['organize_progress', (p) => handlers.onProgress?.(p as OrganizeSnapshot)],
-    ['organize_summary_ready', (p) => handlers.onSummaryReady?.(p as OrganizeSnapshot)],
-    ['organize_file_done', (p) => handlers.onFileDone?.(p as OrganizeSnapshot)],
+    ['organize_progress', (p) => handlers.onProgress?.(p as OrganizeProgressEvent)],
+    ['organize_summary_ready', (p) => handlers.onSummaryReady?.(p as OrganizeSummaryReadyEvent)],
+    ['organize_file_done', (p) => handlers.onFileDone?.(p as OrganizeFileDoneEvent)],
     ['organize_done', (p) => {
-      handlers.onDone?.(p as OrganizeSnapshot);
+      handlers.onDone?.(p as OrganizeTerminalEvent);
       stream.close();
     }],
     ['organize_error', (p) => {
-      handlers.onError?.(p as OrganizeSnapshot & { message?: string; snapshot?: OrganizeSnapshot });
+      handlers.onError?.(p as OrganizeErrorEvent);
       stream.close();
     }],
     ['organize_stopped', (p) => {
-      handlers.onStopped?.(p as OrganizeSnapshot);
+      handlers.onStopped?.(p as OrganizeTerminalEvent);
       stream.close();
     }],
   ]);
@@ -188,4 +193,3 @@ export async function advisorCardAction(params: {
 }): Promise<AdvisorSessionData> {
   return call('advisor_card_action', { input: params });
 }
-

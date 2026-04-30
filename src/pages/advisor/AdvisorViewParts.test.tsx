@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import type { OrganizeSnapshot } from '../../types';
+import type { OrganizeViewSnapshot } from '../../types';
 import { OrganizeSummary } from './AdvisorViewParts';
 import type { AdvisorWorkflowState } from './model';
 
@@ -26,12 +26,17 @@ function stateStub(): AdvisorWorkflowState {
 
 describe('OrganizeSummary', () => {
   it('renders backend batch progress for classification instead of file counter progress', () => {
-    const snapshot: OrganizeSnapshot = {
+    const snapshot: OrganizeViewSnapshot = {
       id: 'org_test',
       status: 'classifying',
+      rootPath: 'E:/Downloads',
       totalFiles: 100,
       processedFiles: 2,
+      totalBatches: 10,
+      processedBatches: 3,
       summaryStrategy: 'local_summary',
+      useWebSearch: false,
+      webSearchEnabled: false,
       progress: {
         stage: 'classification',
         label: 'Classifying batches',
@@ -53,12 +58,17 @@ describe('OrganizeSummary', () => {
   });
 
   it('renders task timing and token metrics when available', () => {
-    const snapshot: OrganizeSnapshot = {
+    const snapshot: OrganizeViewSnapshot = {
       id: 'org_metrics',
       status: 'completed',
+      rootPath: 'E:/Downloads',
       totalFiles: 8,
       processedFiles: 8,
+      totalBatches: 1,
+      processedBatches: 1,
       summaryStrategy: 'agent_summary',
+      useWebSearch: false,
+      webSearchEnabled: false,
       durationMs: 65432,
       timingMs: {
         total: 65432,

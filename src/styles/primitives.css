@@ -688,45 +688,61 @@ textarea.form-input,
 
 /* ── Language Switcher ── */
 .lang-switch-container {
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    gap: 6px;
-    font-size: 0.8rem;
+    gap: 2px;
+    min-height: 30px;
+    padding: 3px;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.025);
+    font-size: 0.78rem;
     color: var(--text-muted);
-    font-weight: 500;
+    font-weight: 700;
+    line-height: 1;
 }
 
 .lang-divider {
-    opacity: 0.5;
+    width: 1px;
+    height: 14px;
+    background: rgba(148, 163, 184, 0.18);
+    opacity: 1;
+    overflow: hidden;
+    text-indent: -999px;
+    flex: 0 0 auto;
 }
 
 .lang-opt {
+    -webkit-appearance: none;
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1;
     cursor: pointer;
-    padding-bottom: 2px;
+    min-width: 34px;
+    min-height: 24px;
+    padding: 0 8px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     position: relative;
-    transition: color var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
 .lang-opt:hover {
     color: var(--text-secondary);
 }
 
-.lang-opt::after {
-    content: '';
-    position: absolute;
-    bottom: -2px;
-    left: 0;
-    width: 100%;
-    height: 1px;
-    background: transparent;
-    transition: background var(--transition-fast);
+.lang-opt:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-primary-glow);
 }
 
 .lang-opt.active {
-    color: var(--accent-primary);
-}
-
-.lang-opt.active::after {
+    color: #071015;
     background: var(--gradient-primary);
 }
 

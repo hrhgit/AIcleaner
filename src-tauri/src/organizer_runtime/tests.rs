@@ -381,6 +381,43 @@ mod tests {
     }
 
     #[test]
+    fn organize_file_done_event_payload_always_carries_task_id() {
+        let payload = build_organize_file_done_payload(
+            "org_expected",
+            &json!({
+                "taskId": "org_stale",
+                "index": 1,
+                "name": "done.txt",
+                "path": r"C:\root\done.txt",
+                "categoryPath": ["Docs"]
+            }),
+        );
+
+        assert_eq!(payload.get("taskId").and_then(Value::as_str), Some("org_expected"));
+        assert_eq!(payload.get("name").and_then(Value::as_str), Some("done.txt"));
+    }
+
+    #[test]
+    fn organize_summary_ready_event_payload_carries_task_id() {
+        let payload = summary::build_organize_summary_ready_payload(
+            "org_summary",
+            2,
+            &json!({
+                "name": "summary.txt",
+                "path": r"C:\root\summary.txt",
+                "summaryStrategy": "local_summary"
+            }),
+        );
+
+        assert_eq!(payload.get("taskId").and_then(Value::as_str), Some("org_summary"));
+        assert_eq!(payload.get("batchIndex").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            payload.get("summaryStrategy").and_then(Value::as_str),
+            Some("local_summary")
+        );
+    }
+
+    #[test]
     fn build_preview_uses_nested_category_path() {
         let preview = planner::build_preview(
             r"C:\root",
@@ -1043,7 +1080,7 @@ mod tests {
                     max_chars: usize::MAX,
                     max_items: 2,
                     flush_ms: 500,
-                    max_in_flight: 50,
+                    max_in_flight: 1,
                 },
             )
             .await
