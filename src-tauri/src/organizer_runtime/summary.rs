@@ -1557,6 +1557,7 @@ pub(super) async fn reconcile_organize_batches(
         available_tool_names: Vec::new(),
         latest_draft: Value::Null,
         latest_review: Value::Null,
+        prepared_stage: None,
     };
     AgentTurnLoop::new(&llm, &registry).run(&mut spec).await
 }
@@ -1573,6 +1574,7 @@ struct ReconcileSpec<'a> {
     available_tool_names: Vec<&'static str>,
     latest_draft: Value,
     latest_review: Value,
+    prepared_stage: Option<&'static str>,
 }
 
 impl ReconcileSpec<'_> {
@@ -1658,7 +1660,15 @@ impl AgentTurnSpec for ReconcileSpec<'_> {
     }
 
     fn before_step(&mut self, _step: usize, messages: &mut Vec<Value>) -> Result<(), String> {
-        *messages = self.stage_messages();
+        if self.prepared_stage != Some(self.stage) {
+            *messages = self.stage_messages();
+            self.prepared_stage = Some(self.stage);
+        } else if let Some(system_message) = messages.get_mut(0) {
+            system_message["content"] = Value::String(build_reconcile_system_prompt(
+                self.response_language,
+                self.stage,
+            ));
+        }
         self.available_tool_names = match self.stage {
             "reconcile_tree" => vec!["revise_tree_draft"],
             "review_tree" => vec!["review_organize_draft"],
@@ -2346,6 +2356,211 @@ mod tool_policy_tests {
         assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
     }
 
+    struct ClassificationBatchRepairLlm {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLlm for ClassificationBatchRepairLlm {
+        async fn complete(
+            &self,
+            messages: &[Value],
+            _tools: &[Value],
+            _trace_key: Option<&str>,
+        ) -> Result<AgentCompletion, AgentLlmError> {
+            let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return Ok(tool_completion(
+                    "call_bad_batch",
+                    "submit_classification_batch",
+                    json!({ "baseTreeVersion": 0, "assignments": "bad assignments" }),
+                ));
+            }
+
+            let saw_validation_feedback = messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|content| {
+                            content.contains("assignments must be an array")
+                                && content.contains("submit_classification_batch")
+                        })
+                        .unwrap_or(false)
+            });
+            assert!(
+                saw_validation_feedback,
+                "classification model should receive tool validation feedback before retrying"
+            );
+
+            Ok(tool_completion(
+                "call_good_batch",
+                "submit_classification_batch",
+                json!({ "baseTreeVersion": 0, "assignments": [] }),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn classification_tool_validation_error_is_returned_for_model_repair() {
+        let route = RouteConfig {
+            endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+        };
+        let llm = ClassificationBatchRepairLlm {
+            calls: AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let mut spec = OrganizerBatchSpec {
+            route: &route,
+            response_language: "zh",
+            search_enabled: false,
+            search_api_key: "",
+            shared_search_calls: Arc::new(AtomicUsize::new(0)),
+            shared_search_gate: Arc::new(tokio::sync::Semaphore::new(ORGANIZER_SEARCH_CONCURRENCY)),
+            diagnostics: None,
+            stage: "classification_batch",
+            initial_messages: vec![
+                json!({ "role": "system", "content": build_organize_system_prompt("zh", false) }),
+                json!({ "role": "user", "content": "{}" }),
+            ],
+            search_calls: 0,
+            budget_exhausted_prompt_sent: false,
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+            aliases: ModelIdMap::default(),
+        };
+
+        let output = AgentTurnLoop::new(&llm, &registry)
+            .run(&mut spec)
+            .await
+            .expect("classification output");
+
+        assert!(output.error.is_none());
+        assert_eq!(
+            output
+                .parsed
+                .as_ref()
+                .and_then(|value| value.get("assignments"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct ReconcileRepairLlm {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLlm for ReconcileRepairLlm {
+        async fn complete(
+            &self,
+            messages: &[Value],
+            _tools: &[Value],
+            _trace_key: Option<&str>,
+        ) -> Result<AgentCompletion, AgentLlmError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(tool_completion(
+                    "call_bad_reconcile",
+                    "revise_tree_draft",
+                    json!({ "draftTree": "bad draft tree" }),
+                )),
+                1 => {
+                    let saw_validation_feedback = messages.iter().any(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("tool")
+                            && message
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .map(|content| {
+                                    content.contains("draftTree must be an object")
+                                        && content.contains("revise_tree_draft")
+                                })
+                                .unwrap_or(false)
+                    });
+                    assert!(
+                        saw_validation_feedback,
+                        "reconcile model should receive tool validation feedback before retrying"
+                    );
+                    Ok(tool_completion(
+                        "call_good_reconcile",
+                        "revise_tree_draft",
+                        json!({
+                            "draftTree": {
+                                "nodeId": "root",
+                                "name": "",
+                                "children": []
+                            }
+                        }),
+                    ))
+                }
+                2 => Ok(tool_completion(
+                    "call_review",
+                    "review_organize_draft",
+                    json!({ "issues": [], "needsRevision": false }),
+                )),
+                _ => Ok(tool_completion(
+                    "call_submit_final",
+                    "submit_reconciled_tree",
+                    json!({
+                        "finalTree": {
+                            "nodeId": "root",
+                            "name": "",
+                            "children": []
+                        },
+                        "proposalMappings": [],
+                        "finalAssignments": []
+                    }),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_tool_validation_error_is_returned_for_model_repair() {
+        let route = RouteConfig {
+            endpoint: "https://example.invalid/v1/chat/completions".to_string(),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+        };
+        let llm = ReconcileRepairLlm {
+            calls: AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let mut spec = ReconcileSpec {
+            route: &route,
+            response_language: "zh",
+            stage: "reconcile_tree",
+            initial_tree: json!({"nodeId": "root", "name": "", "children": []}),
+            classification_results: Vec::new(),
+            aliases: ModelIdMap::default(),
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+            latest_draft: Value::Null,
+            latest_review: Value::Null,
+            prepared_stage: None,
+        };
+
+        let output = AgentTurnLoop::new(&llm, &registry)
+            .run(&mut spec)
+            .await
+            .expect("reconcile output");
+
+        assert!(output.error.is_none());
+        assert_eq!(
+            output
+                .parsed
+                .as_ref()
+                .and_then(|value| { value.pointer("/finalTree/nodeId").and_then(Value::as_str) }),
+            Some("root")
+        );
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 4);
+    }
+
     #[test]
     fn organizer_specs_allow_multiple_tool_calls() {
         let route = RouteConfig {
@@ -2373,6 +2588,7 @@ mod tool_policy_tests {
             available_tool_names: Vec::new(),
             latest_draft: Value::Null,
             latest_review: Value::Null,
+            prepared_stage: None,
         };
         let batch_spec = OrganizerBatchSpec {
             route: &route,
