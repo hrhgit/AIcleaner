@@ -509,11 +509,16 @@ impl LlmTool for WebSearchTool {
             }
         }
 
+        let search_started_at = std::time::Instant::now();
         match tavily_search(&key, &request).await {
             Ok(trace) => {
                 if ctx.workflow == ToolWorkflow::Organizer {
                     if let Some(diagnostics) = ctx.diagnostics {
-                        diagnostics.web_search_succeeded(ctx.stage, &trace);
+                        diagnostics.web_search_succeeded(
+                            ctx.stage,
+                            &trace,
+                            search_started_at.elapsed(),
+                        );
                     }
                 }
                 let result = match ctx.workflow {
@@ -544,7 +549,12 @@ impl LlmTool for WebSearchTool {
                 ToolWorkflow::Advisor => Err(err),
                 ToolWorkflow::Organizer => {
                     if let Some(diagnostics) = ctx.diagnostics {
-                        diagnostics.web_search_failed(ctx.stage, args, &err);
+                        diagnostics.web_search_failed(
+                            ctx.stage,
+                            args,
+                            &err,
+                            search_started_at.elapsed(),
+                        );
                     }
                     Ok(ToolResult::result(json!({
                         "ok": false,

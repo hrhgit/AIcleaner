@@ -103,6 +103,10 @@ pub struct TokenUsage {
     pub total: u64,
 }
 
+fn json_value_is_null(value: &Value) -> bool {
+    value.is_null()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizeProgress {
@@ -181,6 +185,16 @@ pub struct OrganizeSnapshot {
     #[serde(default)]
     pub progress: OrganizeProgress,
     pub token_usage: TokenUsage,
+    #[serde(default, skip_serializing_if = "json_value_is_null")]
+    pub token_usage_by_stage: Value,
+    #[serde(default, skip_serializing_if = "json_value_is_null")]
+    pub timing_ms: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_count: Option<u64>,
     #[serde(default)]
     pub results: Vec<Value>,
     #[serde(default)]

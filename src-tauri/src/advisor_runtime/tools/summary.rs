@@ -325,19 +325,23 @@ async fn summarize_batch_with_model(
     batch: &[InventoryItem],
     level: RepresentationLevel,
     lang: &str,
-) -> (Vec<Value>, Vec<SummaryFailedItem>) {
+) -> (Vec<Value>, Vec<SummaryFailedItem>, TokenUsage) {
     let mut output = Vec::new();
     let mut errors = Vec::new();
+    let mut usage = TokenUsage::default();
     for item in batch {
         match summarize_item_with_model(client, route, root_path, item, level, lang).await {
-            Ok(row) => output.push(row),
+            Ok((row, item_usage)) => {
+                add_token_usage(&mut usage, &item_usage);
+                output.push(row);
+            }
             Err(error) => errors.push(SummaryFailedItem {
                 item: item.clone(),
                 error,
             }),
         }
     }
-    (output, errors)
+    (output, errors, usage)
 }
 
 async fn summarize_item_with_model(
@@ -347,7 +351,7 @@ async fn summarize_item_with_model(
     item: &InventoryItem,
     level: RepresentationLevel,
     lang: &str,
-) -> Result<Value, SummaryErrorRow> {
+) -> Result<(Value, TokenUsage), SummaryErrorRow> {
     let prompt = build_summary_prompt(item, level, lang);
     let api_format = detect_api_format(&route.endpoint);
     let request = build_completion_payload(
@@ -397,9 +401,11 @@ async fn summarize_item_with_model(
                     });
                     continue;
                 }
-                let assistant_text = parse_completion_response(api_format, status, &body)
-                    .map(|parsed| parsed.assistant_text)
-                    .unwrap_or_else(|_| body.clone());
+                let parsed = parse_completion_response(api_format, status, &body);
+                let (assistant_text, usage) = match parsed {
+                    Ok(parsed) => (parsed.assistant_text, parsed.usage),
+                    Err(_) => (body.clone(), TokenUsage::default()),
+                };
                 let Some((short, long)) = parse_summary_response(&assistant_text) else {
                     last_error = Some(SummaryErrorRow {
                         path: item.path.clone(),
@@ -423,7 +429,7 @@ async fn summarize_item_with_model(
                     confidence: item.representation.confidence.clone(),
                     keywords: item.representation.keywords.clone(),
                 };
-                return Ok(build_summary_row(root_path, item, level, representation));
+                return Ok((build_summary_row(root_path, item, level, representation), usage));
             }
             Err(err) => {
                 last_error = Some(SummaryErrorRow {
@@ -505,9 +511,9 @@ async fn run_summary_round(
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
-) -> Result<(Vec<Value>, Vec<SummaryFailedItem>), String> {
+) -> Result<(Vec<Value>, Vec<SummaryFailedItem>, TokenUsage), String> {
     if items.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), TokenUsage::default()));
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
@@ -533,14 +539,16 @@ async fn run_summary_round(
     }
     let mut rows = Vec::new();
     let mut failures = Vec::new();
+    let mut usage = TokenUsage::default();
     for handle in handles {
-        let (mut batch_rows, mut batch_failures) = handle
+        let (mut batch_rows, mut batch_failures, batch_usage) = handle
             .await
             .map_err(|e| format!("summary_batch_join_failed:{e}"))?;
         rows.append(&mut batch_rows);
         failures.append(&mut batch_failures);
+        add_token_usage(&mut usage, &batch_usage);
     }
-    Ok((rows, failures))
+    Ok((rows, failures, usage))
 }
 
 async fn run_summary_scheduler(
@@ -551,7 +559,7 @@ async fn run_summary_scheduler(
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
-) -> Result<(Vec<Value>, Vec<SummaryErrorRow>, SummarySchedulerStats), String> {
+) -> Result<(Vec<Value>, Vec<SummaryErrorRow>, SummarySchedulerStats, TokenUsage), String> {
     let initial_concurrency = max_concurrency.max(1);
     if items.is_empty() {
         return Ok((
@@ -563,11 +571,13 @@ async fn run_summary_scheduler(
                 retry_rounds: 0,
                 degraded_concurrency: false,
             },
+            TokenUsage::default(),
         ));
     }
 
     let mut completed_rows = Vec::new();
     let mut final_errors = Vec::new();
+    let mut total_usage = TokenUsage::default();
     let mut pending = items.to_vec();
     let mut current_concurrency = initial_concurrency;
     let mut retry_rounds = 0usize;
@@ -575,7 +585,7 @@ async fn run_summary_scheduler(
     let backoffs_ms = [500u64, 1000u64, 2000u64];
 
     loop {
-        let (mut rows, failures) = run_summary_round(
+        let (mut rows, failures, usage) = run_summary_round(
             route,
             root_path,
             &pending,
@@ -586,6 +596,7 @@ async fn run_summary_scheduler(
         )
         .await?;
         completed_rows.append(&mut rows);
+        add_token_usage(&mut total_usage, &usage);
 
         let mut retryable_items = Vec::new();
         for failure in failures {
@@ -630,7 +641,14 @@ async fn run_summary_scheduler(
             retry_rounds,
             degraded_concurrency,
         },
+        total_usage,
     ))
+}
+
+fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
+    total.prompt = total.prompt.saturating_add(usage.prompt);
+    total.completion = total.completion.saturating_add(usage.completion);
+    total.total = total.total.saturating_add(usage.total);
 }
 
 fn summary_system_prompt(lang: &str, level: RepresentationLevel) -> String {

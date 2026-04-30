@@ -40,6 +40,9 @@ fn is_sensitive_key(key: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase();
+    if is_usage_metric_key(&normalized) {
+        return false;
+    }
     normalized.contains("apikey")
         || normalized.contains("authorization")
         || normalized == "apikey"
@@ -48,6 +51,19 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("password")
         || normalized.contains("secret")
         || normalized.contains("credential")
+}
+
+fn is_usage_metric_key(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "usage"
+            | "tokenusage"
+            | "tokenusagebystage"
+            | "summaryusage"
+            | "prompt"
+            | "completion"
+            | "total"
+    )
 }
 
 pub fn record_event(
@@ -292,6 +308,11 @@ mod tests {
                 "x-api-key": "abc",
                 "normal": "kept"
             },
+            "tokenUsage": {
+                "prompt": 10,
+                "completion": 5,
+                "total": 15
+            },
             "items": [
                 { "password": "pw" },
                 { "path": "C:\\tmp\\file.txt" }
@@ -302,6 +323,9 @@ mod tests {
         assert_eq!(redacted["headers"]["Authorization"], REDACTED);
         assert_eq!(redacted["headers"]["x-api-key"], REDACTED);
         assert_eq!(redacted["headers"]["normal"], "kept");
+        assert_eq!(redacted["tokenUsage"]["prompt"], 10);
+        assert_eq!(redacted["tokenUsage"]["completion"], 5);
+        assert_eq!(redacted["tokenUsage"]["total"], 15);
         assert_eq!(redacted["items"][0]["password"], REDACTED);
         assert_eq!(redacted["items"][1]["path"], "C:\\tmp\\file.txt");
     }

@@ -128,6 +128,14 @@ export type OrganizeSnapshot = {
   useWebSearch?: boolean;
   webSearchEnabled?: boolean;
   progress?: OrganizeProgress;
+  durationMs?: number;
+  timingMs?: JsonRecord;
+  tokenUsage?: JsonRecord;
+  token_usage?: JsonRecord;
+  tokenUsageByStage?: JsonRecord;
+  token_usage_by_stage?: JsonRecord;
+  requestCount?: number;
+  errorCount?: number;
   tree?: TreeNode;
   results?: OrganizeResultRow[];
   [key: string]: unknown;
@@ -155,7 +163,16 @@ export type AgentTraceStep = {
   usage?: JsonRecord;
   assistantText?: string;
   toolCalls?: Array<{ id?: string; name?: string; arguments?: unknown }>;
-  toolResults?: Array<{ id?: string; name?: string; status?: string; payload?: unknown }>;
+  toolResults?: Array<{ id?: string; name?: string; status?: string; durationMs?: number; payload?: unknown }>;
+};
+
+export type AgentTraceSummary = {
+  durationMs?: number;
+  tokenUsage?: JsonRecord;
+  modelStepCount?: number;
+  toolCallCount?: number;
+  requestCount?: number;
+  errorCount?: number;
 };
 
 export type TimelineTurn = {
@@ -165,6 +182,7 @@ export type TimelineTurn = {
   createdAt?: string;
   cards?: AdvisorCard[];
   agentTrace?: {
+    summary?: AgentTraceSummary;
     steps?: AgentTraceStep[];
   };
   loading?: boolean;

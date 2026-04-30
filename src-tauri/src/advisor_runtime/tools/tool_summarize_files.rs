@@ -20,6 +20,7 @@ impl<'a> ToolService<'a> {
         session: &Value,
         args: &Value,
     ) -> Result<Value, String> {
+        let started_at = Instant::now();
         let lang = session
             .get("responseLanguage")
             .and_then(Value::as_str)
@@ -72,6 +73,10 @@ impl<'a> ToolService<'a> {
                 "failed": 0,
                 "items": items,
                 "errors": [],
+                "durationMs": started_at.elapsed().as_millis() as u64,
+                "tokenUsage": { "prompt": 0, "completion": 0, "total": 0 },
+                "requestCount": 0,
+                "errorCount": 0,
                 "scheduler": {
                     "initialConcurrency": 1,
                     "finalConcurrency": 1,
@@ -102,7 +107,7 @@ impl<'a> ToolService<'a> {
             .unwrap_or(2) as usize;
         let route = AdvisorLlm::new(self.state).resolve_route(None, None)?;
         let mut rows = cached_rows;
-        let (generated_rows, errors, scheduler) = run_summary_scheduler(
+        let (generated_rows, errors, scheduler, usage) = run_summary_scheduler(
             &route,
             root_path,
             &generation_items,
@@ -139,6 +144,14 @@ impl<'a> ToolService<'a> {
             "total": total,
             "completed": items.len(),
             "failed": errors.len(),
+            "durationMs": started_at.elapsed().as_millis() as u64,
+            "tokenUsage": {
+                "prompt": usage.prompt,
+                "completion": usage.completion,
+                "total": usage.total,
+            },
+            "requestCount": generation_items.len(),
+            "errorCount": errors.len(),
             "items": items,
             "errors": errors.into_iter().map(|error| json!({
                 "path": error.path,

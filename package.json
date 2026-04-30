@@ -6,8 +6,11 @@
     "scripts": {
         "dev": "vite",
         "typecheck": "tsc --noEmit",
+        "test:frontend": "vitest run",
         "test": "vitest run",
+        "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
         "check:frontend": "npm run typecheck && npm test && npm run build",
+        "check:all": "npm run check:frontend && npm run test:rust",
         "build": "vite build",
         "tauri": "tauri",
         "tauri:dev": "node scripts/tauri-dev.mjs",

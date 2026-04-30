@@ -173,6 +173,37 @@ function summarizeUsage(usage: unknown): string {
   );
 }
 
+function formatDurationMs(value: unknown): string {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return '-';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}m ${rest}s`;
+}
+
+function metricRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === 'object' ? value as JsonRecord : null;
+}
+
+function formatTokenUsage(value: unknown): string {
+  const row = metricRecord(value);
+  if (!row) return '-';
+  return text(
+    `${row.total ?? '-'} / 输入 ${row.prompt ?? '-'} / 输出 ${row.completion ?? '-'}`,
+    `${row.total ?? '-'} / prompt ${row.prompt ?? '-'} / completion ${row.completion ?? '-'}`,
+  );
+}
+
+const ORGANIZE_METRIC_STAGES = [
+  { key: 'summaryPreparation', label: () => text('摘要准备', 'Summary') },
+  { key: 'initialTree', label: () => text('初始树', 'Initial Tree') },
+  { key: 'classification', label: () => text('分类', 'Classification') },
+  { key: 'reconcile', label: () => text('合并', 'Reconcile') },
+];
+
 function ToolCallDetails({ turn }: { turn: TimelineTurn }) {
   const steps = Array.isArray(turn.agentTrace?.steps) ? turn.agentTrace.steps : [];
   const rows = steps.flatMap((step) => {
@@ -189,6 +220,7 @@ function ToolCallDetails({ turn }: { turn: TimelineTurn }) {
         name: call.name,
         arguments: call.arguments,
         status: result?.status || text('无结果', 'no result'),
+        durationMs: result?.durationMs,
         payload: result?.payload,
       };
     });
@@ -223,6 +255,7 @@ function ToolCallDetails({ turn }: { turn: TimelineTurn }) {
                 <span>{text('调用 ID', 'Call ID')}: {row.id || '-'}</span>
                 {route ? <span>{route}</span> : null}
                 {usage ? <span>{usage}</span> : null}
+                {row.durationMs !== undefined ? <span>{text('耗时', 'Duration')}: {formatDurationMs(row.durationMs)}</span> : null}
               </div>
               {String(row.assistantText || '').trim() ? (
                 <div className="advisor-tool-field">
@@ -493,6 +526,9 @@ export function OrganizeSummary({
   const determinate = hasDeterminateOrganizeProgress(snapshot);
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
   const resultRows = Array.isArray(snapshot.results) ? snapshot.results : [];
+  const timingMs = metricRecord(snapshot.timingMs);
+  const tokenUsage = snapshot.tokenUsage || snapshot.token_usage;
+  const tokenUsageByStage = metricRecord(snapshot.tokenUsageByStage || snapshot.token_usage_by_stage);
   return (
     <section className="advisor-organize-summary">
       <div className="advisor-organize-summary-head">
@@ -527,8 +563,26 @@ export function OrganizeSummary({
       <div className="advisor-organize-stats">
         <div className="advisor-context-chip">{text('文件数', 'Files')}: {totalFiles}</div>
         <div className="advisor-context-chip">{text('当前阶段', 'Stage')}: {getOrganizeStatusLabel(state, snapshot)}</div>
+        <div className="advisor-context-chip">{text('总耗时', 'Total Duration')}: {formatDurationMs(snapshot.durationMs ?? timingMs?.total)}</div>
+        <div className="advisor-context-chip">{text('总 Token', 'Total Tokens')}: {formatTokenUsage(tokenUsage)}</div>
         <div className="advisor-context-chip">{text('任务 ID', 'Task ID')}: {snapshot.id || '-'}</div>
       </div>
+      {(timingMs || tokenUsageByStage) ? (
+        <div className="advisor-organize-metrics">
+          {ORGANIZE_METRIC_STAGES.map((item) => {
+            const stageUsage = tokenUsageByStage?.[item.key];
+            const stageDuration = timingMs?.[item.key];
+            if (stageUsage === undefined && stageDuration === undefined) return null;
+            return (
+              <div className="advisor-context-chip advisor-organize-metric-chip" key={item.key}>
+                <span>{item.label()}</span>
+                <span>{text('耗时', 'Duration')}: {formatDurationMs(stageDuration)}</span>
+                <span>{text('Token', 'Tokens')}: {formatTokenUsage(stageUsage)}</span>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
       {error ? <div className="form-hint">{text('错误: ', 'Error: ')}{error}</div> : null}
       {resultRows.length ? (
         <OrganizeResultBrowser rows={resultRows} />

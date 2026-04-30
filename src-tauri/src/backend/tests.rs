@@ -188,6 +188,54 @@ mod tests {
             snapshot.summary_strategy,
             default_organize_summary_strategy()
         );
+        assert!(snapshot.timing_ms.is_null());
+        assert!(snapshot.token_usage_by_stage.is_null());
+        assert_eq!(snapshot.duration_ms, None);
+    }
+
+    #[test]
+    fn organize_snapshot_serializes_task_metrics_when_present() {
+        let mut snapshot: OrganizeSnapshot = serde_json::from_value(json!({
+            "id": "task_metrics",
+            "status": "completed",
+            "error": null,
+            "rootPath": "C:\\root",
+            "recursive": true,
+            "excludedPatterns": [],
+            "batchSize": 20,
+            "summaryStrategy": "filename_only",
+            "useWebSearch": false,
+            "webSearchEnabled": false,
+            "selectedModel": "deepseek-chat",
+            "selectedModels": {},
+            "selectedProviders": {},
+            "supportsMultimodal": false,
+            "tree": {},
+            "treeVersion": 0,
+            "totalFiles": 0,
+            "processedFiles": 0,
+            "totalBatches": 0,
+            "processedBatches": 0,
+            "tokenUsage": { "prompt": 0, "completion": 0, "total": 0 },
+            "createdAt": "2026-03-28T00:00:00Z",
+            "completedAt": null,
+            "jobId": null
+        }))
+        .expect("deserialize snapshot");
+        snapshot.duration_ms = Some(123);
+        snapshot.timing_ms = json!({ "total": 123 });
+        snapshot.token_usage_by_stage = json!({
+            "classification": { "prompt": 7, "completion": 3, "total": 10 }
+        });
+        snapshot.request_count = Some(2);
+        snapshot.error_count = Some(1);
+
+        let encoded = serde_json::to_value(snapshot).expect("serialize snapshot");
+        assert_eq!(encoded["durationMs"], 123);
+        assert_eq!(encoded["timingMs"]["total"], 123);
+        assert_eq!(encoded["tokenUsageByStage"]["classification"]["total"], 10);
+        assert_eq!(encoded["requestCount"], 2);
+        assert_eq!(encoded["errorCount"], 1);
     }
 
     #[test]

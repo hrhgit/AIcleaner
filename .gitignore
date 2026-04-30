@@ -16,6 +16,7 @@ urls.txt
 .DS_Store
 .codex-candidates.json
 .codex-install-jobs/
+test-runs/
 AGENTS.md
 .encoding-policy.json
 src-tauri/target/

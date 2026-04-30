@@ -51,4 +51,48 @@ describe('OrganizeSummary', () => {
     expect(html).toContain('30%');
     expect(html).not.toContain('已处理');
   });
+
+  it('renders task timing and token metrics when available', () => {
+    const snapshot: OrganizeSnapshot = {
+      id: 'org_metrics',
+      status: 'completed',
+      totalFiles: 8,
+      processedFiles: 8,
+      summaryStrategy: 'agent_summary',
+      durationMs: 65432,
+      timingMs: {
+        total: 65432,
+        summaryPreparation: 1200,
+        initialTree: 2300,
+        classification: 61000,
+        reconcile: 500,
+      },
+      tokenUsage: { prompt: 100, completion: 30, total: 130 },
+      tokenUsageByStage: {
+        summaryPreparation: { prompt: 10, completion: 4, total: 14 },
+        initialTree: { prompt: 20, completion: 6, total: 26 },
+        classification: { prompt: 60, completion: 18, total: 78 },
+        reconcile: { prompt: 10, completion: 2, total: 12 },
+      },
+      progress: {
+        stage: 'completed',
+        label: 'Completed',
+        current: 1,
+        total: 1,
+        unit: 'batches',
+        indeterminate: false,
+      },
+      results: [],
+      tree: { children: [] },
+    };
+
+    const html = renderToStaticMarkup(<OrganizeSummary snapshot={snapshot} state={stateStub()} />);
+
+    expect(html).toContain('总耗时');
+    expect(html).toContain('1m 5s');
+    expect(html).toContain('总 Token');
+    expect(html).toContain('130 / 输入 100 / 输出 30');
+    expect(html).toContain('摘要准备');
+    expect(html).toContain('78 / 输入 60 / 输出 18');
+  });
 });

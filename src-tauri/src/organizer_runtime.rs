@@ -29,7 +29,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const UNCATEGORIZED_NODE_NAME: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
-const DEFAULT_BATCH_SIZE: u32 = 20;
+const DEFAULT_BATCH_SIZE: u32 = 60;
 const CATEGORY_OTHER_PENDING: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
 const CATEGORY_CLASSIFICATION_ERROR: &str = "\u{5206}\u{7C7B}\u{9519}\u{8BEF}";
 const RESULT_REASON_CLASSIFICATION_ERROR: &str = "classification_error";
@@ -39,8 +39,14 @@ const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
-const SUMMARY_PREFETCH_BATCHES: usize = 2;
-const CLASSIFICATION_BATCH_CONCURRENCY: usize = 8;
+const SUMMARY_AGENT_BATCH_MAX_CHARS: usize = 24_000;
+const SUMMARY_AGENT_BATCH_MAX_ITEMS: usize = 20;
+const SUMMARY_AGENT_BATCH_FLUSH_MS: u64 = 500;
+const SUMMARY_AGENT_MAX_IN_FLIGHT: usize = 50;
+const EXTRACTION_GLOBAL_BUDGET: u32 = 128;
+const EXTRACTION_TIKA_HARD_CAP: usize = 32;
+const EXTRACTION_HEAVY_DOC_HARD_CAP: usize = 8;
+const CLASSIFICATION_BATCH_CONCURRENCY: usize = 50;
 const ORGANIZER_SEARCH_CONCURRENCY: usize = 8;
 pub(crate) const ORGANIZER_WEB_SEARCH_BUDGET: usize = 20;
 const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
@@ -532,6 +538,7 @@ impl OrganizerDiagnostics {
         &self,
         stage: &str,
         trace: &crate::web_search::WebSearchTrace,
+        duration: Duration,
     ) {
         self.record(
             "info",
@@ -545,11 +552,17 @@ impl OrganizerDiagnostics {
                 "results": trace.results.clone(),
             }),
             None,
-            None,
+            Some(duration),
         );
     }
 
-    pub(crate) fn web_search_failed(&self, stage: &str, arguments: &Value, message: &str) {
+    pub(crate) fn web_search_failed(
+        &self,
+        stage: &str,
+        arguments: &Value,
+        message: &str,
+        duration: Duration,
+    ) {
         self.record(
             "error",
             "organizer_web_search",
@@ -559,7 +572,7 @@ impl OrganizerDiagnostics {
                 "arguments": arguments,
             }),
             Some(json!({ "message": message })),
-            None,
+            Some(duration),
         );
     }
 }

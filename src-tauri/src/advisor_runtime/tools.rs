@@ -3,7 +3,7 @@ use super::types::{
     array_of_strings, basename, local_text, normalize_message, normalize_path_key, now_iso,
     set_inventory_override, ContextAssets, DirectoryOverview, InventoryItem,
 };
-use crate::backend::AppState;
+use crate::backend::{AppState, TokenUsage};
 use crate::file_representation::{FileRepresentation, RepresentationLevel};
 use crate::llm_protocol::{
     apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 

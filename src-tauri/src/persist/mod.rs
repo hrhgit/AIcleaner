@@ -191,6 +191,11 @@ mod tests {
                 completion: 5,
                 total: 15,
             },
+            token_usage_by_stage: Value::Null,
+            timing_ms: Value::Null,
+            duration_ms: None,
+            request_count: None,
+            error_count: None,
             results: vec![
                 json!({
                     "index": 1,

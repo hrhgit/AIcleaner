@@ -25,7 +25,7 @@ export const DEFAULT_EXCLUSIONS = [
   'Program Files (x86)',
 ];
 
-export const DEFAULT_BATCH_SIZE = 20;
+export const DEFAULT_BATCH_SIZE = 60;
 export const DEFAULT_SUMMARY_MODE: SummaryMode = 'filename_only';
 export const SUMMARY_MODES: SummaryMode[] = ['filename_only', 'local_summary', 'agent_summary'];
 
@@ -44,4 +44,3 @@ export const TRANSIENT_FIELDS = [
   'loading flags',
   'active stream handles',
 ] as const;
-

@@ -589,6 +589,23 @@
     gap: 10px;
 }
 
+.advisor-organize-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 10px;
+}
+
+.advisor-organize-metric-chip {
+    display: grid;
+    gap: 4px;
+    line-height: 1.45;
+}
+
+.advisor-organize-metric-chip span:first-child {
+    color: var(--text-primary);
+    font-weight: 700;
+}
+
 .advisor-organize-state-card {
     display: grid;
     gap: 12px;

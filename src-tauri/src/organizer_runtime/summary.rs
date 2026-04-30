@@ -124,7 +124,7 @@ pub(super) fn extract_unit_content_for_summary(
     }
 }
 
-fn supports_tika_extraction(unit: &OrganizeUnit) -> bool {
+pub(super) fn supports_tika_extraction(unit: &OrganizeUnit) -> bool {
     if unit.item_type != "file" {
         return false;
     }
@@ -1344,10 +1344,6 @@ impl AgentTurnSpec for InitialTreeSpec<'_> {
         }
     }
 
-    fn allow_multiple_tool_calls(&self) -> bool {
-        false
-    }
-
     fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
         Ok(std::mem::take(&mut self.initial_messages))
     }
@@ -1438,17 +1434,6 @@ impl AgentTurnSpec for InitialTreeSpec<'_> {
         Ok(self.output(
             None,
             Some("initial tree response did not call submit_initial_tree".to_string()),
-        ))
-    }
-
-    fn on_multiple_tool_calls(
-        &mut self,
-        _completion: AgentCompletion,
-        _trace: &AgentLoopTrace,
-    ) -> Result<Self::Output, String> {
-        Ok(self.output(
-            None,
-            Some("initial tree response used multiple tool calls".to_string()),
         ))
     }
 
@@ -1621,10 +1606,6 @@ impl AgentTurnSpec for ReconcileSpec<'_> {
         }
     }
 
-    fn allow_multiple_tool_calls(&self) -> bool {
-        false
-    }
-
     fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
         Ok(Vec::new())
     }
@@ -1719,17 +1700,6 @@ impl AgentTurnSpec for ReconcileSpec<'_> {
                 "reconcile stage {} did not call a required tool",
                 self.stage
             )),
-        ))
-    }
-
-    fn on_multiple_tool_calls(
-        &mut self,
-        _completion: AgentCompletion,
-        _trace: &AgentLoopTrace,
-    ) -> Result<Self::Output, String> {
-        Ok(self.output(
-            None,
-            Some("reconcile response used multiple tool calls".to_string()),
         ))
     }
 
@@ -1983,10 +1953,6 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
         }
     }
 
-    fn allow_multiple_tool_calls(&self) -> bool {
-        false
-    }
-
     fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
         Ok(std::mem::take(&mut self.initial_messages))
     }
@@ -2106,17 +2072,6 @@ impl AgentTurnSpec for OrganizerBatchSpec<'_> {
         ))
     }
 
-    fn on_multiple_tool_calls(
-        &mut self,
-        _completion: AgentCompletion,
-        _trace: &AgentLoopTrace,
-    ) -> Result<ClassifyOrganizeBatchOutput, String> {
-        Ok(self.output(
-            None,
-            Some("classification response used multiple tool calls in one step".to_string()),
-        ))
-    }
-
     fn on_tool_success(
         &mut self,
         _step: usize,
@@ -2218,13 +2173,34 @@ mod tool_policy_tests {
     use super::*;
 
     #[test]
-    fn organizer_batch_disallows_multiple_tool_calls() {
+    fn organizer_specs_allow_multiple_tool_calls() {
         let route = RouteConfig {
             endpoint: "https://example.invalid/v1/chat/completions".to_string(),
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
         };
-        let spec = OrganizerBatchSpec {
+        let initial_spec = InitialTreeSpec {
+            route: &route,
+            response_language: "zh",
+            initial_messages: Vec::new(),
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+        };
+        let reconcile_spec = ReconcileSpec {
+            route: &route,
+            response_language: "zh",
+            stage: "reconcile_tree",
+            initial_tree: json!({"nodeId": "root", "name": "", "children": []}),
+            classification_results: Vec::new(),
+            aliases: ModelIdMap::default(),
+            total_usage: TokenUsage::default(),
+            round_trace: Vec::new(),
+            available_tool_names: Vec::new(),
+            latest_draft: Value::Null,
+            latest_review: Value::Null,
+        };
+        let batch_spec = OrganizerBatchSpec {
             route: &route,
             response_language: "zh",
             search_enabled: true,
@@ -2242,7 +2218,9 @@ mod tool_policy_tests {
             aliases: ModelIdMap::default(),
         };
 
-        assert!(!spec.allow_multiple_tool_calls());
+        assert!(initial_spec.allow_multiple_tool_calls());
+        assert!(reconcile_spec.allow_multiple_tool_calls());
+        assert!(batch_spec.allow_multiple_tool_calls());
     }
 }
 

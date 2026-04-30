@@ -5,6 +5,7 @@ use crate::llm_tools::{
     serialize_tool_result_content, ToolExecutionContext, ToolId, ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
+use std::time::Instant;
 
 pub(crate) enum ToolCallOutcome<O> {
     Continue { result: Value },
@@ -99,6 +100,7 @@ where
     {
         let mut messages = spec.build_initial_messages()?;
         let mut trace = AgentLoopTrace::default();
+        let loop_started_at = Instant::now();
 
         for step in 0..spec.max_steps() {
             spec.before_step(step, &mut messages)?;
@@ -120,22 +122,33 @@ where
             spec.on_model_success(step, &completion, &trace)?;
 
             if completion.tool_calls.is_empty() {
+                trace.set_duration(loop_started_at.elapsed());
                 return spec.on_no_tool_calls(completion, &trace);
             }
             if !spec.allow_multiple_tool_calls() && completion.tool_calls.len() > 1 {
+                trace.set_duration(loop_started_at.elapsed());
                 return spec.on_multiple_tool_calls(completion, &trace);
             }
 
             messages.push(normalize_assistant_message(&completion.raw_message));
             for call in completion.tool_calls {
                 let tool_id = self.tool_registry.id_for_name(&call.name);
+                let tool_started_at = Instant::now();
                 let dispatch_result = {
                     let mut tool_ctx = spec.tool_execution_context();
                     self.tool_registry.dispatch(&mut tool_ctx, &call).await
                 };
+                let tool_duration_ms = tool_started_at.elapsed().as_millis() as u64;
                 match dispatch_result {
                     Ok(result) => {
-                        trace.record_tool_result(step, &call, "ok", result.result.clone());
+                        trace.record_tool_result(
+                            step,
+                            &call,
+                            "ok",
+                            result.result.clone(),
+                            tool_duration_ms,
+                        );
+                        trace.set_duration(loop_started_at.elapsed());
                         match spec.on_tool_success(step, tool_id, &call, result, &trace)? {
                             ToolCallOutcome::Continue { result } => {
                                 messages.push(tool_result_message(&call.id, result));
@@ -150,15 +163,21 @@ where
                                 &call,
                                 "error",
                                 json!({ "message": message.clone() }),
+                                tool_duration_ms,
                             );
+                            trace.set_duration(loop_started_at.elapsed());
                             messages.push(tool_error_message(&call.id, message));
                         }
-                        ToolCallErrorOutcome::Finish(output) => return Ok(output),
+                        ToolCallErrorOutcome::Finish(output) => {
+                            trace.set_duration(loop_started_at.elapsed());
+                            return Ok(output);
+                        }
                     },
                 }
             }
         }
 
+        trace.set_duration(loop_started_at.elapsed());
         spec.on_loop_exhausted(&trace)
     }
 }
