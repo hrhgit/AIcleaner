@@ -8,6 +8,7 @@ use super::types::{
 use crate::backend::AppState;
 use crate::persist;
 use serde_json::{json, Value};
+use std::time::Instant;
 use uuid::Uuid;
 
 pub(super) struct ConversationOrchestrator<'a> {
@@ -29,10 +30,25 @@ impl<'a> ConversationOrchestrator<'a> {
         &self,
         input: AdvisorMessageSendInput,
     ) -> Result<Value, String> {
+        let started_at = Instant::now();
         let message = input.message.trim().to_string();
         if message.is_empty() {
             return Err("message is required".to_string());
         }
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_message_handling_started",
+            None,
+            "advisor message handling started",
+            json!({
+                "sessionId": input.session_id,
+                "messageLength": message.len(),
+            }),
+            None,
+            None,
+        );
         let mut session = super::load_session(self.state, input.session_id.trim())?;
         self.refresh_session_overview(&mut session)?;
         let session_id = session
@@ -44,6 +60,20 @@ impl<'a> ConversationOrchestrator<'a> {
         persist::create_advisor_turn(&self.state.db_path(), &session_id, "user", &message)?;
         match self.agent.run_user_turn(&mut session, &message).await {
             Ok(agent_result) => {
+                crate::diagnostics::record_state_event(
+                    self.state,
+                    "info",
+                    "advisor",
+                    "advisor_message_agent_succeeded",
+                    None,
+                    "advisor agent turn succeeded",
+                    json!({
+                        "sessionId": session_id,
+                        "cardsCount": agent_result.cards.len(),
+                    }),
+                    None,
+                    Some(started_at.elapsed()),
+                );
                 self.store_trace(&mut session, &agent_result.trace);
                 super::save_session(self.state, &mut session)?;
 
@@ -66,6 +96,17 @@ impl<'a> ConversationOrchestrator<'a> {
                 }
             }
             Err(error) => {
+                crate::diagnostics::record_state_event(
+                    self.state,
+                    "error",
+                    "advisor",
+                    "advisor_message_agent_failed",
+                    None,
+                    "advisor agent turn failed",
+                    json!({ "sessionId": session_id }),
+                    Some(json!({ "message": error.clone() })),
+                    Some(started_at.elapsed()),
+                );
                 super::save_session(self.state, &mut session)?;
                 persist::create_advisor_turn(
                     &self.state.db_path(),
@@ -80,10 +121,81 @@ impl<'a> ConversationOrchestrator<'a> {
         build_session_payload(self.state, &session)
     }
 
+    pub(super) async fn run_bootstrap_turn(&self, session_id: &str) -> Result<(), String> {
+        let mut session = super::load_session(self.state, session_id)?;
+        let started_at = Instant::now();
+        match self.agent.run_bootstrap_turn(&mut session).await {
+            Ok(result) => {
+                crate::diagnostics::record_state_event(
+                    self.state,
+                    "info",
+                    "advisor",
+                    "advisor_bootstrap_turn_succeeded",
+                    None,
+                    "bootstrap agent turn succeeded",
+                    json!({
+                        "sessionId": session_id,
+                        "cardsCount": result.cards.len(),
+                    }),
+                    None,
+                    Some(started_at.elapsed()),
+                );
+                self.store_trace(&mut session, &result.trace);
+                super::save_session(self.state, &mut session)?;
+                let assistant_turn = persist::create_advisor_turn_with_agent_trace(
+                    &self.state.db_path(),
+                    session_id,
+                    "assistant",
+                    &result.reply,
+                    Some(&result.trace),
+                )?;
+                let turn_id = assistant_turn
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for card in result.cards {
+                    persist::save_advisor_card(
+                        &self.state.db_path(),
+                        &materialize_card(session_id, turn_id, &card),
+                    )?;
+                }
+            }
+            Err(error) => {
+                crate::diagnostics::record_state_event(
+                    self.state,
+                    "error",
+                    "advisor",
+                    "advisor_bootstrap_turn_failed",
+                    None,
+                    "bootstrap agent turn failed",
+                    json!({ "sessionId": session_id }),
+                    Some(json!({ "message": error.clone() })),
+                    Some(started_at.elapsed()),
+                );
+                super::save_session(self.state, &mut session)?;
+                persist::create_advisor_turn(
+                    &self.state.db_path(),
+                    session_id,
+                    "assistant",
+                    &local_text(
+                        session
+                            .get("responseLanguage")
+                            .and_then(Value::as_str)
+                            .unwrap_or("zh"),
+                        "会话已开始。你可以直接告诉我想先处理哪些文件或规则。",
+                        "The conversation is ready. Tell me which files or rules you want to handle first.",
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_card_action(
         &self,
         input: AdvisorCardActionInput,
     ) -> Result<Value, String> {
+        let started_at = Instant::now();
         let mut session = super::load_session(self.state, input.session_id.trim())?;
         let session_id = session
             .get("sessionId")
@@ -105,6 +217,21 @@ impl<'a> ConversationOrchestrator<'a> {
                 "cardId is required for advisor card action: {action}"
             ));
         }
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_card_action_started",
+            None,
+            "advisor card action started",
+            json!({
+                "sessionId": session_id,
+                "cardId": card_id,
+                "action": action,
+            }),
+            None,
+            None,
+        );
         let mut card = self.load_action_card(&session_id, card_id)?;
         match action {
             "dismiss_preference" => self.dismiss_preference(&mut card)?,
@@ -119,6 +246,21 @@ impl<'a> ConversationOrchestrator<'a> {
         }
 
         super::save_session(self.state, &mut session)?;
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_card_action_completed",
+            None,
+            "advisor card action completed",
+            json!({
+                "sessionId": session_id,
+                "cardId": card_id,
+                "action": action,
+            }),
+            None,
+            Some(started_at.elapsed()),
+        );
         let session = super::load_session(self.state, &session_id)?;
         build_session_payload(self.state, &session)
     }
@@ -255,7 +397,6 @@ impl<'a> ConversationOrchestrator<'a> {
             session,
             WORKFLOW_UNDERSTAND,
             None,
-            None,
             rollback
                 .get("available")
                 .and_then(Value::as_bool)
@@ -306,7 +447,7 @@ impl<'a> ConversationOrchestrator<'a> {
             "updatedAt": now_iso(),
         });
         persist::save_advisor_card(&self.state.db_path(), &rollback_card)?;
-        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, None, false);
+        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, false);
         Ok(())
     }
 
@@ -335,7 +476,7 @@ impl<'a> ConversationOrchestrator<'a> {
         self.update_card(card, "applied", Vec::new());
         persist::save_advisor_card(&self.state.db_path(), card)?;
         self.refresh_session_overview(session)?;
-        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, None, false);
+        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, false);
         let turn = persist::create_advisor_turn(
             &self.state.db_path(),
             session
@@ -380,7 +521,7 @@ impl<'a> ConversationOrchestrator<'a> {
             .ok_or_else(|| "reclass jobId is missing".to_string())?;
         let (_job, _result, tree) = self.tools.rollback_reclassification(session, job_id)?;
         self.refresh_session_overview(session)?;
-        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, None, false);
+        self.apply_session_state(session, WORKFLOW_UNDERSTAND, None, false);
         let turn = persist::create_advisor_turn(
             &self.state.db_path(),
             session
@@ -476,7 +617,6 @@ impl<'a> ConversationOrchestrator<'a> {
         session: &mut Value,
         workflow: &str,
         selection_id: Option<&str>,
-        preview_id: Option<&str>,
         rollback_available: bool,
     ) {
         if let Some(obj) = session.as_object_mut() {
@@ -487,12 +627,6 @@ impl<'a> ConversationOrchestrator<'a> {
             obj.insert(
                 "activeSelectionId".to_string(),
                 selection_id
-                    .map(|value| Value::String(value.to_string()))
-                    .unwrap_or(Value::Null),
-            );
-            obj.insert(
-                "activePreviewId".to_string(),
-                preview_id
                     .map(|value| Value::String(value.to_string()))
                     .unwrap_or(Value::Null),
             );

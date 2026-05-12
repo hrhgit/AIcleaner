@@ -120,7 +120,6 @@ export function App() {
         </ul>
 
         <div className="sidebar-provider-action">
-          <ProviderManager />
           <button
             className="btn btn-sidebar-action"
             type="button"
@@ -150,6 +149,9 @@ export function App() {
           </div>
         )}
       </main>
+      <div className="provider-manager-float">
+        <ProviderManager />
+      </div>
     </div>
   );
 }

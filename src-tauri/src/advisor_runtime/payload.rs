@@ -79,13 +79,6 @@ pub(super) fn build_session_payload(state: &AppState, session: &Value) -> Result
             })
         });
 
-    let active_preview_card = session
-        .get("activePreviewId")
-        .and_then(Value::as_str)
-        .map(|card_id| persist::load_advisor_card(&db_path, card_id))
-        .transpose()?
-        .flatten();
-
     Ok(json!({
         "session": {
             "sessionId": session.get("sessionId").cloned().unwrap_or(Value::Null),
@@ -105,7 +98,6 @@ pub(super) fn build_session_payload(state: &AppState, session: &Value) -> Result
         "composer": build_composer(session),
         "rollbackAvailable": session.get("rollbackAvailable").cloned().unwrap_or(Value::Bool(false)),
         "activeSelectionCard": active_selection_card,
-        "activePreviewCard": active_preview_card,
         "latestExecutionCard": latest_execution,
         "derivedTree": session.get("derivedTree").cloned().unwrap_or(Value::Null),
     }))

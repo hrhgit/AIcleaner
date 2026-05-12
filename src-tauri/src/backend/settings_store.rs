@@ -1,20 +1,15 @@
-use crate::backend::provider_registry::default_model_for_endpoint;
+use crate::backend::{
+    normalize_provider_api_format, normalize_provider_endpoint, normalize_provider_thinking_level,
+    preset_provider_configs_json,
+};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
 pub(crate) fn default_settings() -> Value {
     json!({
-        "defaultProviderEndpoint": "https://api.openai.com/v1",
-        "providerConfigs": {
-            "https://api.openai.com/v1": { "name": "OpenAI", "endpoint": "https://api.openai.com/v1", "apiKey": "", "model": "gpt-4o-mini" },
-            "https://api.deepseek.com": { "name": "DeepSeek", "endpoint": "https://api.deepseek.com", "apiKey": "", "model": "deepseek-chat" },
-            "https://generativelanguage.googleapis.com/v1beta/openai/": { "name": "Google Gemini", "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/", "apiKey": "", "model": "gemini-2.5-flash" },
-            "https://dashscope.aliyuncs.com/compatible-mode/v1": { "name": "Qwen", "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1", "apiKey": "", "model": "qwen-plus" },
-            "https://open.bigmodel.cn/api/paas/v4": { "name": "GLM", "endpoint": "https://open.bigmodel.cn/api/paas/v4", "apiKey": "", "model": "glm-4-flash" },
-            "https://api.moonshot.cn/v1": { "name": "Moonshot", "endpoint": "https://api.moonshot.cn/v1", "apiKey": "", "model": "moonshot-v1-8k" },
-            "https://api.minimax.io/anthropic/v1": { "name": "MiniMax (Anthropic)", "endpoint": "https://api.minimax.io/anthropic/v1", "apiKey": "", "model": "MiniMax-M2.7" }
-        },
+        "defaultProviderEndpoint": "",
+        "providerConfigs": preset_provider_configs_json(),
         "searchApi": {
             "provider": "tavily",
             "enabled": false,
@@ -64,6 +59,80 @@ pub(crate) fn legacy_search_api_key_from_settings(settings: &Value) -> Option<St
         .or_else(|| value_as_non_empty_string(settings.get("tavilyApiKey")))
 }
 
+fn ensure_provider_defaults(config: &mut serde_json::Map<String, Value>, fallback_name: &str) {
+    if value_as_non_empty_string(config.get("name")).is_none() {
+        config.insert("name".to_string(), Value::String(fallback_name.to_string()));
+    }
+    if !config.contains_key("model") {
+        config.insert("model".to_string(), Value::String(String::new()));
+    }
+    let thinking = config
+        .entry("thinking".to_string())
+        .or_insert_with(|| json!({}));
+    if !thinking.is_object() {
+        *thinking = json!({});
+    }
+    if let Some(thinking_obj) = thinking.as_object_mut() {
+        let enabled = thinking_obj
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        thinking_obj.insert("enabled".to_string(), Value::Bool(enabled));
+        thinking_obj.insert(
+            "level".to_string(),
+            Value::String(
+                normalize_provider_thinking_level(
+                    thinking_obj.get("level").and_then(Value::as_str),
+                )
+                .to_string(),
+            ),
+        );
+    }
+}
+
+fn normalize_provider_configs(obj: &mut serde_json::Map<String, Value>) -> Result<(), String> {
+    let provider_configs = obj
+        .entry("providerConfigs".to_string())
+        .or_insert_with(|| json!({}));
+    if !provider_configs.is_object() {
+        *provider_configs = json!({});
+    }
+
+    let existing = provider_configs
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut normalized = serde_json::Map::new();
+
+    for (key, raw_config) in existing {
+        let mut config_obj = raw_config.as_object().cloned().unwrap_or_default();
+        let raw_endpoint = config_obj
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or(&key)
+            .trim()
+            .to_string();
+        let api_format = normalize_provider_api_format(
+            &raw_endpoint,
+            config_obj.get("apiFormat").and_then(Value::as_str),
+        );
+        let endpoint = normalize_provider_endpoint(&raw_endpoint, api_format)?;
+        config_obj.insert("endpoint".to_string(), Value::String(endpoint.clone()));
+        config_obj.insert(
+            "apiFormat".to_string(),
+            Value::String(api_format.as_str().to_string()),
+        );
+        ensure_provider_defaults(&mut config_obj, &endpoint);
+        normalized.insert(endpoint, Value::Object(config_obj));
+    }
+
+    *provider_configs = Value::Object(normalized);
+    Ok(())
+}
+
 fn migrate_legacy_settings_fields(value: &mut Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
@@ -79,10 +148,13 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
     });
 
     if let Some(endpoint) = legacy_endpoint.clone() {
+        let api_format = normalize_provider_api_format(&endpoint, None);
+        let normalized_endpoint =
+            normalize_provider_endpoint(&endpoint, api_format).unwrap_or(endpoint.clone());
         if value_as_non_empty_string(obj.get("defaultProviderEndpoint")).is_none() {
             obj.insert(
                 "defaultProviderEndpoint".to_string(),
-                Value::String(endpoint.clone()),
+                Value::String(normalized_endpoint.clone()),
             );
         }
 
@@ -93,25 +165,32 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
             *provider_configs = json!({});
         }
         if let Some(configs) = provider_configs.as_object_mut() {
-            let entry = configs.entry(endpoint.clone()).or_insert_with(|| json!({}));
+            let entry = configs
+                .entry(normalized_endpoint.clone())
+                .or_insert_with(|| json!({}));
             if !entry.is_object() {
                 *entry = json!({});
             }
             if let Some(config) = entry.as_object_mut() {
                 if value_as_non_empty_string(config.get("endpoint")).is_none() {
-                    config.insert("endpoint".to_string(), Value::String(endpoint.clone()));
+                    config.insert(
+                        "endpoint".to_string(),
+                        Value::String(normalized_endpoint.clone()),
+                    );
                 }
                 if value_as_non_empty_string(config.get("name")).is_none() {
-                    config.insert("name".to_string(), Value::String(endpoint.clone()));
+                    config.insert("name".to_string(), Value::String(normalized_endpoint.clone()));
                 }
-                if value_as_non_empty_string(config.get("model")).is_none() {
+                if value_as_non_empty_string(config.get("apiFormat")).is_none() {
+                    config.insert(
+                        "apiFormat".to_string(),
+                        Value::String(api_format.as_str().to_string()),
+                    );
+                }
+                if !config.contains_key("model") {
                     config.insert(
                         "model".to_string(),
-                        Value::String(
-                            legacy_model.clone().unwrap_or_else(|| {
-                                default_model_for_endpoint(&endpoint).to_string()
-                            }),
-                        ),
+                        Value::String(legacy_model.clone().unwrap_or_default()),
                     );
                 }
             }
@@ -177,11 +256,19 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
     }
 }
 
-fn normalize_settings_shape(value: &mut Value) {
+fn normalize_settings_shape(value: &mut Value) -> Result<(), String> {
     let Some(obj) = value.as_object_mut() else {
         *value = default_settings();
-        return;
+        return Ok(());
     };
+
+    normalize_provider_configs(obj)?;
+
+    let provider_configs = obj
+        .get("providerConfigs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
 
     let mut default_provider_endpoint = obj
         .get("defaultProviderEndpoint")
@@ -190,62 +277,23 @@ fn normalize_settings_shape(value: &mut Value) {
         .trim()
         .to_string();
 
-    if let Some(configs) = obj
-        .get_mut("providerConfigs")
-        .and_then(Value::as_object_mut)
-    {
-        let mut first_endpoint = String::new();
-        for (key, config) in configs.iter_mut() {
-            let endpoint = config
-                .get("endpoint")
-                .and_then(Value::as_str)
-                .unwrap_or(key)
-                .trim()
-                .to_string();
-            if endpoint.is_empty() {
-                continue;
-            }
-            if first_endpoint.is_empty() {
-                first_endpoint = endpoint.clone();
-            }
-            if let Some(config_obj) = config.as_object_mut() {
-                config_obj.insert("endpoint".to_string(), Value::String(endpoint.clone()));
-                let current_model = config_obj
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if current_model.is_empty() {
-                    config_obj.insert(
-                        "model".to_string(),
-                        Value::String(default_model_for_endpoint(&endpoint).to_string()),
-                    );
-                }
-                if !config_obj.contains_key("name") {
-                    config_obj.insert("name".to_string(), Value::String(endpoint.clone()));
-                }
-            }
-        }
-        if default_provider_endpoint.is_empty() {
-            default_provider_endpoint = first_endpoint;
-        }
-        if default_provider_endpoint.is_empty() {
-            default_provider_endpoint = "https://api.openai.com/v1".to_string();
-        }
-        let default_provider_endpoint_for_insert = default_provider_endpoint.clone();
-        configs.entry(default_provider_endpoint.clone()).or_insert_with(|| {
-            json!({
-                "name": default_provider_endpoint_for_insert.clone(),
-                "endpoint": default_provider_endpoint_for_insert.clone(),
-                "apiKey": "",
-                "model": default_model_for_endpoint(&default_provider_endpoint_for_insert).to_string()
-            })
-        });
+    if !default_provider_endpoint.is_empty() {
+        let api_format = normalize_provider_api_format(&default_provider_endpoint, None);
+        default_provider_endpoint =
+            normalize_provider_endpoint(&default_provider_endpoint, api_format)?;
     }
+
+    if !provider_configs.contains_key(&default_provider_endpoint) {
+        default_provider_endpoint = provider_configs
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+    }
+
     obj.insert(
         "defaultProviderEndpoint".to_string(),
-        Value::String(default_provider_endpoint.clone()),
+        Value::String(default_provider_endpoint),
     );
 
     let search_api = obj
@@ -336,6 +384,7 @@ fn normalize_settings_shape(value: &mut Value) {
     obj.remove("scanIgnorePaths");
     obj.remove("lastScanTime");
     obj.remove("scanPersistentRules");
+    Ok(())
 }
 
 fn merge_json(base: &mut Value, patch: &Value) {
@@ -363,7 +412,13 @@ pub(crate) fn read_settings(path: &Path) -> Value {
         migrate_legacy_settings_fields(&mut parsed);
         merge_json(&mut merged, &parsed);
     }
-    normalize_settings_shape(&mut merged);
+    if let Err(err) = normalize_settings_shape(&mut merged) {
+        log::warn!("Failed to normalize settings shape: {err}");
+        let mut fallback = default_settings();
+        merge_json(&mut fallback, &merged);
+        normalize_settings_shape(&mut fallback).ok();
+        merged = fallback;
+    }
     merged
 }
 
@@ -394,7 +449,7 @@ pub(crate) fn write_settings(path: &Path, value: &Value) -> Result<(), String> {
         default_settings()
     };
     merge_json(&mut merged, value);
-    normalize_settings_shape(&mut merged);
+    normalize_settings_shape(&mut merged)?;
     strip_secret_fields(&mut merged);
     fs::write(
         path,
@@ -419,7 +474,7 @@ mod tests {
             }
         });
 
-        normalize_settings_shape(&mut value);
+        normalize_settings_shape(&mut value).expect("normalize settings");
 
         assert_eq!(value["searchApi"]["enabled"], Value::Bool(true));
         assert_eq!(value["searchApi"]["scopes"]["classify"], Value::Bool(true));

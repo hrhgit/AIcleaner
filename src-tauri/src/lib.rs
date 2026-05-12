@@ -1,5 +1,6 @@
 mod advisor_runtime;
 mod agent_runtime;
+pub mod app_paths;
 mod backend;
 mod diagnostics;
 mod file_representation;
@@ -10,18 +11,31 @@ mod organizer_runtime;
 mod persist;
 mod system_ops;
 mod web_search;
+pub mod log_cli_support;
 
 use backend::AppState;
 use tauri::Manager;
+use tauri_plugin_log::{Target, TargetKind};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let state = AppState::bootstrap(data_dir)?;
+            let mut logger = tauri_plugin_log::Builder::new().clear_targets().target(
+                Target::new(TargetKind::Folder {
+                    path: state.logs_dir(),
+                    file_name: Some(app_paths::APP_LOG_FILE_STEM.to_string()),
+                }),
+            );
+            if cfg!(debug_assertions) {
+                logger = logger.target(Target::new(TargetKind::Stdout));
+            }
+            app.handle()
+                .plugin(logger.build())
+                .map_err(|e| e.to_string())?;
             app.manage(state);
             Ok(())
         })
@@ -36,6 +50,7 @@ pub fn run() {
             backend::system_get_privilege,
             backend::system_request_elevation,
             backend::system_open_external_url,
+            backend::frontend_log_event,
             backend::organize_get_capability,
             backend::organize_start,
             backend::organize_stop,

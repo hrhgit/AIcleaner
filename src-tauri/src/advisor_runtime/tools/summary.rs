@@ -318,6 +318,40 @@ fn build_reclassification_change_summary(change: &Value, rollback_entries: &[Val
     format!("{change_type}: {file_count} items updated")
 }
 
+fn supports_content_summarization(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        // Document files (Tika)
+        ".pdf" | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx"
+        | ".rtf" | ".odt" | ".ods" | ".odp" | ".epub"
+        // Plain text / code files
+        | ".txt" | ".md" | ".csv" | ".json" | ".yaml" | ".yml" | ".toml"
+        | ".xml" | ".log" | ".ini" | ".cfg" | ".conf"
+        | ".js" | ".ts" | ".jsx" | ".tsx" | ".rs" | ".py" | ".java"
+        | ".go" | ".c" | ".cpp" | ".h" | ".hpp" | ".css" | ".html"
+        | ".sql" | ".sh" | ".bat" | ".ps1"
+    )
+}
+
+fn inventory_to_organize_unit(item: &InventoryItem) -> OrganizeUnit {
+    OrganizeUnit {
+        name: item.name.clone(),
+        path: item.path.clone(),
+        relative_path: item.path.clone(),
+        size: item.size,
+        created_at: item.created_at.clone(),
+        modified_at: item.modified_at.clone(),
+        item_type: "file".to_string(),
+        modality: String::new(),
+        directory_assessment: None,
+    }
+}
+
 async fn summarize_batch_with_model(
     client: &reqwest::Client,
     route: &super::llm::AdvisorModelRoute,
@@ -325,12 +359,13 @@ async fn summarize_batch_with_model(
     batch: &[InventoryItem],
     level: RepresentationLevel,
     lang: &str,
+    extraction_config: Option<&ExtractionToolConfig>,
 ) -> (Vec<Value>, Vec<SummaryFailedItem>, TokenUsage) {
     let mut output = Vec::new();
     let mut errors = Vec::new();
     let mut usage = TokenUsage::default();
     for item in batch {
-        match summarize_item_with_model(client, route, root_path, item, level, lang).await {
+        match summarize_item_with_model(client, route, root_path, item, level, lang, extraction_config).await {
             Ok((row, item_usage)) => {
                 add_token_usage(&mut usage, &item_usage);
                 output.push(row);
@@ -351,9 +386,29 @@ async fn summarize_item_with_model(
     item: &InventoryItem,
     level: RepresentationLevel,
     lang: &str,
+    extraction_config: Option<&ExtractionToolConfig>,
 ) -> Result<(Value, TokenUsage), SummaryErrorRow> {
-    let prompt = build_summary_prompt(item, level, lang);
-    let api_format = detect_api_format(&route.endpoint);
+    let extracted = if let Some(config) = extraction_config.filter(|c| c.tika_ready) {
+        let unit = inventory_to_organize_unit(item);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let extraction = extract_unit_content_for_summary_with_tools(&unit, lang, &stop, config).await;
+        if extraction.excerpt.trim().is_empty() { None } else { Some(extraction.excerpt) }
+    } else {
+        None
+    };
+    let prompt = build_summary_prompt(item, extracted.as_deref(), level, lang);
+    let api_format = route.api_format;
+    let tool_registry = ToolRegistry::new();
+    let tool_ctx = ToolContext {
+        workflow: ToolWorkflow::Advisor,
+        stage: "advisor_summary_generation",
+        session: None,
+        bootstrap_turn: false,
+        response_language: lang,
+        web_search_allowed: false,
+        search_remaining: 0,
+    };
+    let tools = tool_registry.definitions(&tool_ctx);
     let request = build_completion_payload(
         api_format,
         &route.model,
@@ -361,9 +416,13 @@ async fn summarize_item_with_model(
             json!({ "role": "system", "content": summary_system_prompt(lang, level) }),
             json!({ "role": "user", "content": prompt }),
         ],
-        None,
+        Some(&tools),
         0.0,
         DEFAULT_MAX_TOKENS,
+        ThinkingConfig {
+            enabled: route.thinking_enabled,
+            level: &route.thinking_level,
+        },
     )
     .map_err(|reason| SummaryErrorRow {
         path: item.path.clone(),
@@ -401,15 +460,89 @@ async fn summarize_item_with_model(
                     });
                     continue;
                 }
-                let parsed = parse_completion_response(api_format, status, &body);
-                let (assistant_text, usage) = match parsed {
-                    Ok(parsed) => (parsed.assistant_text, parsed.usage),
-                    Err(_) => (body.clone(), TokenUsage::default()),
+                let parsed = match parse_completion_response(api_format, status, &body) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        last_error = Some(SummaryErrorRow {
+                            path: item.path.clone(),
+                            reason: "summary_response_parse_failed".to_string(),
+                            retryable: false,
+                        });
+                        continue;
+                    }
                 };
-                let Some((short, long)) = parse_summary_response(&assistant_text) else {
+                let usage = parsed.usage.clone();
+                let Some(tool_call) = parsed
+                    .tool_calls
+                    .into_iter()
+                    .find(|call| {
+                        tool_registry.id_for_name(&call.name) == Some(ToolId::SubmitFileSummaries)
+                    })
+                else {
                     last_error = Some(SummaryErrorRow {
                         path: item.path.clone(),
-                        reason: "summary_response_parse_failed".to_string(),
+                        reason: "summary response did not call submit_file_summaries".to_string(),
+                        retryable: false,
+                    });
+                    continue;
+                };
+                let mut exec_ctx = ToolExecutionContext {
+                    workflow: ToolWorkflow::Advisor,
+                    stage: "advisor_summary_generation",
+                    session: None,
+                    bootstrap_turn: false,
+                    response_language: lang,
+                    web_search_allowed: false,
+                    search_remaining: 0,
+                    state: None,
+                    search_api_key: None,
+                    diagnostics: None,
+                    organizer_search_counter: None,
+                    organizer_search_gate: None,
+                };
+                let tool_result = match tool_registry.dispatch(&mut exec_ctx, &tool_call).await {
+                    Ok(result) => result.result,
+                    Err(message) => {
+                        last_error = Some(SummaryErrorRow {
+                            path: item.path.clone(),
+                            reason: message,
+                            retryable: false,
+                        });
+                        continue;
+                    }
+                };
+                let Some(payload_item) = tool_result
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                else {
+                    last_error = Some(SummaryErrorRow {
+                        path: item.path.clone(),
+                        reason: "submit_file_summaries returned no items".to_string(),
+                        retryable: false,
+                    });
+                    continue;
+                };
+                let Some(short) = payload_item
+                    .get("summaryShort")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                else {
+                    last_error = Some(SummaryErrorRow {
+                        path: item.path.clone(),
+                        reason: "submit_file_summaries missing summaryShort".to_string(),
+                        retryable: false,
+                    });
+                    continue;
+                };
+                let Some(long) = payload_item
+                    .get("summaryLong")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                else {
+                    last_error = Some(SummaryErrorRow {
+                        path: item.path.clone(),
+                        reason: "submit_file_summaries missing summaryLong".to_string(),
                         retryable: false,
                     });
                     continue;
@@ -422,8 +555,8 @@ async fn summarize_item_with_model(
                     .or_else(|| Some(metadata_summary_short(item)));
                 let representation = FileRepresentation {
                     metadata,
-                    short: Some(short),
-                    long: Some(long),
+                    short: Some(short.to_string()),
+                    long: Some(long.to_string()),
                     source: "model".to_string(),
                     degraded: false,
                     confidence: item.representation.confidence.clone(),
@@ -511,6 +644,7 @@ async fn run_summary_round(
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
+    extraction_config: Option<ExtractionToolConfig>,
 ) -> Result<(Vec<Value>, Vec<SummaryFailedItem>, TokenUsage), String> {
     if items.is_empty() {
         return Ok((Vec::new(), Vec::new(), TokenUsage::default()));
@@ -532,9 +666,10 @@ async fn run_summary_round(
         let root_path = root_path.to_string();
         let lang = lang.to_string();
         let batch = chunk.to_vec();
+        let ext_config = extraction_config.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            summarize_batch_with_model(&client, &route, &root_path, &batch, level, &lang).await
+            summarize_batch_with_model(&client, &route, &root_path, &batch, level, &lang, ext_config.as_ref()).await
         }));
     }
     let mut rows = Vec::new();
@@ -559,6 +694,7 @@ async fn run_summary_scheduler(
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
+    extraction_config: Option<ExtractionToolConfig>,
 ) -> Result<(Vec<Value>, Vec<SummaryErrorRow>, SummarySchedulerStats, TokenUsage), String> {
     let initial_concurrency = max_concurrency.max(1);
     if items.is_empty() {
@@ -593,6 +729,7 @@ async fn run_summary_scheduler(
             lang,
             batch_size,
             current_concurrency,
+            extraction_config.clone(),
         )
         .await?;
         completed_rows.append(&mut rows);
@@ -658,7 +795,7 @@ fn summary_system_prompt(lang: &str, level: RepresentationLevel) -> String {
             r#"你负责为文件整理系统生成 summaryText。
 
 summaryText 用于为后续文件归类提供内容证据。
-你的任务是概括当前输入中可读或可解析的信息，不是最终归类，也不是生成分类树。
+你的任务是根据提供的文件内容推断文件的用途和内容特征，不是最终归类，也不是生成分类树。
 
 请简洁总结：
 1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
@@ -669,12 +806,14 @@ summaryText 用于为后续文件归类提供内容证据。
 
 输出语言使用中文。
 
-只返回 JSON：{"summaryShort":"...","summaryLong":"..."}"#.to_string()
+你必须使用原生 tool calling。
+不要输出普通文本结果，不要手写 JSON。
+当你准备好时，调用 submit_file_summaries。"#.to_string()
         } else {
             r#"你负责为文件整理系统生成 summaryText。
 
 summaryText 用于为后续文件归类提供内容证据。
-你的任务是概括当前输入中可读或可解析的信息，不是最终归类，也不是生成分类树。
+你的任务是根据提供的文件内容推断文件的用途和内容特征，不是最终归类，也不是生成分类树。
 
 请简洁总结：
 1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
@@ -685,14 +824,16 @@ summaryText 用于为后续文件归类提供内容证据。
 
 输出语言使用中文。
 
-只返回 JSON：{"summaryShort":"...","summaryLong":"..."}"#.to_string()
+你必须使用原生 tool calling。
+不要输出普通文本结果，不要手写 JSON。
+当你准备好时，调用 submit_file_summaries。"#.to_string()
         }
     } else {
         if level == RepresentationLevel::Short {
             r#"You are responsible for generating summaryText for a file organization system.
 
 summaryText provides content evidence for subsequent file classification.
-Your task is to summarize readable or parseable information from the current input, not to perform final classification or generate a category tree.
+Your task is to infer the file's purpose and content characteristics from the provided file content, not to perform final classification or generate a category tree.
 
 Please concisely summarize:
 1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
@@ -703,12 +844,14 @@ Do not fabricate content not provided.
 
 Write summaries in English only.
 
-Return JSON only: {"summaryShort":"...","summaryLong":"..."}"#.to_string()
+You must use native tool calling.
+Do not return plain text results and do not hand-write JSON.
+When ready, call submit_file_summaries."#.to_string()
         } else {
             r#"You are responsible for generating summaryText for a file organization system.
 
 summaryText provides content evidence for subsequent file classification.
-Your task is to summarize readable or parseable information from the current input, not to perform final classification or generate a category tree.
+Your task is to infer the file's purpose and content characteristics from the provided file content, not to perform final classification or generate a category tree.
 
 Please concisely summarize:
 1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
@@ -719,13 +862,15 @@ Do not fabricate content not provided.
 
 Write summaries in English only.
 
-Return JSON only: {"summaryShort":"...","summaryLong":"..."}"#.to_string()
+You must use native tool calling.
+Do not return plain text results and do not hand-write JSON.
+When ready, call submit_file_summaries."#.to_string()
         }
     }
 }
 
-fn build_summary_prompt(item: &InventoryItem, _level: RepresentationLevel, _lang: &str) -> String {
-    format!(
+fn build_summary_prompt(item: &InventoryItem, extracted: Option<&str>, _level: RepresentationLevel, _lang: &str) -> String {
+    let mut prompt = format!(
         "path: {}\nname: {}\ncategory: {}\nsize: {}\nexisting metadata: {}\nexisting short summary: {}\nexisting long summary: {}",
         item.path,
         item.name,
@@ -734,27 +879,11 @@ fn build_summary_prompt(item: &InventoryItem, _level: RepresentationLevel, _lang
         item.representation.metadata.clone().unwrap_or_default(),
         item.representation.short.clone().unwrap_or_default(),
         item.representation.long.clone().unwrap_or_default()
-    )
-}
-
-fn parse_summary_response(body: &str) -> Option<(String, String)> {
-    let parsed = serde_json::from_str::<Value>(body).ok().or_else(|| {
-        let start = body.find('{')?;
-        let end = body.rfind('}')?;
-        serde_json::from_str::<Value>(&body[start..=end]).ok()
-    })?;
-    let content = parsed
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or(body);
-    let payload = serde_json::from_str::<Value>(content).ok().or_else(|| {
-        let start = content.find('{')?;
-        let end = content.rfind('}')?;
-        serde_json::from_str::<Value>(&content[start..=end]).ok()
-    })?;
-    Some((
-        payload.get("summaryShort")?.as_str()?.trim().to_string(),
-        payload.get("summaryLong")?.as_str()?.trim().to_string(),
-    ))
+    );
+    if let Some(content) = extracted.filter(|c| !c.trim().is_empty()) {
+        prompt.push_str("\nextracted content:\n");
+        prompt.push_str(content);
+    }
+    prompt
 }
 

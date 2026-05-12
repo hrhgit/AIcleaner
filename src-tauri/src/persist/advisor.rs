@@ -218,10 +218,6 @@ pub fn save_advisor_session(db_path: &Path, session: &Value) -> Result<(), Strin
         .get("activeSelectionId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let active_preview_id = session
-        .get("activePreviewId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     let rollback_available = session
         .get("rollbackAvailable")
         .and_then(Value::as_bool)
@@ -249,14 +245,15 @@ pub fn save_advisor_session(db_path: &Path, session: &Value) -> Result<(), Strin
                 Some(stringify(&derived_tree)?)
             },
             active_selection_id,
-            active_preview_id,
+            None::<String>,
             bool_to_i64(rollback_available),
             stringify(session)?,
             created_at,
             updated_at,
         ],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+    .inspect_err(|e| log::warn!("save_advisor_session failed: {e}"))?;
     Ok(())
 }
 
@@ -394,7 +391,8 @@ pub fn save_advisor_card(db_path: &Path, card: &Value) -> Result<(), String> {
             updated_at,
         ],
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+    .inspect_err(|e| log::warn!("save_advisor_card execute failed: {e}"))?;
     Ok(())
 }
 
@@ -631,7 +629,7 @@ pub fn save_advisor_plan_job(db_path: &Path, row: &Value) -> Result<(), String> 
     let status = row
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or("preview_ready");
+        .unwrap_or("executed");
     let preview = row.get("preview").cloned().unwrap_or_else(|| json!({}));
     let result = row.get("result").cloned().unwrap_or(Value::Null);
     let rollback = row.get("rollback").cloned().unwrap_or(Value::Null);

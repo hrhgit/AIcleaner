@@ -34,6 +34,7 @@ export function getLang(): Lang {
 
 export function setLang(lang: Lang): void {
   if (!translations[lang]) return;
+  const prevLang = currentLang;
   currentLang = lang;
   try {
     localStorage.setItem(LANGUAGE_STORAGE_KEY, lang);
@@ -43,6 +44,13 @@ export function setLang(lang: Lang): void {
   }
   document.documentElement.lang = currentLang;
   window.dispatchEvent(new Event('languageChanged'));
+  import('./api').then(({ logFrontendEvent }) => {
+    logFrontendEvent({
+      event: 'language_changed',
+      message: `Language switched from ${prevLang} to ${lang}`,
+      details: { from: prevLang, to: lang },
+    }).catch(() => {});
+  }).catch(() => {});
 }
 
 export function t(key: TranslationKey, params: Record<string, string> = {}): string {

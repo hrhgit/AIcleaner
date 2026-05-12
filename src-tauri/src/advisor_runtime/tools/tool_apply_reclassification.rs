@@ -189,7 +189,6 @@ impl<'a> ToolService<'a> {
         };
         if let Some(obj) = session.as_object_mut() {
             obj.insert("activeSelectionId".to_string(), Value::Null);
-            obj.insert("activePreviewId".to_string(), Value::Null);
         }
         if apply_preference_capture {
             persist::save_advisor_memory(

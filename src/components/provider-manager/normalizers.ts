@@ -1,9 +1,12 @@
-import type { SearchApiSettings, Settings, ProviderModelOption, ProviderRow } from '../../types';
+import type { ProviderConfig, SearchApiSettings, Settings, ProviderModelOption, ProviderRow } from '../../types';
 import {
+  buildProviderDisplayName,
+  createCustomProviderRow,
   DEFAULT_PROVIDER_ENDPOINT,
-  defaultModelByEndpoint,
-  fallbackModelsByEndpoint,
-  PROVIDER_OPTIONS,
+  inferProviderTemplate,
+  normalizeProviderApiFormat,
+  normalizeProviderEndpoint,
+  normalizeThinkingLevel,
 } from '../../utils/provider-registry';
 
 export function normalizeProviders(settings: Settings | null | undefined): {
@@ -15,35 +18,31 @@ export function normalizeProviders(settings: Settings | null | undefined): {
     ? settings.providerConfigs
     : {};
 
-  const presetSet = new Set<string>();
-  for (const preset of PROVIDER_OPTIONS) {
-    presetSet.add(preset.value);
-    const config = byEndpoint[preset.value] || {};
-    merged.push({
-      name: String(config.name || preset.label),
-      endpoint: preset.value,
-      apiKey: '',
-      model: String(config.model || defaultModelByEndpoint(preset.value)),
-    });
-  }
-
+  let customCounter = 1;
   for (const [key, rawConfig] of Object.entries(byEndpoint)) {
     const endpoint = String(rawConfig?.endpoint || key || '').trim();
-    if (!endpoint || presetSet.has(endpoint)) continue;
+    if (!endpoint) continue;
+    const matchedTemplate = inferProviderTemplate(String(rawConfig?.name || ''), endpoint);
     merged.push({
-      name: String(rawConfig?.name || endpoint),
+      id: `custom:${endpoint}`,
+      name: String(rawConfig?.name || matchedTemplate?.label || buildProviderDisplayName(endpoint) || `Custom Provider ${customCounter++}`),
       endpoint,
       apiKey: '',
-      model: String(rawConfig?.model || defaultModelByEndpoint(endpoint)),
+      apiFormat: normalizeProviderApiFormat(rawConfig?.apiFormat || matchedTemplate?.defaultApiFormat),
+      model: String(rawConfig?.model || ''),
+      thinkingEnabled: !!rawConfig?.thinking?.enabled,
+      thinkingLevel: normalizeThinkingLevel(rawConfig?.thinking?.level),
+      preset: false,
     });
   }
 
   if (!merged.length) {
     merged.push({
+      ...createCustomProviderRow(1),
       name: 'OpenAI',
       endpoint: DEFAULT_PROVIDER_ENDPOINT,
-      apiKey: '',
-      model: defaultModelByEndpoint(DEFAULT_PROVIDER_ENDPOINT),
+      apiFormat: 'openai',
+      preset: false,
     });
   }
 
@@ -80,15 +79,36 @@ export function buildProviderSettingsPayload(
   searchApi: Required<SearchApiSettings>,
 ): Pick<Settings, 'providerConfigs' | 'defaultProviderEndpoint' | 'searchApi'> {
   const providerConfigs = Object.fromEntries(
-    providers.map((provider) => [provider.endpoint, {
-      name: String(provider.name || provider.endpoint),
-      endpoint: provider.endpoint,
-      model: String(provider.model || defaultModelByEndpoint(provider.endpoint)),
-    }]),
-  );
-  const fallbackDefault = providers[0]?.endpoint || DEFAULT_PROVIDER_ENDPOINT;
-  const normalizedDefault = providers.some((provider) => provider.endpoint === defaultProviderEndpoint)
-    ? defaultProviderEndpoint
+    providers
+      .map((provider) => {
+        const endpoint = normalizeProviderEndpoint(provider.endpoint, provider.apiFormat);
+        if (!endpoint) return null;
+        return [endpoint, {
+          name: String(provider.name || buildProviderDisplayName(endpoint)),
+          endpoint,
+          apiFormat: provider.apiFormat,
+          model: String(provider.model || ''),
+          thinking: {
+            enabled: !!provider.thinkingEnabled,
+            level: normalizeThinkingLevel(provider.thinkingLevel),
+          },
+        }];
+      })
+      .filter(Boolean) as Array<[string, ProviderConfig]>,
+  ) as Record<string, ProviderConfig>;
+  const knownEndpoints = Object.keys(providerConfigs);
+  const fallbackDefault = knownEndpoints[0] || DEFAULT_PROVIDER_ENDPOINT;
+  const normalizedDefaultCandidate = providers
+    .find((provider) => provider.endpoint === defaultProviderEndpoint)
+    ?.endpoint || defaultProviderEndpoint;
+  const normalizedDefault = knownEndpoints.includes(normalizeProviderEndpoint(
+    normalizedDefaultCandidate,
+    providers.find((provider) => provider.endpoint === defaultProviderEndpoint)?.apiFormat || 'openai',
+  ))
+    ? normalizeProviderEndpoint(
+        normalizedDefaultCandidate,
+        providers.find((provider) => provider.endpoint === defaultProviderEndpoint)?.apiFormat || 'openai',
+      )
     : fallbackDefault;
 
   return {
@@ -120,34 +140,15 @@ export function buildDirtyCredentialsPayload(
 }
 
 export function mergeProviderModelOptions(
-  endpoint: string,
   currentModel: string,
   models: ProviderModelOption[],
 ): ProviderModelOption[] {
-  const fallbackModel = defaultModelByEndpoint(endpoint);
-  const baseModels = models.length
-    ? models
-    : fallbackModelsByEndpoint(endpoint);
-  const options = baseModels.length
-    ? [...baseModels]
-    : [{ value: fallbackModel, label: fallbackModel }];
   const selectedModel = String(currentModel || '').trim();
-
+  const options = models.length ? [...models] : [];
   if (selectedModel && !options.some((model) => model.value === selectedModel)) {
-    options.push({ value: selectedModel, label: selectedModel });
+    options.unshift({ value: selectedModel, label: selectedModel });
   }
-
   return options;
-}
-
-export function resolveProviderModelValue(
-  endpoint: string,
-  currentModel: string,
-  models: ProviderModelOption[],
-): string {
-  const selectedModel = String(currentModel || '').trim();
-  if (selectedModel) return selectedModel;
-  return mergeProviderModelOptions(endpoint, '', models)[0]?.value || defaultModelByEndpoint(endpoint);
 }
 
 export function applyLoadedProviderModels(
@@ -155,10 +156,11 @@ export function applyLoadedProviderModels(
   endpoint: string,
   models: ProviderModelOption[],
 ): ProviderRow[] {
+  const firstModel = models[0]?.value || '';
   return providers.map((row) => row.endpoint === endpoint
     ? {
         ...row,
-        model: resolveProviderModelValue(endpoint, row.model, models),
+        model: row.model || firstModel,
         modelLoaded: true,
       }
     : row);

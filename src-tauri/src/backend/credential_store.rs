@@ -51,20 +51,29 @@ impl CredentialStore for WindowsCredentialStore {
         match self.entry(account)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(err) => Err(err.to_string()),
+            Err(err) => {
+                log::warn!("credential_store get failed for account '{}': {err}", account);
+                Err(err.to_string())
+            }
         }
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
         self.entry(account)?
             .set_password(value)
-            .map_err(|e| e.to_string())
+            .map_err(|e| {
+                log::warn!("credential_store set failed for account '{}': {e}", account);
+                e.to_string()
+            })
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {
         match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err.to_string()),
+            Err(err) => {
+                log::warn!("credential_store delete failed for account '{}': {err}", account);
+                Err(err.to_string())
+            }
         }
     }
 }

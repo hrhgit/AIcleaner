@@ -113,8 +113,10 @@ AIcleaner 是一个 AI 驱动的文件归类与整理顾问桌面应用。
 
 ```bash
 npm install
-npm run tauri:dev
+portmux start
 ```
+
+如果你的环境里还没装 `portmux`，也可以先用 `npm start`。
 
 如需本地打包：
 
@@ -123,3 +125,33 @@ npm run tauri:build
 ```
 
 当前仓库的脚本和打包配置主要面向桌面端工作流；如果你只是普通用户，阅读上面的产品说明和快速开始部分即可。
+
+## 日志 CLI
+
+仓库内置了统一日志命令 `aicleaner-logs`，用于读取：
+
+- `data_dir/logs` 下的 `aicleaner-diagnostics-*.jsonl`
+- `web_search.jsonl`
+- 常规应用日志 `app.log`
+
+默认语义：
+
+- `list`：按 task/session/operation 聚合后的运行列表
+- `summary`：最新匹配运行的紧凑 AI 摘要包
+- `export`：导出最新匹配运行的紧凑 AI 摘要包
+- `show`：原始解析记录明细
+
+常用开发调用方式：
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- --json doctor
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- list
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- summary --family diagnostics
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- show --family diagnostics --tail 20
+```
+
+本地安装到 Cargo bin 目录：
+
+```bash
+cargo install --path src-tauri --bin aicleaner-logs --force
+```

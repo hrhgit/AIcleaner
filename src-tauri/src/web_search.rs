@@ -1,6 +1,7 @@
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const DEFAULT_MAX_RESULTS: u64 = 5;
@@ -43,6 +44,28 @@ fn extract_string(value: Option<&Value>) -> String {
         .to_string()
 }
 
+fn record_web_search_diagnostic(data_dir: &PathBuf, event: &str, details: Value) {
+    let log_path = data_dir.join("logs").join("web_search.jsonl");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = json!({
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "event": event,
+        "details": details,
+    });
+    if let Ok(line) = serde_json::to_string(&entry) {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{}", line)
+            });
+    }
+}
+
 pub fn parse_web_search_request(value: &Value) -> Option<WebSearchRequest> {
     let action = extract_string(value.get("action")).to_ascii_lowercase();
     let nested = value.get("webSearch").and_then(Value::as_object);
@@ -78,10 +101,23 @@ pub fn parse_web_search_request(value: &Value) -> Option<WebSearchRequest> {
 pub async fn tavily_search(
     api_key: &str,
     request: &WebSearchRequest,
+    data_dir: Option<PathBuf>,
 ) -> Result<WebSearchTrace, String> {
     let key = api_key.trim();
     if key.is_empty() {
         return Err("web search api key is empty".to_string());
+    }
+
+    let search_started_at = Instant::now();
+    if let Some(dir) = data_dir.as_ref() {
+        record_web_search_diagnostic(
+            dir,
+            "web_search_request_started",
+            json!({
+                "query": request.query,
+                "reason": request.reason,
+            }),
+        );
     }
 
     let client = Client::builder()
@@ -105,11 +141,35 @@ pub async fn tavily_search(
         }))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if let Some(dir) = data_dir.as_ref() {
+                record_web_search_diagnostic(
+                    dir,
+                    "web_search_request_failed",
+                    json!({
+                        "query": request.query,
+                        "error": e.to_string(),
+                        "duration_ms": search_started_at.elapsed().as_millis() as u64,
+                    }),
+                );
+            }
+            e.to_string()
+        })?;
 
     let status = response.status();
     let body: Value = response.json().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
+        if let Some(dir) = data_dir.as_ref() {
+            record_web_search_diagnostic(
+                dir,
+                "web_search_response_error",
+                json!({
+                    "query": request.query,
+                    "status": status.as_u16(),
+                    "duration_ms": search_started_at.elapsed().as_millis() as u64,
+                }),
+            );
+        }
         let message = extract_string(body.get("detail"));
         if !message.is_empty() {
             return Err(message);
@@ -121,6 +181,18 @@ pub async fn tavily_search(
         } else {
             fallback
         });
+    }
+
+    if let Some(dir) = data_dir.as_ref() {
+        record_web_search_diagnostic(
+            dir,
+            "web_search_response_success",
+            json!({
+                "query": request.query,
+                "result_count": body.get("results").and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0),
+                "duration_ms": search_started_at.elapsed().as_millis() as u64,
+            }),
+        );
     }
 
     Ok(WebSearchTrace {

@@ -78,6 +78,23 @@ mod tests {
     }
 
     #[test]
+    fn read_settings_defaults_to_empty_provider_collection() {
+        let path = temp_settings_path();
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({})).expect("serialize empty settings"),
+        )
+        .expect("write empty settings");
+
+        let saved = read_settings(&path);
+
+        assert_eq!(saved["defaultProviderEndpoint"], Value::String(String::new()));
+        assert_eq!(saved["providerConfigs"], json!({}));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn read_settings_migrates_legacy_provider_and_search_fields() {
         let path = temp_settings_path();
         let legacy = json!({
@@ -298,9 +315,35 @@ mod tests {
         (state, path)
     }
 
+    fn seed_provider_configs(state: &AppState, endpoints: &[&str]) {
+        let provider_configs = endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    (*endpoint).to_string(),
+                    json!({
+                        "name": endpoint,
+                        "endpoint": endpoint,
+                        "apiFormat": "openai",
+                        "model": ""
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        write_settings(
+            &state.settings_path(),
+            &json!({
+                "defaultProviderEndpoint": endpoints.first().copied().unwrap_or_default(),
+                "providerConfigs": provider_configs
+            }),
+        )
+        .expect("seed provider configs");
+    }
+
     #[test]
     fn credentials_meta_reflects_saved_values() {
         let (state, path) = temp_app_state();
+        seed_provider_configs(&state, &["https://api.openai.com/v1"]);
         let payload = CredentialsSaveInput {
             provider_secrets: Some(HashMap::from([(
                 "https://api.openai.com/v1".to_string(),
@@ -344,6 +387,7 @@ mod tests {
     #[test]
     fn credentials_meta_clears_when_empty_values_saved() {
         let (state, path) = temp_app_state();
+        seed_provider_configs(&state, &["https://api.openai.com/v1"]);
         state
             .credential_store
             .set_many(&[
@@ -388,6 +432,7 @@ mod tests {
     #[test]
     fn credentials_save_preserves_existing_values_for_omitted_fields() {
         let (state, path) = temp_app_state();
+        seed_provider_configs(&state, &["https://api.openai.com/v1"]);
         state
             .credential_store
             .set_many(&[
@@ -436,6 +481,10 @@ mod tests {
     #[test]
     fn credentials_save_updates_only_explicitly_touched_fields() {
         let (state, path) = temp_app_state();
+        seed_provider_configs(
+            &state,
+            &["https://api.openai.com/v1", "https://api.deepseek.com"],
+        );
         state
             .credential_store
             .set_many(&[

@@ -88,6 +88,7 @@ impl<'a> ToolService<'a> {
 
         let mut cached_rows = Vec::new();
         let mut generation_items = Vec::new();
+        let mut unsupported_errors = Vec::new();
         for item in selected {
             if missing_only {
                 if let Some(row) =
@@ -96,6 +97,17 @@ impl<'a> ToolService<'a> {
                     cached_rows.push(row);
                     continue;
                 }
+            }
+            if !supports_content_summarization(&item.path) {
+                unsupported_errors.push(json!({
+                    "path": item.path,
+                    "reason": local_text(
+                        lang,
+                        "此文件类型不支持内容摘要，仅支持文档和纯文本文件。",
+                        "This file type does not support content summarization. Only document and plain text files are supported."
+                    ),
+                }));
+                continue;
             }
             generation_items.push(item);
         }
@@ -106,8 +118,14 @@ impl<'a> ToolService<'a> {
             .and_then(Value::as_u64)
             .unwrap_or(2) as usize;
         let route = AdvisorLlm::new(self.state).resolve_route(None, None)?;
+
+        let settings = crate::backend::read_settings(&self.state.settings_path());
+        let mut extraction_config = extraction_tool_config_from_settings(&settings);
+        force_enable_tika_for_summary_mode(&mut extraction_config);
+        ensure_tika_server_running(self.state, &mut extraction_config).await;
+
         let mut rows = cached_rows;
-        let (generated_rows, errors, scheduler, usage) = run_summary_scheduler(
+        let (generated_rows, scheduler_errors, scheduler, usage) = run_summary_scheduler(
             &route,
             root_path,
             &generation_items,
@@ -115,6 +133,7 @@ impl<'a> ToolService<'a> {
             lang,
             batch_size.max(1),
             max_concurrency.max(1),
+            Some(extraction_config),
         )
         .await?;
         rows.extend(generated_rows);
@@ -125,9 +144,15 @@ impl<'a> ToolService<'a> {
             .iter()
             .map(|row| summary_row_to_tool_item(row, level))
             .collect::<Vec<_>>();
+        let mut all_errors: Vec<Value> = scheduler_errors.into_iter().map(|error| json!({
+            "path": error.path,
+            "reason": error.reason,
+        })).collect();
+        all_errors.extend(unsupported_errors);
+        let total_error_count = all_errors.len();
         Ok(json!({
-            "status": if errors.is_empty() { "ok" } else { "error" },
-            "message": if errors.is_empty() {
+            "status": if all_errors.is_empty() { "ok" } else { "error" },
+            "message": if all_errors.is_empty() {
                 Value::String(local_text(
                     lang,
                     &format!("已完成 {} 条文件摘要。", items.len()),
@@ -143,7 +168,7 @@ impl<'a> ToolService<'a> {
             "representationLevel": level.as_str(),
             "total": total,
             "completed": items.len(),
-            "failed": errors.len(),
+            "failed": total_error_count,
             "durationMs": started_at.elapsed().as_millis() as u64,
             "tokenUsage": {
                 "prompt": usage.prompt,
@@ -151,12 +176,9 @@ impl<'a> ToolService<'a> {
                 "total": usage.total,
             },
             "requestCount": generation_items.len(),
-            "errorCount": errors.len(),
+            "errorCount": total_error_count,
             "items": items,
-            "errors": errors.into_iter().map(|error| json!({
-                "path": error.path,
-                "reason": error.reason,
-            })).collect::<Vec<_>>(),
+            "errors": all_errors,
             "scheduler": {
                 "initialConcurrency": scheduler.initial_concurrency,
                 "finalConcurrency": scheduler.final_concurrency,

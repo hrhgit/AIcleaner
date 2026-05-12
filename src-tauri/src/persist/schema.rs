@@ -76,9 +76,14 @@ fn ensure_organizer_schema_full(conn: &Connection) -> Result<(), String> {
         .map(|value| value != ORGANIZER_SCHEMA_VERSION)
         .unwrap_or_else(|| organizer_tables_exist(conn).unwrap_or(false));
     if needs_reset {
+        log::warn!(
+            "organizer schema mismatch: current={:?} expected={ORGANIZER_SCHEMA_VERSION}, rebuilding tables",
+            current_organizer_schema
+        );
         drop_organizer_tables(conn)?;
     }
-    create_organizer_tables(conn)?;
+    create_organizer_tables(conn)
+        .inspect_err(|e| log::warn!("create_organizer_tables failed: {e}"))?;
     conn.execute(
         "INSERT INTO app_meta(key, value) VALUES('organizer_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -102,9 +107,14 @@ fn ensure_advisor_schema_full(conn: &Connection) -> Result<(), String> {
         .map(|value| value != ADVISOR_SCHEMA_VERSION)
         .unwrap_or_else(|| advisor_tables_exist(conn).unwrap_or(false));
     if needs_reset {
+        log::warn!(
+            "advisor schema mismatch: current={:?} expected={ADVISOR_SCHEMA_VERSION}, rebuilding tables",
+            current_advisor_schema
+        );
         drop_advisor_tables(conn)?;
     }
-    create_advisor_tables(conn)?;
+    create_advisor_tables(conn)
+        .inspect_err(|e| log::warn!("create_advisor_tables failed: {e}"))?;
     conn.execute(
         "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -117,8 +127,10 @@ fn ensure_advisor_schema_full(conn: &Connection) -> Result<(), String> {
 pub fn init_db(db_path: &Path) -> Result<(), String> {
     let conn = open_db_raw(db_path)?;
     ensure_app_meta_table(&conn)?;
-    ensure_organizer_schema_full(&conn)?;
-    ensure_advisor_schema_full(&conn)?;
+    ensure_organizer_schema_full(&conn)
+        .inspect_err(|e| log::warn!("ensure_organizer_schema_full failed: {e}"))?;
+    ensure_advisor_schema_full(&conn)
+        .inspect_err(|e| log::warn!("ensure_advisor_schema_full failed: {e}"))?;
     Ok(())
 }
 

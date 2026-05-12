@@ -1,4 +1,4 @@
-fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfig {
+pub(crate) fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfig {
     let tika = settings
         .get("contentExtraction")
         .and_then(|value| value.get("tika"));
@@ -39,7 +39,7 @@ fn extraction_tool_config_from_settings(settings: &Value) -> ExtractionToolConfi
     }
 }
 
-fn force_enable_tika_for_summary_mode(config: &mut ExtractionToolConfig) {
+pub(crate) fn force_enable_tika_for_summary_mode(config: &mut ExtractionToolConfig) {
     if config.tika_url.trim().is_empty() {
         config.tika_url = DEFAULT_TIKA_URL.to_string();
     }
@@ -152,22 +152,42 @@ fn managed_tika_process_alive(process: &mut crate::backend::ManagedTikaProcess) 
     }
 }
 
-async fn ensure_tika_server_running(state: &AppState, extraction_tool: &mut ExtractionToolConfig) {
+pub(crate) async fn ensure_tika_server_running(state: &AppState, extraction_tool: &mut ExtractionToolConfig) {
     extraction_tool.tika_ready = false;
     if !extraction_tool.tika_enabled {
         return;
     }
     if is_tika_server_available(&extraction_tool.tika_url).await {
+        log::info!(
+            target: "tika",
+            "tika server already available at {}",
+            extraction_tool.tika_url
+        );
         extraction_tool.tika_ready = true;
         return;
     }
     if !extraction_tool.tika_auto_start {
+        log::info!(
+            target: "tika",
+            "tika auto_start disabled, skipping startup for {}",
+            extraction_tool.tika_url
+        );
         return;
     }
     if extraction_tool.tika_jar_path.trim().is_empty() {
         let Some(path) = resolve_tika_server_jar(state, &extraction_tool.tika_jar_path) else {
+            log::warn!(
+                target: "tika",
+                "no tika server jar found for {}, searched configured path and standard locations",
+                extraction_tool.tika_url
+            );
             return;
         };
+        log::info!(
+            target: "tika",
+            "resolved tika jar path: {}",
+            path.display()
+        );
         extraction_tool.tika_jar_path = path.to_string_lossy().to_string();
     }
     let waiting_for_existing_process = {
@@ -200,9 +220,22 @@ async fn ensure_tika_server_running(state: &AppState, extraction_tool: &mut Extr
         command.arg("--host").arg(host);
         command.arg("--port").arg(port.to_string());
     }
-    let Ok(child) = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
-        return;
+    let child = match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            log::warn!(
+                target: "tika",
+                "failed to spawn JVM for tika server '{}': {e}",
+                extraction_tool.tika_jar_path
+            );
+            return;
+        }
     };
+    log::info!(
+        target: "tika",
+        "tika server JVM spawned, waiting for availability at {}",
+        extraction_tool.tika_url
+    );
     {
         let mut guard = state.tika_process.lock();
         *guard = Some(crate::backend::ManagedTikaProcess {
@@ -212,10 +245,20 @@ async fn ensure_tika_server_running(state: &AppState, extraction_tool: &mut Extr
     }
     for _ in 0..30 {
         if is_tika_server_available(&extraction_tool.tika_url).await {
+            log::info!(
+                target: "tika",
+                "tika server is ready at {}",
+                extraction_tool.tika_url
+            );
             extraction_tool.tika_ready = true;
             return;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    log::warn!(
+        target: "tika",
+        "tika server startup timed out after 15s at {}",
+        extraction_tool.tika_url
+    );
 }
 

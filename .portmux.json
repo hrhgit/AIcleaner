@@ -1,0 +1,4 @@
+{
+  "start": "npm start",
+  "port_env": ["PORT", "VITE_PORT"]
+}

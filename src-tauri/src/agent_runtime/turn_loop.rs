@@ -5,7 +5,7 @@ use crate::llm_tools::{
     serialize_tool_result_content, ToolExecutionContext, ToolId, ToolRegistry, ToolResult,
 };
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) enum ToolCallOutcome<O> {
     Continue { result: Value },
@@ -79,6 +79,25 @@ pub(crate) trait AgentTurnSpec {
         Ok(ToolCallErrorOutcome::Continue { message })
     }
     fn on_loop_exhausted(&mut self, trace: &AgentLoopTrace) -> Result<Self::Output, String>;
+
+    fn on_loop_started(&mut self, _step_count: usize, _messages_count: usize) {}
+    fn on_step_started(&mut self, _step: usize, _message_count: usize, _tool_count: usize) {}
+    fn on_tool_dispatched(
+        &mut self,
+        _step: usize,
+        _tool_name: &str,
+        _call_id: &str,
+        _duration_ms: u64,
+    ) {
+    }
+    fn on_loop_completed(
+        &mut self,
+        _total_duration: Duration,
+        _steps: usize,
+        _trace: &AgentLoopTrace,
+    ) {
+    }
+    fn on_loop_exhausted_early_exit(&mut self, _trace: &AgentLoopTrace) {}
 }
 
 pub(crate) struct AgentTurnLoop<'a, L> {
@@ -101,6 +120,7 @@ where
         let mut messages = spec.build_initial_messages()?;
         let mut trace = AgentLoopTrace::default();
         let loop_started_at = Instant::now();
+        spec.on_loop_started(spec.max_steps(), messages.len());
 
         for step in 0..spec.max_steps() {
             spec.before_step(step, &mut messages)?;
@@ -109,6 +129,7 @@ where
                 let ctx = policy.as_tool_context();
                 self.tool_registry.definitions(&ctx)
             };
+            spec.on_step_started(step, messages.len(), tools.len());
             let completion = match self.llm.complete(&messages, &tools, spec.trace_key()).await {
                 Ok(completion) => completion,
                 Err(err) => {
@@ -139,6 +160,7 @@ where
                     self.tool_registry.dispatch(&mut tool_ctx, &call).await
                 };
                 let tool_duration_ms = tool_started_at.elapsed().as_millis() as u64;
+                spec.on_tool_dispatched(step, &call.name, &call.id, tool_duration_ms);
                 match dispatch_result {
                     Ok(result) => {
                         trace.record_tool_result(
@@ -178,6 +200,8 @@ where
         }
 
         trace.set_duration(loop_started_at.elapsed());
+        spec.on_loop_completed(loop_started_at.elapsed(), spec.max_steps(), &trace);
+        spec.on_loop_exhausted_early_exit(&trace);
         spec.on_loop_exhausted(&trace)
     }
 }

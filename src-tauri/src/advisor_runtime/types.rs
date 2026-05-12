@@ -9,11 +9,9 @@ use std::path::Path;
 pub(crate) const CARD_TREE: &str = "tree";
 pub(crate) const CARD_RECLASS: &str = "reclassification_result";
 pub(crate) const CARD_PREFERENCE: &str = "preference_draft";
-pub(crate) const CARD_PLAN_PREVIEW: &str = "plan_preview";
 pub(crate) const CARD_EXECUTION: &str = "execution_result";
 
 pub(crate) const WORKFLOW_UNDERSTAND: &str = "understand";
-pub(crate) const WORKFLOW_PREVIEW_READY: &str = "preview_ready";
 pub(crate) const WORKFLOW_EXECUTE_READY: &str = "execute_ready";
 
 #[derive(Debug, Deserialize, Clone)]

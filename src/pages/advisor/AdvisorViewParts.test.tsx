@@ -45,7 +45,7 @@ describe('OrganizeSummary', () => {
         unit: 'batches',
         indeterminate: false,
       },
-      results: [],
+      displayResults: [],
       tree: { children: [] },
     };
 
@@ -92,7 +92,7 @@ describe('OrganizeSummary', () => {
         unit: 'batches',
         indeterminate: false,
       },
-      results: [],
+      displayResults: [],
       tree: { children: [] },
     };
 

@@ -11,6 +11,12 @@ export type OrganizeBrowserFile = {
   categoryPath: string[];
   leafNodeId: string;
   classificationError: string;
+  reason: string;
+};
+
+export type OrganizeBrowserSampleItem = {
+  name: string;
+  reason: string;
 };
 
 export type OrganizeBrowserFolder = {
@@ -20,6 +26,7 @@ export type OrganizeBrowserFolder = {
   folders: OrganizeBrowserFolder[];
   files: OrganizeBrowserFile[];
   fileCount: number;
+  sampleItems: OrganizeBrowserSampleItem[];
 };
 
 type MutableFolder = OrganizeBrowserFolder & {
@@ -34,6 +41,7 @@ function createFolder(name: string, path: string[]): MutableFolder {
     folders: [],
     files: [],
     fileCount: 0,
+    sampleItems: [],
     folderMap: new Map(),
   };
 }
@@ -93,9 +101,20 @@ function sortFolder(folder: MutableFolder): OrganizeBrowserFolder {
   folder.folders.sort((left, right) => left.name.localeCompare(right.name, 'zh-Hans-CN'));
   folder.files.sort((left, right) => left.name.localeCompare(right.name, 'zh-Hans-CN'));
   folder.fileCount = folder.files.length;
+  // Collect sample items from direct files (up to 5)
+  const sampleItems: OrganizeBrowserSampleItem[] = [];
+  for (const file of folder.files) {
+    if (sampleItems.length >= 5) break;
+    sampleItems.push({ name: file.name, reason: file.reason });
+  }
   for (const child of folder.folders as MutableFolder[]) {
     const sortedChild = sortFolder(child);
     folder.fileCount += sortedChild.fileCount;
+    // Fill remaining sample slots from child folders
+    for (const item of sortedChild.sampleItems) {
+      if (sampleItems.length >= 5) break;
+      sampleItems.push(item);
+    }
   }
   return {
     id: folder.id,
@@ -104,6 +123,7 @@ function sortFolder(folder: MutableFolder): OrganizeBrowserFolder {
     folders: folder.folders,
     files: folder.files,
     fileCount: folder.fileCount,
+    sampleItems,
   };
 }
 
@@ -112,15 +132,17 @@ export function buildOrganizeBrowserTree(rows: OrganizeResultRow[]): OrganizeBro
 
   rows.forEach((row, index) => {
     const folderPath = rowFolderPath(row);
+    const displayPath = normalizeCategoryPath(row.categoryPath);
     const folder = insertFolder(root, folderPath);
     folder.files.push({
       id: fileId(row, index),
       name: fileName(row),
       path: String(row.path || '').trim(),
       itemType: String(row.itemType || 'file').trim() || 'file',
-      categoryPath: folderPath,
+      categoryPath: displayPath,
       leafNodeId: String(row.leafNodeId || '').trim(),
       classificationError: rowClassificationError(row),
+      reason: String(row.reason || '').trim(),
     });
   });
 

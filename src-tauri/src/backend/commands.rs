@@ -333,6 +333,7 @@ fn save_credentials_internal(
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelsInput {
     endpoint: String,
+    api_format: Option<String>,
     api_key: Option<String>,
 }
 
@@ -341,8 +342,14 @@ pub async fn settings_get_provider_models(
     state: State<'_, AppState>,
     data: ProviderModelsInput,
 ) -> Result<Value, String> {
+    let api_format = data
+        .api_format
+        .as_deref()
+        .and_then(crate::llm_protocol::ApiFormat::from_str)
+        .unwrap_or_else(|| normalize_provider_api_format(&data.endpoint, None));
     let details = json!({
         "endpoint": data.endpoint.clone(),
+        "apiFormat": api_format.as_str(),
         "apiKeyProvided": data.api_key.is_some(),
     });
     let (operation_id, started_at) = command_log_start(
@@ -352,14 +359,14 @@ pub async fn settings_get_provider_models(
         details.clone(),
     );
     let result: Result<Value, String> = async {
-        let endpoint = data.endpoint.trim();
+        let endpoint = normalize_provider_endpoint(data.endpoint.trim(), api_format)?;
         if endpoint.is_empty() {
             return Err("Missing endpoint".to_string());
         }
         let api_key = if let Some(raw) = data.api_key {
             raw.trim().to_string()
         } else {
-            resolve_provider_api_key(state.inner(), endpoint).unwrap_or_default()
+            resolve_provider_api_key(state.inner(), &endpoint).unwrap_or_default()
         };
         let url = format!("{}/models", endpoint.trim_end_matches('/'));
         let client = reqwest::Client::builder()
@@ -368,10 +375,7 @@ pub async fn settings_get_provider_models(
             .map_err(|e| e.to_string())?;
         let mut req = client.get(url.clone()).header("Accept", "application/json");
         if !api_key.is_empty() {
-            req = req
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("x-api-key", api_key.clone())
-                .header("api-key", api_key.clone());
+            req = crate::llm_protocol::apply_auth_headers(req, api_format, &api_key);
         }
         let resp = req.send().await.map_err(|e| e.to_string())?;
         let status = resp.status();
@@ -385,6 +389,7 @@ pub async fn settings_get_provider_models(
             "provider models HTTP response",
             json!({
                 "endpoint": endpoint,
+                "apiFormat": api_format.as_str(),
                 "url": url,
                 "status": status.as_u16(),
                 "rawBody": raw_body.clone(),
@@ -393,7 +398,16 @@ pub async fn settings_get_provider_models(
             None,
         );
         if !status.is_success() {
-            return Err(format!("Failed to fetch models ({})", status.as_u16()));
+            let snippet = raw_body
+                .trim()
+                .chars()
+                .take(400)
+                .collect::<String>();
+            return Err(format!(
+                "Failed to fetch models (HTTP {}) | body: {}",
+                status.as_u16(),
+                if snippet.is_empty() { "empty body".to_string() } else { snippet }
+            ));
         }
         let payload: Value = serde_json::from_str(&raw_body).map_err(|e| e.to_string())?;
         let raw = payload
@@ -545,6 +559,30 @@ pub async fn system_request_elevation(state: State<'_, AppState>) -> Result<Valu
 #[serde(rename_all = "camelCase")]
 pub struct OpenExternalUrlInput {
     url: String,
+}
+
+#[tauri::command]
+pub async fn frontend_log_event(
+    state: State<'_, AppState>,
+    data: Value,
+) -> Result<Value, String> {
+    let level = data.get("level").and_then(Value::as_str).unwrap_or("info");
+    let module = data.get("module").and_then(Value::as_str).unwrap_or("frontend");
+    let event = data.get("event").and_then(Value::as_str).unwrap_or("frontend_event");
+    let message = data.get("message").and_then(Value::as_str).unwrap_or("");
+    let details = data.get("details").cloned().unwrap_or(Value::Null);
+    crate::diagnostics::record_state_event(
+        state.inner(),
+        level,
+        module,
+        event,
+        None,
+        message,
+        details,
+        None,
+        None,
+    );
+    Ok(json!({ "success": true }))
 }
 
 #[tauri::command]

@@ -46,7 +46,8 @@ pub(super) fn build_preview(root_path: &str, results: &[Value]) -> Vec<Value> {
 }
 
 pub(super) fn hydrate_loaded_snapshot(mut snapshot: OrganizeSnapshot) -> OrganizeSnapshot {
-    snapshot.preview = build_preview(&snapshot.root_path, &snapshot.results);
+    let final_rows = persist::build_final_result_rows(&snapshot);
+    snapshot.preview = build_preview(&snapshot.root_path, &final_rows);
     if snapshot.progress.stage == "idle" && snapshot.status != "idle" {
         let processed_batches = snapshot.processed_batches;
         let total_batches = snapshot.total_batches;
@@ -178,7 +179,7 @@ pub(super) fn prune_empty_dirs_upward(start_dir: &Path, stop_dir: &Path) {
 }
 
 pub(super) fn build_apply_plan(snapshot: &OrganizeSnapshot) -> Vec<Value> {
-    let preview_rows = build_preview(&snapshot.root_path, &snapshot.results);
+    let preview_rows = build_preview(&snapshot.root_path, &persist::build_final_result_rows(snapshot));
 
     let mut plan = preview_rows
         .into_iter()

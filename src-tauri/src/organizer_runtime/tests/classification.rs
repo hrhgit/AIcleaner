@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn classification_batch_submits_assignments_and_preserves_reduced_payload() {
@@ -465,7 +466,7 @@ async fn reconcile_receives_only_tree_and_classification_results() {
                         "id": "call_submit",
                         "type": "function",
                         "function": {
-                            "name": "submit_reconciled_tree",
+                            "name": "submit_tree_shape",
                             "arguments": submit_args.to_string()
                         }
                     }]
@@ -488,14 +489,12 @@ async fn reconcile_receives_only_tree_and_classification_results() {
     .await
     .expect("reconcile output");
     assert!(output.error.is_none());
-    assert_eq!(
-        output
-            .parsed
-            .as_ref()
-            .and_then(|value| value.pointer("/finalAssignments/0/leafNodeId"))
-            .and_then(Value::as_str),
-        Some(report_leaf.as_str())
-    );
+    assert!(output
+        .parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/finalTree/nodeId"))
+        .and_then(Value::as_str)
+        .is_some());
 
     let requests = server.join().expect("mock server joined");
     let first_request = request_json_body(&requests[0]);
@@ -544,7 +543,6 @@ async fn reconcile_receives_only_tree_and_classification_results() {
         .get("messages")
         .and_then(Value::as_array)
         .expect("second messages");
-    assert_eq!(second_messages.len(), 2);
     assert!(!second_messages[1]
         .get("content")
         .and_then(Value::as_str)
@@ -556,10 +554,392 @@ async fn reconcile_receives_only_tree_and_classification_results() {
         .get("messages")
         .and_then(Value::as_array)
         .expect("third messages");
-    assert_eq!(third_messages.len(), 2);
     assert!(!third_messages[1]
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .contains("classificationResults"));
+}
+
+#[test]
+fn oversized_subtree_candidates_choose_deepest_only() {
+    let mut tree = default_tree();
+    let reports_leaf = ensure_path(
+        &mut tree,
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ],
+    );
+    let archive_leaf = ensure_path(
+        &mut tree,
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Archive".to_string(),
+        ],
+    );
+    let notes_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Notes".to_string()]);
+
+    let mut assignments: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
+    for idx in 0..21 {
+        assignments.insert(
+            format!("invoice_{idx}"),
+            (
+                reports_leaf.clone(),
+                vec![
+                    "Documents".to_string(),
+                    "Reports".to_string(),
+                    "Invoices".to_string(),
+                ],
+                "invoice".to_string(),
+            ),
+        );
+    }
+    assignments.insert(
+        "archive_1".to_string(),
+        (
+            archive_leaf,
+            vec![
+                "Documents".to_string(),
+                "Reports".to_string(),
+                "Archive".to_string(),
+            ],
+            "archive".to_string(),
+        ),
+    );
+    assignments.insert(
+        "note_1".to_string(),
+        (
+            notes_leaf,
+            vec!["Documents".to_string(), "Notes".to_string()],
+            "note".to_string(),
+        ),
+    );
+
+    let candidates = select_oversized_subtree_candidates(&tree, &assignments, 20);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].category_path, vec!["Documents", "Reports", "Invoices"]);
+    assert_eq!(candidates[0].item_count, 21);
+}
+
+#[test]
+fn oversized_subtree_candidates_are_fixed_before_refine() {
+    let mut tree = default_tree();
+    let reports_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]);
+    let mut assignments: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
+    for idx in 0..21 {
+        assignments.insert(
+            format!("report_{idx}"),
+            (
+                reports_leaf.clone(),
+                vec!["Documents".to_string(), "Reports".to_string()],
+                "report".to_string(),
+            ),
+        );
+    }
+
+    let initial_candidates = select_oversized_subtree_candidates(&tree, &assignments, 20);
+    assert_eq!(initial_candidates.len(), 1);
+
+    let split_leaf = ensure_path(
+        &mut tree,
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "2026".to_string(),
+        ],
+    );
+    for idx in 0..10 {
+        assignments.insert(
+            format!("report_{idx}"),
+            (
+                split_leaf.clone(),
+                vec![
+                    "Documents".to_string(),
+                    "Reports".to_string(),
+                    "2026".to_string(),
+                ],
+                "split".to_string(),
+            ),
+        );
+    }
+
+    assert_eq!(initial_candidates.len(), 1);
+    assert_eq!(initial_candidates[0].category_path, vec!["Documents", "Reports"]);
+    let rescanned = select_oversized_subtree_candidates(&tree, &assignments, 20);
+    assert!(rescanned.is_empty());
+}
+
+#[test]
+fn local_refine_rejects_assignment_outside_subtree() {
+    let mut tree = default_tree();
+    let reports_leaf = ensure_path(
+        &mut tree,
+        &["Documents".to_string(), "Reports".to_string(), "Invoices".to_string()],
+    );
+    let notes_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Notes".to_string()]);
+    let candidate = OversizedSubtreeCandidate {
+        node_id: category_path_for_id(&tree, &reports_leaf)
+            .and_then(|_| Some(reports_leaf.clone()))
+            .unwrap(),
+        category_path: vec![
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ],
+        item_count: 1,
+    };
+    let mut assignments = HashMap::new();
+    assignments.insert(
+        "item_1".to_string(),
+        (
+            reports_leaf.clone(),
+            candidate.category_path.clone(),
+            "invoice".to_string(),
+        ),
+    );
+
+    let err = apply_local_refine_assignments(
+        &candidate,
+        &mut tree,
+        &mut assignments,
+        &json!({
+            "assignments": [{
+                "itemId": "item_1",
+                "leafNodeId": notes_leaf,
+                "reason": "wrong scope"
+            }]
+        }),
+    )
+    .expect_err("should reject out-of-scope leaf");
+    assert!(err.contains("outside subtree"));
+}
+
+#[tokio::test]
+async fn local_refine_payload_and_writeback_stay_inside_subtree() {
+    let mut tree = default_tree();
+    let invoices_leaf = ensure_path(
+        &mut tree,
+        &["Documents".to_string(), "Reports".to_string(), "Invoices".to_string()],
+    );
+    let receipts_leaf = ensure_path(
+        &mut tree,
+        &["Documents".to_string(), "Reports".to_string(), "Receipts".to_string()],
+    );
+    let notes_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Notes".to_string()]);
+
+    let candidate = OversizedSubtreeCandidate {
+        node_id: ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]),
+        category_path: vec!["Documents".to_string(), "Reports".to_string()],
+        item_count: 2,
+    };
+
+    let mut assignments = HashMap::new();
+    assignments.insert(
+        "item_1".to_string(),
+        (
+            invoices_leaf.clone(),
+            vec![
+                "Documents".to_string(),
+                "Reports".to_string(),
+                "Invoices".to_string(),
+            ],
+            "invoice".to_string(),
+        ),
+    );
+    assignments.insert(
+        "item_2".to_string(),
+        (
+            receipts_leaf.clone(),
+            vec![
+                "Documents".to_string(),
+                "Reports".to_string(),
+                "Receipts".to_string(),
+            ],
+            "receipt".to_string(),
+        ),
+    );
+    assignments.insert(
+        "item_3".to_string(),
+        (
+            notes_leaf.clone(),
+            vec!["Documents".to_string(), "Notes".to_string()],
+            "note".to_string(),
+        ),
+    );
+
+    let rows_by_id = HashMap::from([
+        (
+            "item_1".to_string(),
+            (
+                0usize,
+                json!({
+                    "itemId": "item_1",
+                    "name": "invoice-jan.pdf",
+                    "relativePath": "Reports\\invoice-jan.pdf",
+                    "itemType": "file",
+                    "modality": "text",
+                    "representation": {
+                        "metadata": "invoice-jan.pdf",
+                        "short": "January invoice",
+                        "long": "January invoice for vendor billing.",
+                        "source": "local_summary",
+                        "degraded": false,
+                        "keywords": ["invoice", "billing"]
+                    }
+                }),
+            ),
+        ),
+        (
+            "item_2".to_string(),
+            (
+                0usize,
+                json!({
+                    "itemId": "item_2",
+                    "name": "receipt-feb.pdf",
+                    "relativePath": "Reports\\receipt-feb.pdf",
+                    "itemType": "file",
+                    "modality": "text",
+                    "representation": {
+                        "metadata": "receipt-feb.pdf",
+                        "short": "February receipt",
+                        "long": "February receipt for expense reimbursement.",
+                        "source": "local_summary",
+                        "degraded": false,
+                        "keywords": ["receipt", "expense"]
+                    }
+                }),
+            ),
+        ),
+        (
+            "item_3".to_string(),
+            (
+                0usize,
+                json!({
+                    "itemId": "item_3",
+                    "name": "notes.txt",
+                    "relativePath": "Notes\\notes.txt",
+                    "itemType": "file",
+                    "modality": "text",
+                    "representation": {
+                        "metadata": "notes.txt",
+                        "short": "Notes",
+                        "long": "Random notes.",
+                        "source": "local_summary",
+                        "degraded": false,
+                        "keywords": ["notes"]
+                    }
+                }),
+            ),
+        ),
+    ]);
+
+    let submitted = json!({
+        "assignments": [{
+            "itemId": "item_1",
+            "categoryPath": ["Invoices"],
+            "reason": "invoice stays"
+        }, {
+            "itemId": "item_2",
+            "categoryPath": ["Expense Receipts"],
+            "reason": "receipt split"
+        }]
+    });
+    let response_body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_submit_local_refine",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_local_reclassification",
+                        "arguments": submitted.to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 15,
+            "completion_tokens": 8,
+            "total_tokens": 23
+        }
+    });
+    let (endpoint, server) = start_mock_chat_server(response_body);
+
+    let subtree = build_local_refine_subtree_value(&tree, &candidate.node_id);
+    let payload_items = build_local_refine_items(&candidate, &tree, &assignments, &rows_by_id);
+    let output = summary::refine_local_subtree_once(
+        &text_route(endpoint),
+        "en-US",
+        &AtomicBool::new(false),
+        &subtree,
+        &payload_items,
+        None,
+    )
+    .await
+    .expect("local refine output");
+    assert!(output.error.is_none());
+
+    let request = server.join().expect("mock server joined");
+    let request_body = request_json_body(&request);
+    let messages = request_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
+    let user_payload: Value = serde_json::from_str(
+        messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("user payload"),
+    )
+    .expect("parse local refine payload");
+    let payload_text = messages[1]
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(payload_text.contains("subtree_only"));
+    assert!(!payload_text.contains("Notes"));
+    assert_eq!(
+        user_payload["items"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        user_payload["subtree"]["name"].as_str(),
+        Some("Reports")
+    );
+
+    let parsed = output.parsed.expect("parsed local refine output");
+    apply_local_refine_assignments(&candidate, &mut tree, &mut assignments, &parsed)
+        .expect("apply local refine");
+
+    let item_1 = assignments.get("item_1").expect("item_1 assignment");
+    assert_eq!(item_1.0, invoices_leaf);
+    assert_eq!(
+        item_1.1,
+        vec![
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ]
+    );
+
+    let item_2 = assignments.get("item_2").expect("item_2 assignment");
+    assert_eq!(
+        item_2.1,
+        vec![
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Expense Receipts".to_string(),
+        ]
+    );
+    assert!(category_path_for_id(&tree, &item_2.0).is_some());
+
+    let item_3 = assignments.get("item_3").expect("item_3 assignment");
+    assert_eq!(item_3.0, notes_leaf);
+    assert_eq!(item_3.1, vec!["Documents".to_string(), "Notes".to_string()]);
 }

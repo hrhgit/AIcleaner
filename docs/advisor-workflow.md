@@ -143,15 +143,19 @@
 要做的事：
 
 1. 不在聊天文本里输出执行 schema。
-2. 在用户意图明确后通过 tool use 生成执行计划。
-3. 通过 tool use 生成执行预览。
-4. 由程序返回可执行数量、风险和阻止原因。
+2. 在用户意图明确后通过 tool use 生成执行计划并直接执行。
+3. 由程序返回可执行数量、风险和阻止原因。
+4. 执行后支持回滚。
 
 ## 6. Tool Use
 
 建议要做的工具：
 
 ### 6.1 `get_directory_overview`
+
+模型描述：
+
+> 查看当前分类树或目录概览。用于理解现状，不会生成摘要、筛选文件或修改分类。
 
 作用：
 
@@ -184,6 +188,10 @@
 3. `viewType`
 
 ### 6.2 `find_files`
+
+模型描述：
+
+> 按类别、名称、路径、扩展名、大小和时间筛选文件候选集，并返回 selectionId。可一次筛选多个文件，也可用 nameExact 或 pathContains 精确定位单个文件。后续 execute_plan 必须使用这个 selectionId。
 
 作用：
 
@@ -252,6 +260,10 @@
 
 ### 6.3 `summarize_files`
 
+模型描述：
+
+> 为指定文件或分类生成或刷新摘要并写入摘要库。仅支持文档文件（pdf/doc/xls/ppt 等）和纯文本文件（txt/md/csv/json 等）；其它文件类型（图片、二进制、可执行文件等）无法生成内容摘要，会被跳过并返回错误。metadata 级别对所有文件有效。不会移动文件。
+
 作用：
 
 1. 为一批文件补摘要或刷新摘要。
@@ -317,8 +329,17 @@
 3. 如果发生超时、连接失败或 HTTP `408/429/500/502/503/504`，调度器会保留已成功结果，并对失败项做重试和降并发。
 4. 如果调度兜底后仍无法完成，就返回 `status=error`。
 5. 不自动退回到 `metadata` 层级。
+6. `short`/`long` 级别仅支持文档和纯文本文件：
+   - 文档文件（`.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, `.rtf`, `.odt`, `.ods`, `.odp`, `.epub`）通过 Tika 提取文本内容。
+   - 纯文本文件（`.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`, `.xml`, `.log`, `.js`, `.ts`, `.rs`, `.py` 等）直接读取内容。
+   - 其它文件类型（图片、二进制、可执行文件等）会被跳过并返回错误。
+7. `metadata` 级别不读取文件内容，直接从元数据拼接，对所有文件有效。
 
 ### 6.4 `read_only_file_summaries`
+
+模型描述：
+
+> 只读取已有文件摘要，不触发生成或刷新。用于低成本查看证据。
 
 作用：
 
@@ -361,6 +382,10 @@
 
 ### 6.5 `capture_preference`
 
+模型描述：
+
+> 从用户消息中提炼可复用偏好并暂存，后续由卡片动作确认保存。只在用户明确表达偏好或规则时使用。
+
 作用：
 
 1. 保存自然语言偏好。
@@ -392,6 +417,10 @@
 
 ### 6.6 `list_preferences`
 
+模型描述：
+
+> 读取当前会话和全局偏好。用于回答偏好相关问题或在计划前确认约束。
+
 作用：
 
 1. 读取当前会话偏好和全局偏好。
@@ -413,14 +442,18 @@
 1. `sessionPreferences`
 2. `globalPreferences`
 
-### 6.7 `preview_plan`
+### 6.7 `execute_plan`
+
+模型描述：
+
+> 根据 plan JSON 和 selectionId 生成执行计划并直接执行。执行后返回结果卡，并可能提供 rollback_plan 可用状态。
 
 作用：
 
 1. 接收模型直接输出的固定 `plan JSON`。
 2. 把执行计划映射到文件级动作。
-3. 给出可执行数量、阻止原因和风险信息。
-4. 作为用户确认前的最后检查层。
+3. 直接执行文件操作。
+4. 记录执行结果和回滚信息。
 
 模型输出的 `plan JSON` 结构：
 
@@ -457,62 +490,14 @@
 1. AI 判断用户意图已经足够明确时。
 2. AI 已经输出固定格式的 `plan JSON` 时。
 3. 当前计划已经对应到已有 `selectionId` 时。
-4. 任何执行前都必须先调用 preview。
-5. AI 准备请求用户确认前。
 
 输入：
 
-1. `sessionId`
-2. `plan`
+1. `plan`
    - `intentSummary`
    - `targets`
      - `selectionId`
      - `action`
-
-输出：
-
-1. `previewId`
-2. `summary`
-   - `total`
-   - `canExecute`
-   - `blocked`
-3. `entries`
-   - `sourcePath`
-   - `targetPath`
-   - `action`
-   - `risk`
-   - `canExecute`
-   - `warnings`
-
-错误处理：
-
-1. 如果 `plan` 中没有 `selectionId`，返回错误。
-2. 如果 `selectionId` 无效、过期或不存在，返回错误。
-3. 错误信息要明确提示模型先调用 `find_files` 生成筛选结果。
-4. preview 阶段只做程序化一致性校验，避免把旧的筛选结果误用于当前意图。
-
-### 6.8 `execute_plan`
-
-作用：
-
-1. 执行已经通过预览的计划。
-2. 记录执行结果。
-3. 返回执行摘要和逐项结果。
-
-什么时候调：
-
-1. 用户明确确认执行时。
-2. 已有 `previewId` 且预览有效时。
-
-约束：
-
-1. 不允许跳过 preview 直接执行。
-2. 没有有效 `previewId` 时必须先生成 preview。
-
-输入：
-
-1. `sessionId`
-2. `previewId`
 
 输出：
 
@@ -525,7 +510,17 @@
    - `failed`
 3. `entries`
 
-### 6.9 `rollback_plan`
+错误处理：
+
+1. 如果 `plan` 中没有 `selectionId`，返回错误。
+2. 如果 `selectionId` 无效、过期或不存在，返回错误。
+3. 错误信息要明确提示模型先调用 `find_files` 生成筛选结果。
+
+### 6.8 `rollback_plan`
+
+模型描述：
+
+> 回滚最近一次可回滚的执行计划。只在 execute_plan 返回可回滚状态或用户明确要求撤销时使用。
 
 作用：
 
@@ -552,14 +547,14 @@
    - `failed`
 3. `entries`
 
-### 6.10 归类修订边界
+### 6.9 归类修订边界
 
-当前用户入口不提供“直接应用归类修订”或“回滚归类修订”的独立操作。用户如果想改变整理方式，应继续通过顾问对话缩小文件集合，并生成新的计划、预览和执行卡片。
+当前用户入口不提供”直接应用归类修订”或”回滚归类修订”的独立操作。用户如果想改变整理方式，应继续通过顾问对话缩小文件集合，并生成新的计划和执行卡片。
 
 说明：
 
 1. 前置归类产物用于建立上下文和分类树。
-2. 真实文件移动只通过 `find_files -> preview_plan -> execute_plan` 主流程落地。
+2. 真实文件移动只通过 `find_files -> execute_plan` 主流程落地。
 3. 执行后的撤回能力属于 `rollback_plan`，不再混入前置归类流程语义。
 
 ## 7. Tool 错误返回
@@ -574,16 +569,14 @@
 建议格式：
 
 ```text
-当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续生成预览。
+当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续执行。
 ```
 
 示例：
 
-1. `preview_plan`
-   - `当前计划缺少 selectionId，请先调用 find_files 生成筛选结果，再继续生成预览。`
-2. `execute_plan`
-   - `当前预览不存在或已过期，请先重新生成 preview，再执行。`
-3. `rollback_plan`
+1. `execute_plan`
+   - `当前计划缺少 selectionId，请先调用 find_files 生成筛选结果，再执行。`
+2. `rollback_plan`
    - `当前执行记录不可回滚，请不要继续尝试回滚这个任务。`
 
 ## 8. 页面结构
@@ -658,7 +651,7 @@
 
 ### 8.4 结果型卡片
 
-顾问页只保留以下 5 类结果型卡片，卡片样式统一。
+顾问页只保留以下 4 类结果型卡片，卡片样式统一。
 
 #### 8.4.1 树结果卡
 
@@ -702,21 +695,7 @@
    - `撤销`
 4. 用户处理完后，页面继续回到普通消息流。
 
-#### 8.4.4 计划预览卡
-
-作用：
-
-1. 展示已经收敛成确定计划的结构化预览结果。
-
-规则：
-
-1. 只在用户意图足够明确且系统已生成有效预览时出现。
-2. 必须明确这是“预览”，不是已执行结果。
-3. 带操作按钮：
-   - `执行`
-4. 计划预览卡是从理解阶段进入落地阶段的关键分界点。
-
-#### 8.4.5 执行结果卡
+#### 8.4.4 执行结果卡
 
 作用：
 
@@ -728,9 +707,9 @@
 1. 带操作按钮：
    - `撤销`
 2. 只有 `rollbackAvailable=true` 时，撤销入口才允许可用。
-3. 执行结果卡用于形成“预览 -> 执行 -> 回滚”的闭环反馈。
+3. 执行结果卡用于形成”执行 -> 回滚”的闭环反馈。
 
-#### 8.4.6 卡片总规则
+#### 8.4.5 卡片总规则
 
 1. 普通 AI 建议不做结果卡，只保留自然语言回复。
 2. 只有程序状态已经形成结构化结果时，才使用卡片。
@@ -762,15 +741,13 @@
 
 1. 未开始会话时，展示初始化引导。
 2. 无树结果时，提示需要先初始化或先让 AI 理解目录。
-3. 无计划时，不显示计划预览卡。
-4. 无执行记录时，不显示执行结果卡。
+3. 无执行记录时，不显示执行结果卡。
 
 #### 8.6.2 加载状态
 
 1. AI 回复中要有统一的处理中表现。
-2. 生成预览中要有统一的处理中表现。
-3. 执行中要有统一的处理中表现。
-4. 回滚中要有统一的处理中表现。
+2. 执行中要有统一的处理中表现。
+3. 回滚中要有统一的处理中表现。
 
 #### 8.6.3 定位与滚动
 
@@ -799,7 +776,7 @@
 1. 只读卡没有底部操作区。
 2. 可操作卡的按钮位置保持一致。
 3. `树结果卡` 与 `分类修改结果卡` 为只读卡。
-4. `偏好提炼卡`、`计划预览卡`、`执行结果卡` 为可操作卡。
+4. `偏好提炼卡`、`执行结果卡` 为可操作卡。
 5. 卡片之间通过内容和状态区分，不通过完全不同的样式语言区分。
 
 ## 9. 上下文组装规范
@@ -884,7 +861,6 @@
   },
   "recentState": {
     "activeSelectionCard": null,
-    "activePreviewCard": null,
     "latestExecutionCard": null
   }
 }
@@ -898,24 +874,6 @@
     "selectionId": "selection_001",
     "querySummary": "截图类，90 天前，按大小降序",
     "total": 24
-  },
-  "activePreviewCard": {
-    "previewId": "preview_001",
-    "planId": "plan_001",
-    "intentSummary": "先处理截图，文档不动",
-    "topActions": [
-      "截图 -> move",
-      "安装包 -> review"
-    ],
-    "summary": {
-      "total": 42,
-      "canExecute": 30,
-      "blocked": 12
-    },
-    "topBlockedReasons": [
-      "项目目录保护",
-      "文档被排除"
-    ]
   },
   "latestExecutionCard": {
     "jobId": "job_001",
@@ -940,16 +898,14 @@
 6. `global` 记忆文本列表。
 7. 当前默认树视图文本。
 8. 当前活跃的筛选卡片。
-9. 当前活跃的预览卡片。
-10. 当前会话内最近一次执行卡片。
+9. 当前会话内最近一次执行卡片。
 
 `context payload` 中不要默认放的内容：
 
 1. 完整归类主结果全文。
 2. 全量文件列表。
 3. 全部树视图。
-4. 预览逐项明细。
-5. 执行逐项明细。
+4. 执行逐项明细。
 
 ### 9.3 当前轮用户消息
 
@@ -1005,9 +961,8 @@
 4. 只有在信息不足时才补工具结果。
 5. 默认只放一个树视图。
 6. 默认只放摘要级结果，不放全量明细。
-7. 进入执行前，优先补充预览相关结果。
-8. 预览卡片和执行卡片可以出现在多轮对话中，但不能只依赖聊天历史。
-9. 当前活跃的预览卡片和当前会话内最近一次执行卡片仍要显式放进 `context payload`。
+7. 执行卡片可以出现在多轮对话中，但不能只依赖聊天历史。
+8. 当前会话内最近一次执行卡片仍要显式放进 `context payload`。
 
 ### 9.6 阶段化 Tool Policy
 
@@ -1015,7 +970,6 @@
 
 1. `workflowStage`
    - `understand`
-   - `preview_ready`
    - `execute_ready`
 2. `rollbackAvailable`
    - `true`
@@ -1024,22 +978,19 @@
 规则：
 
 1. `find_files` 是进入主流程的起点。
-2. 只有拿到有效 `selectionId` 后，才允许 `preview_plan`。
-3. 只有拿到有效 `previewId` 后，才允许 `execute_plan`。
-4. `execute_plan` 成功后：
+2. 只有拿到有效 `selectionId` 后，才允许 `execute_plan`。
+3. `execute_plan` 成功后：
    - `workflowStage` 回到 `understand`
    - `activeSelectionCard` 失效
-   - `activePreviewCard` 失效
    - `latestExecutionCard` 更新
    - `rollbackAvailable=true`
-5. `rollback_plan` 不属于主流程阶段切换条件。
-6. `rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
+4. `rollback_plan` 不属于主流程阶段切换条件。
+5. `rollback_plan` 只取决于 `rollbackAvailable` 是否为 `true`。
 
 工具暴露规则：
 
-1. 严格受阶段限制的工具只有三个：
+1. 严格受阶段限制的工具只有两个：
    - `find_files`
-   - `preview_plan`
    - `execute_plan`
 2. 其它工具默认可用：
    - `get_directory_overview`
@@ -1055,13 +1006,10 @@
 1. `understand`
    - 优先：`get_directory_overview`、`find_files`
    - 其次：`summarize_files`、`list_preferences`
-2. `preview_ready`
-   - 优先：`preview_plan`
-   - 其次：`find_files`、`summarize_files`
-3. `execute_ready`
+2. `execute_ready`
    - 优先：`execute_plan`
-   - 其次：`preview_plan`
-4. 任意阶段
+   - 其次：`find_files`、`summarize_files`
+3. 任意阶段
    - 若 `rollbackAvailable=true`，则 `rollback_plan` 可作为侧边能力保留
 
 ## 10. 归类主结果
@@ -1120,10 +1068,8 @@
 6. AI 给出首轮建议。
 7. 用户自由输入想法。
 8. AI 理解意图。
-9. AI 调用 tool use 生成计划。
-10. 程序返回预览。
-11. 用户确认执行。
-12. 程序执行和回滚。
+9. AI 调用 tool use 生成计划并执行。
+10. 程序执行和回滚。
 
 ## 13. 分类树结构
 

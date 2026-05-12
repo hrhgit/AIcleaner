@@ -2,8 +2,8 @@ use crate::advisor_runtime::tools::{
     compact_advisor_model_value, compact_value_with_tree, expand_advisor_model_args, ToolService,
 };
 use crate::advisor_runtime::types::{
-    local_text, CARD_EXECUTION, CARD_PLAN_PREVIEW, CARD_PREFERENCE, CARD_RECLASS, CARD_TREE,
-    WORKFLOW_EXECUTE_READY, WORKFLOW_PREVIEW_READY, WORKFLOW_UNDERSTAND,
+    local_text, CARD_EXECUTION, CARD_PREFERENCE, CARD_RECLASS, CARD_TREE,
+    WORKFLOW_EXECUTE_READY, WORKFLOW_UNDERSTAND,
 };
 use crate::backend::{resolve_search_api_key, AppState};
 use crate::llm_protocol::ParsedToolCall;
@@ -20,19 +20,22 @@ pub(crate) enum ToolId {
     GetDirectoryOverview,
     FindFiles,
     SummarizeFiles,
+    SubmitFileSummaries,
     ReadOnlyFileSummaries,
     CapturePreference,
     ListPreferences,
-    PreviewPlan,
     ExecutePlan,
     RollbackPlan,
     ApplyReclassification,
     RollbackReclassification,
     SubmitInitialTree,
     SubmitClassificationBatch,
+    SubmitLocalReclassification,
     ReviseTreeDraft,
     ReviewOrganizeDraft,
     SubmitReconciledTree,
+    SubmitTreeShape,
+    SubmitTreeAdjustment,
 }
 
 #[derive(Clone, Debug)]
@@ -174,19 +177,22 @@ impl ToolRegistry {
         self.register(GetDirectoryOverviewTool);
         self.register(FindFilesTool);
         self.register(SummarizeFilesTool);
+        self.register(SubmitFileSummariesTool);
         self.register(ReadOnlyFileSummariesTool);
         self.register(CapturePreferenceTool);
         self.register(ListPreferencesTool);
-        self.register(PreviewPlanTool);
         self.register(ExecutePlanTool);
         self.register(RollbackPlanTool);
         self.register(ApplyReclassificationTool);
         self.register(RollbackReclassificationTool);
         self.register(SubmitInitialTreeTool);
         self.register(SubmitClassificationBatchTool);
+        self.register(SubmitLocalReclassificationTool);
         self.register(ReviseTreeDraftTool);
         self.register(ReviewOrganizeDraftTool);
         self.register(SubmitReconciledTreeTool);
+        self.register(SubmitTreeShapeTool);
+        self.register(SubmitTreeAdjustmentTool);
     }
 
     fn register<T>(&mut self, tool: T)
@@ -198,11 +204,26 @@ impl ToolRegistry {
 
     pub(crate) fn definitions(&self, ctx: &ToolContext<'_>) -> Vec<Value> {
         let _ = ctx.response_language;
-        self.tools
+        let tools: Vec<Value> = self
+            .tools
             .iter()
             .filter(|tool| tool.available(ctx))
             .map(|tool| tool.spec().definition())
-            .collect()
+            .collect();
+        if std::env::var("WIPEOUT_TRACE_TOOLS")
+            .or_else(|_| std::env::var("WIPEOUT_TRACE_TOOLS_ALWAYS"))
+            .is_ok_and(|v| v.is_empty() || v == "1" || v.contains("definitions"))
+        {
+            let names: Vec<_> = tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .collect();
+            eprintln!(
+                "[WIPEOUT_TRACE_TOOLS] definitions | stage={:?} tools={:?}",
+                ctx.stage, names
+            );
+        }
+        tools
     }
 
     #[allow(dead_code)]
@@ -235,6 +256,17 @@ impl ToolRegistry {
             web_search_allowed: ctx.web_search_allowed,
             search_remaining: ctx.search_remaining,
         };
+        let trace_on = std::env::var("WIPEOUT_TRACE_TOOLS")
+            .or_else(|_| std::env::var("WIPEOUT_TRACE_TOOLS_ALWAYS"))
+            .is_ok_and(|v| v.is_empty() || v == "1" || v.contains(call.name.as_str()));
+        if trace_on {
+            eprintln!(
+                "[WIPEOUT_TRACE_TOOLS] dispatch | tool={} ctx.stage={:?} available_tools={:?}",
+                call.name,
+                ctx.stage,
+                self.available_names(&available_ctx)
+            );
+        }
         let Some(tool) = self
             .tools
             .iter()
@@ -272,7 +304,7 @@ fn advisor_non_bootstrap(ctx: &ToolContext<'_>) -> bool {
 
 #[allow(dead_code)]
 fn advisor_any_turn(ctx: &ToolContext<'_>) -> bool {
-    ctx.workflow == ToolWorkflow::Advisor
+    ctx.workflow == ToolWorkflow::Advisor && ctx.stage != "advisor_summary_generation"
 }
 
 #[allow(dead_code)]
@@ -319,7 +351,7 @@ fn category_tree_schema() -> Value {
             },
             "name": {
                 "type": "string",
-                "description": "分类节点展示名称。根节点可以为空字符串。"
+                "description": "分类节点展示名称，纯文本，禁止 emoji 或装饰性符号。根节点可以为空字符串。"
             },
             "children": {
                 "type": "array",
@@ -341,7 +373,7 @@ fn category_tree_schema() -> Value {
                     },
                     "name": {
                         "type": "string",
-                        "description": "分类节点展示名称，应简短、实用。"
+                        "description": "分类节点展示名称，纯文本，禁止 emoji 或装饰性符号，应简短、实用。"
                     },
                     "children": {
                         "type": "array",
@@ -510,7 +542,7 @@ impl LlmTool for WebSearchTool {
         }
 
         let search_started_at = std::time::Instant::now();
-        match tavily_search(&key, &request).await {
+        match tavily_search(&key, &request, ctx.state.map(|s| s.data_dir().clone())).await {
             Ok(trace) => {
                 if ctx.workflow == ToolWorkflow::Organizer {
                     if let Some(diagnostics) = ctx.diagnostics {
@@ -632,7 +664,7 @@ fn tree_proposal_schema() -> Value {
             "operation": { "type": "string", "description": "建议操作。", "enum": ["add_node", "merge_nodes", "split_node", "rename_node"] },
             "targetNodeId": { "type": "string", "description": "被修改或作为父节点的现有 prompt-local 短 nodeId，可为空。" },
             "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的现有 prompt-local 短节点 ID。", "maxItems": 20, "items": { "type": "string" } },
-            "suggestedName": { "type": "string", "description": "建议节点名称。" },
+            "suggestedName": { "type": "string", "description": "建议节点名称，纯文本，禁止 emoji 或装饰性符号。" },
             "suggestedPath": category_path_schema("建议的新路径。"),
             "evidenceItemIds": { "type": "array", "description": "支持该建议的当前 itemId。", "maxItems": 200, "items": { "type": "string" } },
             "reason": { "type": "string", "description": "简短说明建议原因。", "maxLength": 500 }
@@ -689,9 +721,170 @@ fn parse_classification_batch_arguments(value: &Value) -> Result<Value, String> 
     }))
 }
 
-fn parse_revise_tree_draft_arguments(value: &Value) -> Result<Value, String> {
+fn parse_local_reclassification_arguments(value: &Value) -> Result<Value, String> {
+    let assignments = value
+        .get("assignments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "submit_local_reclassification is missing assignments".to_string())?;
+    if assignments.is_empty() {
+        return Err("submit_local_reclassification assignments must be a non-empty array".to_string());
+    }
+
+    let parsed = assignments
+        .iter()
+        .map(|item| {
+            let item_id = item
+                .get("itemId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "submit_local_reclassification itemId must be a non-empty string".to_string()
+                })?;
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "submit_local_reclassification reason must be a non-empty string".to_string()
+                })?;
+            let leaf_node_id = item
+                .get("leafNodeId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_default();
+            let category_path = item
+                .get("categoryPath")
+                .cloned()
+                .filter(Value::is_array)
+                .unwrap_or_else(|| json!([]));
+            let has_category_path = category_path
+                .as_array()
+                .map(|values| !values.is_empty())
+                .unwrap_or(false);
+            if leaf_node_id.is_empty() && !has_category_path {
+                return Err(
+                    "submit_local_reclassification each assignment requires leafNodeId or categoryPath"
+                        .to_string(),
+                );
+            }
+            Ok(json!({
+                "itemId": item_id,
+                "leafNodeId": leaf_node_id,
+                "categoryPath": category_path,
+                "reason": reason,
+                "confidence": item.get("confidence").and_then(Value::as_str).unwrap_or(""),
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(json!({
-        "draftTree": ensure_object_field(value, "draftTree", "revise_tree_draft")?,
+        "assignments": parsed,
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
+    }))
+}
+
+fn summary_item_schema(description: &'static str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": {
+            "itemId": { "type": "string", "description": "输入项的稳定 ID。必须原样回传。" },
+            "summaryShort": { "type": "string", "description": "简短摘要。" },
+            "summaryLong": { "type": "string", "description": "较完整摘要。" },
+            "keywords": {
+                "type": "array",
+                "description": "可帮助后续分类的关键词。",
+                "maxItems": 8,
+                "items": { "type": "string", "description": "单个关键词。" }
+            },
+            "confidence": {
+                "type": "string",
+                "description": "摘要可靠性。",
+                "enum": ["high", "medium", "low"]
+            },
+            "warnings": {
+                "type": "array",
+                "description": "不确定性或输入稀疏提示。",
+                "maxItems": 8,
+                "items": { "type": "string", "description": "单条警告。" }
+            }
+        },
+        "required": ["itemId", "summaryShort", "summaryLong"],
+        "additionalProperties": false
+    })
+}
+
+fn parse_summary_item(item: &Value, tool: &str) -> Result<Value, String> {
+    let item_id = item
+        .get("itemId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{tool} itemId must be a non-empty string"))?;
+    let summary_short = item
+        .get("summaryShort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{tool} summaryShort must be a non-empty string"))?;
+    let summary_long = item
+        .get("summaryLong")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{tool} summaryLong must be a non-empty string"))?;
+    Ok(json!({
+        "itemId": item_id,
+        "summaryShort": summary_short,
+        "summaryLong": summary_long,
+        "keywords": item.get("keywords").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "confidence": item.get("confidence").and_then(Value::as_str).unwrap_or(""),
+        "warnings": item.get("warnings").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+    }))
+}
+
+fn parse_submit_file_summaries_arguments(value: &Value) -> Result<Value, String> {
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "submit_file_summaries is missing items".to_string())?;
+    if items.is_empty() {
+        return Err("submit_file_summaries items must be a non-empty array".to_string());
+    }
+    let parsed = items
+        .iter()
+        .map(|item| parse_summary_item(item, "submit_file_summaries"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "items": parsed,
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
+    }))
+}
+
+fn parse_revise_tree_draft_arguments(value: &Value) -> Result<Value, String> {
+    let draft_tree = value.get("draftTree").cloned().filter(|v| !v.is_null());
+    let operations = value.get("operations").cloned().filter(Value::is_array)
+        .filter(|arr| !arr.as_array().map(|a| a.is_empty()).unwrap_or(true));
+
+    if let Some(ref v) = draft_tree {
+        if !v.is_object() {
+            return Err("revise_tree_draft draftTree must be an object".to_string());
+        }
+    }
+
+    let has_draft = draft_tree.iter().any(|v| v.is_object());
+    let has_ops = operations.is_some();
+    if !has_draft && !has_ops {
+        return Err("revise_tree_draft requires draftTree or operations".to_string());
+    }
+
+    Ok(json!({
+        "draftTree": draft_tree.filter(|v| v.is_object()).unwrap_or(Value::Null),
+        "operations": operations.unwrap_or_else(|| json!([])),
         "proposalMappings": value.get("proposalMappings").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
         "rejectedProposalIds": value.get("rejectedProposalIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
         "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -700,6 +893,7 @@ fn parse_revise_tree_draft_arguments(value: &Value) -> Result<Value, String> {
 
 fn parse_review_organize_draft_arguments(value: &Value) -> Result<Value, String> {
     Ok(json!({
+        "reviewNodeIds": value.get("reviewNodeIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
         "issues": ensure_array_field(value, "issues", "review_organize_draft")?,
         "recommendedOperations": value.get("recommendedOperations").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
         "needsRevision": value.get("needsRevision").and_then(Value::as_bool).unwrap_or(false),
@@ -713,6 +907,40 @@ fn parse_reconciled_tree_arguments(value: &Value) -> Result<Value, String> {
         "proposalMappings": ensure_array_field(value, "proposalMappings", "submit_reconciled_tree")?,
         "finalAssignments": ensure_array_field(value, "finalAssignments", "submit_reconciled_tree")?,
         "unresolvedItemIds": value.get("unresolvedItemIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+    }))
+}
+
+fn parse_submit_tree_shape_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "finalTree": ensure_object_field(value, "finalTree", "submit_tree_shape")?,
+        "proposalMappings": ensure_array_field(value, "proposalMappings", "submit_tree_shape")?,
+        "rejectedProposalIds": value.get("rejectedProposalIds").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
+    }))
+}
+
+fn adjustment_operation_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "单个树调整操作。",
+        "properties": {
+            "type": { "type": "string", "description": "操作类型。", "enum": ["merge_nodes", "split_node", "rename_node"] },
+            "targetNodeId": { "type": "string", "description": "目标节点的 prompt-local 短 nodeId。" },
+            "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的节点 ID。", "maxItems": 20, "items": { "type": "string" } },
+            "newName": { "type": "string", "description": "rename_node 时的新名称，纯文本，禁止 emoji 或装饰性符号。" },
+            "reason": { "type": "string", "description": "操作原因。", "maxLength": 500 }
+        },
+        "required": ["type", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn parse_submit_tree_adjustment_arguments(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "adjustedTree": ensure_object_field(value, "adjustedTree", "submit_tree_adjustment")?,
+        "adjustmentOperations": value.get("adjustmentOperations").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "proposalMappings": value.get("proposalMappings").cloned().filter(Value::is_array).unwrap_or_else(|| json!([])),
+        "notes": value.get("notes").and_then(Value::as_str).unwrap_or("").to_string(),
     }))
 }
 
@@ -731,6 +959,17 @@ macro_rules! organizer_submit_tool {
             }
 
             fn available(&self, ctx: &ToolContext<'_>) -> bool {
+                let Ok(allowed) = std::env::var("WIPEOUT_TRACE_TOOLS")
+                    .or_else(|_| std::env::var("WIPEOUT_TRACE_TOOLS_ALWAYS"))
+                else {
+                    return ctx.workflow == ToolWorkflow::Organizer && ctx.stage == $stage;
+                };
+                if allowed.is_empty() || allowed == "1" || allowed.contains($name) {
+                    eprintln!(
+                        "[WIPEOUT_TRACE_TOOLS] available check | tool={} ctx.workflow={:?} ctx.stage={:?} required_stage={}",
+                        $name, ctx.workflow, ctx.stage, $stage
+                    );
+                }
                 ctx.workflow == ToolWorkflow::Organizer && ctx.stage == $stage
             }
 
@@ -740,10 +979,20 @@ macro_rules! organizer_submit_tool {
                 args: &Value,
             ) -> Result<ToolResult, String> {
                 if ctx.workflow != ToolWorkflow::Organizer || ctx.stage != $stage {
-                    return Ok(ToolResult::blocked(format!(
+                    let block_msg = format!(
                         "{} is only available during organizer stage {}.",
                         $name, $stage
-                    )));
+                    );
+                    let env_on = std::env::var("WIPEOUT_TRACE_TOOLS")
+                        .or_else(|_| std::env::var("WIPEOUT_TRACE_TOOLS_ALWAYS"))
+                        .is_ok_and(|v| v.is_empty() || v == "1" || v.contains($name));
+                    if env_on {
+                        eprintln!(
+                            "[WIPEOUT_TRACE_TOOLS] execute BLOCKED | tool={} ctx.stage={:?} required_stage={}",
+                            $name, ctx.stage, $stage
+                        );
+                    }
+                    return Ok(ToolResult::blocked(block_msg));
                 }
                 Ok(ToolResult::result($parser(args)?))
             }
@@ -792,20 +1041,108 @@ organizer_submit_tool!(
 );
 
 organizer_submit_tool!(
+    SubmitLocalReclassificationTool,
+    SubmitLocalReclassification,
+    "submit_local_reclassification",
+    "提交单个超大子树的一次性局部重分类结果。只能在当前子树内部复用已有叶子，或提供相对 categoryPath 新建后代分类；不得把 item 移出当前子树。",
+    json!({
+        "type": "object",
+        "description": "局部重分类输出。每个 item 都必须给出最终落位，且只能落在当前子树内部。",
+        "properties": {
+            "assignments": {
+                "type": "array",
+                "description": "当前子树内全部 item 的最终局部落位。若复用已有叶子则提供 leafNodeId；若要新增后代分类则提供相对当前节点的 categoryPath。",
+                "minItems": 1,
+                "maxItems": 500,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "itemId": { "type": "string", "description": "当前局部输入中的 itemId，必须原样填写。" },
+                        "leafNodeId": { "type": "string", "description": "当前子树中已有叶子节点的 prompt-local 短 nodeId。若提供 categoryPath 可留空。" },
+                        "categoryPath": category_path_schema("相对当前节点的后代分类路径。提供时必须是非空相对路径，且不能表示外部节点。"),
+                        "reason": { "type": "string", "description": "极短分类依据。", "maxLength": 300 },
+                        "confidence": { "type": "string", "description": "分类置信度。", "enum": ["high", "medium", "low"] }
+                    },
+                    "required": ["itemId", "reason"],
+                    "additionalProperties": false
+                }
+            },
+            "notes": { "type": "string", "description": "可选说明。", "maxLength": 1000 }
+        },
+        "required": ["assignments"],
+        "additionalProperties": false
+    }),
+    "local_refine_subtree",
+    parse_local_reclassification_arguments
+);
+
+struct SubmitFileSummariesTool;
+
+#[async_trait]
+impl LlmTool for SubmitFileSummariesTool {
+    fn id(&self) -> ToolId {
+        ToolId::SubmitFileSummaries
+    }
+
+    fn spec(&self) -> ToolSpec {
+        tool_spec(
+            self.id(),
+            "submit_file_summaries",
+            "提交文件摘要结果。用于摘要阶段返回结构化 summaryShort/summaryLong，不执行文件操作。",
+            json!({
+                "type": "object",
+                "description": "文件摘要提交结果。",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "当前轮次生成的摘要结果。",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": summary_item_schema("单个文件摘要结果。")
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "可选说明。",
+                        "maxLength": 1000
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn available(&self, ctx: &ToolContext<'_>) -> bool {
+        (ctx.workflow == ToolWorkflow::Advisor && ctx.stage == "advisor_summary_generation")
+            || (ctx.workflow == ToolWorkflow::Organizer && ctx.stage == "summary_batch")
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &mut ToolExecutionContext<'_>,
+        args: &Value,
+    ) -> Result<ToolResult, String> {
+        Ok(ToolResult::result(parse_submit_file_summaries_arguments(
+            args,
+        )?))
+    }
+}
+
+organizer_submit_tool!(
     ReviseTreeDraftTool,
     ReviseTreeDraft,
     "revise_tree_draft",
-    "提交 reconciliation 阶段的一版 draft tree 和 proposal 映射。程序会立即校验并返回下一步。",
+    "提交树结构修订。可输出完整 draftTree 或仅输出增量 operations。",
     json!({
         "type": "object",
         "description": "树结构草稿修订结果。",
         "properties": {
             "draftTree": category_tree_schema(),
+            "operations": { "type": "array", "description": "增量修改操作。提供 operations 时无需重复提供无变化的节点。", "maxItems": 100, "items": tree_proposal_schema() },
             "proposalMappings": { "type": "array", "description": "proposalId 到最终 leafNodeId/path 的映射。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 映射。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "leafNodeId": { "type": "string", "description": "映射后的 leafNodeId。" }, "categoryPath": category_path_schema("映射后的分类路径。") }, "required": ["proposalId"], "additionalProperties": false } },
             "rejectedProposalIds": string_array_schema("明确拒绝的 proposalId。"),
             "notes": { "type": "string", "description": "本轮调整说明。", "maxLength": 1000 }
         },
-        "required": ["draftTree"],
         "additionalProperties": false
     }),
     "reconcile_tree",
@@ -816,11 +1153,12 @@ organizer_submit_tool!(
     ReviewOrganizeDraftTool,
     ReviewOrganizeDraft,
     "review_organize_draft",
-    "提交局部审查结论。只审 runtime 给出的局部范围，不直接修改树。",
+    "审查当前 draft tree，可聚焦 reviewNodeIds 只审局部变更。不直接修改树。",
     json!({
         "type": "object",
         "description": "局部审查结果。",
         "properties": {
+            "reviewNodeIds": string_array_schema("可选，限定审查范围的 prompt-local 短 nodeId。"),
             "issues": { "type": "array", "description": "审查发现的问题。", "maxItems": 100, "items": { "type": "object", "description": "单个审查问题。", "properties": { "type": { "type": "string", "description": "问题类型。" }, "nodeIds": string_array_schema("相关 prompt-local 短 nodeId。"), "itemIds": string_array_schema("相关 itemId。"), "severity": { "type": "string", "description": "问题严重程度。", "enum": ["low", "medium", "high"] }, "reason": { "type": "string", "description": "问题原因。", "maxLength": 500 } }, "required": ["type", "reason"], "additionalProperties": false } },
             "recommendedOperations": { "type": "array", "description": "建议后续 revise_tree_draft 采用的操作。", "maxItems": 100, "items": tree_proposal_schema() },
             "needsRevision": { "type": "boolean", "description": "是否需要回到 revise_tree_draft。" },
@@ -829,7 +1167,7 @@ organizer_submit_tool!(
         "required": ["issues", "needsRevision"],
         "additionalProperties": false
     }),
-    "review_tree",
+    "reconcile_tree",
     parse_review_organize_draft_arguments
 );
 
@@ -837,21 +1175,63 @@ organizer_submit_tool!(
     SubmitReconciledTreeTool,
     SubmitReconciledTree,
     "submit_reconciled_tree",
-    "提交通过审查后的最终分类树，以及仅 pending item 的最终分配。直接 assignments 已由 runtime 合并，不要重复输出。",
+    "提交通过审查后的最终分类树。所有 assignments 已由 runtime 合并，不要重复输出。",
     json!({
         "type": "object",
         "description": "最终 reconciliation 结果。",
         "properties": {
             "finalTree": category_tree_schema(),
             "proposalMappings": { "type": "array", "description": "所有 proposal 的处理结果。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 的最终处理结果。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "status": { "type": "string", "description": "proposal 的处理状态。", "enum": ["accepted", "merged", "rejected"] }, "leafNodeId": { "type": "string", "description": "接受或合并后的 leafNodeId。" }, "categoryPath": category_path_schema("最终分类路径。") }, "required": ["proposalId", "status"], "additionalProperties": false } },
-            "finalAssignments": { "type": "array", "description": "仅 pendingAssignments 的最终分配；不要重复直接 assignments。", "maxItems": 500, "items": reconciled_assignment_schema() },
+            "finalAssignments": { "type": "array", "description": "仅用于 runtime 无法自动解析的边界情况；通常留空。", "maxItems": 500, "items": reconciled_assignment_schema() },
             "unresolvedItemIds": string_array_schema("仍无法稳定分类的 itemId。")
         },
-        "required": ["finalTree", "proposalMappings", "finalAssignments"],
+        "required": ["finalTree", "proposalMappings"],
         "additionalProperties": false
     }),
     "submit_reconciled_tree",
     parse_reconciled_tree_arguments
+);
+
+organizer_submit_tool!(
+    SubmitTreeShapeTool,
+    SubmitTreeShape,
+    "submit_tree_shape",
+    "提交通过审查后的最终分类树结构。所有 item 分配由 runtime 处理，不要输出任何 assignments。",
+    json!({
+        "type": "object",
+        "description": "最终树结构结果。",
+        "properties": {
+            "finalTree": category_tree_schema(),
+            "proposalMappings": { "type": "array", "description": "所有 proposal 的处理结果。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 的最终处理结果。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "status": { "type": "string", "description": "proposal 的处理状态。", "enum": ["accepted", "merged", "rejected"] }, "leafNodeId": { "type": "string", "description": "接受或合并后的 leafNodeId。" }, "categoryPath": category_path_schema("最终分类路径。") }, "required": ["proposalId", "status"], "additionalProperties": false } },
+            "rejectedProposalIds": string_array_schema("明确拒绝的 proposalId。"),
+            "notes": { "type": "string", "description": "可选说明。", "maxLength": 1000 }
+        },
+        "required": ["finalTree", "proposalMappings"],
+        "additionalProperties": false
+    }),
+    "reconcile_tree",
+    parse_submit_tree_shape_arguments
+);
+
+organizer_submit_tool!(
+    SubmitTreeAdjustmentTool,
+    SubmitTreeAdjustment,
+    "submit_tree_adjustment",
+    "提交树结构调整结果。根据各节点的 item 数量，合并过小节点或拆分过大节点。",
+    json!({
+        "type": "object",
+        "description": "树结构调整结果。",
+        "properties": {
+            "adjustedTree": category_tree_schema(),
+            "adjustmentOperations": { "type": "array", "description": "执行的调整操作列表。", "maxItems": 100, "items": adjustment_operation_schema() },
+            "proposalMappings": { "type": "array", "description": "调整后的 proposal 映射。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 的映射结果。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "leafNodeId": { "type": "string", "description": "映射后的 leafNodeId。" }, "categoryPath": category_path_schema("分类路径。") }, "required": ["proposalId"], "additionalProperties": false } },
+            "notes": { "type": "string", "description": "调整说明。", "maxLength": 1000 }
+        },
+        "required": ["adjustedTree"],
+        "additionalProperties": false
+    }),
+    "adjust_tree",
+    parse_submit_tree_adjustment_arguments
 );
 
 struct GetDirectoryOverviewTool;
@@ -945,7 +1325,7 @@ impl LlmTool for FindFilesTool {
         tool_spec(
             self.id(),
             "find_files",
-            "按类别、名称、路径、扩展名、大小和时间筛选文件候选集，并返回 selectionId。后续 preview_plan 应使用这个 selectionId。",
+            "按类别、名称、路径、扩展名、大小和时间筛选文件候选集，并返回 selectionId。可一次筛选多个文件，也可用 nameExact 或 pathContains 精确定位单个文件。后续 execute_plan 必须使用这个 selectionId。",
             json!({
                 "type": "object",
                 "description": "文件筛选条件。通常先用较宽条件找到候选集，再用 selectionId 生成预览。",
@@ -1028,7 +1408,7 @@ impl LlmTool for FindFilesTool {
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_stage_is(ctx, &[WORKFLOW_UNDERSTAND, WORKFLOW_PREVIEW_READY])
+        advisor_stage_is(ctx, &[WORKFLOW_UNDERSTAND, WORKFLOW_EXECUTE_READY])
     }
 
     async fn execute(
@@ -1036,9 +1416,9 @@ impl LlmTool for FindFilesTool {
         ctx: &mut ToolExecutionContext<'_>,
         args: &Value,
     ) -> Result<ToolResult, String> {
-        if ctx.stage != WORKFLOW_UNDERSTAND && ctx.stage != WORKFLOW_PREVIEW_READY {
+        if ctx.stage != WORKFLOW_UNDERSTAND && ctx.stage != WORKFLOW_EXECUTE_READY {
             return Ok(ToolResult::blocked(
-                "当前阶段不适合重新筛选，请先处理已有预览或回到理解阶段。",
+                "当前阶段不适合重新筛选，请先处理已有计划或回到理解阶段。",
             ));
         }
         let state = ctx
@@ -1060,10 +1440,9 @@ impl LlmTool for FindFilesTool {
                     .cloned()
                     .unwrap_or(Value::Null),
             );
-            obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert(
                 "workflowStage".to_string(),
-                Value::String(WORKFLOW_PREVIEW_READY.to_string()),
+                Value::String(WORKFLOW_EXECUTE_READY.to_string()),
             );
         }
         Ok(ToolResult::result(result))
@@ -1082,7 +1461,7 @@ impl LlmTool for SummarizeFilesTool {
         tool_spec(
             self.id(),
             "summarize_files",
-            "为指定文件或分类补摘要或刷新摘要，并写入顾问摘要库。用于证据不足时补充本地摘要，不会直接移动文件。",
+            "为指定文件或分类生成或刷新摘要并写入摘要库。仅支持文档文件（pdf/doc/xls/ppt 等）和纯文本文件（txt/md/csv/json 等）；其它文件类型（图片、二进制、可执行文件等）无法生成内容摘要，会被跳过并返回错误。metadata 级别对所有文件有效。不会移动文件。",
             json!({
                 "type": "object",
                 "description": "摘要生成请求。优先使用 paths 精确指定，或用 categoryIds 指定分类范围。",
@@ -1107,7 +1486,7 @@ impl LlmTool for SummarizeFilesTool {
                     },
                     "representationLevel": {
                         "type": "string",
-                        "description": "摘要粒度：metadata 只用元数据，short 生成短摘要，long 生成更详细摘要。",
+                        "description": "摘要粒度。metadata：直接从元数据拼接，对所有文件有效。short/long：仅支持文档和纯文本文件，其它文件类型会被跳过并返回错误。",
                         "enum": ["metadata", "short", "long"]
                     },
                     "missingOnly": {
@@ -1278,7 +1657,7 @@ impl LlmTool for CapturePreferenceTool {
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_non_bootstrap(ctx)
+        advisor_non_bootstrap(ctx) && ctx.stage != "advisor_summary_generation"
     }
 
     async fn execute(
@@ -1364,134 +1743,6 @@ impl LlmTool for ListPreferencesTool {
     }
 }
 
-struct PreviewPlanTool;
-
-#[async_trait]
-impl LlmTool for PreviewPlanTool {
-    fn id(&self) -> ToolId {
-        ToolId::PreviewPlan
-    }
-
-    fn spec(&self) -> ToolSpec {
-        tool_spec(
-            self.id(),
-            "preview_plan",
-            "根据 plan JSON 和 selectionId 生成文件级预览。返回 previewId，后续 execute_plan 必须使用该 previewId。",
-            json!({
-                "type": "object",
-                "description": "执行前预览请求。必须先有 find_files 返回的 selectionId。",
-                "properties": {
-                    "plan": {
-                        "type": "object",
-                        "description": "待预览的计划。预览只计算影响范围，不直接执行文件操作。",
-                        "properties": {
-                            "intentSummary": {
-                                "type": "string",
-                                "description": "用户意图的简短摘要，用于预览卡说明。",
-                                "maxLength": 300
-                            },
-                            "targets": {
-                                "type": "array",
-                                "description": "要对一个或多个 selectionId 执行的动作。",
-                                "minItems": 1,
-                                "maxItems": 20,
-                                "items": {
-                                    "type": "object",
-                                    "description": "单个 selectionId 的预览动作。",
-                                    "properties": {
-                                        "selectionId": {
-                                            "type": "string",
-                                            "description": "find_files 返回的候选集 ID。"
-                                        },
-                                        "action": {
-                                            "type": "string",
-                                            "description": "要预览的处理动作；delete 属高风险动作，只在用户明确要求时使用。",
-                                            "enum": ["archive", "move", "keep", "review", "delete"]
-                                        }
-                                    },
-                                    "required": ["selectionId", "action"],
-                                    "additionalProperties": false
-                                }
-                            }
-                        },
-                        "required": ["targets"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["plan"],
-                "additionalProperties": false
-            }),
-        )
-    }
-
-    fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_stage_is(ctx, &[WORKFLOW_PREVIEW_READY, WORKFLOW_EXECUTE_READY])
-    }
-
-    async fn execute(
-        &self,
-        ctx: &mut ToolExecutionContext<'_>,
-        args: &Value,
-    ) -> Result<ToolResult, String> {
-        if ctx.stage != WORKFLOW_PREVIEW_READY && ctx.stage != WORKFLOW_EXECUTE_READY {
-            return Ok(ToolResult::blocked(
-                "当前阶段缺少有效筛选结果，请先调用 find_files。",
-            ));
-        }
-        let state = ctx
-            .state
-            .ok_or_else(|| "advisor tool is missing AppState".to_string())?;
-        let session = ctx
-            .session
-            .as_deref_mut()
-            .ok_or_else(|| "advisor tool is missing session".to_string())?;
-        let service = ToolService::new(state);
-        let job = service.preview_plan_from_value(session, args.get("plan").unwrap_or(args))?;
-        let preview = job.get("preview").cloned().unwrap_or_else(|| json!({}));
-        if let Some(obj) = session.as_object_mut() {
-            obj.insert(
-                "workflowStage".to_string(),
-                Value::String(WORKFLOW_EXECUTE_READY.to_string()),
-            );
-            obj.insert(
-                "activeSelectionId".to_string(),
-                job.get("selectionId").cloned().unwrap_or(Value::Null),
-            );
-            obj.insert(
-                "activePreviewId".to_string(),
-                Value::String(
-                    preview
-                        .get("previewId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| {
-                            job.get("jobId").and_then(Value::as_str).unwrap_or_default()
-                        })
-                        .to_string(),
-                ),
-            );
-        }
-        let card = json!({
-            "cardType": CARD_PLAN_PREVIEW,
-            "status": "ready",
-            "title": local_text(ctx.response_language, "计划预览", "Plan Preview"),
-            "body": {
-                "previewId": preview.get("previewId").cloned().unwrap_or(job.get("jobId").cloned().unwrap_or(Value::Null)),
-                "jobId": job.get("jobId").cloned().unwrap_or(Value::Null),
-                "selectionId": job.get("selectionId").cloned().unwrap_or(Value::Null),
-                "intentSummary": preview.get("intentSummary").cloned().unwrap_or(Value::String(String::new())),
-                "summary": preview.get("summary").cloned().unwrap_or_else(|| json!({})),
-                "entries": preview.get("entries").cloned().unwrap_or_else(|| json!([])),
-            },
-            "actions": if preview.pointer("/summary/canExecute").and_then(Value::as_u64).unwrap_or(0) > 0 {
-                vec![json!({ "action": "execute_plan", "label": local_text(ctx.response_language, "执行", "Execute"), "variant": "primary" })]
-            } else {
-                Vec::<Value>::new()
-            }
-        });
-        Ok(ToolResult::result(preview).with_card(card))
-    }
-}
-
 struct ExecutePlanTool;
 
 #[async_trait]
@@ -1504,14 +1755,46 @@ impl LlmTool for ExecutePlanTool {
         tool_spec(
             self.id(),
             "execute_plan",
-            "执行已经通过预览的计划。必须使用 preview_plan 返回的 previewId；执行后会返回结果卡，并可能提供 rollback_plan 可用状态。",
+            "根据 plan JSON 和 selectionId 生成执行计划并直接执行。执行后返回结果卡，并可能提供 rollback_plan 可用状态。",
             json!({
                 "type": "object",
-                "description": "计划执行请求。只执行已经生成预览且仍有效的 previewId。",
+                "description": "计划执行请求。必须先有 find_files 返回的 selectionId。",
                 "properties": {
-                    "previewId": {
-                        "type": "string",
-                        "description": "preview_plan 返回的预览 ID。"
+                    "plan": {
+                        "type": "object",
+                        "description": "待执行的计划。会基于 selectionId 构建文件级动作并立即执行。",
+                        "properties": {
+                            "intentSummary": {
+                                "type": "string",
+                                "description": "用户意图的简短摘要。",
+                                "maxLength": 300
+                            },
+                            "targets": {
+                                "type": "array",
+                                "description": "要对一个或多个 selectionId 执行的动作。",
+                                "minItems": 1,
+                                "maxItems": 20,
+                                "items": {
+                                    "type": "object",
+                                    "description": "单个 selectionId 的执行动作。",
+                                    "properties": {
+                                        "selectionId": {
+                                            "type": "string",
+                                            "description": "find_files 返回的候选集 ID。"
+                                        },
+                                        "action": {
+                                            "type": "string",
+                                            "description": "要执行的处理动作；delete 属高风险动作，只在用户明确要求时使用。",
+                                            "enum": ["archive", "move", "keep", "review", "delete"]
+                                        }
+                                    },
+                                    "required": ["selectionId", "action"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["targets"],
+                        "additionalProperties": false
                     },
                     "intentSummary": {
                         "type": "string",
@@ -1519,7 +1802,7 @@ impl LlmTool for ExecutePlanTool {
                         "maxLength": 300
                     }
                 },
-                "required": ["previewId"],
+                "required": ["plan"],
                 "additionalProperties": false
             }),
         )
@@ -1536,13 +1819,9 @@ impl LlmTool for ExecutePlanTool {
     ) -> Result<ToolResult, String> {
         if ctx.stage != WORKFLOW_EXECUTE_READY {
             return Ok(ToolResult::blocked(
-                "当前还没有可执行预览，请先生成并确认计划预览。",
+                "当前阶段缺少有效筛选结果，请先调用 find_files。",
             ));
         }
-        let preview_id = args
-            .get("previewId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "当前预览不存在或已过期，请先重新生成 preview，再执行。".to_string())?;
         let state = ctx
             .state
             .ok_or_else(|| "advisor tool is missing AppState".to_string())?;
@@ -1550,20 +1829,20 @@ impl LlmTool for ExecutePlanTool {
             .session
             .as_deref_mut()
             .ok_or_else(|| "advisor tool is missing session".to_string())?;
-        let session_id = session
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         let service = ToolService::new(state);
-        let (_job, result, rollback) =
-            service.execute_plan_by_preview_id(session_id, preview_id)?;
+        let plan = args.get("plan").unwrap_or(args);
+        let (job, result, rollback) = service.execute_plan_from_plan(session, plan)?;
+        let job_id = job
+            .get("jobId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if let Some(obj) = session.as_object_mut() {
             obj.insert(
                 "workflowStage".to_string(),
                 Value::String(WORKFLOW_UNDERSTAND.to_string()),
             );
             obj.insert("activeSelectionId".to_string(), Value::Null);
-            obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert(
                 "rollbackAvailable".to_string(),
                 Value::Bool(
@@ -1575,7 +1854,7 @@ impl LlmTool for ExecutePlanTool {
             );
         }
         let result_payload = json!({
-            "jobId": preview_id,
+            "jobId": job_id,
             "result": result,
             "rollbackAvailable": rollback.get("available").cloned().unwrap_or(Value::Bool(false)),
         });
@@ -1584,8 +1863,11 @@ impl LlmTool for ExecutePlanTool {
             "status": "done",
             "title": local_text(ctx.response_language, "执行结果", "Execution Result"),
             "body": {
-                "jobId": preview_id,
-                "intentSummary": args.get("intentSummary").cloned().unwrap_or(Value::String(String::new())),
+                "jobId": job_id,
+                "intentSummary": args.get("intentSummary")
+                    .or_else(|| plan.get("intentSummary"))
+                    .cloned()
+                    .unwrap_or(Value::String(String::new())),
                 "result": result_payload.get("result").cloned().unwrap_or(Value::Null),
                 "rollbackAvailable": rollback.get("available").cloned().unwrap_or(Value::Bool(false)),
             },
@@ -1628,7 +1910,7 @@ impl LlmTool for RollbackPlanTool {
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_non_bootstrap(ctx)
+        advisor_non_bootstrap(ctx) && ctx.stage != "advisor_summary_generation"
     }
 
     async fn execute(
@@ -1748,7 +2030,7 @@ impl LlmTool for ApplyReclassificationTool {
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_non_bootstrap(ctx)
+        advisor_non_bootstrap(ctx) && ctx.stage != "advisor_summary_generation"
     }
 
     async fn execute(
@@ -1781,18 +2063,28 @@ impl LlmTool for ApplyReclassificationTool {
         persist::save_advisor_reclass_job(&state.db_path(), &job)?;
         let overview =
             service.get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
+        let new_tree = overview.get("tree").cloned().unwrap_or(Value::Null);
         if let Some(obj) = session.as_object_mut() {
             obj.insert(
                 "workflowStage".to_string(),
                 Value::String(WORKFLOW_UNDERSTAND.to_string()),
             );
             obj.insert("activeSelectionId".to_string(), Value::Null);
-            obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert("rollbackAvailable".to_string(), Value::Bool(false));
-            obj.insert(
-                "derivedTree".to_string(),
-                overview.get("tree").cloned().unwrap_or(Value::Null),
-            );
+            obj.insert("derivedTree".to_string(), new_tree.clone());
+        }
+        if let Some(task_id) = session
+            .pointer("/sessionMeta/organizeTaskId")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(Some(mut snapshot)) =
+                persist::load_organize_snapshot(&state.db_path(), task_id)
+            {
+                if !new_tree.is_null() {
+                    snapshot.tree = new_tree.clone();
+                    let _ = persist::save_organize_snapshot(&state.db_path(), &snapshot);
+                }
+            }
         }
         let cards = vec![
             json!({
@@ -1815,7 +2107,7 @@ impl LlmTool for ApplyReclassificationTool {
                 "status": "ready",
                 "title": local_text(ctx.response_language, "当前分类树", "Current Tree"),
                 "body": {
-                    "tree": overview.get("tree").cloned().unwrap_or(Value::Null)
+                    "tree": new_tree
                 },
                 "actions": []
             }),
@@ -1857,7 +2149,7 @@ impl LlmTool for RollbackReclassificationTool {
     }
 
     fn available(&self, ctx: &ToolContext<'_>) -> bool {
-        advisor_non_bootstrap(ctx)
+        advisor_non_bootstrap(ctx) && ctx.stage != "advisor_summary_generation"
     }
 
     async fn execute(
@@ -1883,10 +2175,23 @@ impl LlmTool for RollbackReclassificationTool {
         let (_job, result, tree) = service.rollback_reclassification(session, job_id)?;
         let overview =
             service.get_directory_overview_tool(session, Some("summaryTree"), None, None)?;
+        let new_tree = overview.get("tree").cloned().unwrap_or(Value::Null);
         if let Some(obj) = session.as_object_mut() {
             obj.insert("activeSelectionId".to_string(), Value::Null);
-            obj.insert("activePreviewId".to_string(), Value::Null);
             obj.insert("derivedTree".to_string(), tree.unwrap_or(Value::Null));
+        }
+        if let Some(task_id) = session
+            .pointer("/sessionMeta/organizeTaskId")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(Some(mut snapshot)) =
+                persist::load_organize_snapshot(&state.db_path(), task_id)
+            {
+                if !new_tree.is_null() {
+                    snapshot.tree = new_tree;
+                    let _ = persist::save_organize_snapshot(&state.db_path(), &snapshot);
+                }
+            }
         }
         let cards = vec![
             json!({
@@ -1992,6 +2297,34 @@ mod tests {
         let exhausted_tools = registry.available_names(&exhausted_ctx);
         assert!(!exhausted_tools.contains(&"web_search"));
         assert!(exhausted_tools.contains(&"submit_classification_batch"));
+    }
+
+    #[test]
+    fn summary_generation_stage_only_exposes_submit_file_summaries() {
+        let registry = ToolRegistry::new();
+        let advisor_ctx = ToolContext {
+            workflow: ToolWorkflow::Advisor,
+            stage: "advisor_summary_generation",
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let advisor_tools = registry.available_names(&advisor_ctx);
+        assert_eq!(advisor_tools, vec!["submit_file_summaries"]);
+
+        let organizer_ctx = ToolContext {
+            workflow: ToolWorkflow::Organizer,
+            stage: "summary_batch",
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let organizer_tools = registry.available_names(&organizer_ctx);
+        assert_eq!(organizer_tools, vec!["submit_file_summaries"]);
     }
 
     #[test]

@@ -5,8 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 
 const HOST = '127.0.0.1';
-const DEFAULT_PORT = 5173;
-const MAX_PORT = 5272;
+const DEFAULT_PORT = 5658;
+const MAX_PORT = 5757;
+
+function parsePort(value) {
+  if (value == null || value === '') {
+    return null;
+  }
+
+  const port = Number(value);
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
 
 function tauriBinary() {
   return process.platform === 'win32'
@@ -26,11 +35,11 @@ function canListen(port) {
 }
 
 async function resolvePort() {
-  const requested = process.env.VITE_PORT ? Number(process.env.VITE_PORT) : null;
+  const requested = parsePort(process.env.PORT) ?? parsePort(process.env.VITE_PORT);
   if (requested) {
     const available = await canListen(requested);
     if (!available) {
-      throw new Error(`VITE_PORT=${requested} is not available on ${HOST}.`);
+      throw new Error(`Requested dev port ${requested} is not available on ${HOST}.`);
     }
     return requested;
   }

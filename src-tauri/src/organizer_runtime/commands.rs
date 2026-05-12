@@ -1,12 +1,11 @@
 pub async fn organize_get_capability(state: State<'_, AppState>) -> Result<Value, String> {
     let settings = crate::backend::read_settings(&state.settings_path());
-    let (endpoint, model) =
-        crate::backend::resolve_provider_endpoint_and_model(state.inner(), None, None);
+    let route = crate::backend::resolve_provider_endpoint_and_model(state.inner(), None, None);
     Ok(json!({
-        "selectedModel": model,
-        "selectedModels": { "text": model, "image": model, "video": model, "audio": model },
-        "selectedProviders": { "text": endpoint, "image": endpoint, "video": endpoint, "audio": endpoint },
-        "supportsMultimodal": supports_multimodal(&model, &endpoint),
+        "selectedModel": route.model,
+        "selectedModels": { "text": route.model, "image": route.model, "video": route.model, "audio": route.model },
+        "selectedProviders": { "text": route.endpoint, "image": route.endpoint, "video": route.endpoint, "audio": route.endpoint },
+        "supportsMultimodal": supports_multimodal(&route.model, &route.endpoint),
         "useWebSearch": settings.pointer("/searchApi/scopes/organizer").and_then(Value::as_bool).unwrap_or(false),
         "webSearchEnabled": settings.pointer("/searchApi/enabled").and_then(Value::as_bool).unwrap_or(false),
     }))
@@ -53,7 +52,10 @@ pub async fn organize_start<R: Runtime>(
     let text_route = routes.get("text").cloned().unwrap_or(RouteConfig {
         endpoint: "https://api.openai.com/v1".to_string(),
         api_key: String::new(),
-        model: "gpt-4o-mini".to_string(),
+        model: String::new(),
+        api_format: ApiFormat::OpenAi,
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     });
     let (tree, tree_version) = (category_tree_to_value(&default_tree()), 0);
     let snapshot = OrganizeSnapshot {
@@ -113,7 +115,7 @@ pub async fn organize_start<R: Runtime>(
         duration_ms: None,
         request_count: None,
         error_count: None,
-        results: Vec::new(),
+        display_results: Vec::new(),
         preview: Vec::new(),
         created_at: now_iso(),
         completed_at: None,
@@ -287,6 +289,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
     );
     persist::save_organize_snapshot(&state.db_path(), &snapshot)?;
 
+    log::info!("organize_apply starting move phase: {} files to move", plan.len());
     let mut entries = Vec::new();
     for row in &plan {
         let source = PathBuf::from(row.get("sourcePath").and_then(Value::as_str).unwrap_or(""));
@@ -329,6 +332,7 @@ pub async fn organize_apply(state: State<'_, AppState>, task_id: String) -> Resu
             continue;
         }
         if let Err(err) = fs::create_dir_all(&target_dir) {
+            log::warn!("organize_apply create_dir_all failed for '{}': {err}", target_dir.display());
             entries.push(json!({
                 "sourcePath": source.to_string_lossy().to_string(),
                 "targetPath": target_base.to_string_lossy().to_string(),
@@ -501,7 +505,9 @@ pub async fn organize_rollback(
             continue;
         }
         if let Some(parent) = source.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(err) = fs::create_dir_all(parent) {
+                log::warn!("organize_rollback create_dir_all failed for '{}': {err}", parent.display());
+            }
         }
         match fs::rename(&target, &source) {
             Ok(_) => {

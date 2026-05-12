@@ -2,7 +2,11 @@ mod credential_store;
 mod provider_registry;
 mod settings_store;
 
+use crate::app_paths::{
+    resolve_storage_data_dir, AppPaths, StorageLocationConfig, STORAGE_LOCATION_FILE,
+};
 use parking_lot::Mutex;
+use crate::llm_protocol::ApiFormat;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,7 +23,11 @@ use tauri::{Runtime, State};
 #[cfg(test)]
 use credential_store::InMemoryCredentialStore;
 use credential_store::{CachedCredentialStore, CredentialStore, WindowsCredentialStore};
-pub(crate) use provider_registry::{default_model_for_endpoint, provider_secret_key};
+pub(crate) use provider_registry::{
+    normalize_provider_api_format, normalize_provider_endpoint,
+    normalize_provider_thinking_level, preset_provider_configs_json,
+    provider_secret_key, provider_secret_key_aliases,
+};
 pub(crate) use settings_store::{
     default_settings, legacy_provider_api_key_from_settings, legacy_search_api_key_from_settings,
     read_settings, strip_secret_fields, write_settings,
@@ -27,30 +35,6 @@ pub(crate) use settings_store::{
 
 const CREDENTIAL_SERVICE: &str = "aicleaner";
 const SEARCH_SECRET_KEY: &str = "search:tavily:apiKey";
-const STORAGE_LOCATION_FILE: &str = "storage-location.json";
-
-#[derive(Clone, Debug)]
-struct AppPaths {
-    data_dir: PathBuf,
-    settings_path: PathBuf,
-    db_path: PathBuf,
-}
-
-impl AppPaths {
-    fn from_data_dir(data_dir: PathBuf) -> Self {
-        Self {
-            settings_path: data_dir.join("settings.json"),
-            db_path: data_dir.join("scan-cache.sqlite"),
-            data_dir,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StorageLocationConfig {
-    data_dir: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -124,6 +108,10 @@ impl AppState {
 
     pub fn db_path(&self) -> PathBuf {
         self.paths.lock().db_path.clone()
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.paths.lock().logs_dir()
     }
 
     pub fn uses_custom_data_dir(&self) -> bool {

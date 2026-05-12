@@ -51,40 +51,12 @@ function summarizeCard(card: AdvisorCard): string {
     const count = Number((card.body?.stats as JsonRecord | undefined)?.itemCount || 0);
     return text(`当前树覆盖 ${count} 个项目。`, `Tree covers ${count} items.`);
   }
-  if (card.cardType === 'plan_preview') {
-    const summary = (card.body?.summary || {}) as JsonRecord;
-    return text(
-      `共 ${summary.total || 0} 项，可执行 ${summary.canExecute || 0} 项。`,
-      `${summary.total || 0} items, ${summary.canExecute || 0} executable.`,
-    );
-  }
   if (card.cardType === 'execution_result') {
     const result = (card.body?.result || {}) as JsonRecord;
     const summary = (result.summary || {}) as JsonRecord;
     return text(`总计 ${summary.total ?? '-'}，失败 ${summary.failed || 0}。`, `Total ${summary.total ?? '-'}, failed ${summary.failed || 0}.`);
   }
   return String(card.body?.summary || card.body?.message || '').trim();
-}
-
-function PlanEntries({ entries }: { entries: unknown[] }) {
-  return (
-    <div className="advisor-entry-list">
-      {entries.slice(0, 10).map((raw, index) => {
-        const entry = (raw || {}) as JsonRecord;
-        return (
-          <div className="advisor-entry-row" key={index}>
-            <div className="advisor-entry-copy">
-              <div>{String(entry.name || entry.sourcePath || '-')}</div>
-              <div className="form-hint">{String(entry.sourcePath || '-')}</div>
-            </div>
-            <span className={`badge ${entry.canExecute ? 'badge-success' : 'badge-warning'}`}>
-              {String(entry.action || '-')}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
 }
 
 function AdvisorCardView({
@@ -97,7 +69,6 @@ function AdvisorCardView({
   onAction: (cardId: string, action: string) => void;
 }) {
   const actions = Array.isArray(card.actions) ? card.actions : [];
-  const entries = Array.isArray(card.body?.entries) ? card.body.entries : [];
   const treeChildren = Array.isArray(((card.body?.tree || {}) as { children?: TreeNode[] }).children)
     ? ((card.body?.tree || {}) as { children?: TreeNode[] }).children || []
     : [];
@@ -118,12 +89,6 @@ function AdvisorCardView({
           <div className="advisor-tree-shell"><TreeList childrenNodes={treeChildren} /></div>
         </>
       ) : null}
-      {card.cardType === 'plan_preview' ? (
-        <>
-          <div className="advisor-card-copy">{summarizeCard(card)}</div>
-          <PlanEntries entries={entries} />
-        </>
-      ) : null}
       {['preference_draft', 'reclassification_result'].includes(card.cardType || '') ? (
         <>
           <div className="advisor-card-copy">{String(card.body?.summary || summarizeCard(card))}</div>
@@ -131,7 +96,7 @@ function AdvisorCardView({
         </>
       ) : null}
       {card.cardType === 'execution_result' ? <div className="advisor-card-copy">{summarizeCard(card)}</div> : null}
-      {!['tree', 'plan_preview', 'preference_draft', 'reclassification_result', 'execution_result'].includes(card.cardType || '') ? (
+      {!['tree', 'preference_draft', 'reclassification_result', 'execution_result'].includes(card.cardType || '') ? (
         <div className="advisor-card-copy">{summarizeCard(card)}</div>
       ) : null}
 
@@ -201,7 +166,8 @@ const ORGANIZE_METRIC_STAGES = [
   { key: 'summaryPreparation', label: () => text('摘要准备', 'Summary') },
   { key: 'initialTree', label: () => text('初始树', 'Initial Tree') },
   { key: 'classification', label: () => text('分类', 'Classification') },
-  { key: 'reconcile', label: () => text('合并', 'Reconcile') },
+  { key: 'buildTreeShape', label: () => text('合并树', 'Merge Tree') },
+  { key: 'adjust', label: () => text('调整', 'Adjust') },
 ];
 
 function ToolCallDetails({ turn }: { turn: TimelineTurn }) {
@@ -295,20 +261,54 @@ function countLabel(count: number): string {
 }
 
 function FolderRow({ folder, onOpen }: { folder: OrganizeBrowserFolder; onOpen: (path: string[]) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasSamples = folder.sampleItems.length > 0;
   return (
-    <button className="advisor-browser-row advisor-browser-folder-row" type="button" onClick={() => onOpen(folder.path)}>
-      <span className="advisor-browser-icon advisor-browser-icon-folder" aria-hidden="true" />
-      <span className="advisor-browser-row-copy">
-        <span className="advisor-browser-row-title">{folder.name || '-'}</span>
-        <span className="advisor-browser-row-meta">{countLabel(folder.fileCount)}</span>
-      </span>
-      <span className="advisor-browser-chevron" aria-hidden="true" />
-    </button>
+    <div className="advisor-browser-folder-group">
+      <div className="advisor-browser-row advisor-browser-folder-row">
+        <button className="advisor-browser-folder-nav" type="button" onClick={() => onOpen(folder.path)}>
+          <span className="advisor-browser-icon advisor-browser-icon-folder" aria-hidden="true" />
+          <span className="advisor-browser-row-copy">
+            <span className="advisor-browser-row-title">{folder.name || '-'}</span>
+            <span className="advisor-browser-row-meta">{countLabel(folder.fileCount)}</span>
+          </span>
+          <span className="advisor-browser-chevron" aria-hidden="true" />
+        </button>
+        {hasSamples ? (
+          <button
+            className="advisor-browser-info-btn"
+            type="button"
+            aria-expanded={expanded}
+            aria-label={text('查看分类详情', 'View classification details')}
+            onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+          >
+            {text('详情', 'Info')}
+          </button>
+        ) : null}
+      </div>
+      {expanded && hasSamples ? (
+        <div className="advisor-browser-folder-detail">
+          <div className="advisor-browser-detail-header">
+            {text(`样本文件 (共 ${folder.fileCount} 项)`, `Sample files (${folder.fileCount} total)`)}
+          </div>
+          <ul className="advisor-browser-sample-list">
+            {folder.sampleItems.map((item, index) => (
+              <li key={index} className="advisor-browser-sample-item">
+                <span className="advisor-browser-sample-name">{item.name}</span>
+                {item.reason ? <span className="advisor-browser-sample-reason">{item.reason}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
 function FileRow({ file }: { file: OrganizeBrowserFile }) {
   const error = file.classificationError.trim();
+  const reason = file.reason.trim();
+  const [showReason, setShowReason] = useState(false);
   return (
     <div className={`advisor-browser-row advisor-browser-file-row ${error ? 'advisor-browser-file-error' : ''}`}>
       <span className="advisor-browser-icon advisor-browser-icon-file" aria-hidden="true" />
@@ -316,8 +316,21 @@ function FileRow({ file }: { file: OrganizeBrowserFile }) {
         <span className="advisor-browser-row-title">{file.name || '-'}</span>
         <span className="advisor-browser-path">{file.path || '-'}</span>
         {error ? <span className="advisor-browser-error-text">{error}</span> : null}
+        {showReason && reason ? <span className="advisor-browser-reason">{reason}</span> : null}
       </span>
-      <span className="advisor-browser-type">{file.itemType || 'file'}</span>
+      <span className="advisor-browser-file-actions">
+        {reason ? (
+          <button
+            className="advisor-browser-reason-btn"
+            type="button"
+            aria-expanded={showReason}
+            onClick={() => setShowReason(!showReason)}
+          >
+            {text('原因', 'Reason')}
+          </button>
+        ) : null}
+        <span className="advisor-browser-type">{file.itemType || 'file'}</span>
+      </span>
     </div>
   );
 }
@@ -373,7 +386,9 @@ const ORGANIZE_STAGE_FLOW = [
   { stage: 'summary', label: () => text('摘要', 'Summary') },
   { stage: 'initial_tree', label: () => text('建树', 'Tree') },
   { stage: 'classification', label: () => text('分类', 'Classify') },
-  { stage: 'reconcile', label: () => text('合并', 'Merge') },
+  { stage: 'build_tree_shape', label: () => text('合并树', 'Merge Tree') },
+  { stage: 'fill_items', label: () => text('填入', 'Fill') },
+  { stage: 'adjust', label: () => text('调整', 'Adjust') },
   { stage: 'finalize', label: () => text('结果', 'Finalize') },
   { stage: 'completed', label: () => text('完成', 'Done') },
 ];
@@ -525,7 +540,7 @@ export function OrganizeSummary({
   const progressValue = getOrganizeProgress(snapshot);
   const determinate = hasDeterminateOrganizeProgress(snapshot);
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
-  const resultRows = Array.isArray(snapshot.results) ? snapshot.results : [];
+  const resultRows = Array.isArray(snapshot.displayResults) ? snapshot.displayResults : [];
   const timingMs = metricRecord(snapshot.timingMs);
   const tokenUsage = snapshot.tokenUsage;
   const tokenUsageByStage = metricRecord(snapshot.tokenUsageByStage);

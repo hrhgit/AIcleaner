@@ -1,9 +1,10 @@
 use super::payload::build_session_payload;
 use super::tools::{build_tree_card, ToolService};
-use super::types::{local_text, now_iso, AdvisorSessionStartInput, WORKFLOW_UNDERSTAND};
+use super::types::{now_iso, AdvisorSessionStartInput, WORKFLOW_UNDERSTAND};
 use crate::backend::AppState;
 use crate::persist;
 use serde_json::{json, Value};
+use std::time::Instant;
 
 pub(super) struct SessionBootstrap<'a> {
     state: &'a AppState,
@@ -19,10 +20,25 @@ impl<'a> SessionBootstrap<'a> {
     }
 
     pub(super) async fn start(&self, input: AdvisorSessionStartInput) -> Result<Value, String> {
+        let started_at = Instant::now();
         let root_path = input.root_path.trim().to_string();
         if root_path.is_empty() {
             return Err("rootPath is required".to_string());
         }
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_session_bootstrap_started",
+            None,
+            "advisor session bootstrap started",
+            json!({
+                "rootPath": root_path.clone(),
+                "responseLanguage": input.response_language,
+            }),
+            None,
+            None,
+        );
         let _ = input.mode;
         let response_language = input.response_language.unwrap_or_else(|| "zh".to_string());
         let (use_web_search, web_search_enabled) =
@@ -30,6 +46,20 @@ impl<'a> SessionBootstrap<'a> {
         let overview =
             self.tools
                 .get_directory_overview(&root_path, None, None, &response_language)?;
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_directory_overview_loaded",
+            None,
+            "directory overview loaded",
+            json!({
+                "rootPath": root_path.clone(),
+                "itemCount": overview.context_bar.as_object().map(|o| o.len()).unwrap_or(0),
+            }),
+            None,
+            None,
+        );
 
         let mut session = json!({
             "sessionId": uuid::Uuid::new_v4().to_string(),
@@ -42,7 +72,6 @@ impl<'a> SessionBootstrap<'a> {
             "useWebSearch": use_web_search,
             "webSearchEnabled": web_search_enabled,
             "activeSelectionId": Value::Null,
-            "activePreviewId": Value::Null,
             "rollbackAvailable": false,
             "createdAt": now_iso(),
             "updatedAt": now_iso(),
@@ -82,21 +111,34 @@ impl<'a> SessionBootstrap<'a> {
                         .unwrap_or("zh"),
                 ),
             )?;
+            crate::diagnostics::record_state_event(
+                self.state,
+                "info",
+                "advisor",
+                "advisor_tree_card_created",
+                None,
+                "tree card created",
+                json!({
+                    "sessionId": session_id,
+                }),
+                None,
+                None,
+            );
         }
 
-        persist::create_advisor_turn(
-            &self.state.db_path(),
-            session_id,
-            "assistant",
-            local_text(
-                session
-                    .get("responseLanguage")
-                    .and_then(Value::as_str)
-                    .unwrap_or("zh"),
-                "会话已开始。你可以直接告诉我想先处理哪些文件或规则。",
-                "The conversation is ready. Tell me which files or rules you want to handle first.",
-            ),
-        )?;
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_session_bootstrap_completed",
+            None,
+            "advisor session bootstrap completed",
+            json!({
+                "sessionId": session_id,
+            }),
+            None,
+            Some(started_at.elapsed()),
+        );
 
         let session = super::load_session(self.state, session_id)?;
         build_session_payload(self.state, &session)
@@ -138,9 +180,9 @@ mod tests {
         assert_eq!(payload["session"]["workflowStage"], WORKFLOW_UNDERSTAND);
         let timeline = payload["timeline"].as_array().expect("timeline");
         assert!(timeline.iter().any(|turn| {
-            turn["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("会话已开始"))
+            turn["cards"]
+                .as_array()
+                .is_some_and(|cards| !cards.is_empty())
         }));
     }
 }

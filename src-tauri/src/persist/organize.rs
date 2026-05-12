@@ -1,8 +1,143 @@
 use super::*;
+use std::collections::HashMap;
+
+fn category_path_from_value(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn display_category_from_path(path: &[String]) -> String {
+    if path.is_empty() {
+        "其他待定".to_string()
+    } else {
+        path.join(" / ")
+    }
+}
+
+fn tree_path_by_node_id(node: &Value, target_id: &str, path: &mut Vec<String>) -> bool {
+    if node.get("nodeId").and_then(Value::as_str).map(str::trim) == Some(target_id) {
+        return true;
+    }
+    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
+        let name = child.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        if !name.is_empty() {
+            path.push(name.to_string());
+        }
+        if tree_path_by_node_id(child, target_id, path) {
+            return true;
+        }
+        if !name.is_empty() {
+            path.pop();
+        }
+    }
+    false
+}
+
+fn category_path_for_id(tree: &Value, target_id: &str) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    if tree_path_by_node_id(tree, target_id, &mut path) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn build_final_result_rows(snapshot: &OrganizeSnapshot) -> Vec<Value> {
+    let display_rows = snapshot.display_results.clone();
+    let final_assignments = snapshot.final_assignments.clone();
+    let final_tree = if !snapshot.final_tree.is_null() {
+        Some(&snapshot.final_tree)
+    } else if !snapshot.tree.is_null() {
+        Some(&snapshot.tree)
+    } else {
+        None
+    };
+    if display_rows.is_empty() {
+        return Vec::new();
+    }
+    if final_assignments.is_empty() || final_tree.is_none() {
+        return display_rows;
+    }
+
+    let mut assignment_by_item_id = HashMap::<String, Value>::new();
+    for assignment in final_assignments {
+        let item_id = assignment.get("itemId").and_then(Value::as_str).unwrap_or("").trim();
+        if !item_id.is_empty() {
+            assignment_by_item_id.insert(item_id.to_string(), assignment);
+        }
+    }
+
+    display_rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut row)| {
+            let item_id = row
+                .get("itemId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let raw_category_path = category_path_from_value(row.get("categoryPath"));
+            let raw_leaf_node_id = row
+                .get("leafNodeId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let assignment = assignment_by_item_id.get(&item_id);
+            let assigned_category_path = assignment
+                .and_then(|value| value.get("categoryPath"))
+                .map(|value| category_path_from_value(Some(value)))
+                .filter(|path| !path.is_empty())
+                .unwrap_or_default();
+            let leaf_node_id = assignment
+                .and_then(|value| value.get("leafNodeId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or(raw_leaf_node_id.clone());
+            let resolved_path = if !assigned_category_path.is_empty() {
+                assigned_category_path
+            } else if let Some(tree) = final_tree {
+                category_path_for_id(tree, &leaf_node_id).unwrap_or(raw_category_path)
+            } else {
+                raw_category_path
+            };
+            let display_category = display_category_from_path(&resolved_path);
+            let index_value = row.get("index").and_then(Value::as_u64).unwrap_or(index as u64 + 1);
+            let reason = assignment
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| row.get("reason").and_then(Value::as_str).map(str::to_string));
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("index".to_string(), json!(index_value));
+                obj.insert("leafNodeId".to_string(), Value::String(leaf_node_id));
+                obj.insert("categoryPath".to_string(), json!(resolved_path));
+                obj.insert("category".to_string(), Value::String(display_category));
+                if let Some(reason) = reason {
+                    obj.insert("reason".to_string(), Value::String(reason));
+                }
+            }
+            row
+        })
+        .collect()
+}
 
 fn compact_organize_snapshot(snapshot: &OrganizeSnapshot) -> OrganizeSnapshot {
     let mut compact = snapshot.clone();
-    compact.results.clear();
+    compact.display_results.clear();
     compact.preview.clear();
     compact
 }
@@ -17,7 +152,7 @@ pub(crate) fn organizer_tables_exist(conn: &Connection) -> Result<bool, String> 
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
                 'organize_tasks',
-                'organize_results',
+                'organize_display_rows',
                 'organize_jobs',
                 'organize_job_entries',
                 'organize_latest_trees'
@@ -34,7 +169,7 @@ pub(crate) fn drop_organizer_tables(conn: &Connection) -> Result<(), String> {
         r#"
         DROP TABLE IF EXISTS organize_job_entries;
         DROP TABLE IF EXISTS organize_jobs;
-        DROP TABLE IF EXISTS organize_results;
+        DROP TABLE IF EXISTS organize_display_rows;
         DROP TABLE IF EXISTS organize_tasks;
         DROP TABLE IF EXISTS organize_latest_trees;
         "#,
@@ -58,7 +193,7 @@ pub(crate) fn create_organizer_tables(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_organize_tasks_root
         ON organize_tasks(root_path_key, created_at DESC);
 
-        CREATE TABLE IF NOT EXISTS organize_results (
+        CREATE TABLE IF NOT EXISTS organize_display_rows (
             task_id TEXT NOT NULL,
             idx INTEGER NOT NULL,
             path TEXT NOT NULL,
@@ -106,7 +241,7 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let compact_snapshot = compact_organize_snapshot(snapshot);
     tx.execute(
-        "DELETE FROM organize_results WHERE task_id = ?1",
+        "DELETE FROM organize_display_rows WHERE task_id = ?1",
         params![snapshot.id],
     )
     .map_err(|e| e.to_string())?;
@@ -121,11 +256,15 @@ pub fn init_organize_task(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result
             snapshot.status,
             snapshot.created_at,
             snapshot.completed_at,
-            serde_json::to_string(&compact_snapshot).map_err(|e| e.to_string())?,
+            serde_json::to_string(&compact_snapshot)
+                .inspect_err(|e| log::warn!("serialize compact snapshot failed: {e}"))
+                .map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit()
+        .map_err(|e| e.to_string())
+        .inspect_err(|e| log::warn!("commit organize task transaction failed: {e}"))
 }
 
 pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Result<(), String> {
@@ -145,14 +284,16 @@ pub fn save_organize_snapshot(db_path: &Path, snapshot: &OrganizeSnapshot) -> Re
             create_root_path_key(&snapshot.root_path),
             snapshot.status,
             snapshot.completed_at,
-            serde_json::to_string(&compact_snapshot).map_err(|e| e.to_string())?,
+            serde_json::to_string(&compact_snapshot)
+                .inspect_err(|e| log::warn!("serialize snapshot for save failed: {e}"))
+                .map_err(|e| e.to_string())?,
         ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn upsert_organize_results(
+pub fn upsert_organize_display_rows(
     db_path: &Path,
     task_id: &str,
     rows: &[Value],
@@ -165,7 +306,7 @@ pub fn upsert_organize_results(
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut stmt = tx
         .prepare_cached(
-            "INSERT INTO organize_results (
+            "INSERT INTO organize_display_rows (
                 task_id, idx, path, leaf_node_id, category_path_json, row_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(task_id, idx) DO UPDATE SET
@@ -212,7 +353,7 @@ pub fn load_organize_snapshot(
     let mut stmt = conn
         .prepare(
             "SELECT row_json
-             FROM organize_results
+             FROM organize_display_rows
              WHERE task_id = ?1
              ORDER BY idx ASC",
         )
@@ -228,8 +369,7 @@ pub fn load_organize_snapshot(
 
     let mut snapshot =
         serde_json::from_str::<OrganizeSnapshot>(&snapshot_json).map_err(|e| e.to_string())?;
-    snapshot.results = results;
-    snapshot.preview.clear();
+    snapshot.display_results = results;
     Ok(Some(snapshot))
 }
 

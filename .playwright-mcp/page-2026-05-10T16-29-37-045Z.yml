@@ -1,0 +1,77 @@
+- generic [active] [ref=e1]:
+  - generic:
+    - generic:
+      - generic:
+        - generic:
+          - img
+        - generic:
+          - generic: AIcleaner
+          - generic: 正在加载工作台...
+      - generic: 开发模式下首次连接前端资源会稍慢一些，但不应再出现空白窗口。
+  - generic [ref=e3]:
+    - navigation [ref=e4]:
+      - generic [ref=e5]:
+        - img [ref=e7]
+        - generic [ref=e10]: AIcleaner
+      - list [ref=e11]:
+        - listitem [ref=e12]:
+          - link "顾问" [ref=e13] [cursor=pointer]:
+            - /url: "#/advisor"
+            - img [ref=e14]
+            - generic [ref=e16]: 顾问
+      - button "迁移缓存" [ref=e18] [cursor=pointer]
+      - generic [ref=e19]:
+        - generic [ref=e20]: v1.0.0
+        - group "语言" [ref=e21]:
+          - button "中" [pressed] [ref=e22] [cursor=pointer]
+          - generic [ref=e23]: /
+          - button "EN" [ref=e24] [cursor=pointer]
+    - main [ref=e25]:
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]:
+            - generic [ref=e29]:
+              - generic [ref=e30]: 顾问工作流
+              - heading "归类、建议、预览和执行" [level=1] [ref=e31]
+            - generic [ref=e33]: 理解中
+          - generic [ref=e34]:
+            - generic [ref=e35]:
+              - generic [ref=e36]:
+                - generic [ref=e37]: 前置归类
+                - heading "归类与顾问对话" [level=2] [ref=e38]
+              - generic [ref=e39]:
+                - button "开始归类" [ref=e40] [cursor=pointer]
+                - button "停止归类" [disabled]
+                - button "直接开始会话" [ref=e41] [cursor=pointer]
+            - generic [ref=e42]:
+              - generic [ref=e43]:
+                - generic [ref=e44]: 工作目录
+                - generic [ref=e45]:
+                  - textbox "工作目录" [ref=e46]:
+                    - /placeholder: 选择目录
+                  - button "浏览" [ref=e47] [cursor=pointer]
+              - generic [ref=e48]:
+                - generic [ref=e49]:
+                  - generic [ref=e50]: 摘要模式
+                  - combobox "摘要模式" [ref=e51]:
+                    - option "仅文件名" [selected]
+                    - option "本地摘要"
+                    - option "AI 摘要"
+                  - generic [ref=e52]: 最低成本，只用文件名、路径和基础元信息归类。
+                - generic [ref=e53]:
+                  - checkbox "联网搜索" [ref=e54]
+                  - generic [ref=e56]: 联网搜索
+        - generic [ref=e61]: 暂无会话内容
+        - generic [ref=e63]:
+          - generic [ref=e64]:
+            - generic [ref=e65]: 下一步指令
+            - textbox "下一步指令" [ref=e66]:
+              - /placeholder: 告诉我你想先处理哪些文件。
+          - generic [ref=e67]:
+            - generic [ref=e68]:
+              - generic [ref=e69]: 当前阶段
+              - generic [ref=e70]: 理解中
+            - button "发送" [disabled]
+    - generic [ref=e71]:
+      - button "服务商 API" [ref=e72] [cursor=pointer]
+      - text: 配置

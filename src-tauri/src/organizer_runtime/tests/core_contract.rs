@@ -183,7 +183,7 @@ fn build_apply_plan_skips_classification_error_rows_even_if_preview_is_stale() {
         duration_ms: None,
         request_count: None,
         error_count: None,
-        results: vec![json!({
+        display_results: vec![json!({
             "name": "bad.txt",
             "path": r"C:\root\bad.txt",
             "itemType": "file",

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-const ORGANIZER_SCHEMA_VERSION: &str = "tree_v2";
+const ORGANIZER_SCHEMA_VERSION: &str = "tree_v3";
 
 static FULL_DB_BOOTSTRAP_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ORGANIZER_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -14,14 +14,20 @@ static ADVISOR_READ_READY_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::ne
 static ORGANIZER_MODULE_PREPARED_CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn open_db_raw(db_path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let conn = Connection::open(db_path)
+        .inspect_err(|e| log::warn!("open_db_raw Connection::open failed: {e}"))
+        .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
+        .inspect_err(|e| log::warn!("open_db_raw pragma journal_mode failed: {e}"))
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "synchronous", "NORMAL")
+        .inspect_err(|e| log::warn!("open_db_raw pragma synchronous failed: {e}"))
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
+        .inspect_err(|e| log::warn!("open_db_raw pragma foreign_keys failed: {e}"))
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "busy_timeout", 5000)
+        .inspect_err(|e| log::warn!("open_db_raw pragma busy_timeout failed: {e}"))
         .map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -196,7 +202,7 @@ mod tests {
             duration_ms: None,
             request_count: None,
             error_count: None,
-            results: vec![
+            display_results: vec![
                 json!({
                     "index": 1,
                     "path": format!("{root_path}\\alpha.txt"),
@@ -230,7 +236,7 @@ mod tests {
         let root_path = r"C:\root";
         let snapshot = make_organize_snapshot("org_task", root_path);
         init_organize_task(&db_path, &snapshot).expect("init organize task");
-        upsert_organize_results(&db_path, &snapshot.id, &snapshot.results)
+        upsert_organize_display_rows(&db_path, &snapshot.id, &snapshot.display_results)
             .expect("write organize rows");
         save_organize_snapshot(&db_path, &snapshot).expect("save compact snapshot");
 
@@ -245,7 +251,7 @@ mod tests {
         let persisted_value: Value =
             serde_json::from_str(&raw_snapshot).expect("parse snapshot json");
         assert_eq!(
-            persisted_value.get("results"),
+            persisted_value.get("displayResults"),
             Some(&Value::Array(Vec::new()))
         );
         assert_eq!(
@@ -256,14 +262,61 @@ mod tests {
         let loaded = load_organize_snapshot(&db_path, &snapshot.id)
             .expect("load snapshot")
             .expect("snapshot exists");
-        assert_eq!(loaded.results.len(), 2);
+        assert_eq!(loaded.display_results.len(), 2);
         assert!(loaded.preview.is_empty());
         assert_eq!(
-            loaded.results[1].get("path").and_then(Value::as_str),
+            loaded.display_results[1].get("path").and_then(Value::as_str),
             Some(r"C:\root\beta.txt")
         );
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn organizer_final_rows_follow_final_assignments_over_stale_results() {
+        let snapshot = make_organize_snapshot("org_final_rows", r"C:\root");
+        let mut snapshot = snapshot;
+        snapshot.tree = json!({
+            "nodeId": "root",
+            "name": "",
+            "children": [
+                {
+                    "nodeId": "leaf-final",
+                    "name": "音视频文件",
+                    "children": []
+                }
+            ]
+        });
+        snapshot.final_tree = snapshot.tree.clone();
+        snapshot.final_assignments = vec![json!({
+            "itemId": "item-1",
+            "leafNodeId": "leaf-final",
+            "categoryPath": ["音视频文件"],
+            "reason": "merged"
+        })];
+        snapshot.display_results = vec![json!({
+            "index": 1,
+            "itemId": "item-1",
+            "path": r"C:\root\song.mp3",
+            "name": "song.mp3",
+            "leafNodeId": "old-leaf",
+            "categoryPath": ["其他待定"],
+            "category": "其他待定"
+        })];
+
+        let rows = build_final_result_rows(&snapshot);
+        assert_eq!(
+            rows[0].get("categoryPath").and_then(Value::as_array).map(|items| items.len()),
+            Some(1)
+        );
+        assert_eq!(
+            rows[0].get("category").and_then(Value::as_str),
+            Some("音视频文件")
+        );
+        assert_eq!(
+            rows[0].get("leafNodeId").and_then(Value::as_str),
+            Some("leaf-final")
+        );
     }
 
     #[test]
@@ -273,7 +326,7 @@ mod tests {
 
         let snapshot = make_organize_snapshot("org_batch", r"C:\root");
         init_organize_task(&db_path, &snapshot).expect("init organize task");
-        upsert_organize_results(
+        upsert_organize_display_rows(
             &db_path,
             &snapshot.id,
             &[json!({
@@ -285,7 +338,7 @@ mod tests {
             })],
         )
         .expect("insert first batch");
-        upsert_organize_results(
+        upsert_organize_display_rows(
             &db_path,
             &snapshot.id,
             &[json!({
@@ -301,16 +354,16 @@ mod tests {
         let loaded = load_organize_snapshot(&db_path, &snapshot.id)
             .expect("load snapshot")
             .expect("snapshot exists");
-        assert_eq!(loaded.results.len(), 1);
+        assert_eq!(loaded.display_results.len(), 1);
         assert_eq!(
-            loaded.results[0]
+            loaded.display_results[0]
                 .get("categoryPath")
                 .and_then(Value::as_array)
                 .map(|items| items.len()),
             Some(2)
         );
         assert_eq!(
-            loaded.results[0].get("leafNodeId").and_then(Value::as_str),
+            loaded.display_results[0].get("leafNodeId").and_then(Value::as_str),
             Some("leaf-b")
         );
 
@@ -356,7 +409,7 @@ mod tests {
 
         let conn = open_db_raw(&db_path).expect("open raw db");
         assert!(table_exists(&conn, "organize_tasks"));
-        assert!(table_exists(&conn, "organize_results"));
+        assert!(table_exists(&conn, "organize_display_rows"));
         assert!(!table_exists(&conn, "advisor_sessions"));
 
         let _ = fs::remove_file(db_path);

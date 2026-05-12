@@ -21,7 +21,12 @@ export type SearchApiSettings = {
 export type ProviderConfig = {
   name?: string;
   endpoint?: string;
+  apiFormat?: 'openai' | 'anthropic';
   model?: string;
+  thinking?: {
+    enabled?: boolean;
+    level?: 'low' | 'medium' | 'high';
+  };
 };
 
 export type Settings = {
@@ -51,10 +56,15 @@ export type CredentialsSaveResult = {
 };
 
 export type ProviderRow = {
+  id?: string;
   name: string;
   endpoint: string;
   apiKey: string;
   model: string;
+  apiFormat: 'openai' | 'anthropic';
+  thinkingEnabled: boolean;
+  thinkingLevel: 'low' | 'medium' | 'high';
+  preset?: boolean;
   modelLoaded?: boolean;
 };
 
@@ -94,6 +104,9 @@ export type OrganizeProgressStage =
   | 'summary'
   | 'initial_tree'
   | 'classification'
+  | 'build_tree_shape'
+  | 'fill_items'
+  | 'adjust'
   | 'reconcile'
   | 'finalize'
   | 'moving'
@@ -137,7 +150,11 @@ export type OrganizeSnapshot = {
   requestCount?: number;
   errorCount?: number;
   tree?: TreeNode;
-  results?: OrganizeResultRow[];
+  finalTree?: TreeNode;
+  final_tree?: TreeNode;
+  finalAssignments?: JsonRecord[];
+  final_assignments?: JsonRecord[];
+  displayResults?: OrganizeResultRow[];
   [key: string]: unknown;
 };
 
@@ -161,7 +178,9 @@ export type OrganizeViewSnapshot = {
   requestCount?: number;
   errorCount?: number;
   tree: TreeNode;
-  results: OrganizeResultRow[];
+  finalTree?: TreeNode;
+  finalAssignments?: JsonRecord[];
+  displayResults: OrganizeResultRow[];
 };
 
 export type OrganizeProgressEvent = OrganizeSnapshot;

@@ -14,6 +14,29 @@ pub enum ApiFormat {
     Anthropic,
 }
 
+impl ApiFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ThinkingConfig<'a> {
+    pub enabled: bool,
+    pub level: &'a str,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParsedToolCall {
     pub id: String,
@@ -94,11 +117,25 @@ pub fn build_completion_payload(
     tools: Option<&[Value]>,
     temperature: f64,
     max_tokens: u64,
+    thinking: ThinkingConfig<'_>,
 ) -> Result<Value, String> {
     match format {
-        ApiFormat::OpenAi => Ok(build_openai_payload(model, messages, tools, temperature)),
+        ApiFormat::OpenAi => Ok(build_openai_payload(
+            model,
+            messages,
+            tools,
+            temperature,
+            thinking,
+        )),
         ApiFormat::Anthropic => {
-            build_anthropic_payload(model, messages, tools, temperature, max_tokens.max(1))
+            build_anthropic_payload(
+                model,
+                messages,
+                tools,
+                temperature,
+                max_tokens.max(1),
+                thinking,
+            )
         }
     }
 }
@@ -152,6 +189,7 @@ fn build_openai_payload(
     messages: &[Value],
     tools: Option<&[Value]>,
     temperature: f64,
+    thinking: ThinkingConfig<'_>,
 ) -> Value {
     let mut payload = json!({
         "model": model,
@@ -162,8 +200,10 @@ fn build_openai_payload(
         payload["tools"] = Value::Array(tools.to_vec());
         payload["tool_choice"] = Value::String("auto".to_string());
     }
-    // DeepSeek V4: enable thinking mode by default
-    payload["extra_body"] = json!({ "thinking": true });
+    if thinking.enabled {
+        payload["reasoning_effort"] = Value::String(normalize_reasoning_level(thinking.level).to_string());
+        payload["thinking"] = json!({ "type": "enabled" });
+    }
     payload
 }
 
@@ -215,6 +255,7 @@ fn build_anthropic_payload(
     tools: Option<&[Value]>,
     temperature: f64,
     max_tokens: u64,
+    thinking: ThinkingConfig<'_>,
 ) -> Result<Value, String> {
     let (system, anthropic_messages) = convert_messages_to_anthropic(messages)?;
     let mut payload = json!({
@@ -235,7 +276,30 @@ fn build_anthropic_payload(
         );
         payload["tool_choice"] = json!({ "type": "auto" });
     }
+    if thinking.enabled {
+        payload["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": anthropic_thinking_budget(thinking.level, max_tokens),
+        });
+    }
     Ok(payload)
+}
+
+fn normalize_reasoning_level(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "high" => "high",
+        _ => "medium",
+    }
+}
+
+fn anthropic_thinking_budget(level: &str, max_tokens: u64) -> u64 {
+    let budget = match normalize_reasoning_level(level) {
+        "low" => 1024,
+        "high" => 3072,
+        _ => 2048,
+    };
+    budget.min(max_tokens.max(1))
 }
 
 fn convert_messages_to_anthropic(messages: &[Value]) -> Result<(String, Vec<Value>), String> {
@@ -720,6 +784,10 @@ mod tests {
             })]),
             0.0,
             1024,
+            ThinkingConfig {
+                enabled: true,
+                level: "medium",
+            },
         )
         .expect("payload");
 

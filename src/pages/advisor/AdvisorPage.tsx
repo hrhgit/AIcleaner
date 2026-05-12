@@ -9,13 +9,14 @@ import {
   getLatestOrganizeResult,
   getOrganizeResult,
   getSettings,
+  logFrontendEvent,
   saveSettings,
   startOrganize,
   stopOrganize,
 } from '../../utils/api';
 import { getErrorMessage } from '../../utils/errors';
 import { getLang, text } from '../../utils/i18n';
-import { ensureRequiredCredentialsConfigured } from '../../utils/secret-ui';
+import { ensureDefaultProviderModelConfigured, ensureRequiredCredentialsConfigured } from '../../utils/secret-ui';
 import { showToast } from '../../utils/toast';
 import type { OrganizeSnapshot, OrganizeViewSnapshot, StreamHandle } from '../../types';
 import {
@@ -96,7 +97,7 @@ export function AdvisorPage() {
       if (stateRef.current.organizeTaskId === taskId) {
         dispatch({ type: 'setOrganizeTaskId', taskId: '' });
       }
-      console.warn('[Advisor] Failed to hydrate organize snapshot:', err);
+      logFrontendEvent({ event: 'hydrate_organize_snapshot_failed', details: { taskId, error: getErrorMessage(err) } }).catch(() => {});
     }
   }, [applyOrganizeSnapshot, connectTaskStream]);
 
@@ -112,7 +113,7 @@ export function AdvisorPage() {
       }
       return true;
     } catch (err) {
-      console.warn('[Advisor] Failed to hydrate latest organize snapshot:', err);
+      logFrontendEvent({ event: 'hydrate_latest_organize_snapshot_failed', details: { error: getErrorMessage(err) } }).catch(() => {});
       return false;
     }
   }, [applyOrganizeSnapshot, connectTaskStream]);
@@ -199,6 +200,7 @@ export function AdvisorPage() {
     }
     try {
       await ensureWorkflowCredentials(current.useWebSearch);
+      await ensureDefaultProviderModelConfigured(text('缺少默认模型。', 'Default model required.'));
       dispatch({ type: 'patch', patch: { organizeStarting: true } });
       const result = await startOrganize({
         rootPath: current.rootPath.trim(),
@@ -209,6 +211,10 @@ export function AdvisorPage() {
         responseLanguage: getLang(),
       });
       const taskId = String(result.taskId || '').trim();
+      if (!taskId) {
+        showToast(text('启动归类失败: 未获取到任务ID', 'Failed to start organize: no task ID returned'), 'error');
+        return;
+      }
       dispatch({ type: 'setOrganizeTaskId', taskId });
       dispatch({
         type: 'setOrganizeSnapshot',
@@ -229,7 +235,9 @@ export function AdvisorPage() {
       connectTaskStream(taskId);
       await hydrateOrganizeSnapshot(taskId, true);
       showToast(text('归类任务已启动。', 'Organize task started.'), 'success');
+      logFrontendEvent({ event: 'organize_started', details: { taskId } }).catch(() => {});
     } catch (err) {
+      logFrontendEvent({ event: 'organize_start_failed', details: { rootPath: current.rootPath, error: getErrorMessage(err) } }).catch(() => {});
       showToast(`${text('启动归类失败: ', 'Failed to start organize: ')}${getErrorMessage(err)}`, 'error');
     } finally {
       dispatch({ type: 'patch', patch: { organizeStarting: false } });
@@ -242,7 +250,9 @@ export function AdvisorPage() {
     dispatch({ type: 'patch', patch: { organizeStopping: true } });
     try {
       await stopOrganize(taskId);
+      logFrontendEvent({ event: 'organize_stopped', details: { taskId } }).catch(() => {});
     } catch (err) {
+      logFrontendEvent({ event: 'organize_stop_failed', details: { taskId, error: getErrorMessage(err) } }).catch(() => {});
       showToast(`${text('停止归类失败: ', 'Failed to stop organize: ')}${getErrorMessage(err)}`, 'error');
     } finally {
       dispatch({ type: 'patch', patch: { organizeStopping: false } });
@@ -257,13 +267,16 @@ export function AdvisorPage() {
     }
     try {
       await ensureWorkflowCredentials(current.useWebSearch);
+      await ensureDefaultProviderModelConfigured(text('缺少默认模型。', 'Default model required.'));
       dispatch({ type: 'patch', patch: { loading: true } });
       const sessionData = await advisorSessionStart({
         rootPath: current.rootPath.trim(),
         responseLanguage: getLang(),
       });
       dispatch({ type: 'setSession', sessionData, sessionId: String(sessionData.sessionId || '') });
+      logFrontendEvent({ event: 'session_started', details: { sessionId: sessionData.sessionId, rootPath: current.rootPath } }).catch(() => {});
     } catch (err) {
+      logFrontendEvent({ event: 'session_start_failed', details: { rootPath: current.rootPath, error: getErrorMessage(err) } }).catch(() => {});
       showToast(`${text('启动会话失败: ', 'Failed to start session: ')}${getErrorMessage(err)}`, 'error');
     } finally {
       dispatch({ type: 'patch', patch: { loading: false } });
@@ -282,14 +295,16 @@ export function AdvisorPage() {
     try {
       const sessionData = await advisorMessageSend({ sessionId: current.sessionId, message });
       dispatch({ type: 'setSession', sessionData, sessionId: String(sessionData.sessionId || current.sessionId) });
+      logFrontendEvent({ event: 'message_sent', details: { sessionId: current.sessionId, messageLength: message.length } }).catch(() => {});
     } catch (err) {
       const errorMessage = getErrorMessage(err);
+      logFrontendEvent({ event: 'message_send_failed', details: { sessionId: current.sessionId, error: errorMessage } }).catch(() => {});
       showToast(`${text('发送失败: ', 'Send failed: ')}${errorMessage}`, 'error');
       try {
         const sessionData = await advisorSessionGet(current.sessionId);
         dispatch({ type: 'setSession', sessionData, sessionId: current.sessionId });
       } catch (hydrateErr) {
-        console.warn('[Advisor] Failed to refresh session after send failure:', hydrateErr);
+        logFrontendEvent({ event: 'session_refresh_after_send_failure_failed', details: { error: getErrorMessage(hydrateErr) } }).catch(() => {});
         dispatch({ type: 'markPendingAssistantFailed', message: `${text('回复生成失败: ', 'Reply failed: ')}${errorMessage}` });
       }
     } finally {
@@ -313,7 +328,9 @@ export function AdvisorPage() {
         payload,
       });
       dispatch({ type: 'setSession', sessionData, sessionId: current.sessionId });
+      logFrontendEvent({ event: 'card_action', details: { sessionId: current.sessionId, cardId, action } }).catch(() => {});
     } catch (err) {
+      logFrontendEvent({ event: 'card_action_failed', details: { sessionId: current.sessionId, cardId, action, error: getErrorMessage(err) } }).catch(() => {});
       showToast(`${text('卡片动作失败: ', 'Card action failed: ')}${getErrorMessage(err)}`, 'error');
     } finally {
       dispatch({ type: 'patch', patch: { acting: false } });
@@ -332,7 +349,9 @@ export function AdvisorPage() {
         },
       });
       dispatch({ type: 'setUseWebSearch', useWebSearch: nextValue });
+      logFrontendEvent({ event: 'web_search_setting_changed', details: { enabled: nextValue } }).catch(() => {});
     } catch (err) {
+      logFrontendEvent({ event: 'web_search_setting_change_failed', details: { error: getErrorMessage(err) } }).catch(() => {});
       showToast(`${text('保存联网搜索开关失败: ', 'Failed to save web search setting: ')}${getErrorMessage(err)}`, 'error');
       dispatch({ type: 'setUseWebSearch', useWebSearch: !nextValue });
     } finally {

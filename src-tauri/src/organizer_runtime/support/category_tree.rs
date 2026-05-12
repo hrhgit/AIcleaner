@@ -178,6 +178,45 @@ fn category_path_for_id(node: &CategoryTreeNode, target_id: &str) -> Option<Vec<
     }
 }
 
+fn find_node_by_id<'a>(node: &'a CategoryTreeNode, target_id: &str) -> Option<&'a CategoryTreeNode> {
+    if node.node_id == target_id {
+        return Some(node);
+    }
+    for child in &node.children {
+        if let Some(found) = find_node_by_id(child, target_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn collect_leaf_ids(node: &CategoryTreeNode) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if node.children.is_empty() {
+        ids.insert(node.node_id.clone());
+    }
+    for child in &node.children {
+        ids.extend(collect_leaf_ids(child));
+    }
+    ids
+}
+
+fn collect_leaf_paths(node: &CategoryTreeNode) -> HashMap<Vec<String>, String> {
+    let mut map = HashMap::new();
+    fn walk(node: &CategoryTreeNode, current_path: &[String], map: &mut HashMap<Vec<String>, String>) {
+        if node.children.is_empty() {
+            map.insert(current_path.to_vec(), node.node_id.clone());
+        }
+        for child in &node.children {
+            let mut child_path = current_path.to_vec();
+            child_path.push(child.name.clone());
+            walk(child, &child_path, map);
+        }
+    }
+    walk(node, &[], &mut map);
+    map
+}
+
 fn category_path_from_value(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -196,7 +235,7 @@ fn trim_to_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect::<String>()
 }
 
-fn normalize_multiline_text(value: &str, max_chars: usize) -> String {
+pub(crate) fn normalize_multiline_text(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut last_blank = false;
     for raw_line in value.replace("\r\n", "\n").replace('\r', "\n").lines() {

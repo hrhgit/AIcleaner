@@ -6,10 +6,16 @@ use super::types::{
 use crate::backend::{AppState, TokenUsage};
 use crate::file_representation::{FileRepresentation, RepresentationLevel};
 use crate::llm_protocol::{
-    apply_auth_headers, build_completion_payload, build_messages_url, detect_api_format,
-    parse_completion_response, DEFAULT_MAX_TOKENS,
+    apply_auth_headers, build_completion_payload, build_messages_url, parse_completion_response,
+    ThinkingConfig, DEFAULT_MAX_TOKENS,
 };
+use crate::llm_tools::{ToolContext, ToolExecutionContext, ToolId, ToolRegistry, ToolWorkflow};
 use crate::model_boundary::ModelIdMap;
+use crate::organizer_runtime::{
+    ensure_tika_server_running, extraction_tool_config_from_settings,
+    force_enable_tika_for_summary_mode, ExtractionToolConfig, OrganizeUnit,
+};
+use crate::organizer_runtime::summary::extract_unit_content_for_summary_with_tools;
 use crate::persist;
 use crate::system_ops;
 use reqwest::StatusCode;
@@ -110,8 +116,6 @@ include!("tools/tool_capture_preference.rs");
 include!("tools/tool_list_preferences.rs");
 
 include!("tools/tool_summarize_files.rs");
-
-include!("tools/tool_preview_plan.rs");
 
 include!("tools/tool_execute_plan.rs");
 

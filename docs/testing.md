@@ -94,7 +94,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\testing\analyze-diagnostics.p
   -Limit 30
 ```
 
-The analyzer scans the newest diagnostics files and chooses the first file containing organizer events. Outputs are written under `test-runs/` as JSONL and Markdown summary files.
+The compatibility script now delegates to `aicleaner-logs`, so CLI summary/show behavior is the single source of truth. Outputs are written under `test-runs/` as a compact AI summary JSON plus raw parsed-record JSONL.
+
+Direct CLI usage:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- --json doctor
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- summary --family diagnostics
+cargo run --manifest-path src-tauri/Cargo.toml --bin aicleaner-logs -- show --family diagnostics --tail 20
+```
 
 ## Failure And Reporting Rules
 

@@ -4,7 +4,7 @@ use crate::backend::{
 };
 use crate::llm_protocol::{
     apply_auth_headers, apply_llm_transport_headers, build_completion_payload,
-    build_llm_http_client, build_messages_url, detect_api_format, parse_completion_response,
+    build_llm_http_client, build_messages_url, parse_completion_response, ThinkingConfig,
     DEFAULT_MAX_TOKENS,
 };
 use reqwest::StatusCode;
@@ -15,13 +15,15 @@ use std::time::Instant;
 use serde_json::json as test_json;
 
 const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
-const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
 
 #[derive(Clone, Debug)]
 pub(super) struct AdvisorModelRoute {
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
+    pub api_format: crate::llm_protocol::ApiFormat,
+    pub thinking_enabled: bool,
+    pub thinking_level: String,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +50,7 @@ pub(super) struct AdvisorLlm<'a> {
 }
 
 #[derive(Debug)]
-struct ChatCompletionError {
+pub(super) struct ChatCompletionError {
     message: String,
     raw_body: String,
 }
@@ -64,12 +66,20 @@ impl<'a> AdvisorLlm<'a> {
         model_hint: Option<&str>,
     ) -> Result<AdvisorModelRoute, String> {
         let (endpoint, model) =
-            resolve_provider_endpoint_and_model(self.state, endpoint_hint, model_hint);
-        let api_key = resolve_provider_api_key(self.state, &endpoint)?;
+            {
+                let route =
+                    resolve_provider_endpoint_and_model(self.state, endpoint_hint, model_hint);
+                (route.endpoint, route.model)
+            };
+        let route = resolve_provider_endpoint_and_model(self.state, Some(&endpoint), Some(&model));
+        let api_key = resolve_provider_api_key(self.state, &route.endpoint)?;
         Ok(AdvisorModelRoute {
-            endpoint,
-            model,
+            endpoint: route.endpoint,
+            model: route.model,
             api_key,
+            api_format: route.api_format,
+            thinking_enabled: route.thinking_enabled,
+            thinking_level: route.thinking_level,
         })
     }
 
@@ -78,8 +88,13 @@ impl<'a> AdvisorLlm<'a> {
         messages: &[Value],
         tools: &[Value],
         session_id: Option<&str>,
-    ) -> Result<AdvisorCompletionOutput, String> {
-        let route = self.resolve_route(None, None)?;
+    ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
+        let route = self
+            .resolve_route(None, None)
+            .map_err(|message| ChatCompletionError {
+                message,
+                raw_body: String::new(),
+            })?;
         let operation_id = crate::diagnostics::new_operation_id();
         chat_completion(
             self.state,
@@ -90,7 +105,6 @@ impl<'a> AdvisorLlm<'a> {
             session_id,
         )
         .await
-        .map_err(|err| render_chat_error(&err))
     }
 }
 
@@ -105,7 +119,7 @@ impl<'a> AgentLlm for AdvisorLlm<'a> {
         self.complete_with_tools(messages, tools, trace_key)
             .await
             .map(AgentCompletion::from)
-            .map_err(|message| AgentLlmError::new(message, ""))
+            .map_err(|err| AgentLlmError::new(err.message, err.raw_body))
     }
 }
 
@@ -134,33 +148,12 @@ impl From<AdvisorCompletionOutput> for AgentCompletion {
     }
 }
 
-fn render_chat_error(err: &ChatCompletionError) -> String {
-    if err.raw_body.trim().is_empty() {
-        err.message.clone()
-    } else {
-        format!(
-            "{} | body: {}",
-            err.message,
-            summarize_response_body(&err.raw_body)
-        )
-    }
-}
-
-fn summarize_response_body(raw_body: &str) -> String {
-    let snippet = raw_body.trim();
-    if snippet.chars().count() <= RESPONSE_ERROR_SNIPPET_CHARS {
-        snippet.to_string()
-    } else {
-        snippet.chars().take(RESPONSE_ERROR_SNIPPET_CHARS).collect()
-    }
-}
-
 fn parse_chat_completion_http_body(
     route: &AdvisorModelRoute,
     status: StatusCode,
     raw_body: &str,
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
-    let parsed = parse_completion_response(detect_api_format(&route.endpoint), status, raw_body)
+    let parsed = parse_completion_response(route.api_format, status, raw_body)
         .map_err(|message| ChatCompletionError {
             message,
             raw_body: raw_body.to_string(),
@@ -193,7 +186,7 @@ async fn chat_completion(
     operation_id: &str,
     session_id: Option<&str>,
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
-    let api_format = detect_api_format(&route.endpoint);
+    let api_format = route.api_format;
     let url = build_messages_url(&route.endpoint, api_format);
     let client =
         build_llm_http_client(CHAT_COMPLETION_TIMEOUT_SECS).map_err(|e| ChatCompletionError {
@@ -208,6 +201,10 @@ async fn chat_completion(
         tools,
         0.0,
         DEFAULT_MAX_TOKENS,
+        ThinkingConfig {
+            enabled: route.thinking_enabled,
+            level: &route.thinking_level,
+        },
     )
     .map_err(|message| ChatCompletionError {
         message,
@@ -225,6 +222,9 @@ async fn chat_completion(
             "sessionId": session_id.unwrap_or(""),
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
+            "apiFormat": route.api_format.as_str(),
+            "thinkingEnabled": route.thinking_enabled,
+            "thinkingLevel": route.thinking_level.clone(),
             "url": url.clone(),
             "messages": messages,
             "tools": tools.unwrap_or(&[]),
@@ -256,6 +256,9 @@ async fn chat_completion(
                     "sessionId": session_id.unwrap_or(""),
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
+                    "apiFormat": route.api_format.as_str(),
+                    "thinkingEnabled": route.thinking_enabled,
+                    "thinkingLevel": route.thinking_level.clone(),
                     "url": url.clone(),
                 }),
                 Some(json!({ "message": e.to_string() })),
@@ -282,6 +285,9 @@ async fn chat_completion(
                     "sessionId": session_id.unwrap_or(""),
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
+                    "apiFormat": route.api_format.as_str(),
+                    "thinkingEnabled": route.thinking_enabled,
+                    "thinkingLevel": route.thinking_level.clone(),
                     "status": status.as_u16(),
                 }),
                 Some(json!({ "message": e.to_string() })),
@@ -304,6 +310,9 @@ async fn chat_completion(
             "sessionId": session_id.unwrap_or(""),
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
+            "apiFormat": route.api_format.as_str(),
+            "thinkingEnabled": route.thinking_enabled,
+            "thinkingLevel": route.thinking_level.clone(),
             "status": status.as_u16(),
             "rawBody": raw_body.clone(),
         }),
@@ -322,6 +331,9 @@ mod tests {
             endpoint: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
             api_key: "test".to_string(),
+            api_format: crate::llm_protocol::ApiFormat::OpenAi,
+            thinking_enabled: false,
+            thinking_level: "medium".to_string(),
         }
     }
 

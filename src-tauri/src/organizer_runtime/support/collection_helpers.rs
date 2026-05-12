@@ -83,6 +83,11 @@ fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
             .unwrap_or("https://api.openai.com/v1")
             .trim()
             .to_string();
+        let api_format = config
+            .get("apiFormat")
+            .and_then(Value::as_str)
+            .and_then(ApiFormat::from_str)
+            .unwrap_or_else(|| crate::llm_protocol::detect_api_format(&endpoint));
         let api_key = config
             .get("apiKey")
             .and_then(Value::as_str)
@@ -92,7 +97,17 @@ fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
         let model = config
             .get("model")
             .and_then(Value::as_str)
-            .unwrap_or("gpt-4o-mini")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let thinking_enabled = config
+            .get("thinkingEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let thinking_level = config
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .unwrap_or("medium")
             .trim()
             .to_string();
         routes.insert(
@@ -101,6 +116,9 @@ fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
                 endpoint,
                 api_key,
                 model,
+                api_format,
+                thinking_enabled,
+                thinking_level,
             },
         );
     }

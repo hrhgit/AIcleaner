@@ -1,7 +1,225 @@
+#[cfg(test)]
 const DIRECTORY_ASSESSMENT_MAX_FILES: u64 = 5_000;
+#[cfg(test)]
 const DIRECTORY_ASSESSMENT_MAX_DIRS: u64 = 1_500;
+#[cfg(test)]
 const DIRECTORY_ASSESSMENT_MAX_DEPTH: usize = 8;
 
+/// Raw data collected during a single `read_dir` pass over a directory.
+/// Feeds into `compute_assessment` (pure scoring) and file collection.
+struct DirectoryProfile {
+    marker_files: Vec<String>,
+    top_level_entries: Vec<String>,
+    direct_family_counts: HashMap<String, u64>,
+    direct_file_names: Vec<String>,
+    direct_dir_names: Vec<String>,
+    direct_child_dirs: Vec<PathBuf>,
+    has_readme: bool,
+    has_src: bool,
+    has_bin: bool,
+    has_lib: bool,
+    has_resources: bool,
+    has_docs: bool,
+    has_images: bool,
+    has_labels: bool,
+    has_annotations: bool,
+    has_train: bool,
+    has_val: bool,
+    has_test: bool,
+    has_mods: bool,
+    junk_named_dirs: u64,
+    direct_exe_count: u32,
+    direct_dll_count: u32,
+    direct_archive_count: u32,
+    direct_font_count: u32,
+    direct_text_count: u32,
+    direct_image_count: u32,
+    direct_video_count: u32,
+    direct_audio_count: u32,
+    direct_runtime_count: u32,
+    direct_config_count: u32,
+    direct_script_count: u32,
+    direct_json_count: u32,
+    direct_pck_count: u32,
+    direct_pak_count: u32,
+    direct_bin_payload_count: u32,
+    direct_cursor_count: u32,
+    direct_inf_count: u32,
+    metadata_marker_count: u32,
+}
+
+/// Aggregated statistics for a directory subtree, built bottom-up.
+struct SubtreeStats {
+    total_size: u64,
+    file_count: u64,
+    dir_count: u64,
+    ext_counts: HashMap<String, u64>,
+    max_depth: u32,
+}
+
+impl SubtreeStats {
+    fn empty() -> Self {
+        Self { total_size: 0, file_count: 0, dir_count: 0, ext_counts: HashMap::new(), max_depth: 0 }
+    }
+}
+
+/// Result of a single `read_dir` pass.
+struct DirectoryScan {
+    profile: DirectoryProfile,
+    file_entries: Vec<(PathBuf, fs::Metadata)>,
+    subdir_paths: Vec<PathBuf>,
+    /// Direct file sizes aggregated (from metadata already collected).
+    direct_total_size: u64,
+}
+
+fn scan_directory_entries(
+    path: &Path,
+    excluded: &[String],
+    stop: &AtomicBool,
+) -> Option<DirectoryScan> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+
+    let mut profile = DirectoryProfile {
+        marker_files: Vec::new(),
+        top_level_entries: Vec::new(),
+        direct_family_counts: HashMap::new(),
+        direct_file_names: Vec::new(),
+        direct_dir_names: Vec::new(),
+        direct_child_dirs: Vec::new(),
+        has_readme: false,
+        has_src: false,
+        has_bin: false,
+        has_lib: false,
+        has_resources: false,
+        has_docs: false,
+        has_images: false,
+        has_labels: false,
+        has_annotations: false,
+        has_train: false,
+        has_val: false,
+        has_test: false,
+        has_mods: false,
+        junk_named_dirs: 0,
+        direct_exe_count: 0,
+        direct_dll_count: 0,
+        direct_archive_count: 0,
+        direct_font_count: 0,
+        direct_text_count: 0,
+        direct_image_count: 0,
+        direct_video_count: 0,
+        direct_audio_count: 0,
+        direct_runtime_count: 0,
+        direct_config_count: 0,
+        direct_script_count: 0,
+        direct_json_count: 0,
+        direct_pck_count: 0,
+        direct_pak_count: 0,
+        direct_bin_payload_count: 0,
+        direct_cursor_count: 0,
+        direct_inf_count: 0,
+        metadata_marker_count: 0,
+    };
+
+    let mut file_entries = Vec::new();
+    let mut subdir_paths = Vec::new();
+    let mut direct_total_size = 0u64;
+
+    for entry in entries.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower = name.to_ascii_lowercase();
+        if should_exclude(&name, excluded) {
+            continue;
+        }
+        if profile.top_level_entries.len() < 18 {
+            profile.top_level_entries.push(name.clone());
+        }
+        if PROJECT_MARKER_NAMES.iter().any(|marker| lower == *marker) {
+            profile.marker_files.push(name.clone());
+        }
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let entry_path = entry.path();
+        if is_dir {
+            profile.direct_dir_names.push(name.clone());
+            profile.direct_child_dirs.push(entry_path.clone());
+            match lower.as_str() {
+                "src" | "app" => profile.has_src = true,
+                "bin" => profile.has_bin = true,
+                "lib" => profile.has_lib = true,
+                "resources" | "resource" => profile.has_resources = true,
+                "docs" | "doc" => profile.has_docs = true,
+                "images" | "image" | "img" | "imgs" => profile.has_images = true,
+                "labels" => profile.has_labels = true,
+                "annotations" | "annotation" => profile.has_annotations = true,
+                "train" => profile.has_train = true,
+                "val" | "valid" | "validation" => profile.has_val = true,
+                "test" | "tests" => profile.has_test = true,
+                "mods" | "plugins" | "plugin" => profile.has_mods = true,
+                _ => {}
+            }
+            if JUNK_DIR_NAMES.iter().any(|value| lower == *value) {
+                profile.junk_named_dirs = profile.junk_named_dirs.saturating_add(1);
+            }
+            subdir_paths.push(entry_path);
+            continue;
+        }
+
+        // File handling
+        profile.direct_file_names.push(name.clone());
+        if lower == "readme.md" || lower == "readme.txt" || lower == "readme" {
+            profile.has_readme = true;
+        }
+        if lower.ends_with(".exe") { profile.direct_exe_count += 1; }
+        if lower.ends_with(".dll") { profile.direct_dll_count += 1; }
+        if lower.ends_with(".json") { profile.direct_json_count += 1; }
+        if lower.ends_with(".pck") { profile.direct_pck_count += 1; }
+        if lower.ends_with(".pak") { profile.direct_pak_count += 1; }
+        if lower.ends_with(".bin") { profile.direct_bin_payload_count += 1; }
+        if lower.ends_with(".ani") || lower.ends_with(".cur") { profile.direct_cursor_count += 1; }
+        if lower.ends_with(".inf") { profile.direct_inf_count += 1; }
+        if lower.contains("manifest") || lower.contains("metadata")
+            || lower.contains("catalog") || lower.contains("index")
+        {
+            profile.metadata_marker_count += 1;
+        }
+
+        let family = classify_extension_family(&extension_key(&entry_path)).to_string();
+        *profile.direct_family_counts.entry(family.clone()).or_insert(0) += 1;
+        match family.as_str() {
+            "archive" => profile.direct_archive_count += 1,
+            "font" => profile.direct_font_count += 1,
+            "document" => profile.direct_text_count += 1,
+            "image" => profile.direct_image_count += 1,
+            "video" => profile.direct_video_count += 1,
+            "audio" => profile.direct_audio_count += 1,
+            "runtime" => profile.direct_runtime_count += 1,
+            "config" => profile.direct_config_count += 1,
+            "script" => profile.direct_script_count += 1,
+            _ => {}
+        }
+
+        // Collect file metadata (needed for both assessment and collection)
+        if let Ok(meta) = entry.metadata() {
+            direct_total_size = direct_total_size.saturating_add(meta.len());
+            file_entries.push((entry_path, meta));
+        }
+    }
+
+    Some(DirectoryScan {
+        profile,
+        file_entries,
+        subdir_paths,
+        direct_total_size,
+    })
+}
+
+#[cfg(test)]
 fn summarize_directory_tree(
     path: &Path,
     excluded: &[String],
@@ -67,224 +285,27 @@ fn summarize_directory_tree(
     (total_size, file_count, dir_count, ext_counts, max_depth)
 }
 
-fn is_collection_root(
-    path: &Path,
-    excluded: &[String],
-    stop: &AtomicBool,
-    report: &mut CollectionReport,
-) -> bool {
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            report.read_dir_errors = report.read_dir_errors.saturating_add(1);
-            return false;
-        }
-    };
-    let root_name = path
-        .file_name()
-        .and_then(|x| x.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let has_download_name = DOWNLOAD_ROOT_TOKENS
-        .iter()
-        .any(|token| root_name.contains(token));
-    let mut direct_file_count = 0_u64;
-    let mut direct_dir_count = 0_u64;
-    let mut file_families = HashSet::<String>::new();
-
-    for entry in entries.filter_map(Result::ok) {
-        if stop.load(Ordering::Relaxed) {
-            report.stopped = true;
-            break;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if should_exclude(&name, excluded) {
-            report.excluded_entries = report.excluded_entries.saturating_add(1);
-            continue;
-        }
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            direct_dir_count = direct_dir_count.saturating_add(1);
-            continue;
-        }
-        if entry_path.is_file() {
-            direct_file_count = direct_file_count.saturating_add(1);
-            file_families
-                .insert(classify_extension_family(&extension_key(&entry_path)).to_string());
-        }
-    }
-
-    (has_download_name && direct_dir_count >= 4)
-        || (direct_dir_count >= 8 && direct_file_count >= 6 && file_families.len() >= 4)
-        || (direct_dir_count >= 12 && file_families.len() >= 3)
-}
-
-fn evaluate_directory_assessment(
-    path: &Path,
-    excluded: &[String],
-    stop: &AtomicBool,
+fn compute_assessment(
+    profile: &DirectoryProfile,
+    subtree: &SubtreeStats,
+    dir_name: &str,
     prefer_whole: bool,
-    report: &mut CollectionReport,
-) -> Option<DirectoryAssessment> {
-    let mut marker_files = Vec::new();
+) -> DirectoryAssessment {
     let mut evidence = Vec::new();
     let mut app_signals = Vec::new();
     let mut fragmentation_warnings = Vec::new();
-    let mut top_level_entries = Vec::new();
-    let mut direct_family_counts = HashMap::<String, u64>::new();
-    let mut direct_file_names = Vec::new();
-    let mut direct_dir_names = Vec::new();
-    let mut direct_child_dirs = Vec::<PathBuf>::new();
-    let mut has_readme = false;
-    let mut has_src = false;
-    let mut has_bin = false;
-    let mut has_lib = false;
-    let mut has_resources = false;
-    let mut has_docs = false;
-    let mut has_images = false;
-    let mut has_labels = false;
-    let mut has_annotations = false;
-    let mut has_train = false;
-    let mut has_val = false;
-    let mut has_test = false;
-    let mut has_mods = false;
-    let mut junk_named_dirs = 0_u64;
-    let mut direct_exe_count = 0_u32;
-    let mut direct_dll_count = 0_u32;
-    let mut direct_archive_count = 0_u32;
-    let mut direct_font_count = 0_u32;
-    let mut direct_text_count = 0_u32;
-    let mut direct_image_count = 0_u32;
-    let mut direct_video_count = 0_u32;
-    let mut direct_audio_count = 0_u32;
-    let mut direct_runtime_count = 0_u32;
-    let mut direct_config_count = 0_u32;
-    let mut direct_script_count = 0_u32;
-    let mut direct_json_count = 0_u32;
-    let mut direct_pck_count = 0_u32;
-    let mut direct_pak_count = 0_u32;
-    let mut direct_bin_payload_count = 0_u32;
-    let mut direct_cursor_count = 0_u32;
-    let mut direct_inf_count = 0_u32;
-    let mut metadata_marker_count = 0_u32;
 
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            report.read_dir_errors = report.read_dir_errors.saturating_add(1);
-            return None;
-        }
-    };
-    for entry in entries.filter_map(Result::ok) {
-        if stop.load(Ordering::Relaxed) {
-            report.stopped = true;
-            break;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let lower = name.to_ascii_lowercase();
-        if should_exclude(&name, excluded) {
-            report.excluded_entries = report.excluded_entries.saturating_add(1);
-            continue;
-        }
-        if top_level_entries.len() < 18 {
-            top_level_entries.push(name.clone());
-        }
-        if PROJECT_MARKER_NAMES.iter().any(|marker| lower == *marker) {
-            marker_files.push(name.clone());
-        }
+    let direct_file_count = profile.direct_file_names.len() as u64;
+    let direct_dir_count = profile.direct_dir_names.len() as u64;
 
-        let entry_path = entry.path();
-        if entry_path.is_dir() {
-            direct_dir_names.push(name.clone());
-            direct_child_dirs.push(entry_path.clone());
-            match lower.as_str() {
-                "src" | "app" => has_src = true,
-                "bin" => has_bin = true,
-                "lib" => has_lib = true,
-                "resources" | "resource" => has_resources = true,
-                "docs" | "doc" => has_docs = true,
-                "images" | "image" | "img" | "imgs" => has_images = true,
-                "labels" => has_labels = true,
-                "annotations" | "annotation" => has_annotations = true,
-                "train" => has_train = true,
-                "val" | "valid" | "validation" => has_val = true,
-                "test" | "tests" => has_test = true,
-                "mods" | "plugins" | "plugin" => has_mods = true,
-                _ => {}
-            }
-            if JUNK_DIR_NAMES.iter().any(|value| lower == *value) {
-                junk_named_dirs = junk_named_dirs.saturating_add(1);
-            }
-            continue;
-        }
-
-        direct_file_names.push(name.clone());
-        if lower == "readme.md" || lower == "readme.txt" || lower == "readme" {
-            has_readme = true;
-        }
-        if lower.ends_with(".exe") {
-            direct_exe_count += 1;
-        }
-        if lower.ends_with(".dll") {
-            direct_dll_count += 1;
-        }
-        if lower.ends_with(".json") {
-            direct_json_count += 1;
-        }
-        if lower.ends_with(".pck") {
-            direct_pck_count += 1;
-        }
-        if lower.ends_with(".pak") {
-            direct_pak_count += 1;
-        }
-        if lower.ends_with(".bin") {
-            direct_bin_payload_count += 1;
-        }
-        if lower.ends_with(".ani") || lower.ends_with(".cur") {
-            direct_cursor_count += 1;
-        }
-        if lower.ends_with(".inf") {
-            direct_inf_count += 1;
-        }
-        if lower.contains("manifest")
-            || lower.contains("metadata")
-            || lower.contains("catalog")
-            || lower.contains("index")
-        {
-            metadata_marker_count += 1;
-        }
-
-        let family = classify_extension_family(&extension_key(&entry_path)).to_string();
-        *direct_family_counts.entry(family.clone()).or_insert(0) += 1;
-        match family.as_str() {
-            "archive" => direct_archive_count += 1,
-            "font" => direct_font_count += 1,
-            "document" => direct_text_count += 1,
-            "image" => direct_image_count += 1,
-            "video" => direct_video_count += 1,
-            "audio" => direct_audio_count += 1,
-            "runtime" => direct_runtime_count += 1,
-            "config" => direct_config_count += 1,
-            "script" => direct_script_count += 1,
-            _ => {}
-        }
-    }
-
-    let (total_size, file_count, dir_count, ext_counts, max_depth) =
-        summarize_directory_tree(path, excluded, stop, report);
-    let dominant_extensions = format_ranked_entries(ext_counts.clone(), 8);
-    let (name_families, max_family_count) = summarize_name_families(&direct_file_names, 5);
-    let paired_sidecars = summarize_sidecars(&direct_file_names, 5);
-    let root_bundle_key = canonical_bundle_key(
-        path.file_name()
-            .and_then(|x| x.to_str())
-            .unwrap_or_default(),
-    );
-    let root_named_file_count = direct_file_names
+    let (name_families, max_family_count) = summarize_name_families(&profile.direct_file_names, 5);
+    let paired_sidecars = summarize_sidecars(&profile.direct_file_names, 5);
+    let root_bundle_key = canonical_bundle_key(dir_name);
+    let root_named_file_count = profile.direct_file_names
         .iter()
         .filter(|name| matches_bundle_root(&root_bundle_key, name))
         .count() as u64;
-    let root_named_binary_count = direct_file_names
+    let root_named_binary_count = profile.direct_file_names
         .iter()
         .filter(|name| {
             matches_bundle_root(&root_bundle_key, name)
@@ -294,30 +315,31 @@ fn evaluate_directory_assessment(
                 )
         })
         .count() as u64;
-    let package_doc_count = direct_file_names
+    let package_doc_count = profile.direct_file_names
         .iter()
         .filter(|name| is_package_doc_name(name))
         .count() as u64;
-    let multi_variant_app_bundle = root_named_binary_count >= 2 && direct_exe_count >= 2;
-    let direct_file_count = direct_file_names.len() as u64;
-    let direct_dir_count = direct_dir_names.len() as u64;
+    let multi_variant_app_bundle = root_named_binary_count >= 2 && profile.direct_exe_count >= 2;
+
     let document_collection_share =
-        (direct_text_count + direct_archive_count) as u64 * 100 / direct_file_count.max(1);
-    let document_collection_layout = direct_text_count >= 8
+        (profile.direct_text_count + profile.direct_archive_count) as u64 * 100 / direct_file_count.max(1);
+    let document_collection_layout = profile.direct_text_count >= 8
         && document_collection_share >= 85
-        && direct_exe_count == 0
-        && direct_dll_count == 0
-        && direct_image_count <= 3
-        && direct_video_count == 0
-        && direct_audio_count == 0
-        && direct_runtime_count == 0
-        && direct_script_count == 0;
-    let dominant_extension_count = ext_counts.values().copied().max().unwrap_or(0);
-    let dominant_share = if file_count == 0 {
+        && profile.direct_exe_count == 0
+        && profile.direct_dll_count == 0
+        && profile.direct_image_count <= 3
+        && profile.direct_video_count == 0
+        && profile.direct_audio_count == 0
+        && profile.direct_runtime_count == 0
+        && profile.direct_script_count == 0;
+
+    let dominant_extension_count = subtree.ext_counts.values().copied().max().unwrap_or(0);
+    let dominant_share = if subtree.file_count == 0 {
         0.0
     } else {
-        dominant_extension_count as f64 / file_count as f64
+        dominant_extension_count as f64 / subtree.file_count as f64
     };
+    let dominant_extensions = format_ranked_entries(subtree.ext_counts.clone(), 8);
     let naming_cohesion = if max_family_count >= 3 {
         "high".to_string()
     } else if max_family_count == 2 || dominant_share >= 0.55 {
@@ -329,18 +351,17 @@ fn evaluate_directory_assessment(
     let wrapper_target_path = if direct_dir_count == 1
         && ((direct_file_count == 0)
             || (direct_file_count <= 2
-                && direct_file_names.iter().all(|name| {
-                    let lower = name.to_ascii_lowercase();
-                    WRAPPER_FILE_EXTS.iter().any(|ext| lower.ends_with(ext))
+                && profile.direct_file_names.iter().all(|name| {
+                    WRAPPER_FILE_EXTS.iter().any(|ext| name.to_ascii_lowercase().ends_with(ext))
                 })))
-        && marker_files.is_empty()
-        && direct_exe_count == 0
-        && direct_dll_count == 0
-        && direct_archive_count == 0
-        && direct_font_count == 0
-        && direct_script_count == 0
+        && profile.marker_files.is_empty()
+        && profile.direct_exe_count == 0
+        && profile.direct_dll_count == 0
+        && profile.direct_archive_count == 0
+        && profile.direct_font_count == 0
+        && profile.direct_script_count == 0
     {
-        direct_child_dirs
+        profile.direct_child_dirs
             .first()
             .map(|child| child.to_string_lossy().to_string())
     } else {
@@ -348,46 +369,46 @@ fn evaluate_directory_assessment(
     };
 
     let runtime_like_only = direct_file_count > 0
-        && (direct_runtime_count + direct_config_count) as u64 * 100 / direct_file_count >= 70
-        && direct_exe_count == 0
-        && direct_dll_count == 0
-        && direct_text_count <= 1
-        && direct_image_count == 0
-        && direct_video_count == 0
-        && direct_audio_count == 0
-        && direct_font_count == 0
-        && direct_script_count <= 1
-        && marker_files.is_empty();
+        && (profile.direct_runtime_count + profile.direct_config_count) as u64 * 100 / direct_file_count >= 70
+        && profile.direct_exe_count == 0
+        && profile.direct_dll_count == 0
+        && profile.direct_text_count <= 1
+        && profile.direct_image_count == 0
+        && profile.direct_video_count == 0
+        && profile.direct_audio_count == 0
+        && profile.direct_font_count == 0
+        && profile.direct_script_count <= 1
+        && profile.marker_files.is_empty();
     let staging_junk = if runtime_like_only {
-        junk_named_dirs == direct_dir_count || direct_dir_count == 0
+        profile.junk_named_dirs == direct_dir_count || direct_dir_count == 0
     } else {
         false
     };
-    let dll_only_directory = direct_dll_count >= 2
-        && u64::from(direct_dll_count) == direct_file_count
+    let dll_only_directory = profile.direct_dll_count >= 2
+        && u64::from(profile.direct_dll_count) == direct_file_count
         && direct_dir_count == 0
-        && direct_exe_count == 0
-        && direct_json_count == 0
-        && direct_pck_count == 0
-        && direct_config_count == 0
-        && direct_text_count == 0
-        && direct_image_count == 0
-        && direct_video_count == 0
-        && direct_audio_count == 0
-        && direct_script_count == 0;
+        && profile.direct_exe_count == 0
+        && profile.direct_json_count == 0
+        && profile.direct_pck_count == 0
+        && profile.direct_config_count == 0
+        && profile.direct_text_count == 0
+        && profile.direct_image_count == 0
+        && profile.direct_video_count == 0
+        && profile.direct_audio_count == 0
+        && profile.direct_script_count == 0;
 
     let mut integrity_kind = "mixed".to_string();
     let mut score = 0_i32;
     let mut strong_anchor = false;
 
-    if !marker_files.is_empty() {
+    if !profile.marker_files.is_empty() {
         score += 38;
         strong_anchor = true;
         integrity_kind = "project".to_string();
-        evidence.push(format!("markerFiles={}", marker_files.join(",")));
+        evidence.push(format!("markerFiles={}", profile.marker_files.join(",")));
         app_signals.push("project_markers".to_string());
     }
-    if has_readme {
+    if profile.has_readme {
         score += 8;
         evidence.push("readme_present".to_string());
         app_signals.push("readme_present".to_string());
@@ -397,15 +418,15 @@ fn evaluate_directory_assessment(
         evidence.push(format!("packageDocs={package_doc_count}"));
         app_signals.push(format!("package_docs:{package_doc_count}"));
     }
-    if has_readme && has_src {
+    if profile.has_readme && profile.has_src {
         score += 30;
         strong_anchor = true;
         integrity_kind = "project".to_string();
         evidence.push("readme+src".to_string());
         app_signals.push("readme+src".to_string());
     }
-    if ((has_train && has_val) || (has_train && has_test) || (has_val && has_test))
-        || ((has_images || has_docs) && (has_labels || has_annotations))
+    if ((profile.has_train && profile.has_val) || (profile.has_train && profile.has_test) || (profile.has_val && profile.has_test))
+        || ((profile.has_images || profile.has_docs) && (profile.has_labels || profile.has_annotations))
     {
         score += 32;
         strong_anchor = true;
@@ -413,138 +434,109 @@ fn evaluate_directory_assessment(
         evidence.push("dataset_skeleton".to_string());
         app_signals.push("dataset_skeleton".to_string());
     }
-    if direct_exe_count > 0
-        && (direct_dll_count > 0
-            || has_resources
-            || has_bin
-            || has_lib
-            || direct_pak_count > 0
-            || direct_bin_payload_count > 0)
+    if profile.direct_exe_count > 0
+        && (profile.direct_dll_count > 0 || profile.has_resources || profile.has_bin
+            || profile.has_lib || profile.direct_pak_count > 0 || profile.direct_bin_payload_count > 0)
     {
         score += 36;
         strong_anchor = true;
         integrity_kind = "app_bundle".to_string();
         evidence.push("exe+companions".to_string());
-        app_signals.push(format!("exe:{direct_exe_count}"));
-    } else if direct_dll_count > 0
-        && (direct_json_count > 0
-            || direct_pck_count > 0
-            || direct_config_count > 0
-            || has_resources
-            || has_bin
-            || has_lib
-            || has_mods)
+        app_signals.push(format!("exe:{}", profile.direct_exe_count));
+    } else if profile.direct_dll_count > 0
+        && (profile.direct_json_count > 0 || profile.direct_pck_count > 0
+            || profile.direct_config_count > 0 || profile.has_resources
+            || profile.has_bin || profile.has_lib || profile.has_mods)
     {
         score += 30;
         strong_anchor = true;
         integrity_kind = "app_bundle".to_string();
         evidence.push("dll+config_bundle".to_string());
-        app_signals.push(format!("dll:{direct_dll_count}"));
-    } else if direct_dll_count > 0 {
+        app_signals.push(format!("dll:{}", profile.direct_dll_count));
+    } else if profile.direct_dll_count > 0 {
         score += 4;
         evidence.push("dll_weak_signal".to_string());
-        app_signals.push(format!("dll:{direct_dll_count}"));
+        app_signals.push(format!("dll:{}", profile.direct_dll_count));
     }
-    if direct_font_count >= 2 && direct_file_count <= 6 && direct_dir_count == 0 {
+    if profile.direct_font_count >= 2 && direct_file_count <= 6 && direct_dir_count == 0 {
         score += 45;
         strong_anchor = true;
         integrity_kind = "doc_bundle".to_string();
         evidence.push("font_pack".to_string());
         app_signals.push("font_pack".to_string());
     }
-    if direct_text_count >= 6 && document_collection_share >= 75 {
+    if profile.direct_text_count >= 6 && document_collection_share >= 75 {
         score += 30;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "doc_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "doc_bundle".to_string(); }
         evidence.push("document_bundle".to_string());
         app_signals.push("document_bundle".to_string());
-    } else if direct_archive_count > 0 && direct_text_count >= 3 {
+    } else if profile.direct_archive_count > 0 && profile.direct_text_count >= 3 {
         score += 18;
-        if integrity_kind == "mixed" {
-            integrity_kind = "doc_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "doc_bundle".to_string(); }
         evidence.push("archive+documents".to_string());
         app_signals.push("archive+documents".to_string());
     }
-    if (direct_image_count + direct_video_count + direct_audio_count) >= 3
+    if (profile.direct_image_count + profile.direct_video_count + profile.direct_audio_count) >= 3
         && !paired_sidecars.is_empty()
     {
         score += 22;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "media_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "media_bundle".to_string(); }
         evidence.push("media_sidecars".to_string());
         app_signals.push("media_sidecars".to_string());
     }
-    if metadata_marker_count > 0 && (direct_dir_count > 0 || direct_file_count >= 3) {
+    if profile.metadata_marker_count > 0 && (direct_dir_count > 0 || direct_file_count >= 3) {
         score += 22;
-        if integrity_kind == "mixed" {
-            integrity_kind = "export_backup_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "export_backup_bundle".to_string(); }
         evidence.push("metadata_markers".to_string());
         app_signals.push("metadata_markers".to_string());
     }
-    if direct_exe_count >= 1
-        && package_doc_count > 0
-        && direct_file_count <= 6
-        && direct_dir_count == 0
-        && direct_dll_count == 0
-        && direct_archive_count == 0
+    if profile.direct_exe_count >= 1 && package_doc_count > 0 && direct_file_count <= 6
+        && direct_dir_count == 0 && profile.direct_dll_count == 0 && profile.direct_archive_count == 0
     {
         score += 30;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "app_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "app_bundle".to_string(); }
         evidence.push("installer_with_docs".to_string());
         app_signals.push(format!("installer_docs:{package_doc_count}"));
     }
     if document_collection_layout {
         score += 14;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "doc_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "doc_bundle".to_string(); }
         evidence.push("document_collection_layout".to_string());
-        app_signals.push(format!("document_files:{}", direct_text_count));
+        app_signals.push(format!("document_files:{}", profile.direct_text_count));
     }
-    if direct_cursor_count >= 8
-        && (direct_image_count > 0 || direct_text_count > 0 || direct_inf_count > 0)
+    if profile.direct_cursor_count >= 8
+        && (profile.direct_image_count > 0 || profile.direct_text_count > 0 || profile.direct_inf_count > 0)
     {
         score += 34;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "theme_pack".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "theme_pack".to_string(); }
         evidence.push("cursor_theme_pack".to_string());
-        app_signals.push(format!("cursor_files:{direct_cursor_count}"));
-        if direct_inf_count > 0 {
+        app_signals.push(format!("cursor_files:{}", profile.direct_cursor_count));
+        if profile.direct_inf_count > 0 {
             evidence.push("install_manifest_present".to_string());
         }
     }
     if multi_variant_app_bundle {
         score += 42;
         strong_anchor = true;
-        if integrity_kind == "mixed" {
-            integrity_kind = "app_bundle".to_string();
-        }
+        if integrity_kind == "mixed" { integrity_kind = "app_bundle".to_string(); }
         evidence.push("multi_variant_app_bundle".to_string());
         app_signals.push(format!("root_named_binaries:{root_named_binary_count}"));
         if package_doc_count > 0 {
             evidence.push("package_docs_present".to_string());
         }
-    } else if package_doc_count > 0
-        && root_named_file_count >= 1
-        && (direct_exe_count > 0 || direct_dll_count > 0 || direct_archive_count > 0)
+    } else if package_doc_count > 0 && root_named_file_count >= 1
+        && (profile.direct_exe_count > 0 || profile.direct_dll_count > 0 || profile.direct_archive_count > 0)
         && direct_file_count <= 12
     {
         score += 20;
         strong_anchor = true;
         if integrity_kind == "mixed" {
-            integrity_kind = if direct_exe_count > 0 || direct_dll_count > 0 {
+            integrity_kind = if profile.direct_exe_count > 0 || profile.direct_dll_count > 0 {
                 "app_bundle".to_string()
             } else {
                 "doc_bundle".to_string()
@@ -564,12 +556,11 @@ fn evaluate_directory_assessment(
         score += 10;
         evidence.push("dominantExtension".to_string());
     }
-    if direct_file_count >= 2
-        && direct_file_count <= 5
-        && ((direct_exe_count == 1 && (direct_bin_payload_count > 0 || direct_dll_count > 0))
-            || (direct_dll_count > 0
-                && (direct_json_count > 0 || direct_pck_count > 0 || direct_config_count > 0))
-            || (direct_font_count >= 2 && direct_dir_count == 0))
+    if direct_file_count >= 2 && direct_file_count <= 5
+        && ((profile.direct_exe_count == 1 && (profile.direct_bin_payload_count > 0 || profile.direct_dll_count > 0))
+            || (profile.direct_dll_count > 0
+                && (profile.direct_json_count > 0 || profile.direct_pck_count > 0 || profile.direct_config_count > 0))
+            || (profile.direct_font_count >= 2 && direct_dir_count == 0))
     {
         score += 15;
         evidence.push("small_strong_bundle".to_string());
@@ -581,39 +572,28 @@ fn evaluate_directory_assessment(
 
     let app_bundle_layout = strong_anchor
         && integrity_kind == "app_bundle"
-        && direct_exe_count > 0
-        && (direct_dll_count > 0
-            || has_resources
-            || has_bin
-            || has_lib
-            || direct_pak_count > 0
-            || direct_bin_payload_count > 0);
+        && profile.direct_exe_count > 0
+        && (profile.direct_dll_count > 0 || profile.has_resources || profile.has_bin
+            || profile.has_lib || profile.direct_pak_count > 0 || profile.direct_bin_payload_count > 0);
     if app_bundle_layout {
         score += 8;
         evidence.push("app_layout_bundle".to_string());
     }
 
-    if direct_dir_count >= 3
-        && direct_file_count >= 6
-        && direct_family_counts.len() >= 4
-        && !strong_anchor
+    if direct_dir_count >= 3 && direct_file_count >= 6
+        && profile.direct_family_counts.len() >= 4 && !strong_anchor
     {
         score -= 25;
         fragmentation_warnings.push("heterogeneous_top_level".to_string());
     }
-    if file_count >= 6
-        && dominant_share < 0.45
-        && ext_counts.len() >= 5
-        && !app_bundle_layout
-        && !multi_variant_app_bundle
+    if subtree.file_count >= 6 && dominant_share < 0.45
+        && subtree.ext_counts.len() >= 5 && !app_bundle_layout && !multi_variant_app_bundle
     {
         score -= 18;
         fragmentation_warnings.push("low_content_cohesion".to_string());
     }
-    if max_family_count <= 1
-        && direct_file_count >= 8
-        && !app_bundle_layout
-        && !document_collection_layout
+    if max_family_count <= 1 && direct_file_count >= 8
+        && !app_bundle_layout && !document_collection_layout
     {
         score -= 12;
         fragmentation_warnings.push("weak_name_families".to_string());
@@ -632,19 +612,12 @@ fn evaluate_directory_assessment(
 
     let integrity_score = score.clamp(0, 100) as u8;
     let explicit_split = (!strong_anchor
-        && direct_dir_count >= 3
-        && direct_file_count >= 6
-        && direct_family_counts.len() >= 4)
-        || (!strong_anchor
-            && file_count >= 6
-            && dominant_share < 0.45
-            && ext_counts.len() >= 5
-            && direct_family_counts.len() >= 4)
+        && direct_dir_count >= 3 && direct_file_count >= 6 && profile.direct_family_counts.len() >= 4)
+        || (!strong_anchor && subtree.file_count >= 6 && dominant_share < 0.45
+            && subtree.ext_counts.len() >= 5 && profile.direct_family_counts.len() >= 4)
         || dll_only_directory
-        || (integrity_kind == "mixed"
-            && direct_dir_count >= 2
-            && direct_file_count >= 6
-            && direct_family_counts.len() >= 4);
+        || (integrity_kind == "mixed" && direct_dir_count >= 2
+            && direct_file_count >= 6 && profile.direct_family_counts.len() >= 4);
     let result_kind = if wrapper_target_path.is_some() {
         DirectoryResultKind::WholeWrapperPassthrough
     } else if staging_junk {
@@ -655,24 +628,58 @@ fn evaluate_directory_assessment(
         DirectoryResultKind::Whole
     };
 
-    Some(DirectoryAssessment {
+    DirectoryAssessment {
         result_kind,
         integrity_score,
         integrity_kind,
         evidence,
-        wrapper_target_path,
-        top_level_entries,
+        top_level_entries: profile.top_level_entries.clone(),
         dominant_extensions,
         name_families,
         paired_sidecars,
         fragmentation_warnings,
         naming_cohesion,
+        total_size: subtree.total_size,
+        file_count: subtree.file_count,
+        dir_count: subtree.dir_count,
+        direct_file_count,
+        direct_dir_count,
+        max_depth: subtree.max_depth,
+    }
+}
+
+/// Backward-compatible wrapper: scans the directory and computes assessment using WalkDir.
+#[cfg(test)]
+fn evaluate_directory_assessment(
+    path: &Path,
+    excluded: &[String],
+    stop: &AtomicBool,
+    prefer_whole: bool,
+    report: &mut CollectionReport,
+) -> Option<DirectoryAssessment> {
+    let scan = match scan_directory_entries(path, excluded, stop) {
+        Some(scan) => scan,
+        None => {
+            report.read_dir_errors = report.read_dir_errors.saturating_add(1);
+            return None;
+        }
+    };
+
+    let (total_size, file_count, dir_count, ext_counts, max_depth) =
+        summarize_directory_tree(path, excluded, stop, report);
+
+    let subtree = SubtreeStats {
         total_size,
         file_count,
         dir_count,
-        direct_file_count,
-        direct_dir_count,
+        ext_counts,
         max_depth,
-    })
-}
+    };
 
+    let dir_name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .unwrap_or("");
+
+    Some(compute_assessment(&scan.profile, &subtree, dir_name, prefer_whole))
+}

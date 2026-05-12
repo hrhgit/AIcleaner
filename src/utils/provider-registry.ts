@@ -1,59 +1,62 @@
-import type { ProviderModelOption } from '../types';
+import type { ProviderModelOption, ProviderRow } from '../types';
+
+export type ProviderApiFormat = 'openai' | 'anthropic';
+
+export type ProviderTemplate = {
+  id: string;
+  label: string;
+  defaultApiFormat: ProviderApiFormat;
+  endpoints: Partial<Record<ProviderApiFormat, string>>;
+};
 
 export const DEFAULT_PROVIDER_ENDPOINT = 'https://api.openai.com/v1';
-export const DEFAULT_PROVIDER_MODEL = 'gpt-4o-mini';
 
-export const PROVIDER_OPTIONS = [
-  { value: 'https://api.deepseek.com', label: 'DeepSeek' },
-  { value: 'https://api.openai.com/v1', label: 'OpenAI' },
-  { value: 'https://generativelanguage.googleapis.com/v1beta/openai/', label: 'Google Gemini' },
-  { value: 'https://dashscope.aliyuncs.com/compatible-mode/v1', label: 'Qwen (DashScope)' },
-  { value: 'https://open.bigmodel.cn/api/paas/v4', label: 'GLM (BigModel)' },
-  { value: 'https://api.moonshot.cn/v1', label: 'Kimi (Moonshot)' },
-  { value: 'https://api.minimax.io/anthropic/v1', label: 'MiniMax (Anthropic)' },
+export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://api.deepseek.com' },
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://api.openai.com/v1' },
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  },
+  {
+    id: 'qwen',
+    label: 'Qwen (DashScope)',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  },
+  {
+    id: 'glm',
+    label: 'GLM (BigModel)',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://open.bigmodel.cn/api/paas/v4' },
+  },
+  {
+    id: 'kimi',
+    label: 'Kimi (Moonshot)',
+    defaultApiFormat: 'openai',
+    endpoints: { openai: 'https://api.moonshot.cn/v1' },
+  },
+  {
+    id: 'minimax',
+    label: 'MiniMax',
+    defaultApiFormat: 'anthropic',
+    endpoints: { anthropic: 'https://api.minimax.io/anthropic/v1' },
+  },
 ] as const;
 
-export const PROVIDER_MODELS: Record<string, ProviderModelOption[]> = {
-  'https://api.openai.com/v1': [
-    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
-    { value: 'gpt-4o', label: 'gpt-4o' },
-    { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
-  ],
-  'https://api.deepseek.com': [
-    { value: 'deepseek-chat', label: 'deepseek-chat' },
-    { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
-  ],
-  'https://dashscope.aliyuncs.com/compatible-mode/v1': [
-    { value: 'qwen-plus', label: 'qwen-plus' },
-    { value: 'qwen-turbo', label: 'qwen-turbo' },
-    { value: 'qwen-max', label: 'qwen-max' },
-  ],
-  'https://open.bigmodel.cn/api/paas/v4': [
-    { value: 'glm-4-flash', label: 'glm-4-flash' },
-    { value: 'glm-4', label: 'glm-4' },
-  ],
-  'https://api.moonshot.cn/v1': [
-    { value: 'moonshot-v1-8k', label: 'moonshot-v1-8k' },
-    { value: 'moonshot-v1-32k', label: 'moonshot-v1-32k' },
-  ],
-  'https://generativelanguage.googleapis.com/v1beta/openai/': [
-    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
-    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
-    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
-    { value: 'gemini-1.5-pro', label: 'gemini-1.5-pro' },
-  ],
-  'https://api.minimax.io/anthropic/v1': [
-    { value: 'MiniMax-M2.7', label: 'MiniMax-M2.7' },
-    { value: 'MiniMax-M2.7-High-Speed', label: 'MiniMax-M2.7-High-Speed' },
-    { value: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
-    { value: 'MiniMax-M2.5-High-Speed', label: 'MiniMax-M2.5-High-Speed' },
-    { value: 'MiniMax-M2.1', label: 'MiniMax-M2.1' },
-    { value: 'MiniMax-M2.1-High-Speed', label: 'MiniMax-M2.1-High-Speed' },
-    { value: 'MiniMax-M2', label: 'MiniMax-M2' },
-    { value: 'MiniMax-M1-80k', label: 'MiniMax-M1-80k' },
-    { value: 'MiniMax-Text-01', label: 'MiniMax-Text-01' },
-  ],
-};
+export const PROVIDER_NAME_OPTIONS = PROVIDER_TEMPLATES.map((template) => template.label);
 
 export function normalizeRemoteModels(models: Array<{ value?: string; label?: string }> = []): ProviderModelOption[] {
   const seen = new Set<string>();
@@ -67,17 +70,101 @@ export function normalizeRemoteModels(models: Array<{ value?: string; label?: st
   return normalized;
 }
 
-export function fallbackModelsByEndpoint(endpoint: string): ProviderModelOption[] {
-  return normalizeRemoteModels(
-    PROVIDER_MODELS[String(endpoint || '').trim()] || [{ value: DEFAULT_PROVIDER_MODEL, label: DEFAULT_PROVIDER_MODEL }],
-  );
+export function normalizeProviderApiFormat(value: string | null | undefined): ProviderApiFormat {
+  return String(value || '').trim().toLowerCase() === 'anthropic' ? 'anthropic' : 'openai';
 }
 
-export function defaultModelByEndpoint(endpoint: string): string {
-  return fallbackModelsByEndpoint(endpoint)[0]?.value || DEFAULT_PROVIDER_MODEL;
+export function normalizeThinkingLevel(value: string | null | undefined): 'low' | 'medium' | 'high' {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'low' || normalized === 'high') return normalized;
+  return 'medium';
+}
+
+export function normalizeProviderEndpoint(endpoint: string, apiFormat: ProviderApiFormat): string {
+  const raw = String(endpoint || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (apiFormat === 'openai') {
+      if (segments.at(-2) === 'chat' && segments.at(-1) === 'completions') {
+        segments.splice(-2, 2);
+      }
+    } else {
+      if (segments.at(-1) === 'messages') segments.pop();
+      if (segments.at(-1) !== 'v1') segments.push('v1');
+    }
+    url.pathname = segments.length ? `/${segments.join('/')}` : '/';
+    url.search = '';
+    url.hash = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return raw.replace(/\/$/, '');
+  }
+}
+
+export function getProviderTemplateFormats(template: ProviderTemplate): ProviderApiFormat[] {
+  const formats: ProviderApiFormat[] = [];
+  if (template.endpoints.openai) formats.push('openai');
+  if (template.endpoints.anthropic) formats.push('anthropic');
+  return formats.length ? formats : [template.defaultApiFormat];
+}
+
+export function getProviderTemplateEndpoint(
+  template: ProviderTemplate,
+  apiFormat: ProviderApiFormat,
+): string {
+  return template.endpoints[apiFormat] || template.endpoints[template.defaultApiFormat] || '';
+}
+
+export function findProviderTemplateByName(name: string): ProviderTemplate | undefined {
+  const normalizedName = String(name || '').trim().toLowerCase();
+  if (!normalizedName) return undefined;
+  return PROVIDER_TEMPLATES.find((template) => template.label.toLowerCase() === normalizedName);
+}
+
+export function findProviderTemplateByEndpoint(endpoint: string): ProviderTemplate | undefined {
+  const normalizedEndpoint = String(endpoint || '').trim().replace(/\/$/, '');
+  if (!normalizedEndpoint) return undefined;
+  return PROVIDER_TEMPLATES.find((template) => (
+    Object.values(template.endpoints).some((candidate) => candidate === normalizedEndpoint)
+  ));
+}
+
+export function inferProviderTemplate(name: string, endpoint: string): ProviderTemplate | undefined {
+  return findProviderTemplateByName(name) || findProviderTemplateByEndpoint(endpoint);
 }
 
 export function getProviderLabel(endpoint: string): string {
-  return PROVIDER_OPTIONS.find((item) => item.value === endpoint)?.label || String(endpoint || '').trim() || 'N/A';
+  return findProviderTemplateByEndpoint(endpoint)?.label || String(endpoint || '').trim() || 'N/A';
 }
 
+export function buildProviderDisplayName(endpoint: string): string {
+  const normalized = String(endpoint || '').trim();
+  if (!normalized) return 'Custom Provider';
+  const template = findProviderTemplateByEndpoint(normalized);
+  if (template) return template.label;
+  try {
+    const url = new URL(normalized);
+    const host = url.hostname.replace(/^api\./, '').replace(/^www\./, '');
+    const path = url.pathname.split('/').filter(Boolean).slice(0, 2).join(' / ');
+    return path ? `${host} (${path})` : host;
+  } catch {
+    return normalized;
+  }
+}
+
+export function createCustomProviderRow(id: number): ProviderRow {
+  return {
+    id: `custom-${id}`,
+    name: '',
+    endpoint: '',
+    apiKey: '',
+    apiFormat: 'openai',
+    model: '',
+    thinkingEnabled: false,
+    thinkingLevel: 'medium',
+    preset: false,
+    modelLoaded: false,
+  };
+}

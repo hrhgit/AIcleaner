@@ -52,3 +52,22 @@ export async function ensureRequiredCredentialsConfigured({
   throw new Error(reasonText || t('settings.api_key_managed_hint'));
 }
 
+export async function ensureDefaultProviderModelConfigured(reasonText = ''): Promise<void> {
+  const settings = await getSettings({ force: true });
+  const defaultProviderEndpoint = String(settings.defaultProviderEndpoint || '').trim();
+  const defaultConfig = defaultProviderEndpoint
+    ? settings.providerConfigs?.[defaultProviderEndpoint]
+    : undefined;
+  const model = String(defaultConfig?.model || '').trim();
+  if (model) return;
+
+  window.dispatchEvent(new CustomEvent('open-provider-manager-requested', {
+    detail: {
+      reasonText: reasonText || t('settings.model_required_hint'),
+      missingProviderEndpoints: [],
+      requireSearchApi: false,
+    },
+  }));
+
+  throw new Error(reasonText || t('settings.model_required_hint'));
+}

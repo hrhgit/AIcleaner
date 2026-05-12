@@ -87,7 +87,19 @@ pub async fn advisor_session_start(
     state: State<'_, AppState>,
     input: AdvisorSessionStartInput,
 ) -> Result<Value, String> {
-    SessionBootstrap::new(state.inner()).start(input).await
+    let payload = SessionBootstrap::new(state.inner()).start(input).await?;
+    let session_id = payload["sessionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if !session_id.is_empty() {
+        ConversationOrchestrator::new(state.inner())
+            .run_bootstrap_turn(&session_id)
+            .await?;
+        let session = load_session(state.inner(), &session_id)?;
+        return payload::build_session_payload(state.inner(), &session);
+    }
+    Ok(payload)
 }
 
 pub async fn advisor_session_get(

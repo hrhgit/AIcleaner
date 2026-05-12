@@ -1,7 +1,7 @@
 use super::llm::AdvisorLlm;
 use super::types::{local_text, now_iso, WORKFLOW_UNDERSTAND};
 use crate::agent_runtime::{
-    AgentCompletion, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop, AgentTurnSpec,
+    AgentCompletion, AgentLlmError, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop, AgentTurnSpec,
     ToolCallErrorOutcome, ToolCallOutcome,
 };
 use crate::backend::AppState;
@@ -9,6 +9,7 @@ use crate::llm_protocol::ParsedToolCall;
 use crate::llm_tools::{ToolExecutionContext, ToolId, ToolRegistry, ToolResult, ToolWorkflow};
 use crate::persist;
 use serde_json::{json, Value};
+use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_AGENT_STEPS: usize = 8;
@@ -42,6 +43,13 @@ impl<'a> AdvisorAgentRunner<'a> {
         self.run_turn(session, Some(message)).await
     }
 
+    pub(super) async fn run_bootstrap_turn(
+        &self,
+        session: &mut Value,
+    ) -> Result<AgentTurnResult, String> {
+        self.run_turn(session, None).await
+    }
+
     async fn run_turn(
         &self,
         session: &mut Value,
@@ -52,7 +60,10 @@ impl<'a> AdvisorAgentRunner<'a> {
             .and_then(Value::as_str)
             .unwrap_or("zh")
             .to_string();
-        let bootstrap_turn = user_message.is_none();
+        let bootstrap_turn = user_message.is_none()
+            || session
+                .pointer("/sessionMeta/lastAgentTrace")
+                .map_or(true, |v| v.is_null());
         let session_id = session
             .get("sessionId")
             .and_then(Value::as_str)
@@ -99,6 +110,7 @@ impl<'a> AdvisorAgentRunner<'a> {
             "你会收到本会话完整 transcript，包含历史用户消息、顾问回复、工具调用和工具结果；必须把它作为连续对话上下文。".to_string(),
             "不要假设上一轮自然语言方案会被压缩成额外状态；确认、继续、执行等短指令应优先回看完整 transcript。".to_string(),
             "需要当前目录、筛选、预览或执行证据时，继续通过工具读取或操作。".to_string(),
+            "文件操作必须遵循工作流：find_files 筛选候选集 → execute_plan 执行。每一步由运行时强制，跳步会返回 blocked 提示。".to_string(),
             "当 session 记忆和 global 记忆冲突时，以 session 为准。".to_string(),
             "高风险动作不确定时先澄清，不要直接执行。".to_string(),
             format!("最终自然语言回复必须使用 {language_name}。"),
@@ -142,7 +154,7 @@ impl<'a> AdvisorAgentRunner<'a> {
             append_turn_messages(&mut messages, &turn);
         }
 
-        if messages.len() == 1 {
+        if messages.len() == 1 || (bootstrap_turn && user_message.is_none()) {
             messages.push(json!({
                 "role": "user",
                 "content": user_message
@@ -440,18 +452,18 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
         completion: AgentCompletion,
         trace: &AgentLoopTrace,
     ) -> Result<AgentTurnResult, String> {
-        let reply = if self.bootstrap_turn {
-            normalize_bootstrap_reply(&completion.assistant_text)
-        } else {
-            completion.assistant_text.trim().to_string()
-        };
+        let reply = completion.assistant_text.trim().to_string();
         if reply.is_empty() {
-            return Err(local_text(
-                &self.lang,
-                "顾问返回了空回复，请重试。",
-                "The advisor returned an empty reply. Please try again.",
-            )
-            .to_string());
+            return Ok(AgentTurnResult {
+                reply: local_text(
+                    &self.lang,
+                    "顾问返回了空回复，请重试。",
+                    "The advisor returned an empty reply. Please try again.",
+                )
+                .to_string(),
+                cards: std::mem::take(&mut self.cards),
+                trace: trace.as_json(),
+            });
         }
         Ok(AgentTurnResult {
             reply,
@@ -521,29 +533,146 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
         Ok(ToolCallErrorOutcome::Continue { message })
     }
 
-    fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<AgentTurnResult, String> {
-        Err(local_text(
-            &self.lang,
-            "顾问在当前轮次内没有收敛，请重试。",
-            "The advisor did not converge within this turn. Please try again.",
-        )
-        .to_string())
+    fn on_loop_exhausted(&mut self, trace: &AgentLoopTrace) -> Result<AgentTurnResult, String> {
+        Ok(AgentTurnResult {
+            reply: local_text(
+                &self.lang,
+                "顾问在当前轮次内没有收敛，请重试。",
+                "The advisor did not converge within this turn. Please try again.",
+            )
+            .to_string(),
+            cards: std::mem::take(&mut self.cards),
+            trace: trace.as_json(),
+        })
+    }
+
+    fn on_model_error(
+        &mut self,
+        step: usize,
+        err: AgentLlmError,
+        _trace: &AgentLoopTrace,
+    ) -> Result<Option<AgentTurnResult>, String> {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "error",
+            "advisor",
+            "advisor_turn_model_error",
+            None,
+            "advisor model error during turn loop",
+            json!({
+                "sessionId": self.session_id,
+                "step": step,
+            }),
+            Some(json!({ "message": err.message })),
+            None,
+        );
+        Ok(None)
+    }
+
+    fn on_loop_started(&mut self, step_count: usize, messages_count: usize) {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_turn_loop_started",
+            None,
+            "advisor turn loop started",
+            json!({
+                "sessionId": self.session_id,
+                "maxSteps": step_count,
+                "initialMessages": messages_count,
+                "bootstrapTurn": self.bootstrap_turn,
+            }),
+            None,
+            None,
+        );
+    }
+
+    fn on_step_started(&mut self, step: usize, message_count: usize, tool_count: usize) {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_turn_step_started",
+            None,
+            "advisor turn step started",
+            json!({
+                "sessionId": self.session_id,
+                "step": step,
+                "messageCount": message_count,
+                "toolCount": tool_count,
+            }),
+            None,
+            None,
+        );
+    }
+
+    fn on_tool_dispatched(
+        &mut self,
+        step: usize,
+        tool_name: &str,
+        call_id: &str,
+        duration_ms: u64,
+    ) {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_tool_dispatched",
+            None,
+            "advisor tool dispatched",
+            json!({
+                "sessionId": self.session_id,
+                "step": step,
+                "tool": tool_name,
+                "toolCallId": call_id,
+                "durationMs": duration_ms,
+            }),
+            None,
+            None,
+        );
+    }
+
+    fn on_loop_completed(
+        &mut self,
+        total_duration: Duration,
+        steps: usize,
+        _trace: &AgentLoopTrace,
+    ) {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "info",
+            "advisor",
+            "advisor_turn_loop_completed",
+            None,
+            "advisor turn loop completed",
+            json!({
+                "sessionId": self.session_id,
+                "totalDurationMs": total_duration.as_millis() as u64,
+                "steps": steps,
+            }),
+            None,
+            Some(total_duration),
+        );
+    }
+
+    fn on_loop_exhausted_early_exit(&mut self, _trace: &AgentLoopTrace) {
+        crate::diagnostics::record_state_event(
+            self.state,
+            "warn",
+            "advisor",
+            "advisor_turn_loop_exhausted",
+            None,
+            "advisor turn loop exhausted without completion",
+            json!({
+                "sessionId": self.session_id,
+            }),
+            None,
+            None,
+        );
     }
 }
 
-fn normalize_bootstrap_reply(reply: &str) -> String {
-    let lines = reply
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(4)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        reply.trim().to_string()
-    } else {
-        lines.join("\n")
-    }
-}
 
 pub(super) fn materialize_card(session_id: &str, turn_id: &str, card: &Value) -> Value {
     json!({

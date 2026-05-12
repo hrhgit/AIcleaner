@@ -1,3 +1,12 @@
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderRouteConfig {
+    pub endpoint: String,
+    pub model: String,
+    pub api_format: ApiFormat,
+    pub thinking_enabled: bool,
+    pub thinking_level: String,
+}
+
 fn apply_credentials_meta(
     settings: &mut Value,
     provider_meta: &HashMap<String, bool>,
@@ -42,27 +51,79 @@ fn collect_provider_endpoints(settings: &Value) -> Vec<String> {
     endpoints
 }
 
+fn build_credentials_status_from_meta(settings: &Value) -> Value {
+    let endpoints = collect_provider_endpoints(settings);
+    let saved_provider_meta = settings
+        .get("credentialsMeta")
+        .and_then(|meta| meta.get("providers"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut provider_meta = HashMap::new();
+    for endpoint in endpoints {
+        let saved = saved_provider_meta
+            .get(&endpoint)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        provider_meta.insert(
+            endpoint.clone(),
+            saved || legacy_provider_api_key_from_settings(settings, &endpoint).is_some(),
+        );
+    }
+    let saved_search_has_key = settings
+        .get("credentialsMeta")
+        .and_then(|meta| meta.get("searchApi"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    json!({
+        "providerHasApiKey": provider_meta,
+        "searchApiHasKey": saved_search_has_key
+            || legacy_search_api_key_from_settings(settings).is_some()
+    })
+}
+
 fn build_credentials_status_value(state: &AppState, settings: &Value) -> Value {
     let endpoints = collect_provider_endpoints(settings);
-    let mut accounts = endpoints
-        .iter()
-        .map(|endpoint| provider_secret_key(endpoint))
-        .collect::<Vec<_>>();
+    let mut accounts = Vec::new();
+    let mut endpoint_accounts = Vec::new();
+    for endpoint in &endpoints {
+        let api_format = settings
+            .get("providerConfigs")
+            .and_then(|configs| configs.get(endpoint))
+            .and_then(|config| config.get("apiFormat"))
+            .and_then(Value::as_str)
+            .map(|raw| normalize_provider_api_format(endpoint, Some(raw)))
+            .unwrap_or_else(|| normalize_provider_api_format(endpoint, None));
+        let aliases = provider_secret_key_aliases(endpoint, api_format);
+        for alias in &aliases {
+            if !accounts.contains(alias) {
+                accounts.push(alias.clone());
+            }
+        }
+        endpoint_accounts.push((endpoint.clone(), aliases));
+    }
     accounts.push(SEARCH_SECRET_KEY.to_string());
     let values = state
         .credential_store
         .get_many(&accounts)
+        .inspect_err(|err| {
+            log::warn!(
+                "Failed to read credential store in status builder ({} accounts): {err}",
+                accounts.len()
+            );
+        })
         .unwrap_or_default();
     let mut provider_meta = HashMap::new();
-    for endpoint in endpoints {
-        let account = provider_secret_key(&endpoint);
-        provider_meta.insert(
-            endpoint.clone(),
+    for (endpoint, aliases) in endpoint_accounts {
+        let has_value = aliases.iter().any(|account| {
             values
-                .get(&account)
+                .get(account)
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false)
-                || legacy_provider_api_key_from_settings(settings, &endpoint).is_some(),
+        });
+        provider_meta.insert(
+            endpoint.clone(),
+            has_value || legacy_provider_api_key_from_settings(settings, &endpoint).is_some(),
         );
     }
     json!({
@@ -89,7 +150,7 @@ fn redact_settings_for_client(state: &AppState, raw_settings: &Value) -> Value {
         );
         obj.insert(
             "credentialsStatus".to_string(),
-            build_credentials_status_value(state, raw_settings),
+            build_credentials_status_from_meta(raw_settings),
         );
     }
     sanitized
@@ -142,8 +203,13 @@ pub(crate) fn resolve_provider_endpoint_and_model(
     state: &AppState,
     endpoint_hint: Option<&str>,
     model_hint: Option<&str>,
-) -> (String, String) {
+) -> ProviderRouteConfig {
     let settings = read_settings(&state.settings_path());
+    let provider_configs = settings
+        .get("providerConfigs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let endpoint = endpoint_hint
         .unwrap_or("")
         .trim()
@@ -157,10 +223,9 @@ pub(crate) fn resolve_provider_endpoint_and_model(
                 .to_string()
         })
         .if_empty_then(|| {
-            settings
-                .get("providerConfigs")
-                .and_then(Value::as_object)
-                .and_then(|configs| configs.iter().next())
+            provider_configs
+                .iter()
+                .next()
                 .map(|(key, config)| {
                     config
                         .get("endpoint")
@@ -172,50 +237,71 @@ pub(crate) fn resolve_provider_endpoint_and_model(
                 .unwrap_or_default()
         })
         .if_empty_then(|| "https://api.openai.com/v1".to_string());
+
+    let provider = provider_configs.get(&endpoint);
+    let api_format = normalize_provider_api_format(
+        &endpoint,
+        provider
+            .and_then(|config| config.get("apiFormat"))
+            .and_then(Value::as_str),
+    );
     let model = model_hint
         .unwrap_or("")
         .trim()
         .to_string()
         .if_empty_then(|| {
-            settings
-                .get("providerConfigs")
-                .and_then(|v| v.get(&endpoint))
-                .and_then(|v| v.get("model"))
+            provider
+                .and_then(|config| config.get("model"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
                 .to_string()
-        })
-        .if_empty_then(|| {
-            settings
-                .get("providerConfigs")
-                .and_then(|v| {
-                    v.get(
-                        settings
-                            .get("defaultProviderEndpoint")
-                            .and_then(Value::as_str)
-                            .unwrap_or(""),
-                    )
-                })
-                .and_then(|v| v.get("model"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        })
-        .if_empty_then(|| default_model_for_endpoint(&endpoint).to_string());
-    (endpoint, model)
+        });
+    let thinking_enabled = provider
+        .and_then(|config| config.get("thinking"))
+        .and_then(|thinking| thinking.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let thinking_level = normalize_provider_thinking_level(
+        provider
+            .and_then(|config| config.get("thinking"))
+            .and_then(|thinking| thinking.get("level"))
+            .and_then(Value::as_str),
+    )
+    .to_string();
+
+    ProviderRouteConfig {
+        endpoint,
+        model,
+        api_format,
+        thinking_enabled,
+        thinking_level,
+    }
+}
+
+pub(crate) fn validate_default_provider_ready(state: &AppState) -> Result<ProviderRouteConfig, String> {
+    let route = resolve_provider_endpoint_and_model(state, None, None);
+    if route.model.trim().is_empty() {
+        return Err(
+            "Default provider model is empty. Please open Provider API and select or enter a model."
+                .to_string(),
+        );
+    }
+    Ok(route)
 }
 
 pub(crate) fn resolve_provider_api_key(state: &AppState, endpoint: &str) -> Result<String, String> {
-    if let Some(api_key) = state
-        .credential_store
-        .get(&provider_secret_key(endpoint))?
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(api_key);
+    let route = resolve_provider_endpoint_and_model(state, Some(endpoint), None);
+    for account in provider_secret_key_aliases(&route.endpoint, route.api_format) {
+        if let Some(api_key) = state
+            .credential_store
+            .get(&account)?
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(api_key);
+        }
     }
-    legacy_provider_api_key_from_settings(&read_settings(&state.settings_path()), endpoint)
+    legacy_provider_api_key_from_settings(&read_settings(&state.settings_path()), &route.endpoint)
         .ok_or_else(|| "Credential not found.".to_string())
 }
 
@@ -230,4 +316,3 @@ pub(crate) fn resolve_search_api_key(state: &AppState) -> Result<String, String>
     legacy_search_api_key_from_settings(&read_settings(&state.settings_path()))
         .ok_or_else(|| "Credential not found.".to_string())
 }
-

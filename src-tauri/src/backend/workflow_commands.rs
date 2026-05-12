@@ -18,13 +18,24 @@ fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let (resolved_endpoint, resolved_model) =
-                resolve_provider_endpoint_and_model(state, Some(&endpoint), Some(&model));
-            let api_key = resolve_provider_api_key(state, &resolved_endpoint).unwrap_or_default();
+            let route = resolve_provider_endpoint_and_model(state, Some(&endpoint), Some(&model));
+            let api_key = resolve_provider_api_key(state, &route.endpoint).unwrap_or_default();
             if let Some(map) = entry.as_object_mut() {
-                map.insert("endpoint".to_string(), Value::String(resolved_endpoint));
-                map.insert("model".to_string(), Value::String(resolved_model));
+                map.insert("endpoint".to_string(), Value::String(route.endpoint));
+                map.insert("model".to_string(), Value::String(route.model));
                 map.insert("apiKey".to_string(), Value::String(api_key));
+                map.insert(
+                    "apiFormat".to_string(),
+                    Value::String(route.api_format.as_str().to_string()),
+                );
+                map.insert(
+                    "thinkingEnabled".to_string(),
+                    Value::Bool(route.thinking_enabled),
+                );
+                map.insert(
+                    "thinkingLevel".to_string(),
+                    Value::String(route.thinking_level),
+                );
             }
         }
     }
@@ -76,6 +87,7 @@ pub async fn organize_start<R: Runtime>(
         "organize_start",
         details.clone(),
     );
+    crate::backend::validate_default_provider_ready(state.inner())?;
     input.model_routing = hydrate_model_routing_with_secrets(state.inner(), &input.model_routing);
     if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
         input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
@@ -239,6 +251,7 @@ pub async fn advisor_session_start(
         "advisor_session_start",
         details.clone(),
     );
+    crate::backend::validate_default_provider_ready(state.inner())?;
     let result = crate::advisor_runtime::advisor_session_start(state, input).await;
     command_log_finish(
         &state_for_log,

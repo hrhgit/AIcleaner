@@ -105,9 +105,13 @@ export async function browseFolder(): Promise<BrowseFolderResult> {
   return call('settings_browse_folder');
 }
 
-export async function getProviderModels(endpoint: string, apiKey?: string): Promise<{ models?: Array<{ value?: string; label?: string }> }> {
+export async function getProviderModels(
+  endpoint: string,
+  apiFormat: 'openai' | 'anthropic',
+  apiKey?: string,
+): Promise<{ models?: Array<{ value?: string; label?: string }> }> {
   return call('settings_get_provider_models', {
-    data: apiKey == null ? { endpoint } : { endpoint, apiKey },
+    data: apiKey == null ? { endpoint, apiFormat } : { endpoint, apiFormat, apiKey },
   });
 }
 
@@ -192,4 +196,14 @@ export async function advisorCardAction(params: {
   payload?: unknown;
 }): Promise<AdvisorSessionData> {
   return call('advisor_card_action', { input: params });
+}
+
+export async function logFrontendEvent(params: {
+  level?: string;
+  module?: string;
+  event: string;
+  message?: string;
+  details?: Record<string, unknown>;
+}): Promise<void> {
+  await call('frontend_log_event', { data: params });
 }

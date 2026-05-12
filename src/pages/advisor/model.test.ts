@@ -77,7 +77,7 @@ describe('advisor workflow model', () => {
         indeterminate: false,
       },
       tree: { children: [] },
-      results: [{ index: 1, name: 'a.txt', categoryPath: ['Docs'] }],
+      displayResults: [{ index: 1, name: 'a.txt', categoryPath: ['Docs'] }],
     });
 
     expect(snapshot).toMatchObject({
@@ -92,7 +92,77 @@ describe('advisor workflow model', () => {
       webSearchEnabled: false,
     });
     expect(snapshot?.progress.current).toBe(2);
-    expect(snapshot?.results[0].name).toBe('a.txt');
+    expect(snapshot?.displayResults[0].name).toBe('a.txt');
+  });
+
+  it('prefers final assignments over stale results when building display rows', () => {
+    const snapshot = normalizeOrganizeSnapshot({
+      id: 'org_final',
+      status: 'completed',
+      rootPath: 'E:/Downloads',
+      tree: {
+        nodeId: 'root',
+        name: '',
+        children: [
+          {
+            nodeId: 'audio-video',
+            name: '音视频文件',
+            children: [],
+          },
+        ],
+      },
+      finalTree: {
+        nodeId: 'root',
+        name: '',
+        children: [
+          {
+            nodeId: 'audio-video',
+            name: '音视频文件',
+            children: [],
+          },
+        ],
+      },
+      finalAssignments: [
+        {
+          itemId: 'item-1',
+          leafNodeId: 'audio-video',
+          categoryPath: ['音视频文件'],
+          reason: 'merged',
+        },
+      ],
+      displayResults: [
+        {
+          itemId: 'item-1',
+          index: 1,
+          name: 'song.mp3',
+          path: 'E:/Downloads/song.mp3',
+          categoryPath: ['其他待定'],
+          leafNodeId: 'old-leaf',
+        },
+      ],
+    });
+
+    expect(snapshot?.displayResults[0].categoryPath).toEqual(['音视频文件']);
+    expect(snapshot?.displayResults[0].category).toBe('音视频文件');
+  });
+
+  it('falls back to raw results when final state is unavailable', () => {
+    const snapshot = normalizeOrganizeSnapshot({
+      id: 'org_fallback',
+      status: 'completed',
+      rootPath: 'E:/Downloads',
+      displayResults: [
+        {
+          itemId: 'item-1',
+          index: 1,
+          name: 'song.mp3',
+          path: 'E:/Downloads/song.mp3',
+          categoryPath: ['音乐'],
+        },
+      ],
+    });
+
+    expect(snapshot?.displayResults[0].categoryPath).toEqual(['音乐']);
   });
 
   it('does not normalize row-level organize events as snapshots', () => {

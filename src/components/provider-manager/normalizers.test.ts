@@ -7,21 +7,51 @@ import {
   mergeProviderModelOptions,
   normalizeProviders,
   normalizeSearchApi,
-  resolveProviderModelValue,
 } from './normalizers';
 
+const baseProvider = {
+  name: 'OpenAI',
+  endpoint: DEFAULT_PROVIDER_ENDPOINT,
+  apiKey: '',
+  apiFormat: 'openai' as const,
+  model: '',
+  thinkingEnabled: false,
+  thinkingLevel: 'medium' as const,
+  preset: true,
+};
+
 describe('provider manager normalizers', () => {
-  it('keeps preset providers and normalizes default provider endpoint', () => {
+  it('keeps saved providers and normalizes default provider endpoint', () => {
     const result = normalizeProviders({
       defaultProviderEndpoint: 'missing',
       providerConfigs: {
-        custom: { endpoint: 'https://example.test/v1', name: 'Custom', model: 'custom-model' },
+        custom: {
+          endpoint: 'https://example.test/v1',
+          name: 'Custom',
+          apiFormat: 'anthropic',
+          model: 'custom-model',
+          thinking: { enabled: true, level: 'high' },
+        },
       },
     });
 
-    expect(result.providers.some((provider) => provider.endpoint === DEFAULT_PROVIDER_ENDPOINT)).toBe(true);
     expect(result.providers.some((provider) => provider.endpoint === 'https://example.test/v1')).toBe(true);
     expect(result.defaultProviderEndpoint).toBe(result.providers[0].endpoint);
+  });
+
+  it('maps known provider endpoints back to provider template labels', () => {
+    const result = normalizeProviders({
+      providerConfigs: {
+        'https://api.deepseek.com': {
+          endpoint: 'https://api.deepseek.com',
+          model: 'deepseek-chat',
+        },
+      },
+      defaultProviderEndpoint: 'https://api.deepseek.com',
+    });
+
+    expect(result.providers[0]?.name).toBe('DeepSeek');
+    expect(result.providers[0]?.apiFormat).toBe('openai');
   });
 
   it('treats any enabled search scope as workflow web search enabled', () => {
@@ -34,7 +64,7 @@ describe('provider manager normalizers', () => {
 
   it('serializes provider settings without credentials', () => {
     const payload = buildProviderSettingsPayload(
-      [{ name: 'OpenAI', endpoint: DEFAULT_PROVIDER_ENDPOINT, apiKey: 'secret', model: 'gpt-4o-mini' }],
+      [{ ...baseProvider, model: 'gpt-4o-mini', thinkingEnabled: true, thinkingLevel: 'high' }],
       DEFAULT_PROVIDER_ENDPOINT,
       { provider: 'tavily', enabled: true, scopes: { classify: true, organizer: true } },
     );
@@ -42,7 +72,12 @@ describe('provider manager normalizers', () => {
     expect(payload.providerConfigs?.[DEFAULT_PROVIDER_ENDPOINT]).toEqual({
       name: 'OpenAI',
       endpoint: DEFAULT_PROVIDER_ENDPOINT,
+      apiFormat: 'openai',
       model: 'gpt-4o-mini',
+      thinking: {
+        enabled: true,
+        level: 'high',
+      },
     });
     expect(JSON.stringify(payload)).not.toContain('secret');
   });
@@ -55,9 +90,9 @@ describe('provider manager normalizers', () => {
     )).toEqual({ providerSecrets: { b: 'new-b' } });
   });
 
-  it('marks provider models loaded after fallback refresh results', () => {
+  it('marks provider models loaded and fills first remote model when empty', () => {
     const [provider] = applyLoadedProviderModels(
-      [{ name: 'OpenAI', endpoint: DEFAULT_PROVIDER_ENDPOINT, apiKey: '', model: 'gpt-4o-mini' }],
+      [{ ...baseProvider }],
       DEFAULT_PROVIDER_ENDPOINT,
       [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }],
     );
@@ -68,23 +103,10 @@ describe('provider manager normalizers', () => {
 
   it('preserves unknown saved model values in provider options', () => {
     const options = mergeProviderModelOptions(
-      DEFAULT_PROVIDER_ENDPOINT,
       'custom-model',
       [{ value: 'gpt-4o-mini', label: 'gpt-4o-mini' }],
     );
 
-    expect(options.map((option) => option.value)).toEqual(['gpt-4o-mini', 'custom-model']);
-    expect(resolveProviderModelValue(DEFAULT_PROVIDER_ENDPOINT, 'custom-model', options)).toBe('custom-model');
-  });
-
-  it('falls back to the first available model when no model is selected', () => {
-    expect(resolveProviderModelValue(
-      DEFAULT_PROVIDER_ENDPOINT,
-      '',
-      [
-        { value: 'first-model', label: 'first-model' },
-        { value: 'second-model', label: 'second-model' },
-      ],
-    )).toBe('first-model');
+    expect(options.map((option) => option.value)).toEqual(['custom-model', 'gpt-4o-mini']);
   });
 });

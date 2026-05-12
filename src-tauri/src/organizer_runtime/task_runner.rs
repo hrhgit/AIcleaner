@@ -5,7 +5,6 @@ struct PreparedSummaryBatch {
 }
 
 struct PreparedLocalSummaryUnit {
-    unit: OrganizeUnit,
     route: RouteConfig,
     extraction: Option<SummaryExtraction>,
     local_result: SummaryBuildResult,
@@ -96,6 +95,226 @@ struct ClassificationBatchRun {
     prepared: PreparedClassificationBatch,
     output: ClassifyOrganizeBatchOutput,
     attempt_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct OversizedSubtreeCandidate {
+    node_id: String,
+    category_path: Vec<String>,
+    item_count: usize,
+}
+
+fn count_items_for_leaf_subtree(
+    tree: &CategoryTreeNode,
+    assignments: &HashMap<String, (String, Vec<String>, String)>,
+) -> HashMap<String, usize> {
+    fn walk(
+        node: &CategoryTreeNode,
+        assignments: &HashMap<String, (String, Vec<String>, String)>,
+        out: &mut HashMap<String, usize>,
+    ) -> usize {
+        let count = if node.children.is_empty() {
+            assignments
+                .values()
+                .filter(|(leaf_node_id, _, _)| leaf_node_id == &node.node_id)
+                .count()
+        } else {
+            node.children
+                .iter()
+                .map(|child| walk(child, assignments, out))
+                .sum()
+        };
+        out.insert(node.node_id.clone(), count);
+        count
+    }
+
+    let mut counts = HashMap::new();
+    walk(tree, assignments, &mut counts);
+    counts
+}
+
+fn select_oversized_subtree_candidates(
+    tree: &CategoryTreeNode,
+    assignments: &HashMap<String, (String, Vec<String>, String)>,
+    threshold: usize,
+) -> Vec<OversizedSubtreeCandidate> {
+    fn walk(
+        node: &CategoryTreeNode,
+        counts: &HashMap<String, usize>,
+        threshold: usize,
+        current_path: &mut Vec<String>,
+        out: &mut Vec<OversizedSubtreeCandidate>,
+    ) -> bool {
+        let mut oversized_descendant_selected = false;
+        for child in &node.children {
+            current_path.push(child.name.clone());
+            let child_selected = walk(child, counts, threshold, current_path, out);
+            oversized_descendant_selected |= child_selected;
+            current_path.pop();
+        }
+        let current_count = counts.get(&node.node_id).copied().unwrap_or(0);
+        let current_oversized = current_count > threshold;
+        if current_oversized && !oversized_descendant_selected && !current_path.is_empty() {
+            out.push(OversizedSubtreeCandidate {
+                node_id: node.node_id.clone(),
+                category_path: current_path.clone(),
+                item_count: current_count,
+            });
+            return true;
+        }
+        current_oversized || oversized_descendant_selected
+    }
+
+    let counts = count_items_for_leaf_subtree(tree, assignments);
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    walk(tree, &counts, threshold, &mut path, &mut out);
+    out
+}
+
+fn build_local_refine_items(
+    candidate: &OversizedSubtreeCandidate,
+    tree: &CategoryTreeNode,
+    assignments: &HashMap<String, (String, Vec<String>, String)>,
+    rows_by_id: &HashMap<String, (usize, Value)>,
+) -> Vec<Value> {
+    let Some(subtree) = find_node_by_id(tree, &candidate.node_id) else {
+        return Vec::new();
+    };
+    let leaf_ids = collect_leaf_ids(subtree);
+    let mut items = assignments
+        .iter()
+        .filter(|(_, (leaf_node_id, _, _))| leaf_ids.contains(leaf_node_id.as_str()))
+        .filter_map(|(item_id, (_, _, current_reason))| {
+            let row = rows_by_id.get(item_id)?;
+            let row_value = &row.1;
+            let representation =
+                FileRepresentation::from_value(row_value.get("representation").unwrap_or(&Value::Null));
+            Some(json!({
+                "itemId": item_id,
+                "name": row_value.get("name").and_then(Value::as_str).unwrap_or(""),
+                "relativePath": row_value.get("relativePath").and_then(Value::as_str).unwrap_or(""),
+                "itemType": row_value.get("itemType").and_then(Value::as_str).unwrap_or("file"),
+                "modality": row_value.get("modality").and_then(Value::as_str).unwrap_or("text"),
+                "createdAge": compute_relative_age(row_value.get("createdAt").and_then(Value::as_str)),
+                "modifiedAge": compute_relative_age(row_value.get("modifiedAt").and_then(Value::as_str)),
+                "evidence": summary::classification_evidence(row_value, &representation),
+                "keywords": representation.keywords,
+                "currentReason": current_reason,
+            }))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.get("itemId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(right.get("itemId").and_then(Value::as_str).unwrap_or(""))
+    });
+    items
+}
+
+fn build_local_refine_subtree_value(tree: &CategoryTreeNode, candidate_node_id: &str) -> Value {
+    find_node_by_id(tree, candidate_node_id)
+        .map(category_tree_to_value)
+        .unwrap_or(Value::Null)
+}
+
+fn apply_local_refine_assignments(
+    candidate: &OversizedSubtreeCandidate,
+    tree: &mut CategoryTreeNode,
+    assignments: &mut HashMap<String, (String, Vec<String>, String)>,
+    parsed: &Value,
+) -> Result<usize, String> {
+    let candidate_path = candidate.category_path.clone();
+    let assignment_rows = parsed
+        .get("assignments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "local refine response missing assignments".to_string())?;
+    if assignment_rows.is_empty() {
+        return Err("local refine assignments were empty".to_string());
+    }
+
+    let subtree_leaf_ids = find_node_by_id(tree, &candidate.node_id)
+        .map(collect_leaf_ids)
+        .ok_or_else(|| format!("local refine subtree missing node:{}", candidate.node_id))?;
+    let scoped_item_ids = assignments
+        .iter()
+        .filter(|(_, (leaf_node_id, _, _))| subtree_leaf_ids.contains(leaf_node_id.as_str()))
+        .map(|(item_id, _)| item_id.clone())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut applied = 0usize;
+
+    for assignment in assignment_rows {
+        let item_id = assignment
+            .get("itemId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "local refine assignment missing itemId".to_string())?;
+        if !scoped_item_ids.contains(item_id) {
+            return Err(format!(
+                "local refine assignment escaped subtree scope for itemId:{item_id}"
+            ));
+        }
+        if !seen.insert(item_id.to_string()) {
+            return Err(format!("local refine assignment duplicated itemId:{item_id}"));
+        }
+        let reason = assignment
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("local_refine")
+            .to_string();
+        let leaf_node_id = assignment
+            .get("leafNodeId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
+        let relative_path = category_path_from_value(assignment.get("categoryPath"));
+
+        let (resolved_leaf, resolved_path) = if !leaf_node_id.is_empty() {
+            if !subtree_leaf_ids.contains(leaf_node_id) {
+                return Err(format!(
+                    "local refine assignment referenced leaf outside subtree:{leaf_node_id}"
+                ));
+            }
+            let path = category_path_for_id(tree, leaf_node_id)
+                .ok_or_else(|| format!("local refine assignment missing leaf path:{leaf_node_id}"))?;
+            if path.len() < candidate_path.len() || path[..candidate_path.len()] != candidate_path[..] {
+                return Err(format!(
+                    "local refine assignment referenced leaf outside subtree path:{leaf_node_id}"
+                ));
+            }
+            (leaf_node_id.to_string(), path)
+        } else {
+            if relative_path.is_empty() {
+                return Err(format!(
+                    "local refine assignment missing relative categoryPath for itemId:{item_id}"
+                ));
+            }
+            let mut full_path = candidate_path.clone();
+            full_path.extend(relative_path);
+            let leaf = ensure_path(tree, &full_path);
+            (leaf, full_path)
+        };
+
+        assignments.insert(
+            item_id.to_string(),
+            (resolved_leaf, resolved_path, reason),
+        );
+        applied = applied.saturating_add(1);
+    }
+
+    if seen.len() != scoped_item_ids.len() {
+        return Err(format!(
+            "local refine assignment count mismatch: expected {}, actual {}",
+            scoped_item_ids.len(),
+            seen.len()
+        ));
+    }
+
+    Ok(applied)
 }
 
 fn abort_initial_tree_task(handle: &mut Option<JoinHandle<Result<InitialTreeOutput, String>>>) {
@@ -372,13 +591,17 @@ fn token_usage_by_stage_json(
     summary: &TokenUsage,
     initial_tree: &TokenUsage,
     classification: &TokenUsage,
-    reconcile: &TokenUsage,
+    build_tree_shape: &TokenUsage,
+    local_refine: &TokenUsage,
+    adjust: &TokenUsage,
 ) -> Value {
     json!({
         "summaryPreparation": token_usage_json(summary),
         "initialTree": token_usage_json(initial_tree),
         "classification": token_usage_json(classification),
-        "reconcile": token_usage_json(reconcile),
+        "buildTreeShape": token_usage_json(build_tree_shape),
+        "localRefineOversizedNodes": token_usage_json(local_refine),
+        "adjust": token_usage_json(adjust),
     })
 }
 
@@ -465,20 +688,6 @@ fn compact_reconcile_deferred_assignments(values: &[Value]) -> Vec<Value> {
         })
         .collect()
 }
-fn refresh_assignment_paths(
-    assignments: &mut HashMap<String, (String, Vec<String>, String)>,
-    tree: &CategoryTreeNode,
-) -> Result<(), String> {
-    for (item_id, (leaf_node_id, category_path, _reason)) in assignments.iter_mut() {
-        let Some(path) = category_path_for_id(tree, leaf_node_id) else {
-            return Err(format!(
-                "reconcile_failed:existing assignment for {item_id} references missing leafNodeId:{leaf_node_id}"
-            ));
-        };
-        *category_path = path;
-    }
-    Ok(())
-}
 
 fn route_for_unit(task: &OrganizeTaskRuntime, unit: &OrganizeUnit) -> RouteConfig {
     let route_key = if unit.item_type == "directory" {
@@ -493,7 +702,10 @@ fn route_for_unit(task: &OrganizeTaskRuntime, unit: &OrganizeUnit) -> RouteConfi
         .unwrap_or(RouteConfig {
             endpoint: "https://api.openai.com/v1".to_string(),
             api_key: String::new(),
-            model: "gpt-4o-mini".to_string(),
+            model: String::new(),
+            api_format: ApiFormat::OpenAi,
+            thinking_enabled: false,
+            thinking_level: "medium".to_string(),
         })
 }
 
@@ -651,7 +863,6 @@ async fn prepare_summary_unit(
         ),
     };
     Ok(PreparedLocalSummaryUnit {
-        unit,
         route,
         extraction: extracted,
         local_result,
@@ -737,6 +948,9 @@ async fn prepare_summary_units_weighted(
                 for handle in &handles {
                     handle.abort();
                 }
+                for handle in handles {
+                    let _ = handle.await;
+                }
                 return Err(err);
             }
         }
@@ -744,6 +958,9 @@ async fn prepare_summary_units_weighted(
     if completed != units.len() {
         for handle in &handles {
             handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
         }
         return Err(format!(
             "summary_extraction_incomplete:completed={},expected={}",
@@ -1565,6 +1782,7 @@ async fn run_organize_task<R: Runtime>(
         "recursive": recursive,
         "excludedPatterns": excluded.clone(),
         "batchSize": batch_size,
+        "responseLanguage": task.response_language.clone(),
         "summaryExtractionGlobalBudget": EXTRACTION_GLOBAL_BUDGET,
         "summaryExtractionTikaHardCap": EXTRACTION_TIKA_HARD_CAP,
         "summaryExtractionHeavyDocHardCap": EXTRACTION_HEAVY_DOC_HARD_CAP,
@@ -1639,7 +1857,7 @@ async fn run_organize_task<R: Runtime>(
             Some("batches"),
             total_batches == 0,
         );
-        snap.results.clear();
+        snap.display_results.clear();
         snap.preview.clear();
     }
     emit_snapshot(app, state, task).await?;
@@ -1647,7 +1865,10 @@ async fn run_organize_task<R: Runtime>(
     let text_route = task.routes.get("text").cloned().unwrap_or(RouteConfig {
         endpoint: "https://api.openai.com/v1".to_string(),
         api_key: String::new(),
-        model: "gpt-4o-mini".to_string(),
+        model: String::new(),
+        api_format: ApiFormat::OpenAi,
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     });
     let task_id = task.snapshot.lock().id.clone();
     let basic_batch_rows = build_basic_batch_rows(&units, batch_size);
@@ -2047,12 +2268,12 @@ async fn run_organize_task<R: Runtime>(
     let mut batch_outputs = Vec::new();
     let mut reconcile_inputs = Vec::new();
     let mut proposal_map: HashMap<String, (String, Vec<String>)> = HashMap::new();
-    let mut deferred = Vec::new();
     let mut final_assignment_inputs: HashMap<String, (String, Vec<String>, String)> =
         HashMap::new();
     let mut rows_by_id: HashMap<String, (usize, Value)> = HashMap::new();
     let mut classification_errors = Vec::new();
     let mut result_rows = Vec::new();
+    let mut deferred_assignment_batches: Vec<(usize, Vec<Value>)> = Vec::new();
 
     for ClassificationBatchRun {
         prepared,
@@ -2208,41 +2429,14 @@ async fn run_organize_task<R: Runtime>(
                 ),
             );
         }
-        deferred.extend(
-            parsed
-                .get("deferredAssignments")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        );
-    }
 
-    for assignment in deferred {
-        let Some(item_id) = assignment.get("itemId").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(proposal_id) = assignment.get("proposalId").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Some((leaf, path)) = proposal_map.get(proposal_id).cloned() {
-            final_assignment_inputs.insert(
-                item_id.to_string(),
-                (
-                    leaf,
-                    path,
-                    assignment
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("resolved_deferred_assignment")
-                        .to_string(),
-                ),
-            );
-        } else {
-            classification_errors.push(json!({
-                "kind": "validation_error",
-                "message": format!("deferred assignment references unresolved proposalId:{proposal_id}"),
-                "itemId": item_id,
-            }));
+        let deferred_items: Vec<Value> = parsed
+            .get("deferredAssignments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !deferred_items.is_empty() {
+            deferred_assignment_batches.push((prepared.batch_idx, deferred_items));
         }
     }
     let classification_elapsed = classification_started_at.elapsed();
@@ -2262,15 +2456,16 @@ async fn run_organize_task<R: Runtime>(
         classification_elapsed,
     );
 
-    let reconcile_started_at = Instant::now();
-    let mut reconcile_token_usage = TokenUsage::default();
+    // --- Phase 1: Build Tree Shape (LLM) ---
+    let build_tree_shape_started_at = Instant::now();
+    let mut build_tree_shape_token_usage = TokenUsage::default();
     {
         let mut snap = task.snapshot.lock();
         set_organize_progress(
             &mut snap,
-            "reconcile",
-            "Reconciling tree",
-            Some("Merging batch results into the final category tree.".to_string()),
+            "build_tree_shape",
+            "Building tree shape",
+            Some("Merging batch proposals into the final category tree.".to_string()),
             None,
             None,
             None,
@@ -2278,9 +2473,11 @@ async fn run_organize_task<R: Runtime>(
         );
     }
     emit_snapshot(app, state, task).await?;
-    let reconcile_used_model = !text_route.api_key.trim().is_empty() && !reconcile_inputs.is_empty();
-    if reconcile_used_model {
-        match summary::reconcile_organize_batches(
+    let tree_before = tree.clone();
+    let proposal_map_before = proposal_map.clone();
+    let build_tree_shape_used_model = !text_route.api_key.trim().is_empty() && !reconcile_inputs.is_empty();
+    if build_tree_shape_used_model {
+        match summary::reconcile_tree_shape(
             &text_route,
             &task.response_language,
             &task.stop,
@@ -2295,63 +2492,513 @@ async fn run_organize_task<R: Runtime>(
                     let mut snap = task.snapshot.lock();
                     add_token_usage(&mut snap.token_usage, &output.usage);
                 }
-                add_token_usage(&mut reconcile_token_usage, &output.usage);
+                add_token_usage(&mut build_tree_shape_token_usage, &output.usage);
                 if let Some(err) = output.error {
-                    return Err(format!("reconcile_failed:{err}"));
+                    return Err(format!("build_tree_shape_failed:{err}"));
                 }
                 if let Some(parsed) = output.parsed {
                     let final_tree = parsed
                         .get("finalTree")
                         .cloned()
-                        .ok_or_else(|| "reconcile_failed:missing finalTree".to_string())?;
-                    let reconciled_tree = tree_from_value(&final_tree);
-                    let mut reconciled_assignments = HashMap::new();
-                    for assignment in parsed
-                        .get("finalAssignments")
+                        .ok_or_else(|| "build_tree_shape_failed:missing finalTree".to_string())?;
+                    let new_tree = tree_from_value(&final_tree);
+
+                    // Update proposal_map from Phase 1 output (new tree node IDs)
+                    proposal_map.clear();
+                    for mapping in parsed
+                        .get("proposalMappings")
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default()
                     {
-                        let Some(item_id) = assignment.get("itemId").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let Some(leaf_node_id) =
-                            assignment.get("leafNodeId").and_then(Value::as_str)
+                        let Some(proposal_id) = mapping.get("proposalId").and_then(Value::as_str)
                         else {
                             continue;
                         };
-                        let fallback_path =
-                            category_path_from_value(assignment.get("categoryPath"));
-                        let path = category_path_for_id(&reconciled_tree, leaf_node_id)
-                            .or_else(|| {
-                                if fallback_path.is_empty() {
-                                    None
-                                } else {
-                                    Some(fallback_path)
+                        let leaf = mapping
+                            .get("leafNodeId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let path = category_path_for_id(&new_tree, &leaf).unwrap_or_else(|| {
+                            category_path_from_value(mapping.get("categoryPath"))
+                        });
+                        proposal_map.insert(proposal_id.to_string(), (leaf, path));
+                    }
+
+                    // Build old_leaf -> new_leaf mapping from proposal chain
+                    let mut old_to_new: HashMap<String, String> = HashMap::new();
+                    for (proposal_id, (old_leaf, _old_path)) in &proposal_map_before {
+                        if let Some((new_leaf, _new_path)) = proposal_map.get(proposal_id) {
+                            old_to_new.insert(old_leaf.clone(), new_leaf.clone());
+                        }
+                    }
+
+                    // Supplement with path matching: old tree leaf path -> new tree leaf id
+                    let old_path_to_id = collect_leaf_paths(&tree_before);
+                    let new_path_to_id = collect_leaf_paths(&new_tree);
+                    for (path, old_id) in &old_path_to_id {
+                        if let Some(new_id) = new_path_to_id.get(path) {
+                            old_to_new.entry(old_id.clone()).or_insert_with(|| new_id.clone());
+                        }
+                    }
+
+                    // Redirect assignments through old_to_new mapping
+                    let mut pending_assignments: Vec<(String, String, Vec<String>, String)> = Vec::new();
+                    for (item_id, (leaf_node_id, path, reason)) in final_assignment_inputs.iter_mut() {
+                        if category_path_for_id(&new_tree, leaf_node_id).is_some() {
+                            *path = category_path_for_id(&new_tree, leaf_node_id).unwrap();
+                        } else if let Some(new_id) = old_to_new.get(leaf_node_id) {
+                            let new_path = category_path_for_id(&new_tree, new_id)
+                                .unwrap_or_else(|| path.clone());
+                            *leaf_node_id = new_id.clone();
+                            *path = new_path;
+                        } else {
+                            pending_assignments.push((
+                                item_id.clone(),
+                                leaf_node_id.clone(),
+                                path.clone(),
+                                reason.clone(),
+                            ));
+                        }
+                    }
+                    for (item_id, _, _, _) in &pending_assignments {
+                        final_assignment_inputs.remove(item_id.as_str());
+                    }
+
+                    tree = new_tree;
+
+                    // Second pass: resolve pending assignments via path matching
+                    let mut pending_resolved = 0u64;
+                    let mut pending_uncategorized = 0u64;
+                    for (item_id, _old_id, old_path, reason) in &pending_assignments {
+                        // 1. Exact path match
+                        let mut found_id = new_path_to_id.get(old_path).cloned();
+                        // 2. Prefix match: progressively shorten path
+                        if found_id.is_none() {
+                            for len in (1..old_path.len()).rev() {
+                                let prefix: Vec<String> = old_path[..len].to_vec();
+                                if let Some(id) = new_path_to_id.get(&prefix) {
+                                    found_id = Some(id.clone());
+                                    break;
                                 }
-                            })
-                            .ok_or_else(|| {
-                                format!(
-                                    "reconcile_failed:final assignment references missing leafNodeId:{leaf_node_id}"
-                                )
-                            })?;
-                        reconciled_assignments.insert(
-                            item_id.to_string(),
-                            (
-                                leaf_node_id.to_string(),
-                                path,
-                                assignment
-                                    .get("reason")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("reconciled_assignment")
-                                    .to_string(),
-                            ),
+                            }
+                        }
+                        // 3. Last-segment name match
+                        if found_id.is_none() {
+                            if let Some(last_segment) = old_path.last() {
+                                found_id = new_path_to_id.iter().find_map(|(path, id)| {
+                                    if path.last() == Some(last_segment) {
+                                        Some(id.clone())
+                                    } else {
+                                        None
+                                    }
+                                });
+                            }
+                        }
+                        // 4. Fallback to uncategorized
+                        let (final_id, final_path) = if let Some(id) = &found_id {
+                            pending_resolved += 1;
+                            let p = category_path_for_id(&tree, id)
+                                .unwrap_or_else(|| old_path.clone());
+                            (id.clone(), p)
+                        } else {
+                            pending_uncategorized += 1;
+                            let leaf = ensure_uncategorized_leaf(&mut tree);
+                            let p = category_path_for_id(&tree, &leaf)
+                                .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
+                            (leaf, p)
+                        };
+                        final_assignment_inputs.insert(
+                            item_id.clone(),
+                            (final_id, final_path, reason.clone()),
                         );
                     }
-                    tree = reconciled_tree;
-                    refresh_assignment_paths(&mut final_assignment_inputs, &tree)?;
-                    final_assignment_inputs.extend(reconciled_assignments);
-                    proposal_map.clear();
+                    if pending_resolved > 0 || pending_uncategorized > 0 {
+                        let mut snap = task.snapshot.lock();
+                        snap.review_issues.push(json!({
+                            "stage": "build_tree_shape",
+                            "type": "pending_assignment_resolution",
+                            "resolved": pending_resolved,
+                            "uncategorized": pending_uncategorized,
+                        }));
+                    }
+                }
+                if !output.raw_output.trim().is_empty() {
+                    batch_outputs.push(json!({
+                        "stage": "build_tree_shape",
+                        "modelRawOutput": output.raw_output,
+                    }));
+                }
+            }
+            Err(err) => return Err(format!("build_tree_shape_failed:{err}")),
+        }
+    }
+    let build_tree_shape_elapsed = build_tree_shape_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "build_tree_shape",
+        json!({
+            "usedModel": build_tree_shape_used_model,
+            "rowCount": rows_by_id.len(),
+            "pendingBatchCount": reconcile_inputs.len(),
+            "tokenUsage": token_usage_json(&build_tree_shape_token_usage),
+        }),
+        build_tree_shape_elapsed,
+    );
+
+    // --- Phase 2: Fill Items (deterministic) ---
+    let fill_items_started_at = Instant::now();
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "fill_items",
+            "Filling items into tree",
+            Some("Resolving all assignments against the final tree.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
+
+    // Update paths for direct assignments (all should be valid after Phase 1 resolution)
+    for (_item_id, (leaf_node_id, category_path, _reason)) in final_assignment_inputs.iter_mut() {
+        if let Some(path) = category_path_for_id(&tree, leaf_node_id) {
+            *category_path = path;
+        }
+    }
+
+    // Resolve deferred assignments via finalized proposal_map
+    let resolve_path = collect_leaf_paths(&tree);
+    let mut deferred_pending = 0u64;
+    let mut deferred_resolved = 0u64;
+    for (_batch_idx, deferred_items) in &deferred_assignment_batches {
+        for deferred in deferred_items {
+            let Some(item_id) = deferred.get("itemId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(proposal_id) = deferred.get("proposalId").and_then(Value::as_str) else {
+                continue;
+            };
+            let reason = deferred
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("resolved_deferred_assignment")
+                .to_string();
+            if let Some((leaf, path)) = proposal_map.get(proposal_id).cloned() {
+                deferred_resolved += 1;
+                final_assignment_inputs.insert(
+                    item_id.to_string(),
+                    (leaf, path, reason),
+                );
+            } else {
+                // Proposal was rejected — try path matching via proposal_map_before
+                let old_path = proposal_map_before
+                    .get(proposal_id)
+                    .map(|(_leaf, path)| path.clone());
+                let mut found_id: Option<String> = None;
+                if let Some(ref op) = old_path {
+                    // Exact path match
+                    found_id = resolve_path.get(op).cloned();
+                    // Prefix match
+                    if found_id.is_none() {
+                        for len in (1..op.len()).rev() {
+                            let prefix: Vec<String> = op[..len].to_vec();
+                            if let Some(id) = resolve_path.get(&prefix) {
+                                found_id = Some(id.clone());
+                                break;
+                            }
+                        }
+                    }
+                    // Last-segment name match
+                    if found_id.is_none() {
+                        if let Some(last_segment) = op.last() {
+                            found_id = resolve_path.iter().find_map(|(path, id)| {
+                                if path.last() == Some(last_segment) {
+                                    Some(id.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                        }
+                    }
+                }
+                if let Some(id) = found_id {
+                    deferred_resolved += 1;
+                    let p = category_path_for_id(&tree, &id)
+                        .unwrap_or_else(|| old_path.unwrap_or_default());
+                    final_assignment_inputs.insert(
+                        item_id.to_string(),
+                        (id, p, reason),
+                    );
+                } else {
+                    deferred_pending += 1;
+                    let leaf = ensure_uncategorized_leaf(&mut tree);
+                    let p = category_path_for_id(&tree, &leaf)
+                        .unwrap_or_else(|| vec![UNCATEGORIZED_NODE_NAME.to_string()]);
+                    final_assignment_inputs.insert(
+                        item_id.to_string(),
+                        (leaf, p, reason),
+                    );
+                }
+            }
+        }
+    }
+
+    let fill_items_elapsed = fill_items_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "fill_items",
+        json!({
+            "rowCount": rows_by_id.len(),
+            "resolvedCount": final_assignment_inputs.len(),
+            "errorCount": classification_errors.len(),
+            "deferredResolved": deferred_resolved,
+            "deferredPendingUncategorized": deferred_pending,
+        }),
+        fill_items_elapsed,
+    );
+
+    // --- Phase 3: One-pass Local Refinement for Oversized Subtrees (LLM) ---
+    let local_refine_started_at = Instant::now();
+    let mut local_refine_token_usage = TokenUsage::default();
+    let mut local_refine_error_count = 0u64;
+    let local_refine_candidates = select_oversized_subtree_candidates(
+        &tree,
+        &final_assignment_inputs,
+        LOCAL_REFINE_OVERSIZED_THRESHOLD,
+    );
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "local_refine_oversized_nodes",
+            "Refining oversized nodes",
+            Some(format!(
+                "Checking {} oversized subtree candidate(s).",
+                local_refine_candidates.len()
+            )),
+            Some(0),
+            Some(local_refine_candidates.len() as u64),
+            Some("nodes"),
+            local_refine_candidates.is_empty(),
+        );
+    }
+    emit_snapshot(app, state, task).await?;
+
+    let local_refine_used_model =
+        !text_route.api_key.trim().is_empty() && !local_refine_candidates.is_empty();
+    let mut local_refine_request_count = 0u64;
+    for (candidate_index, candidate) in local_refine_candidates.iter().enumerate() {
+        {
+            let mut snap = task.snapshot.lock();
+            set_organize_progress(
+                &mut snap,
+                "local_refine_oversized_nodes",
+                "Refining oversized nodes",
+                Some(format!(
+                    "Refining subtree {} / {}: {} ({} items).",
+                    candidate_index + 1,
+                    local_refine_candidates.len(),
+                    category_path_display(&candidate.category_path),
+                    candidate.item_count
+                )),
+                Some(candidate_index as u64),
+                Some(local_refine_candidates.len() as u64),
+                Some("nodes"),
+                false,
+            );
+        }
+        emit_snapshot(app, state, task).await?;
+
+        let subtree = build_local_refine_subtree_value(&tree, &candidate.node_id);
+        let items = build_local_refine_items(candidate, &tree, &final_assignment_inputs, &rows_by_id);
+        if subtree.is_null() || items.is_empty() {
+            batch_outputs.push(json!({
+                "stage": "local_refine_oversized_nodes",
+                "nodeId": candidate.node_id.clone(),
+                "categoryPath": candidate.category_path.clone(),
+                "itemCount": candidate.item_count,
+                "usedModel": false,
+                "error": "local_refine_candidate_missing_subtree_or_items",
+                "modelRawOutput": "",
+            }));
+            local_refine_error_count = local_refine_error_count.saturating_add(1);
+            continue;
+        }
+
+        if text_route.api_key.trim().is_empty() {
+            batch_outputs.push(json!({
+                "stage": "local_refine_oversized_nodes",
+                "nodeId": candidate.node_id.clone(),
+                "categoryPath": candidate.category_path.clone(),
+                "itemCount": candidate.item_count,
+                "usedModel": false,
+                "error": "local_refine_missing_api_key",
+                "modelRawOutput": "",
+            }));
+            local_refine_error_count = local_refine_error_count.saturating_add(1);
+            continue;
+        }
+
+        if !text_route.api_key.trim().is_empty() {
+            local_refine_request_count = local_refine_request_count.saturating_add(1);
+        }
+        match summary::refine_local_subtree_once(
+            &text_route,
+            &task.response_language,
+            &task.stop,
+            &subtree,
+            &items,
+            Some(&task.diagnostics),
+        )
+        .await
+        {
+            Ok(output) => {
+                {
+                    let mut snap = task.snapshot.lock();
+                    add_token_usage(&mut snap.token_usage, &output.usage);
+                }
+                add_token_usage(&mut local_refine_token_usage, &output.usage);
+                let mut error = output.error.clone();
+                let mut applied_count = 0usize;
+                if error.is_none() {
+                    match output.parsed.as_ref() {
+                        Some(parsed) => match apply_local_refine_assignments(
+                            candidate,
+                            &mut tree,
+                            &mut final_assignment_inputs,
+                            parsed,
+                        ) {
+                            Ok(applied) => {
+                                applied_count = applied;
+                            }
+                            Err(err) => {
+                                error = Some(format!("local_refine_invalid_output:{err}"));
+                            }
+                        },
+                        None => {
+                            error = Some("local_refine_missing_parsed_output".to_string());
+                        }
+                    }
+                }
+                if error.is_some() {
+                    local_refine_error_count = local_refine_error_count.saturating_add(1);
+                }
+                batch_outputs.push(json!({
+                    "stage": "local_refine_oversized_nodes",
+                    "nodeId": candidate.node_id.clone(),
+                    "categoryPath": candidate.category_path.clone(),
+                    "itemCount": candidate.item_count,
+                    "appliedAssignments": applied_count,
+                    "usedModel": !text_route.api_key.trim().is_empty(),
+                    "error": error.unwrap_or_default(),
+                    "modelRawOutput": output.raw_output,
+                }));
+            }
+            Err(err) => {
+                local_refine_error_count = local_refine_error_count.saturating_add(1);
+                batch_outputs.push(json!({
+                    "stage": "local_refine_oversized_nodes",
+                    "nodeId": candidate.node_id.clone(),
+                    "categoryPath": candidate.category_path.clone(),
+                    "itemCount": candidate.item_count,
+                    "usedModel": !text_route.api_key.trim().is_empty(),
+                    "error": err,
+                    "modelRawOutput": "",
+                }));
+            }
+        }
+    }
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "local_refine_oversized_nodes",
+            "Refining oversized nodes",
+            Some(format!(
+                "Completed oversized subtree refinement for {} candidate(s).",
+                local_refine_candidates.len()
+            )),
+            Some(local_refine_candidates.len() as u64),
+            Some(local_refine_candidates.len() as u64),
+            Some("nodes"),
+            local_refine_candidates.is_empty(),
+        );
+    }
+    emit_snapshot(app, state, task).await?;
+
+    let local_refine_elapsed = local_refine_started_at.elapsed();
+    task.diagnostics.stage_completed(
+        "local_refine_oversized_nodes",
+        json!({
+            "usedModel": local_refine_used_model,
+            "candidateCount": local_refine_candidates.len(),
+            "errorCount": local_refine_error_count,
+            "threshold": LOCAL_REFINE_OVERSIZED_THRESHOLD,
+            "tokenUsage": token_usage_json(&local_refine_token_usage),
+        }),
+        local_refine_elapsed,
+    );
+
+    // --- Phase 4: Post-placement Adjustment (LLM) ---
+    let adjust_started_at = Instant::now();
+    let mut adjust_token_usage = TokenUsage::default();
+    {
+        let mut snap = task.snapshot.lock();
+        set_organize_progress(
+            &mut snap,
+            "adjust",
+            "Adjusting tree",
+            Some("Reviewing item counts and proposing merges/splits.".to_string()),
+            None,
+            None,
+            None,
+            true,
+        );
+    }
+    emit_snapshot(app, state, task).await?;
+
+    let tree_with_counts = summary::build_tree_with_counts(&tree, &final_assignment_inputs, &rows_by_id);
+    let adjust_used_model = !text_route.api_key.trim().is_empty();
+    if adjust_used_model {
+        match summary::reconcile_tree_adjustment(
+            &text_route,
+            &task.response_language,
+            &task.stop,
+            &tree_with_counts,
+            Some(&task.diagnostics),
+        )
+        .await
+        {
+            Ok(output) => {
+                {
+                    let mut snap = task.snapshot.lock();
+                    add_token_usage(&mut snap.token_usage, &output.usage);
+                }
+                add_token_usage(&mut adjust_token_usage, &output.usage);
+                if let Some(err) = output.error {
+                    return Err(format!("adjust_failed:{err}"));
+                }
+                if let Some(parsed) = output.parsed {
+                    if let Some(adjusted_tree) = parsed.get("adjustedTree").or_else(|| parsed.get("finalTree")) {
+                        let adjust_path_map = collect_leaf_paths(&tree_from_value(adjusted_tree));
+                        tree = tree_from_value(adjusted_tree);
+                        // Soft-redirect: path-update valid IDs, redirect orphans by path
+                        for (_item_id, (leaf_node_id, category_path, _reason)) in final_assignment_inputs.iter_mut() {
+                            if let Some(path) = category_path_for_id(&tree, leaf_node_id) {
+                                *category_path = path;
+                            } else if let Some((found_id, found_path)) = adjust_path_map.iter()
+                                .find(|(_, id)| *id == leaf_node_id)
+                                .map(|(path, id)| (id.clone(), path.clone()))
+                            {
+                                *leaf_node_id = found_id;
+                                *category_path = found_path;
+                            }
+                        }
+                    }
+                    // Update proposal_map from adjustment proposalMappings if present
                     for mapping in parsed
                         .get("proposalMappings")
                         .and_then(Value::as_array)
@@ -2375,24 +3022,23 @@ async fn run_organize_task<R: Runtime>(
                 }
                 if !output.raw_output.trim().is_empty() {
                     batch_outputs.push(json!({
-                        "stage": "reconcile",
+                        "stage": "adjust",
                         "modelRawOutput": output.raw_output,
                     }));
                 }
             }
-            Err(err) => return Err(format!("reconcile_failed:{err}")),
+            Err(err) => return Err(format!("adjust_failed:{err}")),
         }
     }
-    let reconcile_elapsed = reconcile_started_at.elapsed();
+    let adjust_elapsed = adjust_started_at.elapsed();
     task.diagnostics.stage_completed(
-        "reconcile",
+        "adjust",
         json!({
-            "usedModel": reconcile_used_model,
+            "usedModel": adjust_used_model,
             "rowCount": rows_by_id.len(),
-            "pendingBatchCount": reconcile_inputs.len(),
-            "tokenUsage": token_usage_json(&reconcile_token_usage),
+            "tokenUsage": token_usage_json(&adjust_token_usage),
         }),
-        reconcile_elapsed,
+        adjust_elapsed,
     );
 
     let finalize_started_at = Instant::now();
@@ -2442,7 +3088,7 @@ async fn run_organize_task<R: Runtime>(
     }
 
     result_rows.sort_by_key(|row| row.get("index").and_then(Value::as_u64).unwrap_or(0));
-    persist::upsert_organize_results(&state.db_path(), &task_id, &result_rows)?;
+    persist::upsert_organize_display_rows(&state.db_path(), &task_id, &result_rows)?;
     for row in &result_rows {
         app.emit(
             "organize_file_done",
@@ -2466,7 +3112,7 @@ async fn run_organize_task<R: Runtime>(
             Some("files"),
             units.is_empty(),
         );
-        snap.results = result_rows.clone();
+        snap.display_results = persist::build_final_result_rows(&snap);
         snap.batch_outputs = batch_outputs;
         snap.tree_proposals = proposal_map
             .iter()
@@ -2505,7 +3151,10 @@ async fn run_organize_task<R: Runtime>(
         "summaryPreparation": summary_elapsed.as_millis() as u64,
         "initialTree": initial_tree_elapsed.as_millis() as u64,
         "classification": classification_elapsed.as_millis() as u64,
-        "reconcile": reconcile_elapsed.as_millis() as u64,
+        "buildTreeShape": build_tree_shape_elapsed.as_millis() as u64,
+        "fillItems": fill_items_elapsed.as_millis() as u64,
+        "localRefineOversizedNodes": local_refine_elapsed.as_millis() as u64,
+        "adjust": adjust_elapsed.as_millis() as u64,
         "finalize": finalize_elapsed.as_millis() as u64,
         "total": task_started_at.elapsed().as_millis() as u64,
     });
@@ -2513,7 +3162,9 @@ async fn run_organize_task<R: Runtime>(
         &summary_token_usage,
         &initial_tree_token_usage,
         &classification_token_usage,
-        &reconcile_token_usage,
+        &build_tree_shape_token_usage,
+        &local_refine_token_usage,
+        &adjust_token_usage,
     );
     let request_count = agent_summary_stats
         .as_ref()
@@ -2527,18 +3178,21 @@ async fn run_organize_task<R: Runtime>(
             },
         )
         .saturating_add(classification_request_count)
-        .saturating_add(if reconcile_used_model { 1 } else { 0 });
+        .saturating_add(local_refine_request_count)
+        .saturating_add(if build_tree_shape_used_model { 1 } else { 0 })
+        .saturating_add(if adjust_used_model { 1 } else { 0 });
     let error_count = agent_summary_stats
         .as_ref()
         .map(|stats| stats.failed_batches as u64)
         .unwrap_or(0)
-        .saturating_add(classification_error_count as u64);
+        .saturating_add(classification_error_count as u64)
+        .saturating_add(local_refine_error_count);
 
     let final_snapshot = {
         let mut snap = task.snapshot.lock();
-        snap.results
+        snap.display_results
             .sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
-        snap.preview = planner::build_preview(&snap.root_path, &snap.results);
+        snap.preview = planner::build_preview(&snap.root_path, &snap.display_results);
         snap.tree = snap.final_tree.clone();
         snap.status = "completed".to_string();
         let processed_batches = snap.processed_batches;
@@ -2571,7 +3225,7 @@ async fn run_organize_task<R: Runtime>(
     task.diagnostics.stage_completed(
         "finalize",
         json!({
-            "resultRows": final_snapshot.results.len(),
+            "resultRows": final_snapshot.display_results.len(),
             "previewCount": final_snapshot.preview.len(),
             "classificationErrorCount": final_snapshot.classification_errors.len(),
         }),

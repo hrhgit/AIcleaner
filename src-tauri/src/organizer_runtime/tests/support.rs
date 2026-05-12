@@ -112,7 +112,7 @@ pub(super) fn make_summary_test_runtime_with_extraction_tool(
             duration_ms: None,
             request_count: None,
             error_count: None,
-            results: Vec::new(),
+            display_results: Vec::new(),
             preview: Vec::new(),
             created_at: "2026-04-29T00:00:00Z".to_string(),
             completed_at: None,
@@ -136,6 +136,9 @@ pub(super) fn text_route(endpoint: String) -> RouteConfig {
         endpoint,
         api_key: "test-key".to_string(),
         model: "test-model".to_string(),
+        api_format: ApiFormat::OpenAi,
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     }
 }
 
@@ -236,9 +239,17 @@ pub(super) fn summary_response_for_test_ids() -> Value {
         "choices": [{
             "message": {
                 "role": "assistant",
-                "content": json!({ "items": items }).to_string()
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_submit_file_summaries",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_file_summaries",
+                        "arguments": json!({ "items": items }).to_string()
+                    }
+                }]
             },
-            "finish_reason": "stop"
+            "finish_reason": "tool_calls"
         }],
         "usage": {
             "prompt_tokens": 11,

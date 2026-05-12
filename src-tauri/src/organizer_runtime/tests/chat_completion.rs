@@ -1,5 +1,16 @@
 use super::*;
 
+fn openai_route() -> RouteConfig {
+    RouteConfig {
+        endpoint: "https://api.openai.com/v1".to_string(),
+        api_key: "test".to_string(),
+        model: "test-model".to_string(),
+        api_format: ApiFormat::OpenAi,
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
+    }
+}
+
 #[test]
 fn parse_chat_completion_http_body_extracts_content_and_usage() {
     let raw_body = r#"{
@@ -17,7 +28,7 @@ fn parse_chat_completion_http_body_extracts_content_and_usage() {
       }
     }"#;
     let parsed = summary::parse_chat_completion_http_body(
-        "https://api.openai.com/v1",
+        &openai_route(),
         StatusCode::OK,
         raw_body,
     )
@@ -32,7 +43,7 @@ fn parse_chat_completion_http_body_extracts_content_and_usage() {
 fn parse_chat_completion_http_body_keeps_raw_body_on_decode_error() {
     let raw_body = "<html>upstream gateway error</html>";
     let err = summary::parse_chat_completion_http_body(
-        "https://api.openai.com/v1",
+        &openai_route(),
         StatusCode::OK,
         raw_body,
     )
@@ -69,7 +80,7 @@ fn parse_chat_completion_http_body_accepts_tool_calls_without_text() {
       }
     }"#;
     let parsed = summary::parse_chat_completion_http_body(
-        "https://api.openai.com/v1",
+        &openai_route(),
         StatusCode::OK,
         raw_body,
     )

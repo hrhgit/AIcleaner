@@ -55,9 +55,12 @@ async fn real_folder_classification_smoke_with_real_model() {
     );
 
     let route = RouteConfig {
-        endpoint,
+        endpoint: endpoint.clone(),
         api_key,
         model,
+        api_format: crate::llm_protocol::detect_api_format(&endpoint),
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());
@@ -220,7 +223,321 @@ async fn real_folder_classification_smoke_with_real_model() {
     }
 }
 
-fn env_or_default(name: &str, fallback: &str) -> String {
+    #[tokio::test]
+    #[ignore = "requires WIPEOUT_PIPELINE_ROOT, ENDPOINT, API_KEY, and MODEL"]
+    async fn real_folder_pipeline_smoke_with_real_model() {
+        let root = PathBuf::from(env_or_default(
+            "WIPEOUT_PIPELINE_ROOT",
+            &env_or_default("WIPEOUT_CLASSIFICATION_SMOKE_ROOT", "E:\\Download"),
+        ));
+        let endpoint = env_or_default(
+            "WIPEOUT_PIPELINE_ENDPOINT",
+            &env_or_default("WIPEOUT_CLASSIFICATION_SMOKE_ENDPOINT", "https://api.deepseek.com"),
+        );
+        let api_key = {
+            let explicit = env::var("WIPEOUT_PIPELINE_API_KEY")
+                .or_else(|_| env::var("WIPEOUT_CLASSIFICATION_SMOKE_API_KEY"))
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            if let Some(key) = explicit {
+                key
+            } else {
+                let data_dir = PathBuf::from(env_or_default(
+                    "WIPEOUT_PIPELINE_DATA_DIR",
+                    "E:\\Cache\\AIcleaner",
+                ));
+                let state = crate::backend::AppState::bootstrap(data_dir)
+                    .expect("bootstrap app state for pipeline test");
+                crate::backend::resolve_provider_api_key(&state, &endpoint)
+                    .expect("resolve provider API key for pipeline test")
+            }
+        };
+        let model = env_or_default(
+            "WIPEOUT_PIPELINE_MODEL",
+            &env_or_default("WIPEOUT_CLASSIFICATION_SMOKE_MODEL", "deepseek-v4-flash"),
+        );
+        let summary_strategy = env::var("WIPEOUT_PIPELINE_SUMMARY_STRATEGY")
+            .unwrap_or_else(|_| SUMMARY_MODE_FILENAME_ONLY.to_string());
+        let max_items = env::var("WIPEOUT_PIPELINE_MAX_ITEMS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(96);
+        let chunk_size = env::var("WIPEOUT_PIPELINE_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(24)
+            .min(max_items)
+            .max(1);
+        let concurrency = env::var("WIPEOUT_PIPELINE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8);
+        let stages: Vec<String> = env::var("WIPEOUT_PIPELINE_STAGES")
+            .ok()
+            .map(|v| {
+                v.split([',', ' ', ';'])
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["classify".to_string()]);
+
+        assert!(root.is_dir(), "pipeline root must be a directory: {:?}", root);
+
+        let route = RouteConfig {
+            endpoint: endpoint.clone(),
+            api_key,
+            model,
+            api_format: crate::llm_protocol::detect_api_format(&endpoint),
+            thinking_enabled: false,
+            thinking_level: "medium".to_string(),
+        };
+
+        // ── Stage: collect ──────────────────────────────────────────
+        let pipeline_started_at = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let collect_started_at = Instant::now();
+        let collection = collect_units(&root, true, &normalize_excluded(None), stop.as_ref());
+        let collect_elapsed = collect_started_at.elapsed();
+        let collected_count = collection.units.len();
+        let units = collection.units.into_iter().take(max_items).collect::<Vec<_>>();
+        assert!(!units.is_empty(), "pipeline found no classifiable units in {:?}", root);
+
+        // ── Stage: classify ─────────────────────────────────────────
+        let mut routes = HashMap::new();
+        routes.insert("text".to_string(), route.clone());
+        let task = make_summary_test_runtime(&root, routes);
+        let mut summary_elapsed = Duration::default();
+        let mut total_usage = TokenUsage::default();
+        let mut total_assigned = 0usize;
+        let mut classified_items = 0usize;
+        let mut prepared_batches = Vec::new();
+
+        for (chunk_idx, chunk) in units.chunks(chunk_size).enumerate() {
+            let summary_started_at = Instant::now();
+            let prepared = prepare_summary_batch(
+                task.clone(),
+                route.clone(),
+                summary_strategy.clone(),
+                chunk_idx,
+                chunk.to_vec(),
+            )
+            .await
+            .expect("prepare pipeline summary batch");
+            summary_elapsed += summary_started_at.elapsed();
+            prepared_batches.push((chunk_idx, prepared));
+        }
+
+        let classify_wall_started_at = Instant::now();
+        let classify_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let shared_search_calls = Arc::new(AtomicUsize::new(0));
+        let shared_search_gate = Arc::new(tokio::sync::Semaphore::new(ORGANIZER_SEARCH_CONCURRENCY));
+        let mut classify_batch_rows: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut handles = Vec::new();
+
+        for (chunk_idx, prepared) in prepared_batches {
+            classify_batch_rows.push((chunk_idx, prepared.batch_rows.clone()));
+            let permit = classify_semaphore.clone().acquire_owned().await
+                .expect("classification concurrency semaphore");
+            let route = route.clone();
+            let stop = stop.clone();
+            let shared_search_calls = shared_search_calls.clone();
+            let shared_search_gate = shared_search_gate.clone();
+            handles.push(tauri::async_runtime::spawn(async move {
+                let _permit = permit;
+                let batch_rows = prepared.batch_rows;
+                let item_count = batch_rows.len();
+                let tree = deterministic_initial_tree(&batch_rows);
+                let classify_started_at = Instant::now();
+                let output = summary::classify_organize_batch(
+                    &route, "zh-CN", stop.as_ref(), &tree, 1, &batch_rows, &[],
+                    None, false, "", shared_search_calls, shared_search_gate, None,
+                    "pipeline_classify",
+                )
+                .await
+                .expect("run pipeline classification");
+                let batch_classify_elapsed = classify_started_at.elapsed();
+                (chunk_idx, item_count, batch_classify_elapsed, output)
+            }));
+        }
+
+        let mut classify_elapsed_sum = Duration::default();
+        let mut batch_outputs: Vec<(usize, usize, Value)> = Vec::new();
+        for handle in handles {
+            let (chunk_idx, item_count, batch_classify_elapsed, output) =
+                handle.await.expect("join pipeline classification");
+            classify_elapsed_sum += batch_classify_elapsed;
+            println!(
+                "classify_batch={} items={} timing=classify_model:{}ms usage=prompt:{},completion:{},total:{}",
+                chunk_idx + 1,
+                item_count,
+                batch_classify_elapsed.as_millis(),
+                output.usage.prompt,
+                output.usage.completion,
+                output.usage.total
+            );
+            assert!(output.error.is_none(),
+                "classification failed in batch {}: {:?}\n{}",
+                chunk_idx + 1, output.error, output.raw_output
+            );
+            let parsed = output.parsed.expect("classification batch parsed output");
+            assert_eq!(parsed.get("baseTreeVersion").and_then(Value::as_u64), Some(1));
+            let direct = parsed.get("assignments").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+            let deferred = parsed.get("deferredAssignments").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+            assert!(direct + deferred >= item_count,
+                "batch {} did not assign all items: direct={}, deferred={}, items={}",
+                chunk_idx + 1, direct, deferred, item_count
+            );
+            total_assigned += direct + deferred;
+            classified_items += item_count;
+            total_usage.prompt += output.usage.prompt;
+            total_usage.completion += output.usage.completion;
+            total_usage.total += output.usage.total;
+            batch_outputs.push((chunk_idx, item_count, parsed));
+        }
+        let classify_wall_elapsed = classify_wall_started_at.elapsed();
+
+        // ── Stage: tree_shape (reconcile) ───────────────────────────
+        let tree_shape_elapsed;
+        if stages.contains(&"tree_shape".to_string()) || stages.contains(&"full".to_string()) {
+            let mut reconcile_inputs = Vec::new();
+            let mut all_tree_proposals = Vec::new();
+            for (_chunk_idx, _item_count, parsed) in &batch_outputs {
+                let tree_proposals = parsed
+                    .get("treeProposals")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let deferred_assignments = parsed
+                    .get("deferredAssignments")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !tree_proposals.is_empty() || !deferred_assignments.is_empty() {
+                    reconcile_inputs.push(json!({
+                        "batchIndex": _chunk_idx + 1,
+                        "baseTreeVersion": 1,
+                        "treeProposals": tree_proposals,
+                        "deferredAssignments": deferred_assignments,
+                        "assignments": [],
+                    }));
+                    all_tree_proposals.extend(
+                        tree_proposals.iter().filter_map(|p|
+                            p.get("proposalId").and_then(Value::as_str).map(|s| s.to_string())
+                        )
+                    );
+                }
+            }
+
+            if !reconcile_inputs.is_empty() && !route.api_key.trim().is_empty() {
+                let initial_tree = {
+                    let mut tree = CategoryTreeNode {
+                        node_id: "root".to_string(),
+                        name: String::new(),
+                        children: Vec::new(),
+                    };
+                    for (chunk_idx, batch_rows) in &classify_batch_rows {
+                        let batch_tree = deterministic_initial_tree(batch_rows);
+                        if *chunk_idx == 0 {
+                            tree = batch_tree;
+                        } else {
+                            tree.children.extend(batch_tree.children);
+                        }
+                    }
+                    category_tree_to_value(&tree)
+                };
+                let tree_shape_started_at = Instant::now();
+                match summary::reconcile_tree_shape(
+                    &route,
+                    "zh-CN",
+                    stop.as_ref(),
+                    &initial_tree,
+                    &reconcile_inputs,
+                    None,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        tree_shape_elapsed = tree_shape_started_at.elapsed();
+                        total_usage.prompt += output.usage.prompt;
+                        total_usage.completion += output.usage.completion;
+                        total_usage.total += output.usage.total;
+                        if let Some(err) = &output.error {
+                            println!("tree_shape error: {}", err);
+                        }
+                        if let Some(parsed) = &output.parsed {
+                            let mappings = parsed.get("proposalMappings")
+                                .and_then(Value::as_array)
+                                .map(Vec::len)
+                                .unwrap_or(0);
+                            let tree_nodes = parsed.get("finalTree")
+                                .and_then(count_tree_nodes)
+                                .unwrap_or(0);
+                            println!(
+                                "tree_shape timing=tree_shape:{}ms usage=prompt:{},completion:{},total:{} mappings={} tree_nodes={} proposals={}",
+                                tree_shape_elapsed.as_millis(),
+                                output.usage.prompt,
+                                output.usage.completion,
+                                output.usage.total,
+                                mappings,
+                                tree_nodes,
+                                all_tree_proposals.len(),
+                            );
+                        }
+                        println!("tree_shape trace={}", &output.raw_output[..output.raw_output.len().min(2000)]);
+                    }
+                    Err(err) => {
+                        tree_shape_elapsed = tree_shape_started_at.elapsed();
+                        println!("tree_shape FAILED: {} (elapsed={}ms)", err, tree_shape_elapsed.as_millis());
+                    }
+                }
+            } else {
+                tree_shape_elapsed = Duration::default();
+                println!("tree_shape skipped: {} inputs, has_api_key={}", reconcile_inputs.len(), !route.api_key.trim().is_empty());
+            }
+        } else {
+            tree_shape_elapsed = Duration::default();
+        }
+
+        let total_elapsed = pipeline_started_at.elapsed();
+        println!(
+            "pipeline_stages={} root={} collected={} items={}",
+            stages.join(","),
+            root.display(),
+            collected_count,
+            classified_items,
+        );
+        println!(
+            "timing=collect:{}ms,summary:{}ms,classify_model_sum:{}ms,classify_wall:{}ms,tree_shape:{}ms,total:{}ms",
+            collect_elapsed.as_millis(),
+            summary_elapsed.as_millis(),
+            classify_elapsed_sum.as_millis(),
+            classify_wall_elapsed.as_millis(),
+            tree_shape_elapsed.as_millis(),
+            total_elapsed.as_millis(),
+        );
+        println!(
+            "usage=prompt:{},completion:{},total:{}",
+            total_usage.prompt, total_usage.completion, total_usage.total
+        );
+        println!("assigned={}", total_assigned);
+    }
+
+    fn count_tree_nodes(tree: &Value) -> Option<usize> {
+        let obj = tree.as_object()?;
+        let children = obj.get("children").and_then(Value::as_array)?;
+        let mut count = 1usize;
+        for child in children {
+            count += count_tree_nodes(child)?;
+        }
+        Some(count)
+    }
+
+    fn env_or_default(name: &str, fallback: &str) -> String {
     env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
@@ -368,9 +685,12 @@ async fn real_folder_single_batch_capacity_sweep_with_real_model() {
     );
 
     let route = RouteConfig {
-        endpoint,
+        endpoint: endpoint.clone(),
         api_key,
         model,
+        api_format: crate::llm_protocol::detect_api_format(&endpoint),
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());
@@ -682,9 +1002,12 @@ async fn real_folder_small_batch_concurrency_sweep_with_real_model() {
     );
 
     let route = RouteConfig {
-        endpoint,
+        endpoint: endpoint.clone(),
         api_key,
         model,
+        api_format: crate::llm_protocol::detect_api_format(&endpoint),
+        thinking_enabled: false,
+        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());

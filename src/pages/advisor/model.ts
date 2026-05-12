@@ -2,6 +2,7 @@ import type {
   AdvisorSessionData,
   JsonRecord,
   OrganizeProgress,
+  OrganizeResultRow,
   OrganizeSnapshot,
   OrganizeViewSnapshot,
   StreamHandle,
@@ -82,6 +83,79 @@ function arrayField<T>(value: unknown): T[] {
   return Array.isArray(value) ? value as T[] : [];
 }
 
+function normalizeCategoryPath(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function treePathByNodeId(node: unknown, targetId: string, path: string[] = []): string[] | null {
+  const record = asRecord(node);
+  if (!record || !targetId) return null;
+  const nodeId = stringField(record.nodeId ?? record.id);
+  if (nodeId === targetId) return path;
+  const children = arrayField<unknown>(record.children);
+  for (const child of children) {
+    const childRecord = asRecord(child);
+    const childName = stringField(childRecord?.name ?? childRecord?.label);
+    const nextPath = childName ? [...path, childName] : path;
+    const found = treePathByNodeId(child, targetId, nextPath);
+    if (found) return found;
+  }
+  return null;
+}
+
+function pathDisplay(path: string[]): string {
+  return path.length ? path.join(' / ') : '其他待定';
+}
+
+function displayRowsFromFinalState(snapshot: OrganizeSnapshotInput): OrganizeResultRow[] {
+  const row = asRecord(snapshot);
+  if (!row) return [];
+  const finalAssignments = arrayField<JsonRecord>(row.finalAssignments ?? row.final_assignments);
+  const displayResults = arrayField<JsonRecord>(row.displayResults ?? row.display_results);
+  const finalTree = row.finalTree ?? row.final_tree ?? row.tree;
+  if (!displayResults.length) return [];
+  if (!finalAssignments.length || !finalTree) {
+    return displayResults.map((result) => ({
+      ...result,
+      categoryPath: normalizeCategoryPath(result.categoryPath),
+    } as OrganizeResultRow));
+  }
+
+  const assignmentByItemId = new Map<string, JsonRecord>();
+  for (const assignment of finalAssignments) {
+    const itemId = stringField(assignment.itemId ?? assignment.item_id);
+    if (itemId) assignmentByItemId.set(itemId, assignment);
+  }
+
+  return displayResults.map((result, index) => {
+    const itemId = stringField(result.itemId);
+    const assignment = itemId ? assignmentByItemId.get(itemId) : undefined;
+    const categoryPath = normalizeCategoryPath(
+      assignment?.categoryPath ?? assignment?.category_path ?? result.categoryPath,
+    );
+    const leafNodeId = stringField(assignment?.leafNodeId ?? assignment?.leaf_node_id ?? result.leafNodeId);
+    const resolvedPath = categoryPath.length
+      ? categoryPath
+      : treePathByNodeId(finalTree, leafNodeId) ?? normalizeCategoryPath(result.categoryPath);
+    return {
+      ...result,
+      index: Number(result.index ?? index + 1) || index + 1,
+      itemId,
+      path: stringField(result.path),
+      name: stringField(result.name),
+      itemType: stringField(result.itemType) || 'file',
+      categoryPath: resolvedPath,
+      leafNodeId,
+      reason: stringField(assignment?.reason ?? result.reason),
+      category: pathDisplay(resolvedPath),
+    } as OrganizeResultRow;
+  });
+}
+
 function normalizeProgress(value: unknown, status: string): OrganizeProgress {
   const progress = asRecord(value) || {};
   const stage = stringField(progress.stage) || (status === 'done' ? 'completed' : status || 'idle');
@@ -119,8 +193,12 @@ export function normalizeOrganizeSnapshot(snapshot: unknown): OrganizeViewSnapsh
     webSearchEnabled: booleanField(row.webSearchEnabled ?? row.web_search_enabled),
     progress: normalizeProgress(row.progress, status),
     tree: objectField<TreeNode>(row.tree, { children: [] }),
-    results: arrayField(row.results),
+    finalTree: objectField<TreeNode>(row.finalTree ?? row.final_tree, { children: [] }),
+    finalAssignments: arrayField(row.finalAssignments || row.final_assignments),
+    displayResults: arrayField(row.displayResults ?? row.display_results),
   };
+  const displayResults = displayRowsFromFinalState(row);
+  view.displayResults = displayResults.length ? displayResults : view.displayResults;
   const durationMs = numberField(row.durationMs ?? row.duration_ms);
   const requestCount = numberField(row.requestCount ?? row.request_count);
   const errorCount = numberField(row.errorCount ?? row.error_count);
@@ -293,7 +371,6 @@ export function getWorkflowStage(state: AdvisorWorkflowState): string {
 export function getStageLabel(state: AdvisorWorkflowState): string {
   const stage = getWorkflowStage(state);
   if (stage === 'execute_ready') return text('可执行', 'Ready to Execute');
-  if (stage === 'preview_ready') return text('可预览', 'Ready to Preview');
   return text('理解中', 'Understanding');
 }
 
@@ -328,6 +405,9 @@ export function getOrganizeStatusLabel(state: AdvisorWorkflowState, snapshot: Or
   if (stage === 'summary') return text('准备摘要', 'Preparing Summaries');
   if (stage === 'initial_tree') return text('生成分类树', 'Building Category Tree');
   if (stage === 'classification') return text('分类批次', 'Classifying Batches');
+  if (stage === 'build_tree_shape') return text('合并分类树', 'Building Tree Shape');
+  if (stage === 'fill_items') return text('填入文件', 'Filling Items');
+  if (stage === 'adjust') return text('调整分类', 'Adjusting Tree');
   if (stage === 'reconcile') return text('合并校验', 'Reconciling Tree');
   if (stage === 'finalize') return text('生成结果', 'Finalizing Results');
   if (stage === 'moving') return text('执行移动', 'Applying Moves');

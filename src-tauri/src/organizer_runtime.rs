@@ -1,5 +1,5 @@
 mod planner;
-mod summary;
+pub(crate) mod summary;
 
 use crate::backend::{
     AppState, OrganizeProgress, OrganizeSnapshot, OrganizeStartInput, TokenUsage,
@@ -7,8 +7,8 @@ use crate::backend::{
 use crate::file_representation::FileRepresentation;
 use crate::llm_protocol::{
     apply_auth_headers, apply_llm_transport_headers, build_completion_payload,
-    build_llm_http_client, build_messages_url, detect_api_format, parse_completion_response,
-    ParsedToolCall, DEFAULT_MAX_TOKENS,
+    build_llm_http_client, build_messages_url, parse_completion_response, ApiFormat,
+    ParsedToolCall, ThinkingConfig, DEFAULT_MAX_TOKENS,
 };
 use crate::model_boundary::ModelIdMap;
 use crate::persist;
@@ -34,9 +34,9 @@ const CATEGORY_OTHER_PENDING: &str = "\u{5176}\u{4ED6}\u{5F85}\u{5B9A}";
 const CATEGORY_CLASSIFICATION_ERROR: &str = "\u{5206}\u{7C7B}\u{9519}\u{8BEF}";
 const RESULT_REASON_CLASSIFICATION_ERROR: &str = "classification_error";
 const CHAT_COMPLETION_TIMEOUT_SECS: u64 = 180;
-const TIKA_EXTRACT_TIMEOUT_SECS: u64 = 90;
+pub(crate) const TIKA_EXTRACT_TIMEOUT_SECS: u64 = 90;
 const RESPONSE_ERROR_SNIPPET_CHARS: usize = 400;
-const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
+pub(crate) const LOCAL_TEXT_EXCERPT_CHARS: usize = 1200;
 const LOCAL_SUMMARY_EXCERPT_CHARS: usize = 480;
 const SUMMARY_AGENT_SUMMARY_CHARS: usize = 320;
 const SUMMARY_AGENT_BATCH_MAX_CHARS: usize = 24_000;
@@ -47,11 +47,12 @@ const EXTRACTION_GLOBAL_BUDGET: u32 = 128;
 const EXTRACTION_TIKA_HARD_CAP: usize = 32;
 const EXTRACTION_HEAVY_DOC_HARD_CAP: usize = 8;
 const CLASSIFICATION_BATCH_CONCURRENCY: usize = 50;
+const LOCAL_REFINE_OVERSIZED_THRESHOLD: usize = 20;
 const ORGANIZER_SEARCH_CONCURRENCY: usize = 8;
 pub(crate) const ORGANIZER_WEB_SEARCH_BUDGET: usize = 20;
-const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
-const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
-const DEFAULT_TIKA_URL: &str = "http://127.0.0.1:9998";
+pub(crate) const LOCAL_SUMMARY_MAX_PLAIN_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const TIKA_MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const DEFAULT_TIKA_URL: &str = "http://127.0.0.1:9998";
 
 const SUMMARY_MODE_FILENAME_ONLY: &str = "filename_only";
 const SUMMARY_MODE_LOCAL_SUMMARY: &str = "local_summary";
@@ -81,6 +82,9 @@ struct RouteConfig {
     endpoint: String,
     api_key: String,
     model: String,
+    api_format: ApiFormat,
+    thinking_enabled: bool,
+    thinking_level: String,
 }
 
 #[derive(Debug)]
@@ -114,6 +118,13 @@ struct InitialTreeOutput {
 }
 
 struct ReconcileOrganizeOutput {
+    parsed: Option<Value>,
+    usage: TokenUsage,
+    raw_output: String,
+    error: Option<String>,
+}
+
+struct LocalReclassificationOutput {
     parsed: Option<Value>,
     usage: TokenUsage,
     raw_output: String,
@@ -176,13 +187,13 @@ fn set_organize_progress(
 }
 
 #[derive(Clone, Debug, Default)]
-struct SummaryExtraction {
-    parser: String,
-    title: Option<String>,
-    excerpt: String,
-    keywords: Vec<String>,
-    metadata_lines: Vec<String>,
-    warnings: Vec<String>,
+pub(crate) struct SummaryExtraction {
+    pub(crate) parser: String,
+    pub(crate) title: Option<String>,
+    pub(crate) excerpt: String,
+    pub(crate) keywords: Vec<String>,
+    pub(crate) metadata_lines: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -192,12 +203,12 @@ struct SummaryBuildResult {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ExtractionToolConfig {
-    tika_enabled: bool,
-    tika_url: String,
-    tika_auto_start: bool,
-    tika_jar_path: String,
-    tika_ready: bool,
+pub(crate) struct ExtractionToolConfig {
+    pub(crate) tika_enabled: bool,
+    pub(crate) tika_url: String,
+    pub(crate) tika_auto_start: bool,
+    pub(crate) tika_jar_path: String,
+    pub(crate) tika_ready: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,12 +231,11 @@ impl DirectoryResultKind {
 }
 
 #[derive(Clone)]
-struct DirectoryAssessment {
+pub(crate) struct DirectoryAssessment {
     result_kind: DirectoryResultKind,
     integrity_score: u8,
     integrity_kind: String,
     evidence: Vec<String>,
-    wrapper_target_path: Option<String>,
     top_level_entries: Vec<String>,
     dominant_extensions: Vec<String>,
     name_families: Vec<String>,
@@ -241,16 +251,16 @@ struct DirectoryAssessment {
 }
 
 #[derive(Clone)]
-struct OrganizeUnit {
-    name: String,
-    path: String,
-    relative_path: String,
-    size: u64,
-    created_at: Option<String>,
-    modified_at: Option<String>,
-    item_type: String,
-    modality: String,
-    directory_assessment: Option<DirectoryAssessment>,
+pub(crate) struct OrganizeUnit {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: u64,
+    pub(crate) created_at: Option<String>,
+    pub(crate) modified_at: Option<String>,
+    pub(crate) item_type: String,
+    pub(crate) modality: String,
+    pub(crate) directory_assessment: Option<DirectoryAssessment>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -462,6 +472,9 @@ impl OrganizerDiagnostics {
                 "stage": stage,
                 "endpoint": route.endpoint.clone(),
                 "model": route.model.clone(),
+                "apiFormat": route.api_format.as_str(),
+                "thinkingEnabled": route.thinking_enabled,
+                "thinkingLevel": route.thinking_level.clone(),
                 "url": url,
                 "messages": messages,
                 "tools": tools,
@@ -475,8 +488,7 @@ impl OrganizerDiagnostics {
     fn model_error(
         &self,
         stage: &str,
-        endpoint: &str,
-        model: &str,
+        route: &RouteConfig,
         message: &str,
         details: Value,
         duration: Duration,
@@ -495,8 +507,11 @@ impl OrganizerDiagnostics {
             crate::diagnostics::merge_details(
                 json!({
                     "stage": stage,
-                    "endpoint": endpoint,
-                    "model": model,
+                    "endpoint": route.endpoint,
+                    "model": route.model,
+                    "apiFormat": route.api_format.as_str(),
+                    "thinkingEnabled": route.thinking_enabled,
+                    "thinkingLevel": route.thinking_level,
                 }),
                 details,
             ),
@@ -508,8 +523,7 @@ impl OrganizerDiagnostics {
     fn model_response(
         &self,
         stage: &str,
-        endpoint: &str,
-        model: &str,
+        route: &RouteConfig,
         status: u16,
         raw_body: &str,
         duration: Duration,
@@ -524,8 +538,11 @@ impl OrganizerDiagnostics {
             "organizer model response received",
             json!({
                 "stage": stage,
-                "endpoint": endpoint,
-                "model": model,
+                "endpoint": route.endpoint,
+                "model": route.model,
+                "apiFormat": route.api_format.as_str(),
+                "thinkingEnabled": route.thinking_enabled,
+                "thinkingLevel": route.thinking_level,
                 "status": status,
                 "rawBody": raw_body,
             }),

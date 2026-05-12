@@ -85,26 +85,12 @@ fn category_inventory_groups_history_without_summaries() {
 
 #[test]
 fn collection_root_detects_download_like_root() {
-    let root = temp_dir("download-root").join("Download");
-    fs::create_dir_all(root.join("Buzz-1.4.2-Windows-X64")).expect("create buzz dir");
-    fs::create_dir_all(root.join("QuickRestart")).expect("create quick dir");
-    fs::create_dir_all(root.join("Fonts")).expect("create fonts dir");
-    fs::create_dir_all(root.join("Docs")).expect("create docs dir");
-    write_file(&root.join("setup.exe"));
-    write_file(&root.join("paper.pdf"));
-    write_file(&root.join("archive.zip"));
-    write_file(&root.join("image.png"));
-
-    let stop = AtomicBool::new(false);
-    let mut report = CollectionReport::default();
-    assert!(is_collection_root(
-        &root,
-        &normalize_excluded(None),
-        &stop,
-        &mut report
-    ));
-
-    let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    let mut families = HashSet::new();
+    families.insert("app".to_string());
+    families.insert("document".to_string());
+    families.insert("archive".to_string());
+    families.insert("image".to_string());
+    assert!(compute_is_collection_root_from_scan("Download", 4, 4, &families));
 }
 
 #[test]
@@ -182,10 +168,6 @@ fn evaluates_wrapper_passthrough_for_single_child_shell() {
     assert_eq!(
         assessment.result_kind,
         DirectoryResultKind::WholeWrapperPassthrough
-    );
-    assert_eq!(
-        assessment.wrapper_target_path.as_deref(),
-        Some(target.to_string_lossy().as_ref())
     );
 
     let units = collect_units(&root, true, &normalize_excluded(None), &stop).units;

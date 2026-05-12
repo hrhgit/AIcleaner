@@ -1,13 +1,3 @@
-fn resolve_storage_data_dir(base_data_dir: &Path, bootstrap_path: &Path) -> PathBuf {
-    fs::read_to_string(bootstrap_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<StorageLocationConfig>(&raw).ok())
-        .and_then(|config| config.data_dir)
-        .map(|value| PathBuf::from(value.trim()))
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| base_data_dir.to_path_buf())
-}
-
 fn write_storage_location_config(
     base_data_dir: &Path,
     bootstrap_path: &Path,
@@ -196,7 +186,7 @@ pub struct OrganizeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_count: Option<u64>,
     #[serde(default)]
-    pub results: Vec<Value>,
+    pub display_results: Vec<Value>,
     #[serde(default)]
     pub preview: Vec<Value>,
     pub created_at: String,

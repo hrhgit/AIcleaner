@@ -45,7 +45,7 @@ impl<'a> ToolService<'a> {
         let mut map = std::collections::HashMap::<String, InventoryItem>::new();
 
         if let Some(snapshot) = &assets.organize_snapshot {
-            for row in &snapshot.results {
+            for row in persist::build_final_result_rows(snapshot) {
                 let path = row
                     .get("path")
                     .and_then(Value::as_str)
@@ -56,7 +56,7 @@ impl<'a> ToolService<'a> {
                     continue;
                 }
                 let key = normalize_path_key(&path);
-                let representation = representation_from_organize_row(row);
+                let representation = representation_from_organize_row(&row);
                 let summary = representation.best_text();
                 let mut category_path = overrides
                     .get(&key)

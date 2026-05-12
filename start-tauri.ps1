@@ -48,14 +48,21 @@ if (-not $SkipInstall) {
 }
 
 if ($CheckOnly) {
-  Write-Step "Environment check passed"
-  exit 0
+    Write-Step "Environment check passed"
+    exit 0
 }
 
 Write-Step "Starting Tauri dev app"
-Write-Host "This will launch Vite through Tauri beforeDevCommand." -ForegroundColor DarkGray
-
-npm run tauri:dev
-if ($LASTEXITCODE -ne 0) {
-  throw "npm run tauri:dev failed."
+if (Test-Command "portmux") {
+  Write-Host "This will launch via portmux-managed dev port allocation." -ForegroundColor DarkGray
+  portmux start
+  if ($LASTEXITCODE -ne 0) {
+    throw "portmux start failed."
+  }
+} else {
+  Write-Host "portmux is not on PATH; falling back to npm start." -ForegroundColor Yellow
+  npm start
+  if ($LASTEXITCODE -ne 0) {
+    throw "npm start failed."
+  }
 }
