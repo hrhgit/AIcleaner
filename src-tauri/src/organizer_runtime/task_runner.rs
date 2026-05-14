@@ -97,6 +97,12 @@ struct ClassificationBatchRun {
     attempt_errors: Vec<String>,
 }
 
+struct LocalRefineCandidateRun {
+    candidate: OversizedSubtreeCandidate,
+    output: Option<LocalReclassificationOutput>,
+    request_error: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct OversizedSubtreeCandidate {
     node_id: String,
@@ -141,34 +147,33 @@ fn select_oversized_subtree_candidates(
     fn walk(
         node: &CategoryTreeNode,
         counts: &HashMap<String, usize>,
-        threshold: usize,
         current_path: &mut Vec<String>,
+        threshold: usize,
         out: &mut Vec<OversizedSubtreeCandidate>,
-    ) -> bool {
-        let mut oversized_descendant_selected = false;
+    ) {
+        if node.children.is_empty() {
+            let current_count = counts.get(&node.node_id).copied().unwrap_or(0);
+            if current_count > threshold && !current_path.is_empty() {
+                out.push(OversizedSubtreeCandidate {
+                    node_id: node.node_id.clone(),
+                    category_path: current_path.clone(),
+                    item_count: current_count,
+                });
+            }
+            return;
+        }
+
         for child in &node.children {
             current_path.push(child.name.clone());
-            let child_selected = walk(child, counts, threshold, current_path, out);
-            oversized_descendant_selected |= child_selected;
+            walk(child, counts, current_path, threshold, out);
             current_path.pop();
         }
-        let current_count = counts.get(&node.node_id).copied().unwrap_or(0);
-        let current_oversized = current_count > threshold;
-        if current_oversized && !oversized_descendant_selected && !current_path.is_empty() {
-            out.push(OversizedSubtreeCandidate {
-                node_id: node.node_id.clone(),
-                category_path: current_path.clone(),
-                item_count: current_count,
-            });
-            return true;
-        }
-        current_oversized || oversized_descendant_selected
     }
 
     let counts = count_items_for_leaf_subtree(tree, assignments);
     let mut out = Vec::new();
     let mut path = Vec::new();
-    walk(tree, &counts, threshold, &mut path, &mut out);
+    walk(tree, &counts, &mut path, threshold, &mut out);
     out
 }
 
@@ -704,8 +709,6 @@ fn route_for_unit(task: &OrganizeTaskRuntime, unit: &OrganizeUnit) -> RouteConfi
             api_key: String::new(),
             model: String::new(),
             api_format: ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         })
 }
 
@@ -1867,8 +1870,6 @@ async fn run_organize_task<R: Runtime>(
         api_key: String::new(),
         model: String::new(),
         api_format: ApiFormat::OpenAi,
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     });
     let task_id = task.snapshot.lock().id.clone();
     let basic_batch_rows = build_basic_batch_rows(&units, batch_size);
@@ -2790,7 +2791,81 @@ async fn run_organize_task<R: Runtime>(
     let local_refine_used_model =
         !text_route.api_key.trim().is_empty() && !local_refine_candidates.is_empty();
     let mut local_refine_request_count = 0u64;
-    for (candidate_index, candidate) in local_refine_candidates.iter().enumerate() {
+    let mut local_refine_handles: Vec<JoinHandle<LocalRefineCandidateRun>> = Vec::new();
+    for candidate in &local_refine_candidates {
+        let subtree = build_local_refine_subtree_value(&tree, &candidate.node_id);
+        let items =
+            build_local_refine_items(candidate, &tree, &final_assignment_inputs, &rows_by_id);
+        if subtree.is_null() || items.is_empty() {
+            local_refine_handles.push(tauri::async_runtime::spawn({
+                let candidate = candidate.clone();
+                async move {
+                    LocalRefineCandidateRun {
+                        candidate,
+                        output: None,
+                        request_error: Some(
+                            "local_refine_candidate_missing_subtree_or_items".to_string(),
+                        ),
+                    }
+                }
+            }));
+            continue;
+        }
+
+        if text_route.api_key.trim().is_empty() {
+            local_refine_handles.push(tauri::async_runtime::spawn({
+                let candidate = candidate.clone();
+                async move {
+                    LocalRefineCandidateRun {
+                        candidate,
+                        output: None,
+                        request_error: Some("local_refine_missing_api_key".to_string()),
+                    }
+                }
+            }));
+            continue;
+        }
+
+        local_refine_request_count = local_refine_request_count.saturating_add(1);
+        let candidate = candidate.clone();
+        let text_route = text_route.clone();
+        let task = task.clone();
+        local_refine_handles.push(tauri::async_runtime::spawn(async move {
+            let output = summary::refine_local_subtree_once(
+                &text_route,
+                &task.response_language,
+                &task.stop,
+                &subtree,
+                &items,
+                Some(&task.diagnostics),
+            )
+            .await;
+            match output {
+                Ok(output) => LocalRefineCandidateRun {
+                    candidate,
+                    output: Some(output),
+                    request_error: None,
+                },
+                Err(err) => LocalRefineCandidateRun {
+                    candidate,
+                    output: None,
+                    request_error: Some(err),
+                },
+            }
+        }));
+    }
+
+    let mut local_refine_runs = Vec::with_capacity(local_refine_handles.len());
+    for handle in local_refine_handles {
+        local_refine_runs.push(
+            handle
+                .await
+                .map_err(|e| format!("local_refine_join_failed:{e}"))?,
+        );
+    }
+
+    for (candidate_index, run) in local_refine_runs.into_iter().enumerate() {
+        let candidate = run.candidate;
         {
             let mut snap = task.snapshot.lock();
             set_organize_progress(
@@ -2812,50 +2887,22 @@ async fn run_organize_task<R: Runtime>(
         }
         emit_snapshot(app, state, task).await?;
 
-        let subtree = build_local_refine_subtree_value(&tree, &candidate.node_id);
-        let items = build_local_refine_items(candidate, &tree, &final_assignment_inputs, &rows_by_id);
-        if subtree.is_null() || items.is_empty() {
+        if let Some(err) = run.request_error {
             batch_outputs.push(json!({
                 "stage": "local_refine_oversized_nodes",
                 "nodeId": candidate.node_id.clone(),
                 "categoryPath": candidate.category_path.clone(),
                 "itemCount": candidate.item_count,
                 "usedModel": false,
-                "error": "local_refine_candidate_missing_subtree_or_items",
+                "error": err,
                 "modelRawOutput": "",
             }));
             local_refine_error_count = local_refine_error_count.saturating_add(1);
             continue;
         }
 
-        if text_route.api_key.trim().is_empty() {
-            batch_outputs.push(json!({
-                "stage": "local_refine_oversized_nodes",
-                "nodeId": candidate.node_id.clone(),
-                "categoryPath": candidate.category_path.clone(),
-                "itemCount": candidate.item_count,
-                "usedModel": false,
-                "error": "local_refine_missing_api_key",
-                "modelRawOutput": "",
-            }));
-            local_refine_error_count = local_refine_error_count.saturating_add(1);
-            continue;
-        }
-
-        if !text_route.api_key.trim().is_empty() {
-            local_refine_request_count = local_refine_request_count.saturating_add(1);
-        }
-        match summary::refine_local_subtree_once(
-            &text_route,
-            &task.response_language,
-            &task.stop,
-            &subtree,
-            &items,
-            Some(&task.diagnostics),
-        )
-        .await
-        {
-            Ok(output) => {
+        match run.output {
+            Some(output) => {
                 {
                     let mut snap = task.snapshot.lock();
                     add_token_usage(&mut snap.token_usage, &output.usage);
@@ -2866,7 +2913,7 @@ async fn run_organize_task<R: Runtime>(
                 if error.is_none() {
                     match output.parsed.as_ref() {
                         Some(parsed) => match apply_local_refine_assignments(
-                            candidate,
+                            &candidate,
                             &mut tree,
                             &mut final_assignment_inputs,
                             parsed,
@@ -2897,7 +2944,7 @@ async fn run_organize_task<R: Runtime>(
                     "modelRawOutput": output.raw_output,
                 }));
             }
-            Err(err) => {
+            None => {
                 local_refine_error_count = local_refine_error_count.saturating_add(1);
                 batch_outputs.push(json!({
                     "stage": "local_refine_oversized_nodes",
@@ -2905,7 +2952,7 @@ async fn run_organize_task<R: Runtime>(
                     "categoryPath": candidate.category_path.clone(),
                     "itemCount": candidate.item_count,
                     "usedModel": !text_route.api_key.trim().is_empty(),
-                    "error": err,
+                    "error": "local_refine_missing_output",
                     "modelRawOutput": "",
                 }));
             }

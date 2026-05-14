@@ -6,7 +6,6 @@ import {
   inferProviderTemplate,
   normalizeProviderApiFormat,
   normalizeProviderEndpoint,
-  normalizeThinkingLevel,
 } from '../../utils/provider-registry';
 
 export function normalizeProviders(settings: Settings | null | undefined): {
@@ -30,8 +29,6 @@ export function normalizeProviders(settings: Settings | null | undefined): {
       apiKey: '',
       apiFormat: normalizeProviderApiFormat(rawConfig?.apiFormat || matchedTemplate?.defaultApiFormat),
       model: String(rawConfig?.model || ''),
-      thinkingEnabled: true,
-      thinkingLevel: normalizeThinkingLevel(rawConfig?.thinking?.level),
       preset: false,
     });
   }
@@ -88,10 +85,6 @@ export function buildProviderSettingsPayload(
           endpoint,
           apiFormat: provider.apiFormat,
           model: String(provider.model || ''),
-          thinking: {
-            enabled: true,
-            level: normalizeThinkingLevel(provider.thinkingLevel),
-          },
         }];
       })
       .filter(Boolean) as Array<[string, ProviderConfig]>,

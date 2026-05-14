@@ -1603,7 +1603,7 @@ impl LlmTool for SummarizeFilesTool {
         tool_spec(
             self.id(),
             "summarize_files",
-            "为指定文件或分类生成或刷新摘要并写入摘要库。仅支持文档文件（pdf/doc/xls/ppt 等）和纯文本文件（txt/md/csv/json 等）；其它文件类型（图片、二进制、可执行文件等）无法生成内容摘要，会被跳过并返回错误。metadata 级别对所有文件有效。不会移动文件。",
+            "为指定文件或分类生成或刷新摘要并写入摘要库。摘要模式与归类保持一致：filename_only、local_summary、agent_summary。不会移动文件。",
             json!({
                 "type": "object",
                 "description": "摘要生成请求。优先使用 paths 精确指定，或用 categoryIds 指定分类范围。",
@@ -1626,10 +1626,10 @@ impl LlmTool for SummarizeFilesTool {
                             "description": "get_directory_overview 返回的 prompt-local 短分类 ID。"
                         }
                     },
-                    "representationLevel": {
+                    "summaryStrategy": {
                         "type": "string",
-                        "description": "摘要粒度。metadata：直接从元数据拼接，对所有文件有效。short/long：仅支持文档和纯文本文件，其它文件类型会被跳过并返回错误。",
-                        "enum": ["metadata", "short", "long"]
+                        "description": "摘要模式。filename_only：只用文件名、路径和元信息。local_summary：只做本地提取。agent_summary：本地提取后再调用摘要模型。",
+                        "enum": ["filename_only", "local_summary", "agent_summary"]
                     },
                     "missingOnly": {
                         "type": "boolean",
@@ -1691,7 +1691,7 @@ impl LlmTool for ReadOnlyFileSummariesTool {
         tool_spec(
             self.id(),
             "read_only_file_summaries",
-            "只读取已有文件摘要，不触发生成或刷新。用于低成本查看证据。",
+            "只读取已有文件摘要，不触发生成或刷新。返回与归类一致的 evidence 证据文本。",
             json!({
                 "type": "object",
                 "description": "已有摘要读取请求。不会修改摘要库。",
@@ -1714,10 +1714,10 @@ impl LlmTool for ReadOnlyFileSummariesTool {
                             "description": "get_directory_overview 返回的 prompt-local 短分类 ID。"
                         }
                     },
-                    "representationLevel": {
+                    "summaryStrategy": {
                         "type": "string",
-                        "description": "期望读取的摘要粒度。",
-                        "enum": ["metadata", "short", "long"]
+                        "description": "期望读取的摘要模式。",
+                        "enum": ["filename_only", "local_summary", "agent_summary"]
                     },
                     "limit": {
                         "type": "integer",

@@ -3,8 +3,6 @@ pub(crate) struct ProviderRouteConfig {
     pub endpoint: String,
     pub model: String,
     pub api_format: ApiFormat,
-    pub thinking_enabled: bool,
-    pub thinking_level: String,
 }
 
 fn apply_credentials_meta(
@@ -257,25 +255,10 @@ pub(crate) fn resolve_provider_endpoint_and_model(
                 .trim()
                 .to_string()
         });
-    let thinking_enabled = provider
-        .and_then(|config| config.get("thinking"))
-        .and_then(|thinking| thinking.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let thinking_level = normalize_provider_thinking_level(
-        provider
-            .and_then(|config| config.get("thinking"))
-            .and_then(|thinking| thinking.get("level"))
-            .and_then(Value::as_str),
-    )
-    .to_string();
-
     ProviderRouteConfig {
         endpoint,
         model,
         api_format,
-        thinking_enabled,
-        thinking_level,
     }
 }
 

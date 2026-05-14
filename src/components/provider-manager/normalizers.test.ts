@@ -15,8 +15,6 @@ const baseProvider = {
   apiKey: '',
   apiFormat: 'openai' as const,
   model: '',
-  thinkingEnabled: false,
-  thinkingLevel: 'medium' as const,
   preset: true,
 };
 
@@ -30,14 +28,13 @@ describe('provider manager normalizers', () => {
           name: 'Custom',
           apiFormat: 'anthropic',
           model: 'custom-model',
-          thinking: { enabled: true, level: 'high' },
         },
       },
     });
 
     expect(result.providers.some((provider) => provider.endpoint === 'https://example.test/v1')).toBe(true);
     expect(result.defaultProviderEndpoint).toBe(result.providers[0].endpoint);
-    expect(result.providers[0]?.thinkingEnabled).toBe(true);
+    expect(result.providers[0]?.model).toBe('custom-model');
   });
 
   it('maps known provider endpoints back to provider template labels', () => {
@@ -65,7 +62,7 @@ describe('provider manager normalizers', () => {
 
   it('serializes provider settings without credentials', () => {
     const payload = buildProviderSettingsPayload(
-      [{ ...baseProvider, model: 'gpt-4o-mini', thinkingEnabled: false, thinkingLevel: 'high' }],
+      [{ ...baseProvider, model: 'gpt-4o-mini' }],
       DEFAULT_PROVIDER_ENDPOINT,
       { provider: 'tavily', enabled: true, scopes: { classify: true, organizer: true } },
     );
@@ -75,10 +72,6 @@ describe('provider manager normalizers', () => {
       endpoint: DEFAULT_PROVIDER_ENDPOINT,
       apiFormat: 'openai',
       model: 'gpt-4o-mini',
-      thinking: {
-        enabled: true,
-        level: 'high',
-      },
     });
     expect(JSON.stringify(payload)).not.toContain('secret');
   });

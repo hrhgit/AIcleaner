@@ -59,8 +59,6 @@ async fn real_folder_classification_smoke_with_real_model() {
         api_key,
         model,
         api_format: crate::llm_protocol::detect_api_format(&endpoint),
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());
@@ -293,8 +291,6 @@ async fn real_folder_classification_smoke_with_real_model() {
             api_key,
             model,
             api_format: crate::llm_protocol::detect_api_format(&endpoint),
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         };
 
         // ── Stage: collect ──────────────────────────────────────────
@@ -689,8 +685,6 @@ async fn real_folder_single_batch_capacity_sweep_with_real_model() {
         api_key,
         model,
         api_format: crate::llm_protocol::detect_api_format(&endpoint),
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());
@@ -1006,8 +1000,6 @@ async fn real_folder_small_batch_concurrency_sweep_with_real_model() {
         api_key,
         model,
         api_format: crate::llm_protocol::detect_api_format(&endpoint),
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     };
     let mut routes = HashMap::new();
     routes.insert("text".to_string(), route.clone());

@@ -35,30 +35,32 @@ impl<'a> ToolService<'a> {
             Some(session),
             lang,
         )?;
-        let level =
-            RepresentationLevel::parse(args.get("representationLevel").and_then(Value::as_str));
+        let summary_strategy = summary_strategy_from_args(args);
         let selected = filter_inventory_by_args(&overview.inventory, args);
         let total = selected.len();
         let missing_only = args
             .get("missingOnly")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if level == RepresentationLevel::Metadata {
+        if summary_strategy == ADVISOR_SUMMARY_MODE_FILENAME_ONLY {
             let mut items = Vec::new();
             for item in selected {
                 if missing_only {
                     if let Some(row) =
-                        load_summary_row(&self.state.db_path(), root_path, &item.path, level, true)?
+                        load_summary_row(
+                            &self.state.db_path(),
+                            root_path,
+                            &item.path,
+                            &summary_strategy,
+                            true,
+                        )?
                     {
-                        items.push(summary_row_to_tool_item(
-                            &row,
-                            RepresentationLevel::Metadata,
-                        ));
+                        items.push(summary_row_to_tool_item(&row));
                         continue;
                     }
                 }
-                let row = self.persist_summary(root_path, &item, level, None)?;
-                items.push(summary_row_to_tool_item(&row, level));
+                let row = self.persist_summary(root_path, &item, &summary_strategy, None)?;
+                items.push(summary_row_to_tool_item(&row));
             }
             return Ok(json!({
                 "status": "ok",
@@ -67,7 +69,7 @@ impl<'a> ToolService<'a> {
                     &format!("已完成 {} 条文件摘要。", items.len()),
                     &format!("Completed {} file summaries.", items.len())
                 ),
-                "representationLevel": level.as_str(),
+                "summaryStrategy": summary_strategy,
                 "total": total,
                 "completed": items.len(),
                 "failed": 0,
@@ -92,7 +94,13 @@ impl<'a> ToolService<'a> {
         for item in selected {
             if missing_only {
                 if let Some(row) =
-                    load_summary_row(&self.state.db_path(), root_path, &item.path, level, true)?
+                    load_summary_row(
+                        &self.state.db_path(),
+                        root_path,
+                        &item.path,
+                        &summary_strategy,
+                        true,
+                    )?
                 {
                     cached_rows.push(row);
                     continue;
@@ -121,28 +129,61 @@ impl<'a> ToolService<'a> {
 
         let settings = crate::backend::read_settings(&self.state.settings_path());
         let mut extraction_config = extraction_tool_config_from_settings(&settings);
-        force_enable_tika_for_summary_mode(&mut extraction_config);
-        ensure_tika_server_running(self.state, &mut extraction_config).await;
+        if summary_strategy_uses_content(&summary_strategy) {
+            force_enable_tika_for_summary_mode(&mut extraction_config);
+            ensure_tika_server_running(self.state, &mut extraction_config).await;
+        }
 
         let mut rows = cached_rows;
-        let (generated_rows, scheduler_errors, scheduler, usage) = run_summary_scheduler(
-            &route,
-            root_path,
-            &generation_items,
-            level,
-            lang,
-            batch_size.max(1),
-            max_concurrency.max(1),
-            Some(extraction_config),
-        )
-        .await?;
+        let (generated_rows, scheduler_errors, scheduler, usage) =
+            if summary_strategy == ADVISOR_SUMMARY_MODE_AGENT_SUMMARY {
+                run_summary_scheduler(
+                    &route,
+                    root_path,
+                    &generation_items,
+                    &summary_strategy,
+                    lang,
+                    batch_size.max(1),
+                    max_concurrency.max(1),
+                    Some(extraction_config),
+                )
+                .await?
+            } else {
+                let mut generated_rows = Vec::new();
+                let mut scheduler_errors = Vec::new();
+                for item in &generation_items {
+                    match summarize_item_with_local_strategy(
+                        root_path,
+                        item,
+                        &summary_strategy,
+                        lang,
+                        Some(&extraction_config),
+                    )
+                    .await
+                    {
+                        Ok(row) => generated_rows.push(row),
+                        Err(error) => scheduler_errors.push(error),
+                    }
+                }
+                (
+                    generated_rows,
+                    scheduler_errors,
+                    SummarySchedulerStats {
+                        initial_concurrency: 1,
+                        final_concurrency: 1,
+                        retry_rounds: 0,
+                        degraded_concurrency: false,
+                    },
+                    TokenUsage::default(),
+                )
+            };
         rows.extend(generated_rows);
         for row in &rows {
             persist::save_advisor_file_summary(&self.state.db_path(), row)?;
         }
         let items = rows
             .iter()
-            .map(|row| summary_row_to_tool_item(row, level))
+            .map(summary_row_to_tool_item)
             .collect::<Vec<_>>();
         let mut all_errors: Vec<Value> = scheduler_errors.into_iter().map(|error| json!({
             "path": error.path,
@@ -165,7 +206,7 @@ impl<'a> ToolService<'a> {
                     "Some summaries failed. Check errors and retry."
                 ).to_string())
             },
-            "representationLevel": level.as_str(),
+            "summaryStrategy": summary_strategy,
             "total": total,
             "completed": items.len(),
             "failed": total_error_count,
@@ -205,8 +246,7 @@ impl<'a> ToolService<'a> {
                 .and_then(Value::as_str)
                 .unwrap_or("zh"),
         )?;
-        let level =
-            RepresentationLevel::parse(args.get("representationLevel").and_then(Value::as_str));
+        let summary_strategy = summary_strategy_from_args(args);
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(24) as usize;
         let root_path = session
             .get("rootPath")
@@ -216,11 +256,17 @@ impl<'a> ToolService<'a> {
             .into_iter()
             .take(limit)
             .filter_map(|item| {
-                read_existing_summary_item(&self.state.db_path(), root_path, &item, level)
+                read_existing_summary_item(
+                    &self.state.db_path(),
+                    root_path,
+                    &item,
+                    &summary_strategy,
+                )
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
+            "summaryStrategy": summary_strategy,
             "message": local_text(
                 session.get("responseLanguage").and_then(Value::as_str).unwrap_or("zh"),
                 &format!("已读取 {} 条已有摘要。", items.len()),
@@ -235,12 +281,10 @@ impl<'a> ToolService<'a> {
         &self,
         root_path: &str,
         item: &InventoryItem,
-        level: RepresentationLevel,
+        summary_strategy: &str,
         representation: Option<FileRepresentation>,
     ) -> Result<Value, String> {
-        let representation = representation
-            .unwrap_or_else(|| metadata_representation(item))
-            .prune_to_level(level);
+        let representation = representation.unwrap_or_else(|| metadata_representation(item));
         let row = json!({
             "rootPathKey": persist::create_root_path_key(root_path),
             "pathKey": persist::create_root_path_key(&item.path),
@@ -250,7 +294,7 @@ impl<'a> ToolService<'a> {
             "summaryShort": representation.short.clone(),
             "summaryNormal": representation.long.clone(),
             "source": representation.source,
-            "representationLevel": level.as_str(),
+            "summaryStrategy": summary_strategy,
             "updatedAt": now_iso(),
         });
         persist::save_advisor_file_summary(&self.state.db_path(), &row)?;

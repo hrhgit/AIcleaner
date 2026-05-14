@@ -100,16 +100,6 @@ fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
             .unwrap_or("")
             .trim()
             .to_string();
-        let thinking_enabled = config
-            .get("thinkingEnabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let thinking_level = config
-            .get("thinkingLevel")
-            .and_then(Value::as_str)
-            .unwrap_or("medium")
-            .trim()
-            .to_string();
         routes.insert(
             modality.to_string(),
             RouteConfig {
@@ -117,8 +107,6 @@ fn parse_routes(model_routing: &Option<Value>) -> HashMap<String, RouteConfig> {
                 api_key,
                 model,
                 api_format,
-                thinking_enabled,
-                thinking_level,
             },
         );
     }

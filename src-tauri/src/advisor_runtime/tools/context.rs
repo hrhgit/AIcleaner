@@ -61,29 +61,40 @@ fn summary_state_from_representation(
 ) -> TreeSummaryState {
     let mut state = TreeSummaryState::default();
     if let Some(representation) = representation {
-        state.metadata = representation.has_level(RepresentationLevel::Metadata);
-        state.short = representation.has_level(RepresentationLevel::Short);
-        state.long = representation.has_level(RepresentationLevel::Long);
+        let source = representation.source.trim();
+        if source == "filename_only" {
+            state.filename_only = true;
+        } else if source == "local_summary" {
+            state.local_summary = true;
+        } else if source == "agent_summary" {
+            state.agent_summary = true;
+        } else if representation.has_level(RepresentationLevel::Long) {
+            state.agent_summary = true;
+        } else if representation.has_level(RepresentationLevel::Short) {
+            state.local_summary = true;
+        } else if representation.has_level(RepresentationLevel::Metadata) {
+            state.filename_only = true;
+        }
     }
     state
 }
 
 fn merge_summary_state(target: &mut TreeSummaryState, source: TreeSummaryState) {
-    target.metadata |= source.metadata;
-    target.short |= source.short;
-    target.long |= source.long;
+    target.filename_only |= source.filename_only;
+    target.local_summary |= source.local_summary;
+    target.agent_summary |= source.agent_summary;
 }
 
 fn summary_types_value(state: TreeSummaryState) -> Value {
     let mut types = Vec::new();
-    if state.metadata {
-        types.push("metadata");
+    if state.filename_only {
+        types.push("filename_only");
     }
-    if state.short {
-        types.push("short");
+    if state.local_summary {
+        types.push("local_summary");
     }
-    if state.long {
-        types.push("long");
+    if state.agent_summary {
+        types.push("agent_summary");
     }
     json!(types)
 }
@@ -137,7 +148,9 @@ fn tree_to_value(prefix: &str, path: &[String], node: &TreeDraftNode) -> Value {
         "categoryPath": path,
         "name": node.name,
         "itemCount": node.item_count,
-        "hasSummary": node.summary_state.metadata || node.summary_state.short || node.summary_state.long,
+        "hasSummary": node.summary_state.filename_only
+            || node.summary_state.local_summary
+            || node.summary_state.agent_summary,
         "summaryTypes": summary_types_value(node.summary_state),
         "children": children,
     })

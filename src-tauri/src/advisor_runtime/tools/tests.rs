@@ -427,10 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn summary_row_to_tool_item_prunes_representation_by_level() {
+    fn summary_row_to_tool_item_returns_classification_aligned_evidence() {
         let row = json!({
             "path": r"C:\test\report.pdf",
             "name": "report.pdf",
+            "summaryStrategy": "agent_summary",
             "representation": {
                 "metadata": "report.pdf，document，1.0 MB",
                 "short": "季度报告",
@@ -442,23 +443,21 @@ mod tests {
             }
         });
 
-        let short_item = summary_row_to_tool_item(&row, RepresentationLevel::Short);
+        let item = summary_row_to_tool_item(&row);
         assert_eq!(
-            short_item
-                .pointer("/representation/metadata")
-                .and_then(Value::as_str),
-            Some("report.pdf，document，1.0 MB")
+            item.get("summaryStrategy").and_then(Value::as_str),
+            Some("agent_summary")
         );
         assert_eq!(
-            short_item
-                .pointer("/representation/short")
-                .and_then(Value::as_str),
-            Some("季度报告")
+            item.get("evidence").and_then(Value::as_str),
+            Some("季度报告，包含财务指标与结论。")
         );
         assert_eq!(
-            short_item.pointer("/representation/long"),
-            Some(&Value::Null)
+            item.get("source").and_then(Value::as_str),
+            Some("model")
         );
+        assert_eq!(item.get("keywords"), Some(&json!(["季度", "财务"])));
+        assert_eq!(item.get("warnings"), Some(&json!([])));
     }
 
     #[test]
@@ -512,7 +511,7 @@ mod tests {
                 "summaryShort": "short report summary",
                 "summaryNormal": Value::Null,
                 "source": "advisor",
-                "representationLevel": "short",
+                "summaryStrategy": "local_summary",
                 "updatedAt": now_iso(),
             }),
         )
@@ -536,7 +535,7 @@ mod tests {
                 "summaryShort": Value::Null,
                 "summaryNormal": Value::Null,
                 "source": "advisor",
-                "representationLevel": "metadata",
+                "summaryStrategy": "filename_only",
                 "updatedAt": now_iso(),
             }),
         )
@@ -566,9 +565,9 @@ mod tests {
             .cloned()
             .expect("category node");
         assert_eq!(category["hasSummary"], Value::Bool(true));
-        assert_eq!(category["summaryTypes"], json!(["metadata", "short"]));
+        assert_eq!(category["summaryTypes"], json!(["filename_only", "local_summary"]));
 
         let tree_text = build_tree_text(&tree);
-        assert!(tree_text.contains("[summary=metadata/short]"));
+        assert!(tree_text.contains("[summary=filename_only/local_summary]"));
     }
 }

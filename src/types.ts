@@ -23,10 +23,6 @@ export type ProviderConfig = {
   endpoint?: string;
   apiFormat?: 'openai' | 'anthropic';
   model?: string;
-  thinking?: {
-    enabled?: boolean;
-    level?: 'low' | 'medium' | 'high';
-  };
 };
 
 export type Settings = {
@@ -62,8 +58,6 @@ export type ProviderRow = {
   apiKey: string;
   model: string;
   apiFormat: 'openai' | 'anthropic';
-  thinkingEnabled: boolean;
-  thinkingLevel: 'low' | 'medium' | 'high';
   preset?: boolean;
   modelLoaded?: boolean;
 };

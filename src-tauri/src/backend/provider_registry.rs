@@ -15,14 +15,6 @@ pub(crate) fn normalize_provider_api_format(endpoint: &str, raw: Option<&str>) -
         .unwrap_or_else(|| crate::llm_protocol::detect_api_format(endpoint))
 }
 
-pub(crate) fn normalize_provider_thinking_level(raw: Option<&str>) -> &'static str {
-    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "low" => "low",
-        "high" => "high",
-        _ => "medium",
-    }
-}
-
 pub(crate) fn normalize_provider_endpoint(
     endpoint: &str,
     api_format: ApiFormat,

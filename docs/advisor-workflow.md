@@ -47,8 +47,8 @@
 1. 为文件生成摘要。
 2. 为目录生成摘要。
 3. 统一输出 `representation` 对象，包含 `metadata`、`short`、`long`、`source`、`degraded`、`confidence`、`keywords`。
-4. `summarize_files` 与 `read_only_file_summaries` 使用 `representationLevel` 控制返回层级，取值为 `metadata`、`short`、`long`。
-5. 顾问页内置前置归类流程使用 `filename_only`、`local_summary`、`agent_summary`，其结果同样落到 `representation`。
+4. `summarize_files` 与 `read_only_file_summaries` 使用 `summaryStrategy` 控制摘要模式，取值为 `filename_only`、`local_summary`、`agent_summary`。
+5. 顾问页内置前置归类流程与顾问工具统一使用 `filename_only`、`local_summary`、`agent_summary`。
 6. 摘要结果写入数据库。
 7. 支持系统流程调用，也支持顾问对话中按需调用。
 8. 支持批量输入。
@@ -273,7 +273,7 @@
 
 模型描述：
 
-> 为指定文件或分类生成或刷新摘要并写入摘要库。仅支持文档文件（pdf/doc/xls/ppt 等）和纯文本文件（txt/md/csv/json 等）；其它文件类型（图片、二进制、可执行文件等）无法生成内容摘要，会被跳过并返回错误。metadata 级别对所有文件有效。不会移动文件。
+> 为指定文件或分类生成或刷新摘要并写入摘要库。摘要模式与归类一致：`filename_only`、`local_summary`、`agent_summary`。不会移动文件。
 
 作用：
 
@@ -293,10 +293,10 @@
 
 1. `paths`（可选）
 2. `categoryIds`（可选）
-3. `representationLevel`（可选）
-   - `metadata`
-   - `short`
-   - `long`
+3. `summaryStrategy`（可选）
+   - `filename_only`
+   - `local_summary`
+   - `agent_summary`
 4. `missingOnly`（可选）
 5. `batchSize`（可选）
 6. `maxConcurrency`（可选）
@@ -313,7 +313,7 @@
    - `ok`
    - `error`
 2. `message`
-3. `representationLevel`
+3. `summaryStrategy`
 4. `total`
 5. `completed`
 6. `failed`
@@ -327,15 +327,13 @@
 11. `items`
     - `path`
     - `name`
-    - `representation`
-       - `metadata`
-       - `short`
-       - `long`
-       - `source`
-       - `degraded`
-       - `confidence`
-       - `keywords`
-    - `warning`
+    - `summaryStrategy`
+    - `evidence`
+    - `source`
+    - `keywords`
+    - `warnings`
+    - `degraded`
+    - `confidence`
 12. `errors`
     - `path`
     - `reason`
@@ -351,12 +349,10 @@
 2. 这个工具支持通过 `batchSize` 分批和通过 `maxConcurrency` 控制并发请求。
 3. 如果发生超时、连接失败或 HTTP `408/429/500/502/503/504`，调度器会保留已成功结果，并对失败项做重试和降并发。
 4. 如果调度兜底后仍无法完成，就返回 `status=error`。
-5. 不自动退回到 `metadata` 层级。
-6. `short`/`long` 级别仅支持文档和纯文本文件：
-   - 文档文件（`.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, `.rtf`, `.odt`, `.ods`, `.odp`, `.epub`）通过 Tika 提取文本内容。
-   - 纯文本文件（`.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`, `.xml`, `.log`, `.js`, `.ts`, `.rs`, `.py` 等）直接读取内容。
-   - 其它文件类型（图片、二进制、可执行文件等）会被跳过并返回错误。
-7. `metadata` 级别不读取文件内容，直接从元数据拼接，对所有文件有效。
+5. `filename_only` 不读取文件内容，直接从文件名、路径和元信息生成证据，对所有文件有效。
+6. `local_summary` 只做本地提取，不额外调用摘要模型。
+7. `agent_summary` 在本地提取后再调用摘要模型。
+8. 不自动从高成本模式退回到低成本模式。
 
 ### 6.4 `read_only_file_summaries`
 
@@ -380,10 +376,10 @@
 
 1. `paths`（可选）
 2. `categoryIds`（可选）
-3. `representationLevel`（可选）
-   - `metadata`
-   - `short`
-   - `long`
+3. `summaryStrategy`（可选）
+   - `filename_only`
+   - `local_summary`
+   - `agent_summary`
 4. `limit`（可选）
 
 说明：
@@ -399,14 +395,13 @@
 3. `items`
    - `path`
    - `name`
-   - `representation`
-      - `metadata`
-      - `short`
-      - `long`
-      - `source`
-      - `degraded`
-      - `confidence`
-      - `keywords`
+   - `summaryStrategy`
+   - `evidence`
+   - `source`
+   - `keywords`
+   - `warnings`
+   - `degraded`
+   - `confidence`
 
 ### 6.5 `capture_preference`
 

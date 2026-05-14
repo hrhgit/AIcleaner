@@ -46,13 +46,86 @@ fn metadata_representation(item: &InventoryItem) -> FileRepresentation {
     }
 }
 
+const ADVISOR_SUMMARY_MODE_FILENAME_ONLY: &str = "filename_only";
+const ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY: &str = "local_summary";
+const ADVISOR_SUMMARY_MODE_AGENT_SUMMARY: &str = "agent_summary";
+
+fn summary_strategy_from_args(args: &Value) -> String {
+    match args
+        .get("summaryStrategy")
+        .or_else(|| args.get("representationLevel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY) => ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY.to_string(),
+        Some(ADVISOR_SUMMARY_MODE_AGENT_SUMMARY) => ADVISOR_SUMMARY_MODE_AGENT_SUMMARY.to_string(),
+        _ => ADVISOR_SUMMARY_MODE_FILENAME_ONLY.to_string(),
+    }
+}
+
+fn summary_strategy_uses_content(summary_strategy: &str) -> bool {
+    matches!(
+        summary_strategy,
+        ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY | ADVISOR_SUMMARY_MODE_AGENT_SUMMARY
+    )
+}
+
+fn summary_strategy_from_row(row: &Value) -> String {
+    row.get("summaryStrategy")
+        .or_else(|| row.get("representationLevel"))
+        .or_else(|| row.get("mode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| ADVISOR_SUMMARY_MODE_FILENAME_ONLY.to_string())
+}
+
+fn summary_strategy_matches_representation(
+    strategy: &str,
+    representation: &FileRepresentation,
+) -> bool {
+    match strategy {
+        ADVISOR_SUMMARY_MODE_FILENAME_ONLY => representation
+            .metadata
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY | ADVISOR_SUMMARY_MODE_AGENT_SUMMARY => {
+            !representation.best_text().is_empty()
+                && representation.source.trim() == strategy
+                && !representation.degraded
+        }
+        _ => false,
+    }
+}
+
+fn summary_warnings_from_row(row: &Value) -> Value {
+    row.get("warnings")
+        .or_else(|| row.get("summaryWarnings"))
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()))
+}
+
+fn summary_row_evidence(row: &Value) -> String {
+    let representation = FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
+    let source = representation.source.trim();
+    let best_text = representation.best_text();
+    if !best_text.is_empty() && source != ADVISOR_SUMMARY_MODE_FILENAME_ONLY {
+        return best_text;
+    }
+    row.get("relativePath")
+        .or_else(|| row.get("path"))
+        .or_else(|| row.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string()
+}
+
 fn representation_from_organize_row(row: &Value) -> FileRepresentation {
     if let Some(value) = row.get("representation") {
         let parsed = FileRepresentation::from_value(value);
-        if parsed.has_level(RepresentationLevel::Metadata)
-            || parsed.has_level(RepresentationLevel::Short)
-            || parsed.has_level(RepresentationLevel::Long)
-        {
+        if !parsed.best_text().is_empty() {
             return parsed;
         }
     }
@@ -189,7 +262,7 @@ fn load_summary_row(
     db_path: &Path,
     root_path: &str,
     path: &str,
-    level: RepresentationLevel,
+    summary_strategy: &str,
     missing_only: bool,
 ) -> Result<Option<Value>, String> {
     let row = persist::load_advisor_file_summary(
@@ -201,8 +274,9 @@ fn load_summary_row(
         return Ok(row);
     }
     Ok(row.filter(|value| {
-        FileRepresentation::from_value(value.get("representation").unwrap_or(&Value::Null))
-            .has_level(level)
+        let representation =
+            FileRepresentation::from_value(value.get("representation").unwrap_or(&Value::Null));
+        summary_strategy_matches_representation(summary_strategy, &representation)
     }))
 }
 
@@ -210,7 +284,7 @@ fn read_existing_summary_item(
     db_path: &Path,
     root_path: &str,
     item: &InventoryItem,
-    level: RepresentationLevel,
+    summary_strategy: &str,
 ) -> Result<Option<Value>, String> {
     if let Some(row) = persist::load_advisor_file_summary(
         db_path,
@@ -219,40 +293,112 @@ fn read_existing_summary_item(
     )? {
         let representation =
             FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
-        if representation.has_level(level) {
-            return Ok(Some(summary_row_to_read_item(&row, level)));
+        if summary_strategy_matches_representation(summary_strategy, &representation) {
+            return Ok(Some(summary_row_to_read_item(&row)));
         }
     }
-    if item.representation.has_level(level) {
+    if summary_strategy == ADVISOR_SUMMARY_MODE_FILENAME_ONLY
+        && item
+            .representation
+            .metadata
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
         return Ok(Some(json!({
             "path": item.path,
             "name": item.name,
-            "representation": item.representation.prune_to_level(level).to_value(),
-            "warning": Value::Null,
+            "summaryStrategy": ADVISOR_SUMMARY_MODE_FILENAME_ONLY,
+            "evidence": item.representation.metadata.clone().unwrap_or_default(),
+            "source": item.representation.source,
+            "keywords": item.representation.keywords,
+            "warnings": Value::Array(Vec::new()),
+            "degraded": item.representation.degraded,
+            "confidence": item.representation.confidence,
         })));
     }
     Ok(None)
 }
 
-fn summary_row_to_tool_item(row: &Value, level: RepresentationLevel) -> Value {
+fn warnings_to_value(warnings: &[String]) -> Value {
+    Value::Array(
+        warnings
+            .iter()
+            .map(|warning| Value::String(warning.clone()))
+            .collect(),
+    )
+}
+
+fn summary_row_to_tool_item(row: &Value) -> Value {
+    let representation = FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
     json!({
         "path": row.get("path").cloned().unwrap_or(Value::Null),
         "name": row.get("name").cloned().unwrap_or(Value::Null),
-        "representation": FileRepresentation::from_value(
-            row.get("representation").unwrap_or(&Value::Null),
-        ).prune_to_level(level).to_value(),
-        "warning": Value::Null,
+        "summaryStrategy": summary_strategy_from_row(row),
+        "evidence": summary_row_evidence(row),
+        "source": representation.source,
+        "keywords": representation.keywords,
+        "warnings": summary_warnings_from_row(row),
+        "degraded": representation.degraded,
+        "confidence": representation.confidence,
     })
 }
 
-fn summary_row_to_read_item(row: &Value, level: RepresentationLevel) -> Value {
+fn summary_row_to_read_item(row: &Value) -> Value {
+    let representation = FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null));
     json!({
         "path": row.get("path").cloned().unwrap_or(Value::Null),
         "name": row.get("name").cloned().unwrap_or(Value::Null),
-        "representation": FileRepresentation::from_value(
-            row.get("representation").unwrap_or(&Value::Null),
-        ).prune_to_level(level).to_value(),
+        "summaryStrategy": summary_strategy_from_row(row),
+        "evidence": summary_row_evidence(row),
+        "source": representation.source,
+        "keywords": representation.keywords,
+        "warnings": summary_warnings_from_row(row),
+        "degraded": representation.degraded,
+        "confidence": representation.confidence,
     })
+}
+
+fn advisor_build_local_summary(item: &InventoryItem, extracted: Option<&str>) -> (FileRepresentation, Vec<String>) {
+    let mut warnings = Vec::new();
+    let metadata = metadata_summary_short(item);
+    let keywords = Vec::new();
+    let normalized = extracted
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    match normalized {
+        Some(text) => {
+            let short = text.chars().take(240).collect::<String>().trim().to_string();
+            (
+                FileRepresentation {
+                    metadata: Some(metadata),
+                    short: Some(if short.is_empty() { text.clone() } else { short }),
+                    long: Some(text),
+                    source: ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY.to_string(),
+                    degraded: false,
+                    confidence: None,
+                    keywords,
+                },
+                warnings,
+            )
+        }
+        None => {
+            warnings.push("filename_only_fallback".to_string());
+            (
+                FileRepresentation {
+                    metadata: Some(metadata),
+                    short: None,
+                    long: None,
+                    source: ADVISOR_SUMMARY_MODE_FILENAME_ONLY.to_string(),
+                    degraded: true,
+                    confidence: None,
+                    keywords,
+                },
+                warnings,
+            )
+        }
+    }
 }
 
 fn collect_reclassification_changes(request: &Value) -> Result<Vec<Value>, String> {
@@ -465,7 +611,7 @@ async fn summarize_batch_with_model(
     route: &super::llm::AdvisorModelRoute,
     root_path: &str,
     batch: &[InventoryItem],
-    level: RepresentationLevel,
+    summary_strategy: &str,
     lang: &str,
     extraction_config: Option<&ExtractionToolConfig>,
 ) -> (Vec<Value>, Vec<SummaryFailedItem>, TokenUsage) {
@@ -473,7 +619,17 @@ async fn summarize_batch_with_model(
     let mut errors = Vec::new();
     let mut usage = TokenUsage::default();
     for item in batch {
-        match summarize_item_with_model(client, route, root_path, item, level, lang, extraction_config).await {
+        match summarize_item_with_model(
+            client,
+            route,
+            root_path,
+            item,
+            summary_strategy,
+            lang,
+            extraction_config,
+        )
+        .await
+        {
             Ok((row, item_usage)) => {
                 add_token_usage(&mut usage, &item_usage);
                 output.push(row);
@@ -492,7 +648,7 @@ async fn summarize_item_with_model(
     route: &super::llm::AdvisorModelRoute,
     root_path: &str,
     item: &InventoryItem,
-    level: RepresentationLevel,
+    summary_strategy: &str,
     lang: &str,
     extraction_config: Option<&ExtractionToolConfig>,
 ) -> Result<(Value, TokenUsage), SummaryErrorRow> {
@@ -504,7 +660,7 @@ async fn summarize_item_with_model(
     } else {
         None
     };
-    let prompt = build_summary_prompt(item, extracted.as_deref(), level, lang);
+    let prompt = build_summary_prompt(item, extracted.as_deref(), summary_strategy, lang);
     let api_format = route.api_format;
     let tool_registry = ToolRegistry::new();
     let tool_ctx = ToolContext {
@@ -521,14 +677,14 @@ async fn summarize_item_with_model(
         api_format,
         &route.model,
         &[
-            json!({ "role": "system", "content": summary_system_prompt(lang, level) }),
+            json!({ "role": "system", "content": summary_system_prompt(lang, summary_strategy) }),
             json!({ "role": "user", "content": prompt }),
         ],
         Some(&tools),
         0.0,
         DEFAULT_MAX_TOKENS,
         {
-            let thinking = reasoning_policy::advisor_summary_tool(&route.thinking_level);
+            let thinking = reasoning_policy::advisor_summary_tool("high");
             ThinkingConfig {
                 enabled: thinking.enabled,
                 level: thinking.level,
@@ -673,7 +829,7 @@ async fn summarize_item_with_model(
                     confidence: item.representation.confidence.clone(),
                     keywords: item.representation.keywords.clone(),
                 };
-                return Ok((build_summary_row(root_path, item, level, representation), usage));
+                return Ok((build_summary_row(root_path, item, summary_strategy, representation), usage));
             }
             Err(err) => {
                 last_error = Some(SummaryErrorRow {
@@ -691,13 +847,61 @@ async fn summarize_item_with_model(
     }))
 }
 
+async fn summarize_item_with_local_strategy(
+    root_path: &str,
+    item: &InventoryItem,
+    summary_strategy: &str,
+    lang: &str,
+    extraction_config: Option<&ExtractionToolConfig>,
+) -> Result<Value, SummaryErrorRow> {
+    let representation = if summary_strategy == ADVISOR_SUMMARY_MODE_FILENAME_ONLY {
+        metadata_representation(item)
+    } else {
+        let unit = inventory_to_organize_unit(item);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let extracted = if let Some(config) = extraction_config.filter(|c| c.tika_ready) {
+            extract_unit_content_for_summary_with_tools(&unit, lang, &stop, config).await
+        } else {
+            return Err(SummaryErrorRow {
+                path: item.path.clone(),
+                reason: "summary_extraction_unavailable".to_string(),
+                retryable: false,
+            });
+        };
+        let (mut representation, warnings) =
+            advisor_build_local_summary(item, Some(extracted.excerpt.as_str()));
+        if summary_strategy == ADVISOR_SUMMARY_MODE_AGENT_SUMMARY
+            && representation.source.trim() == ADVISOR_SUMMARY_MODE_LOCAL_SUMMARY
+        {
+            representation.source = ADVISOR_SUMMARY_MODE_AGENT_SUMMARY.to_string();
+        }
+        let row = build_summary_row(root_path, item, summary_strategy, representation.clone());
+        let mut row = row;
+        row["warnings"] = warnings_to_value(&warnings);
+        return Ok(row);
+    };
+
+    Ok(json!({
+        "rootPathKey": persist::create_root_path_key(root_path),
+        "pathKey": persist::create_root_path_key(&item.path),
+        "path": item.path,
+        "name": item.name,
+        "representation": representation.to_value(),
+        "summaryShort": representation.short.clone(),
+        "summaryNormal": representation.long.clone(),
+        "source": representation.source,
+        "summaryStrategy": summary_strategy,
+        "warnings": Value::Array(Vec::new()),
+        "updatedAt": now_iso(),
+    }))
+}
+
 fn build_summary_row(
     root_path: &str,
     item: &InventoryItem,
-    level: RepresentationLevel,
+    summary_strategy: &str,
     representation: FileRepresentation,
 ) -> Value {
-    let representation = representation.prune_to_level(level);
     json!({
         "rootPathKey": persist::create_root_path_key(root_path),
         "pathKey": persist::create_root_path_key(&item.path),
@@ -707,7 +911,8 @@ fn build_summary_row(
         "summaryShort": representation.short.clone(),
         "summaryNormal": representation.long.clone(),
         "source": representation.source,
-        "representationLevel": level.as_str(),
+        "summaryStrategy": summary_strategy,
+        "warnings": Value::Array(Vec::new()),
         "updatedAt": now_iso(),
     })
 }
@@ -751,7 +956,7 @@ async fn run_summary_round(
     route: &super::llm::AdvisorModelRoute,
     root_path: &str,
     items: &[InventoryItem],
-    level: RepresentationLevel,
+    summary_strategy: &str,
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
@@ -775,12 +980,22 @@ async fn run_summary_round(
         let client = client.clone();
         let route = route.clone();
         let root_path = root_path.to_string();
+        let summary_strategy = summary_strategy.to_string();
         let lang = lang.to_string();
         let batch = chunk.to_vec();
         let ext_config = extraction_config.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            summarize_batch_with_model(&client, &route, &root_path, &batch, level, &lang, ext_config.as_ref()).await
+            summarize_batch_with_model(
+                &client,
+                &route,
+                &root_path,
+                &batch,
+                &summary_strategy,
+                &lang,
+                ext_config.as_ref(),
+            )
+            .await
         }));
     }
     let mut rows = Vec::new();
@@ -801,7 +1016,7 @@ async fn run_summary_scheduler(
     route: &super::llm::AdvisorModelRoute,
     root_path: &str,
     items: &[InventoryItem],
-    level: RepresentationLevel,
+    summary_strategy: &str,
     lang: &str,
     batch_size: usize,
     max_concurrency: usize,
@@ -836,7 +1051,7 @@ async fn run_summary_scheduler(
             route,
             root_path,
             &pending,
-            level,
+            summary_strategy,
             lang,
             batch_size,
             current_concurrency,
@@ -899,14 +1114,14 @@ fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
     total.total = total.total.saturating_add(usage.total);
 }
 
-fn summary_system_prompt(lang: &str, level: RepresentationLevel) -> String {
+fn summary_system_prompt(lang: &str, _summary_strategy: &str) -> String {
     let is_zh = lang.trim().to_ascii_lowercase().starts_with("zh");
     if is_zh {
-        if level == RepresentationLevel::Short {
-            r#"你负责为文件整理系统生成 summaryText。
+        r#"你负责为文件整理系统生成 summaryText。
 
 summaryText 用于为后续文件归类提供内容证据。
 你的任务是根据提供的文件内容推断文件的用途和内容特征，不是最终归类，也不是生成分类树。
+只有文档类文件才可以提取摘要；如果当前输入不是文档类文件，不要伪造内容摘要，只说明无法提取摘要，或者只能依赖文件名、路径和类型线索。
 
 请简洁总结：
 1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
@@ -920,31 +1135,12 @@ summaryText 用于为后续文件归类提供内容证据。
 你必须使用原生 tool calling。
 不要输出普通文本结果，不要手写 JSON。
 当你准备好时，调用 submit_file_summaries。"#.to_string()
-        } else {
-            r#"你负责为文件整理系统生成 summaryText。
-
-summaryText 用于为后续文件归类提供内容证据。
-你的任务是根据提供的文件内容推断文件的用途和内容特征，不是最终归类，也不是生成分类树。
-
-请简洁总结：
-1. 文件或目录的主要内容、主题、用途、文档类型、数据类型或主要对象。
-2. 对分类有帮助的类型、命名或路径线索。
-3. 如果信息不足，请说明具体不确定点。
-
-不要编造未提供的内容。
-
-输出语言使用中文。
-
-你必须使用原生 tool calling。
-不要输出普通文本结果，不要手写 JSON。
-当你准备好时，调用 submit_file_summaries。"#.to_string()
-        }
     } else {
-        if level == RepresentationLevel::Short {
-            r#"You are responsible for generating summaryText for a file organization system.
+        r#"You are responsible for generating summaryText for a file organization system.
 
 summaryText provides content evidence for subsequent file classification.
 Your task is to infer the file's purpose and content characteristics from the provided file content, not to perform final classification or generate a category tree.
+Only document files can produce a content summary; if the current input is not a document file, do not fabricate a content summary and instead state that no summary can be extracted, or that only filename, path, and type clues are available.
 
 Please concisely summarize:
 1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
@@ -958,29 +1154,15 @@ Write summaries in English only.
 You must use native tool calling.
 Do not return plain text results and do not hand-write JSON.
 When ready, call submit_file_summaries."#.to_string()
-        } else {
-            r#"You are responsible for generating summaryText for a file organization system.
-
-summaryText provides content evidence for subsequent file classification.
-Your task is to infer the file's purpose and content characteristics from the provided file content, not to perform final classification or generate a category tree.
-
-Please concisely summarize:
-1. The main content, topic, purpose, document type, data type, or primary object of the file or directory.
-2. Type, naming, or path clues that help with classification.
-3. If information is insufficient, specify the exact uncertainty.
-
-Do not fabricate content not provided.
-
-Write summaries in English only.
-
-You must use native tool calling.
-Do not return plain text results and do not hand-write JSON.
-When ready, call submit_file_summaries."#.to_string()
-        }
     }
 }
 
-fn build_summary_prompt(item: &InventoryItem, extracted: Option<&str>, _level: RepresentationLevel, _lang: &str) -> String {
+fn build_summary_prompt(
+    item: &InventoryItem,
+    extracted: Option<&str>,
+    _summary_strategy: &str,
+    _lang: &str,
+) -> String {
     let mut prompt = format!(
         "path: {}\nname: {}\ncategory: {}\nsize: {}\nexisting metadata: {}\nexisting short summary: {}\nexisting long summary: {}",
         item.path,

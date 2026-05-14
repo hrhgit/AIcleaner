@@ -23,8 +23,6 @@ pub(super) struct AdvisorModelRoute {
     pub model: String,
     pub api_key: String,
     pub api_format: crate::llm_protocol::ApiFormat,
-    pub thinking_enabled: bool,
-    pub thinking_level: String,
 }
 
 #[derive(Clone, Debug)]
@@ -77,8 +75,6 @@ impl<'a> AdvisorLlm<'a> {
             model: route.model,
             api_key,
             api_format: route.api_format,
-            thinking_enabled: route.thinking_enabled,
-            thinking_level: route.thinking_level,
         })
     }
 
@@ -102,7 +98,7 @@ impl<'a> AdvisorLlm<'a> {
             Some(tools),
             &operation_id,
             session_id,
-            reasoning_policy::advisor_turn(&route.thinking_level),
+            reasoning_policy::advisor_turn("high"),
         )
         .await
     }
@@ -226,7 +222,6 @@ async fn chat_completion(
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
             "apiFormat": route.api_format.as_str(),
-            "configuredThinkingEnabled": route.thinking_enabled,
             "thinkingEnabled": effective_thinking.enabled,
             "thinkingLevel": effective_thinking.level,
             "url": url.clone(),
@@ -261,7 +256,6 @@ async fn chat_completion(
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
                     "apiFormat": route.api_format.as_str(),
-                    "configuredThinkingEnabled": route.thinking_enabled,
                     "thinkingEnabled": effective_thinking.enabled,
                     "thinkingLevel": effective_thinking.level,
                     "url": url.clone(),
@@ -291,7 +285,6 @@ async fn chat_completion(
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
                     "apiFormat": route.api_format.as_str(),
-                    "configuredThinkingEnabled": route.thinking_enabled,
                     "thinkingEnabled": effective_thinking.enabled,
                     "thinkingLevel": effective_thinking.level,
                     "status": status.as_u16(),
@@ -317,7 +310,6 @@ async fn chat_completion(
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
             "apiFormat": route.api_format.as_str(),
-            "configuredThinkingEnabled": route.thinking_enabled,
             "thinkingEnabled": effective_thinking.enabled,
             "thinkingLevel": effective_thinking.level,
             "status": status.as_u16(),
@@ -339,8 +331,6 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             api_key: "test".to_string(),
             api_format: crate::llm_protocol::ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         }
     }
 

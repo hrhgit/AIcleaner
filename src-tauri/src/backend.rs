@@ -24,8 +24,8 @@ use tauri::{Runtime, State};
 use credential_store::InMemoryCredentialStore;
 use credential_store::{CachedCredentialStore, CredentialStore, WindowsCredentialStore};
 pub(crate) use provider_registry::{
-    normalize_provider_api_format, normalize_provider_endpoint, normalize_provider_thinking_level,
-    preset_provider_configs_json, provider_secret_key, provider_secret_key_aliases,
+    normalize_provider_api_format, normalize_provider_endpoint, preset_provider_configs_json,
+    provider_secret_key, provider_secret_key_aliases,
 };
 pub(crate) use settings_store::{
     default_settings, legacy_provider_api_key_from_settings, legacy_search_api_key_from_settings,

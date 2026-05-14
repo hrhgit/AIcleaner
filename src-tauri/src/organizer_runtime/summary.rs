@@ -476,7 +476,7 @@ async fn chat_completion_with_messages(
             message: e.to_string(),
             raw_body: String::new(),
         })?;
-    let effective_thinking = reasoning_policy::organizer_stage(stage, &route.thinking_level);
+    let effective_thinking = reasoning_policy::organizer_stage(stage, "high");
     let payload = build_completion_payload(
         api_format,
         &route.model,
@@ -1385,9 +1385,9 @@ fn build_initial_tree_system_prompt(response_language: &str) -> String {
         .to_ascii_lowercase()
         .starts_with("zh")
     {
-        "你负责为文件整理任务生成初始分类树。只基于文件名、后缀、itemType/modality 和统计信息建树；不要分配文件；顶层优先按基础文件类型分类；准备好后调用 submit_initial_tree。所有分类名称必须使用中文纯文本，禁止使用 emoji 或装饰性 Unicode 符号。".to_string()
+        "你负责为文件整理任务生成初始分类树。只基于文件名、后缀、itemType/modality 和统计信息建树；不要分配文件；顶层优先按基础文件类型分类；文件夹不要单独归为一类，必须根据实际用途和内容分类；允许并鼓励在合适时创建一个建议删除分类，专门放那些判断后应删除或清理的文件；准备好后调用 submit_initial_tree。所有分类名称必须使用中文纯文本，禁止使用 emoji 或装饰性 Unicode 符号。".to_string()
     } else {
-        "Generate the initial category tree for a file organization task. Use only filenames, extensions, itemType/modality, and stats; do not assign files; keep top-level nodes primarily type-based; call submit_initial_tree when ready. All category names must be plain text; do not use emoji or decorative Unicode symbols.".to_string()
+        "Generate the initial category tree for a file organization task. Use only filenames, extensions, itemType/modality, and stats; do not assign files; keep top-level nodes primarily type-based; do not place folders into their own category just because they are folders; classify them by actual purpose and content; allow and encourage a dedicated suggested-delete category for files that should be deleted or cleaned up; call submit_initial_tree when ready. All category names must be plain text; do not use emoji or decorative Unicode symbols.".to_string()
     }
 }
 
@@ -3795,8 +3795,6 @@ mod tool_policy_tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             api_format: ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         };
         let llm = InitialTreeRepairLlm {
             calls: AtomicUsize::new(0),
@@ -3882,8 +3880,6 @@ mod tool_policy_tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             api_format: ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         };
         let llm = ClassificationBatchRepairLlm {
             calls: AtomicUsize::new(0),
@@ -4003,8 +3999,6 @@ mod tool_policy_tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             api_format: ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         };
         let llm = ReconcileRepairLlm {
             calls: AtomicUsize::new(0),
@@ -4047,8 +4041,6 @@ mod tool_policy_tests {
             api_key: "test-key".to_string(),
             model: "test-model".to_string(),
             api_format: ApiFormat::OpenAi,
-            thinking_enabled: false,
-            thinking_level: "medium".to_string(),
         };
         let initial_spec = InitialTreeSpec {
             route: &route,
@@ -4155,6 +4147,16 @@ mod tests {
         let prompt = build_adjust_system_prompt("en-US");
         assert!(prompt.contains("submit_tree_shape"));
         assert!(!prompt.contains("submit_tree_adjustment"));
+    }
+
+    #[test]
+    fn initial_tree_prompt_mentions_removable_category() {
+        let zh = build_initial_tree_system_prompt("zh-CN");
+        let en = build_initial_tree_system_prompt("en-US");
+        assert!(zh.contains("建议删除分类"));
+        assert!(en.contains("suggested-delete category"));
+        assert!(zh.contains("文件夹不要单独归为一类"));
+        assert!(en.contains("do not place folders into their own category"));
     }
 
     #[test]

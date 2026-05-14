@@ -696,36 +696,6 @@ export function ProviderManager() {
                       </div>
                     </section>
 
-                    <section className="provider-section-card">
-                      <div className="provider-section-head">
-                        <div>
-                          <div className="provider-section-kicker">{text('推理选项', 'Reasoning options')}</div>
-                          <div className="provider-section-title">{text('推理强度', 'Reasoning level')}</div>
-                        </div>
-                      </div>
-                      <p className="provider-section-description">
-                        {text('是否启用推理由具体流程自动决定。这里只设置全局推理强度：顾问主流程全程启用；归类流程仅在最终调整与提交阶段启用；摘要工具始终关闭。', 'Whether reasoning is enabled is decided by the workflow. This setting only controls the global reasoning level: advisor turns keep it on, organize turns only enable it during final adjustment and submission, and summary tools always keep it off.')}
-                      </p>
-                      <div className="provider-grid">
-                        <div className="form-group">
-                          <label className="form-label" htmlFor="provider-thinking-level">{t('provider_modal.thinking_level')}</label>
-                          <select
-                            id="provider-thinking-level"
-                            className="form-input"
-                            value={activeProvider.thinkingLevel}
-                            onChange={(event) => updateProvider(activeProvider.id || activeProvider.endpoint, (provider) => ({
-                              ...provider,
-                              thinkingEnabled: true,
-                              thinkingLevel: event.target.value as 'low' | 'medium' | 'high',
-                            }))}
-                          >
-                            <option value="low">{t('provider_modal.thinking_low')}</option>
-                            <option value="medium">{t('provider_modal.thinking_medium')}</option>
-                            <option value="high">{t('provider_modal.thinking_high')}</option>
-                          </select>
-                        </div>
-                      </div>
-                    </section>
                   </div>
                 ) : null}
               </div>

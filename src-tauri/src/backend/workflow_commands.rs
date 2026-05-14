@@ -28,14 +28,6 @@ fn hydrate_model_routing_with_secrets(state: &AppState, input: &Option<Value>) -
                     "apiFormat".to_string(),
                     Value::String(route.api_format.as_str().to_string()),
                 );
-                map.insert(
-                    "thinkingEnabled".to_string(),
-                    Value::Bool(route.thinking_enabled),
-                );
-                map.insert(
-                    "thinkingLevel".to_string(),
-                    Value::String(route.thinking_level),
-                );
             }
         }
     }
@@ -87,13 +79,16 @@ pub async fn organize_start<R: Runtime>(
         "organize_start",
         details.clone(),
     );
-    crate::backend::validate_default_provider_ready(state.inner())?;
-    input.model_routing = hydrate_model_routing_with_secrets(state.inner(), &input.model_routing);
-    if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
-        input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
+    let result = async {
+        crate::backend::validate_default_provider_ready(state.inner())?;
+        input.model_routing =
+            hydrate_model_routing_with_secrets(state.inner(), &input.model_routing);
+        if input.use_web_search.unwrap_or(false) && input.search_api_key.is_none() {
+            input.search_api_key = Some(resolve_search_api_key(state.inner()).unwrap_or_default());
+        }
+        crate::organizer_runtime::organize_start(app, state, input, operation_id.clone()).await
     }
-    let result =
-        crate::organizer_runtime::organize_start(app, state, input, operation_id.clone()).await;
+    .await;
     command_log_finish(
         &state_for_log,
         "organizer",
@@ -251,8 +246,11 @@ pub async fn advisor_session_start(
         "advisor_session_start",
         details.clone(),
     );
-    crate::backend::validate_default_provider_ready(state.inner())?;
-    let result = crate::advisor_runtime::advisor_session_start(state, input).await;
+    let result = async {
+        crate::backend::validate_default_provider_ready(state.inner())?;
+        crate::advisor_runtime::advisor_session_start(state, input).await
+    }
+    .await;
     command_log_finish(
         &state_for_log,
         "advisor",

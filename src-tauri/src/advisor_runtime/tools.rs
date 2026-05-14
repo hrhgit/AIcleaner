@@ -54,9 +54,9 @@ struct TreeDraftNode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TreeSummaryState {
-    metadata: bool,
-    short: bool,
-    long: bool,
+    filename_only: bool,
+    local_summary: bool,
+    agent_summary: bool,
 }
 
 #[derive(Clone, Debug, Default)]

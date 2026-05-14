@@ -507,10 +507,11 @@ pub fn save_advisor_file_summary(db_path: &Path, row: &Value) -> Result<(), Stri
         .and_then(Value::as_str)
         .unwrap_or("advisor");
     let level = row
-        .get("representationLevel")
+        .get("summaryStrategy")
+        .or_else(|| row.get("representationLevel"))
         .or_else(|| row.get("mode"))
         .and_then(Value::as_str)
-        .unwrap_or("metadata");
+        .unwrap_or("filename_only");
     let summary_short = row
         .get("summaryShort")
         .and_then(Value::as_str)

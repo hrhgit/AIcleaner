@@ -1,6 +1,5 @@
 use crate::backend::{
-    normalize_provider_api_format, normalize_provider_endpoint, normalize_provider_thinking_level,
-    preset_provider_configs_json,
+    normalize_provider_api_format, normalize_provider_endpoint, preset_provider_configs_json,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -66,28 +65,7 @@ fn ensure_provider_defaults(config: &mut serde_json::Map<String, Value>, fallbac
     if !config.contains_key("model") {
         config.insert("model".to_string(), Value::String(String::new()));
     }
-    let thinking = config
-        .entry("thinking".to_string())
-        .or_insert_with(|| json!({}));
-    if !thinking.is_object() {
-        *thinking = json!({});
-    }
-    if let Some(thinking_obj) = thinking.as_object_mut() {
-        let enabled = thinking_obj
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        thinking_obj.insert("enabled".to_string(), Value::Bool(enabled));
-        thinking_obj.insert(
-            "level".to_string(),
-            Value::String(
-                normalize_provider_thinking_level(
-                    thinking_obj.get("level").and_then(Value::as_str),
-                )
-                .to_string(),
-            ),
-        );
-    }
+    config.remove("thinking");
 }
 
 fn normalize_provider_configs(obj: &mut serde_json::Map<String, Value>) -> Result<(), String> {

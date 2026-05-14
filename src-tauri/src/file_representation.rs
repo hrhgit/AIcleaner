@@ -22,24 +22,6 @@ pub enum RepresentationLevel {
     Long,
 }
 
-impl RepresentationLevel {
-    pub fn parse(value: Option<&str>) -> Self {
-        match value.unwrap_or("metadata").trim() {
-            "short" => Self::Short,
-            "long" => Self::Long,
-            _ => Self::Metadata,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Metadata => "metadata",
-            Self::Short => "short",
-            Self::Long => "long",
-        }
-    }
-}
-
 impl FileRepresentation {
     pub fn from_value(value: &Value) -> Self {
         serde_json::from_value::<Self>(value.clone()).unwrap_or_default()
@@ -57,30 +39,6 @@ impl FileRepresentation {
             .unwrap_or_default()
             .trim()
             .to_string()
-    }
-
-    pub fn prune_to_level(&self, level: RepresentationLevel) -> Self {
-        match level {
-            RepresentationLevel::Metadata => Self {
-                metadata: Self::non_empty(self.metadata.as_deref()),
-                short: None,
-                long: None,
-                source: self.source.clone(),
-                degraded: self.degraded,
-                confidence: self.confidence.clone(),
-                keywords: self.keywords.clone(),
-            },
-            RepresentationLevel::Short => Self {
-                metadata: Self::non_empty(self.metadata.as_deref()),
-                short: Self::non_empty(self.short.as_deref()),
-                long: None,
-                source: self.source.clone(),
-                degraded: self.degraded,
-                confidence: self.confidence.clone(),
-                keywords: self.keywords.clone(),
-            },
-            RepresentationLevel::Long => self.clone(),
-        }
     }
 
     pub fn has_level(&self, level: RepresentationLevel) -> bool {

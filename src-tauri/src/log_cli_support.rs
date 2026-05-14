@@ -364,13 +364,27 @@ fn classify_log_family(file_name: &str) -> Option<LogFamily> {
 
 fn infer_correlation_id(file_name: &str, family: &LogFamily) -> Option<String> {
     match family {
-        LogFamily::Diagnostics => file_name
-            .strip_prefix("aicleaner-diagnostics-")
-            .and_then(|value| value.strip_suffix(".jsonl"))
-            .and_then(|value| value.splitn(2, '-').nth(1))
-            .map(|value| value.to_string()),
+        LogFamily::Diagnostics => {
+            let stem = file_name
+                .strip_prefix("aicleaner-diagnostics-")
+                .and_then(|value| value.strip_suffix(".jsonl"))?;
+            if is_daily_diagnostics_stem(stem) {
+                return None;
+            }
+            stem.splitn(2, '-').nth(1).map(|value| value.to_string())
+        }
         _ => None,
     }
+}
+
+fn is_daily_diagnostics_stem(stem: &str) -> bool {
+    let bytes = stem.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit)
 }
 
 pub fn read_records(files: &[LogFileInfo], filter: &RecordFilter) -> Result<Vec<ParsedRecord>> {
@@ -1473,7 +1487,7 @@ mod tests {
         let dir = temp_dir();
         let logs = dir.join("logs");
         fs::create_dir_all(&logs).expect("create logs");
-        let path = logs.join("aicleaner-diagnostics-20260506-000000-000Z-task_1.jsonl");
+        let path = logs.join("aicleaner-diagnostics-2026-05-06.jsonl");
         fs::write(
             &path,
             "{\"timestamp\":\"2026-05-06T00:00:00.000Z\",\"level\":\"info\",\"event\":\"organizer_model_request\",\"module\":\"organizer\",\"taskId\":\"task_1\",\"details\":{\"stage\":\"classify\"}}\n",
@@ -1489,10 +1503,30 @@ mod tests {
         .expect("discover");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].family, LogFamily::Diagnostics);
+        assert_eq!(files[0].correlation_id, None);
 
         let records = read_records(&files, &RecordFilter::default()).expect("read");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].task_id.as_deref(), Some("task_1"));
+    }
+
+    #[test]
+    fn infers_correlation_id_for_legacy_diagnostics_file_names_only() {
+        assert_eq!(
+            infer_correlation_id(
+                "aicleaner-diagnostics-20260506-000000-000Z-task_1.jsonl",
+                &LogFamily::Diagnostics,
+            )
+            .as_deref(),
+            Some("000000-000Z-task_1")
+        );
+        assert_eq!(
+            infer_correlation_id(
+                "aicleaner-diagnostics-2026-05-06.jsonl",
+                &LogFamily::Diagnostics,
+            ),
+            None
+        );
     }
 
     #[test]

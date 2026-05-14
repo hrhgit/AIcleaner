@@ -54,8 +54,6 @@ pub async fn organize_start<R: Runtime>(
         api_key: String::new(),
         model: String::new(),
         api_format: ApiFormat::OpenAi,
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     });
     let (tree, tree_version) = (category_tree_to_value(&default_tree()), 0);
     let snapshot = OrganizeSnapshot {

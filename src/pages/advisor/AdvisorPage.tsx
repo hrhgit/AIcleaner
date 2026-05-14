@@ -360,7 +360,7 @@ export function AdvisorPage() {
   }, []);
 
   const handleMessageKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       void handleSend();
     }

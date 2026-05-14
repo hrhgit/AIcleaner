@@ -6,8 +6,6 @@ fn openai_route() -> RouteConfig {
         api_key: "test".to_string(),
         model: "test-model".to_string(),
         api_format: ApiFormat::OpenAi,
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     }
 }
 

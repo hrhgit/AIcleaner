@@ -162,8 +162,6 @@ export function createCustomProviderRow(id: number): ProviderRow {
     apiKey: '',
     apiFormat: 'openai',
     model: '',
-    thinkingEnabled: false,
-    thinkingLevel: 'medium',
     preset: false,
     modelLoaded: false,
   };

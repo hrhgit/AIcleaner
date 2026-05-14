@@ -137,8 +137,6 @@ pub(super) fn text_route(endpoint: String) -> RouteConfig {
         api_key: "test-key".to_string(),
         model: "test-model".to_string(),
         api_format: ApiFormat::OpenAi,
-        thinking_enabled: false,
-        thinking_level: "medium".to_string(),
     }
 }
 

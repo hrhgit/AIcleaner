@@ -682,7 +682,7 @@ async fn reconcile_receives_only_tree_and_classification_results() {
 }
 
 #[test]
-fn oversized_subtree_candidates_choose_deepest_only() {
+fn oversized_subtree_candidates_choose_leaf_only() {
     let mut tree = default_tree();
     let reports_leaf = ensure_path(
         &mut tree,
@@ -748,23 +748,56 @@ fn oversized_subtree_candidates_choose_deepest_only() {
 }
 
 #[test]
-fn oversized_subtree_candidates_are_fixed_before_refine() {
+fn oversized_subtree_candidates_skip_non_leaf_aggregate_overflow() {
     let mut tree = default_tree();
-    let reports_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Reports".to_string()]);
+    let invoices_leaf = ensure_path(
+        &mut tree,
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ],
+    );
+    let archive_leaf = ensure_path(
+        &mut tree,
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Archive".to_string(),
+        ],
+    );
     let mut assignments: HashMap<String, (String, Vec<String>, String)> = HashMap::new();
-    for idx in 0..21 {
+    for idx in 0..10 {
         assignments.insert(
-            format!("report_{idx}"),
+            format!("invoice_{idx}"),
             (
-                reports_leaf.clone(),
-                vec!["Documents".to_string(), "Reports".to_string()],
-                "report".to_string(),
+                invoices_leaf.clone(),
+                vec![
+                    "Documents".to_string(),
+                    "Reports".to_string(),
+                    "Invoices".to_string(),
+                ],
+                "invoice".to_string(),
+            ),
+        );
+    }
+    for idx in 0..11 {
+        assignments.insert(
+            format!("archive_{idx}"),
+            (
+                archive_leaf.clone(),
+                vec![
+                    "Documents".to_string(),
+                    "Reports".to_string(),
+                    "Archive".to_string(),
+                ],
+                "archive".to_string(),
             ),
         );
     }
 
     let initial_candidates = select_oversized_subtree_candidates(&tree, &assignments, 20);
-    assert_eq!(initial_candidates.len(), 1);
+    assert!(initial_candidates.is_empty());
 
     let split_leaf = ensure_path(
         &mut tree,
@@ -776,12 +809,13 @@ fn oversized_subtree_candidates_are_fixed_before_refine() {
     );
     for idx in 0..10 {
         assignments.insert(
-            format!("report_{idx}"),
+            format!("archive_{idx}"),
             (
                 split_leaf.clone(),
                 vec![
                     "Documents".to_string(),
                     "Reports".to_string(),
+                    "Archive".to_string(),
                     "2026".to_string(),
                 ],
                 "split".to_string(),
@@ -789,11 +823,6 @@ fn oversized_subtree_candidates_are_fixed_before_refine() {
         );
     }
 
-    assert_eq!(initial_candidates.len(), 1);
-    assert_eq!(
-        initial_candidates[0].category_path,
-        vec!["Documents", "Reports"]
-    );
     let rescanned = select_oversized_subtree_candidates(&tree, &assignments, 20);
     assert!(rescanned.is_empty());
 }
