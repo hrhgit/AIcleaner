@@ -10,10 +10,7 @@ pub(crate) fn preset_provider_configs_json() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
-pub(crate) fn normalize_provider_api_format(
-    endpoint: &str,
-    raw: Option<&str>,
-) -> ApiFormat {
+pub(crate) fn normalize_provider_api_format(endpoint: &str, raw: Option<&str>) -> ApiFormat {
     raw.and_then(ApiFormat::from_str)
         .unwrap_or_else(|| crate::llm_protocol::detect_api_format(endpoint))
 }

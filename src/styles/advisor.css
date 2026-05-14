@@ -830,18 +830,33 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
-    background: none;
-    border: none;
-    padding: 0;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 6px 8px;
     display: flex;
     align-items: center;
     gap: 10px;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.advisor-browser-folder-nav .advisor-browser-row-copy {
+    flex: 1 1 auto;
 }
 
 .advisor-browser-folder-nav:hover,
 .advisor-browser-folder-nav:focus-visible {
     border-color: rgba(20, 184, 166, 0.24);
     background: rgba(20, 184, 166, 0.055);
+}
+
+.advisor-browser-folder-nav.expanded {
+    border-color: rgba(20, 184, 166, 0.28);
+    background: rgba(20, 184, 166, 0.09);
+}
+
+.advisor-browser-folder-nav.expanded .advisor-browser-chevron {
+    transform: rotate(45deg);
 }
 
 .advisor-browser-info-btn {
@@ -866,6 +881,13 @@
     border-top: 1px solid rgba(148, 163, 184, 0.08);
     background: rgba(148, 163, 184, 0.04);
     border-radius: 0 0 8px 8px;
+}
+
+.advisor-browser-folder-children {
+    margin-top: 6px;
+    display: grid;
+    gap: 8px;
+    border-left: 1px solid rgba(148, 163, 184, 0.12);
 }
 
 .advisor-browser-detail-header {
@@ -1052,7 +1074,8 @@
     border-right: 2px solid rgba(203, 213, 225, 0.7);
     border-bottom: 2px solid rgba(203, 213, 225, 0.7);
     transform: rotate(-45deg);
-    justify-self: end;
+    margin-left: auto;
+    flex-shrink: 0;
 }
 
 .advisor-browser-empty {
@@ -1478,6 +1501,17 @@
 .advisor-entry-copy {
     min-width: 0;
     overflow-wrap: anywhere;
+}
+
+.advisor-turn-tree-panel {
+    display: grid;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.advisor-turn-tree-head {
+    display: grid;
+    gap: 4px;
 }
 
 .advisor-tree-shell {

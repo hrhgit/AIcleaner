@@ -2,6 +2,7 @@ node_modules/
 dist/
 codex_asar/
 .codex/
+.claude/
 .codex-release/
 .codex-runtime/
 assets/

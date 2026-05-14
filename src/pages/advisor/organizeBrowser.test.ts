@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildOrganizeBrowserTree,
+  buildOrganizeBrowserTreeFromTreeNodes,
   CLASSIFICATION_ERROR_FOLDER_NAME,
   findOrganizeBrowserFolder,
   UNCATEGORIZED_FOLDER_NAME,
@@ -75,5 +76,32 @@ describe('organize browser tree', () => {
       'file:index:7:draft.txt',
       'file:index:8:draft.txt',
     ]);
+  });
+
+  it('converts category tree nodes into folder-browser folders', () => {
+    const tree = buildOrganizeBrowserTreeFromTreeNodes([
+      {
+        nodeId: 'docs',
+        name: '文档',
+        itemCount: 3,
+        children: [
+          {
+            nodeId: 'contracts',
+            name: '合同',
+            itemCount: 2,
+          },
+        ],
+      },
+    ]);
+
+    const docs = findOrganizeBrowserFolder(tree, ['文档']);
+    const contracts = findOrganizeBrowserFolder(tree, ['文档', '合同']);
+
+    expect(tree.fileCount).toBe(3);
+    expect(docs?.id).toBe('folder:docs');
+    expect(docs?.fileCount).toBe(3);
+    expect(docs?.files).toHaveLength(0);
+    expect(contracts?.id).toBe('folder:contracts');
+    expect(contracts?.fileCount).toBe(2);
   });
 });

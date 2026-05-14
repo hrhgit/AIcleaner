@@ -32,6 +32,9 @@ pub(super) fn build_session_payload(state: &AppState, session: &Value) -> Result
     let mut latest_execution = None;
 
     for card in cards {
+        if card.get("cardType").and_then(Value::as_str) == Some("tree") {
+            continue;
+        }
         if card.get("cardType").and_then(Value::as_str) == Some(CARD_EXECUTION) {
             latest_execution = Some(card.clone());
         }

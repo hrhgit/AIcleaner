@@ -37,6 +37,7 @@ describe('provider manager normalizers', () => {
 
     expect(result.providers.some((provider) => provider.endpoint === 'https://example.test/v1')).toBe(true);
     expect(result.defaultProviderEndpoint).toBe(result.providers[0].endpoint);
+    expect(result.providers[0]?.thinkingEnabled).toBe(true);
   });
 
   it('maps known provider endpoints back to provider template labels', () => {
@@ -64,7 +65,7 @@ describe('provider manager normalizers', () => {
 
   it('serializes provider settings without credentials', () => {
     const payload = buildProviderSettingsPayload(
-      [{ ...baseProvider, model: 'gpt-4o-mini', thinkingEnabled: true, thinkingLevel: 'high' }],
+      [{ ...baseProvider, model: 'gpt-4o-mini', thinkingEnabled: false, thinkingLevel: 'high' }],
       DEFAULT_PROVIDER_ENDPOINT,
       { provider: 'tavily', enabled: true, scopes: { classify: true, organizer: true } },
     );

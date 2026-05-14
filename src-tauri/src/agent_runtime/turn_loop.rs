@@ -17,6 +17,11 @@ pub(crate) enum ToolCallErrorOutcome<O> {
     Finish(O),
 }
 
+pub(crate) enum NoToolCallOutcome<O> {
+    Continue { message: String },
+    Finish(O),
+}
+
 pub(crate) trait AgentTurnSpec {
     type Output;
 
@@ -51,14 +56,14 @@ pub(crate) trait AgentTurnSpec {
     }
     fn on_no_tool_calls(
         &mut self,
-        completion: AgentCompletion,
+        completion: &AgentCompletion,
         trace: &AgentLoopTrace,
-    ) -> Result<Self::Output, String>;
+    ) -> Result<NoToolCallOutcome<Self::Output>, String>;
     fn on_multiple_tool_calls(
         &mut self,
-        completion: AgentCompletion,
+        completion: &AgentCompletion,
         trace: &AgentLoopTrace,
-    ) -> Result<Self::Output, String> {
+    ) -> Result<NoToolCallOutcome<Self::Output>, String> {
         self.on_no_tool_calls(completion, trace)
     }
     fn on_tool_success(
@@ -144,11 +149,31 @@ where
 
             if completion.tool_calls.is_empty() {
                 trace.set_duration(loop_started_at.elapsed());
-                return spec.on_no_tool_calls(completion, &trace);
+                match spec.on_no_tool_calls(&completion, &trace)? {
+                    NoToolCallOutcome::Continue { message } => {
+                        messages.push(normalize_assistant_message(&completion.raw_message));
+                        messages.push(json!({
+                            "role": "user",
+                            "content": message,
+                        }));
+                        continue;
+                    }
+                    NoToolCallOutcome::Finish(output) => return Ok(output),
+                }
             }
             if !spec.allow_multiple_tool_calls() && completion.tool_calls.len() > 1 {
                 trace.set_duration(loop_started_at.elapsed());
-                return spec.on_multiple_tool_calls(completion, &trace);
+                match spec.on_multiple_tool_calls(&completion, &trace)? {
+                    NoToolCallOutcome::Continue { message } => {
+                        messages.push(normalize_assistant_message(&completion.raw_message));
+                        messages.push(json!({
+                            "role": "user",
+                            "content": message,
+                        }));
+                        continue;
+                    }
+                    NoToolCallOutcome::Finish(output) => return Ok(output),
+                }
             }
 
             messages.push(normalize_assistant_message(&completion.raw_message));
@@ -322,18 +347,18 @@ mod tests {
 
         fn on_no_tool_calls(
             &mut self,
-            _completion: AgentCompletion,
+            _completion: &AgentCompletion,
             _trace: &AgentLoopTrace,
-        ) -> Result<Self::Output, String> {
-            Ok("no_tool".to_string())
+        ) -> Result<NoToolCallOutcome<Self::Output>, String> {
+            Ok(NoToolCallOutcome::Finish("no_tool".to_string()))
         }
 
         fn on_multiple_tool_calls(
             &mut self,
-            _completion: AgentCompletion,
+            _completion: &AgentCompletion,
             _trace: &AgentLoopTrace,
-        ) -> Result<Self::Output, String> {
-            Ok("multiple_tool_calls".to_string())
+        ) -> Result<NoToolCallOutcome<Self::Output>, String> {
+            Ok(NoToolCallOutcome::Finish("multiple_tool_calls".to_string()))
         }
 
         fn on_tool_success(
@@ -368,5 +393,142 @@ mod tests {
 
         assert_eq!(output, "multiple_tool_calls");
         assert!(!spec.on_tool_success_called);
+    }
+
+    struct NoToolRetryLlm {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentLlm for NoToolRetryLlm {
+        async fn complete(
+            &self,
+            _messages: &[Value],
+            _tools: &[Value],
+            _trace_key: Option<&str>,
+        ) -> Result<AgentCompletion, AgentLlmError> {
+            let call = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(AgentCompletion {
+                    raw_body: "{}".to_string(),
+                    assistant_text: "I am done.".to_string(),
+                    tool_calls: vec![],
+                    raw_message: json!({
+                        "role": "assistant",
+                        "content": "I am done."
+                    }),
+                    finish_reason: None,
+                    usage: TokenUsage::default(),
+                    route: None,
+                })
+            } else {
+                Ok(AgentCompletion {
+                    raw_body: "{}".to_string(),
+                    assistant_text: String::new(),
+                    tool_calls: vec![ParsedToolCall {
+                        id: "call_1".to_string(),
+                        name: "submit_classification_batch".to_string(),
+                        arguments: json!({ "baseTreeVersion": 1, "assignments": [] }),
+                    }],
+                    raw_message: json!({
+                        "role": "assistant",
+                        "tool_calls": []
+                    }),
+                    finish_reason: None,
+                    usage: TokenUsage::default(),
+                    route: None,
+                })
+            }
+        }
+    }
+
+    struct RetryAfterNoToolSpec {
+        reminder_count: usize,
+    }
+
+    impl AgentTurnSpec for RetryAfterNoToolSpec {
+        type Output = String;
+
+        fn max_steps(&self) -> usize {
+            2
+        }
+
+        fn tool_policy<'ctx>(&'ctx self) -> AgentToolPolicy<'ctx> {
+            AgentToolPolicy {
+                workflow: ToolWorkflow::Organizer,
+                stage: "classification_batch",
+                session: None,
+                bootstrap_turn: false,
+                response_language: "en",
+                web_search_allowed: false,
+                search_remaining: 0,
+            }
+        }
+
+        fn build_initial_messages(&mut self) -> Result<Vec<Value>, String> {
+            Ok(vec![json!({ "role": "user", "content": "classify" })])
+        }
+
+        fn tool_execution_context<'ctx>(&'ctx mut self) -> ToolExecutionContext<'ctx> {
+            ToolExecutionContext {
+                workflow: ToolWorkflow::Organizer,
+                stage: "classification_batch",
+                session: None,
+                bootstrap_turn: false,
+                response_language: "en",
+                web_search_allowed: false,
+                search_remaining: 0,
+                state: None,
+                search_api_key: None,
+                diagnostics: None,
+                organizer_search_counter: None,
+                organizer_search_gate: None,
+            }
+        }
+
+        fn on_no_tool_calls(
+            &mut self,
+            _completion: &AgentCompletion,
+            _trace: &AgentLoopTrace,
+        ) -> Result<NoToolCallOutcome<Self::Output>, String> {
+            self.reminder_count += 1;
+            Ok(NoToolCallOutcome::Continue {
+                message: "Call submit_classification_batch now.".to_string(),
+            })
+        }
+
+        fn on_tool_success(
+            &mut self,
+            _step: usize,
+            _tool_id: Option<ToolId>,
+            _call: &ParsedToolCall,
+            _result: ToolResult,
+            _trace: &AgentLoopTrace,
+        ) -> Result<ToolCallOutcome<Self::Output>, String> {
+            Ok(ToolCallOutcome::Finish("submitted".to_string()))
+        }
+
+        fn on_loop_exhausted(&mut self, _trace: &AgentLoopTrace) -> Result<Self::Output, String> {
+            Ok("exhausted".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn no_tool_calls_can_retry_with_follow_up_message() {
+        let llm = NoToolRetryLlm {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let registry = ToolRegistry::new();
+        let mut spec = RetryAfterNoToolSpec { reminder_count: 0 };
+
+        let output = AgentTurnLoop::new(&llm, &registry)
+            .run(&mut spec)
+            .await
+            .expect("loop output");
+
+        assert_eq!(output, "submitted");
+        assert_eq!(spec.reminder_count, 1);
     }
 }

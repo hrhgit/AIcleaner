@@ -1,6 +1,7 @@
 use crate::backend::TokenUsage;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -43,6 +44,9 @@ pub struct ParsedToolCall {
     pub name: String,
     pub arguments: Value,
 }
+
+const TOOL_ARGUMENTS_RAW_FIELD: &str = "__tool_arguments_raw";
+const TOOL_ARGUMENTS_PARSE_ERROR_FIELD: &str = "__tool_arguments_parse_error";
 
 #[derive(Clone, Debug)]
 pub struct ParsedCompletion {
@@ -127,16 +131,14 @@ pub fn build_completion_payload(
             temperature,
             thinking,
         )),
-        ApiFormat::Anthropic => {
-            build_anthropic_payload(
-                model,
-                messages,
-                tools,
-                temperature,
-                max_tokens.max(1),
-                thinking,
-            )
-        }
+        ApiFormat::Anthropic => build_anthropic_payload(
+            model,
+            messages,
+            tools,
+            temperature,
+            max_tokens.max(1),
+            thinking,
+        ),
     }
 }
 
@@ -201,7 +203,8 @@ fn build_openai_payload(
         payload["tool_choice"] = Value::String("auto".to_string());
     }
     if thinking.enabled {
-        payload["reasoning_effort"] = Value::String(normalize_reasoning_level(thinking.level).to_string());
+        payload["reasoning_effort"] =
+            Value::String(normalize_reasoning_level(thinking.level).to_string());
         payload["thinking"] = json!({ "type": "enabled" });
     }
     payload
@@ -661,29 +664,321 @@ fn parse_arguments_value(value: Option<&Value>) -> Result<Value, String> {
 }
 
 fn parse_tool_arguments_string(raw: &str) -> Result<Value, String> {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(value) => Ok(value),
-        Err(original_err) => {
-            let repaired = escape_likely_unescaped_string_quotes(raw);
-            if repaired == raw {
-                return Err(format!(
-                    "tool call arguments are not valid JSON: {original_err}"
-                ));
-            }
-            serde_json::from_str::<Value>(&repaired).map_err(|repair_err| {
-                format!(
-                    "tool call arguments are not valid JSON: {original_err}; repair failed: {repair_err}"
-                )
-            })
+    if let Some(value) = try_parse_tool_arguments_string(raw) {
+        return Ok(value);
+    }
+    let original_err = serde_json::from_str::<Value>(raw)
+        .err()
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "unknown parse failure".to_string());
+    Ok(tool_argument_parse_fallback(
+        raw,
+        &format!("tool call arguments are not valid JSON: {original_err}"),
+    ))
+}
+
+fn tool_argument_parse_fallback(raw: &str, parse_error: &str) -> Value {
+    json!({
+        TOOL_ARGUMENTS_RAW_FIELD: raw,
+        TOOL_ARGUMENTS_PARSE_ERROR_FIELD: parse_error,
+    })
+}
+
+pub(crate) fn tool_arguments_parse_error(value: &Value) -> Option<&str> {
+    value
+        .get(TOOL_ARGUMENTS_PARSE_ERROR_FIELD)
+        .and_then(Value::as_str)
+}
+
+fn try_parse_tool_arguments_string(raw: &str) -> Option<Value> {
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+
+    queue.push_back(raw.trim().to_string());
+    while let Some(candidate) = queue.pop_front() {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
         }
+        if let Some(value) = try_parse_json_value(trimmed) {
+            return Some(value);
+        }
+        enqueue_repaired_variants(trimmed, &mut queue);
+    }
+
+    None
+}
+
+fn try_parse_json_value(raw: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    if let Value::String(inner) = &value {
+        let trimmed = inner.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return serde_json::from_str::<Value>(trimmed).ok().or(Some(value));
+        }
+    }
+    Some(value)
+}
+
+fn enqueue_repaired_variants(raw: &str, queue: &mut VecDeque<String>) {
+    if let Some(normalized) = normalize_jsonish_quotes(raw) {
+        queue.push_back(normalized);
+    }
+    if let Some(unwrapped) = strip_markdown_code_fence(raw) {
+        queue.push_back(unwrapped);
+    }
+    if let Some(repaired) = escape_likely_unescaped_string_quotes(raw) {
+        queue.push_back(repaired);
+    }
+    if let Some(repaired) = remove_premature_root_closes(raw) {
+        queue.push_back(repaired);
+    }
+    if let Some(repaired) = remove_trailing_commas(raw) {
+        queue.push_back(repaired);
+    }
+    if let Some(repaired) = close_unbalanced_json_delimiters(raw) {
+        queue.push_back(repaired);
+    }
+    if let Some(extracted) = extract_first_json_payload(raw) {
+        queue.push_back(extracted);
     }
 }
 
-fn escape_likely_unescaped_string_quotes(raw: &str) -> String {
+fn normalize_jsonish_quotes(raw: &str) -> Option<String> {
+    let normalized = raw
+        .replace(['“', '”', '„', '‟', '〝', '〞', '＂'], "\"")
+        .replace(['‘', '’'], "'");
+    (normalized != raw).then_some(normalized)
+}
+
+fn strip_markdown_code_fence(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let start = trimmed.find("```")?;
+    let rest = &trimmed[start + 3..];
+    let newline_idx = rest.find('\n')?;
+    let body = &rest[newline_idx + 1..];
+    let end = body.find("```")?;
+    let extracted = body[..end].trim();
+    (!extracted.is_empty()).then(|| extracted.to_string())
+}
+
+fn extract_first_json_payload(raw: &str) -> Option<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut start = None;
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in chars.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if *ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if *ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if start.is_none() {
+            match *ch {
+                '{' => {
+                    start = Some(idx);
+                    stack.push('}');
+                }
+                '[' => {
+                    start = Some(idx);
+                    stack.push(']');
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match *ch {
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                let expected = stack.pop()?;
+                if *ch != expected {
+                    return None;
+                }
+                if stack.is_empty() {
+                    let begin = start?;
+                    let extracted: String = chars[begin..=idx].iter().collect();
+                    let extracted = extracted.trim().to_string();
+                    return (!extracted.is_empty() && extracted != raw.trim()).then_some(extracted);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Some models produce malformed JSON like:
+///   {"draftTree": {...}, "notes": "..."}, "proposalMappings": [...]}
+/// where an extra `}` closes the root object prematurely, pushing later
+/// fields outside. This function detects that pattern by tracking brace
+/// depth and removing `}` characters that would close the root object
+/// while non-whitespace content still follows.
+fn remove_premature_root_closes(raw: &str) -> Option<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut skip_positions = Vec::new();
+
+    for (i, ch) in chars.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if *ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if *ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match *ch {
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                if depth == 1 {
+                    // This brace would close the root object.
+                    // Check if non-whitespace content follows.
+                    let rest: String = chars[i + 1..].iter().collect();
+                    if rest.trim_start().starts_with(',') {
+                        // Premature close: remove this brace
+                        skip_positions.push(i);
+                        // Don't decrement depth — stay at 1
+                    } else {
+                        depth -= 1;
+                    }
+                } else if depth > 1 {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if skip_positions.is_empty() {
+        return None;
+    }
+    let skip_set: HashSet<usize> = skip_positions.into_iter().collect();
+    let fixed: String = chars
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !skip_set.contains(i))
+        .map(|(_, ch)| *ch)
+        .collect();
+    Some(fixed)
+}
+
+fn remove_trailing_commas(raw: &str) -> Option<String> {
     let chars = raw.chars().collect::<Vec<_>>();
     let mut out = String::with_capacity(raw.len());
     let mut in_string = false;
     let mut escaped = false;
+    let mut changed = false;
+
+    for (idx, ch) in chars.iter().enumerate() {
+        if escaped {
+            out.push(*ch);
+            escaped = false;
+            continue;
+        }
+        if *ch == '\\' && in_string {
+            out.push(*ch);
+            escaped = true;
+            continue;
+        }
+        if *ch == '"' {
+            out.push(*ch);
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && *ch == ',' {
+            if chars[idx + 1..]
+                .iter()
+                .find(|ch| !ch.is_whitespace())
+                .is_some_and(|ch| matches!(ch, '}' | ']'))
+            {
+                changed = true;
+                continue;
+            }
+        }
+        out.push(*ch);
+    }
+
+    changed.then_some(out)
+}
+
+fn close_unbalanced_json_delimiters(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+
+    let mut expected_closers = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in trimmed.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => expected_closers.push('}'),
+            '[' => expected_closers.push(']'),
+            '}' | ']' => {
+                let expected = expected_closers.pop()?;
+                if ch != expected {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || expected_closers.is_empty() {
+        return None;
+    }
+
+    let mut repaired = trimmed.to_string();
+    for ch in expected_closers.iter().rev() {
+        repaired.push(*ch);
+    }
+    Some(repaired)
+}
+
+fn escape_likely_unescaped_string_quotes(raw: &str) -> Option<String> {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
 
     for (idx, ch) in chars.iter().enumerate() {
         if escaped {
@@ -712,13 +1007,14 @@ fn escape_likely_unescaped_string_quotes(raw: &str) -> String {
                 } else {
                     out.push('\\');
                     out.push('"');
+                    changed = true;
                 }
             }
             _ => out.push(*ch),
         }
     }
 
-    out
+    changed.then_some(out)
 }
 
 fn looks_like_json_string_end(chars: &[char], quote_idx: usize) -> bool {
@@ -869,5 +1165,220 @@ mod tests {
             ".exe文件名含\"Installer\"，表明是安装包"
         );
         assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn repairs_premature_root_close_in_tool_arguments() {
+        // Model produced: {"draftTree": {...}, "notes": "..."}, "proposalMappings": [...]}
+        // where extra } after notes closes the root prematurely.
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "revise_tree_draft",
+                            "arguments": "{\"draftTree\":{\"nodeId\":\"root\",\"name\":\"\",\"children\":[]},\"notes\":\"test note\"},\"proposalMappings\":[{\"proposalId\":\"p1\",\"status\":\"accepted\"}],\"rejectedProposalIds\":[\"p2\"]}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "revise_tree_draft");
+        assert_eq!(parsed.tool_calls[0].arguments["notes"], "test note");
+        assert_eq!(
+            parsed.tool_calls[0].arguments["proposalMappings"][0]["proposalId"],
+            "p1"
+        );
+        assert_eq!(
+            parsed.tool_calls[0].arguments["rejectedProposalIds"][0],
+            "p2"
+        );
+    }
+
+    #[test]
+    fn preserves_tool_call_with_parse_fallback_when_arguments_stay_invalid() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "{\"assignments\":[}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "submit_classification_batch");
+        assert_eq!(
+            parsed.tool_calls[0].arguments[TOOL_ARGUMENTS_RAW_FIELD],
+            json!("{\"assignments\":[}")
+        );
+        assert!(
+            parsed.tool_calls[0].arguments[TOOL_ARGUMENTS_PARSE_ERROR_FIELD]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tool call arguments are not valid JSON")
+        );
+    }
+
+    #[test]
+    fn parses_tool_call_arguments_inside_markdown_code_fence() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "```json\n{\"baseTreeVersion\":1,\"assignments\":[]}\n```"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls[0].arguments["baseTreeVersion"], 1);
+    }
+
+    #[test]
+    fn parses_tool_call_arguments_embedded_in_natural_language() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "Here is the JSON payload: {\"baseTreeVersion\":1,\"assignments\":[]} Please apply it."
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls[0].arguments["assignments"], json!([]));
+    }
+
+    #[test]
+    fn repairs_trailing_commas_in_tool_arguments() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "{\"baseTreeVersion\":1,\"assignments\":[{\"itemId\":\"batch1_1\",\"reason\":\"doc\",}],}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(
+            parsed.tool_calls[0].arguments["assignments"][0]["itemId"],
+            "batch1_1"
+        );
+    }
+
+    #[test]
+    fn repairs_missing_closing_delimiters_in_tool_arguments() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "{\"baseTreeVersion\":1,\"assignments\":[{\"itemId\":\"batch1_1\",\"reason\":\"doc\"}]"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls[0].arguments["baseTreeVersion"], 1);
+    }
+
+    #[test]
+    fn parses_double_encoded_tool_arguments_string() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_classification_batch",
+                            "arguments": "\"{\\\"baseTreeVersion\\\":1,\\\"assignments\\\":[]}\""
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })
+        .to_string();
+
+        let parsed =
+            parse_completion_response(ApiFormat::OpenAi, StatusCode::OK, &raw).expect("parsed");
+        assert_eq!(parsed.tool_calls[0].arguments["baseTreeVersion"], 1);
     }
 }

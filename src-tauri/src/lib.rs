@@ -6,12 +6,13 @@ mod diagnostics;
 mod file_representation;
 mod llm_protocol;
 mod llm_tools;
+pub mod log_cli_support;
 mod model_boundary;
 mod organizer_runtime;
 mod persist;
+mod reasoning_policy;
 mod system_ops;
 mod web_search;
-pub mod log_cli_support;
 
 use backend::AppState;
 use tauri::Manager;
@@ -24,12 +25,12 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let state = AppState::bootstrap(data_dir)?;
-            let mut logger = tauri_plugin_log::Builder::new().clear_targets().target(
-                Target::new(TargetKind::Folder {
+            let mut logger = tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(Target::new(TargetKind::Folder {
                     path: state.logs_dir(),
                     file_name: Some(app_paths::APP_LOG_FILE_STEM.to_string()),
-                }),
-            );
+                }));
             if cfg!(debug_assertions) {
                 logger = logger.target(Target::new(TargetKind::Stdout));
             }

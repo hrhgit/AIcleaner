@@ -39,6 +39,7 @@ impl<'a> ToolService<'a> {
         assets: &ContextAssets,
         session: Option<&Value>,
     ) -> Vec<InventoryItem> {
+        let db_path = self.state.db_path();
         let overrides = session
             .map(super::types::inventory_overrides)
             .unwrap_or_default();
@@ -57,6 +58,14 @@ impl<'a> ToolService<'a> {
                 }
                 let key = normalize_path_key(&path);
                 let representation = representation_from_organize_row(&row);
+                let summary_representation =
+                    load_cached_summary_representation(&db_path, root_path, &path).or_else(|| {
+                        Some(representation.clone()).filter(|value| {
+                            value.has_level(RepresentationLevel::Metadata)
+                                || value.has_level(RepresentationLevel::Short)
+                                || value.has_level(RepresentationLevel::Long)
+                        })
+                    });
                 let summary = representation.best_text();
                 let mut category_path = overrides
                     .get(&key)
@@ -86,6 +95,7 @@ impl<'a> ToolService<'a> {
                         parent_category_id,
                         category_path,
                         representation,
+                        summary_representation,
                         risk: "medium".to_string(),
                     },
                 );
@@ -93,7 +103,9 @@ impl<'a> ToolService<'a> {
         }
 
         if map.is_empty() {
-            for item in collect_inventory_from_fs(root_path, &overrides) {
+            for mut item in collect_inventory_from_fs(root_path, &overrides) {
+                item.summary_representation =
+                    load_cached_summary_representation(&db_path, root_path, &item.path);
                 map.insert(normalize_path_key(&item.path), item);
             }
         }
@@ -107,4 +119,24 @@ impl<'a> ToolService<'a> {
         });
         rows
     }
+}
+
+fn load_cached_summary_representation(
+    db_path: &std::path::Path,
+    root_path: &str,
+    path: &str,
+) -> Option<FileRepresentation> {
+    persist::load_advisor_file_summary(
+        db_path,
+        &persist::create_root_path_key(root_path),
+        &persist::create_root_path_key(path),
+    )
+    .ok()
+    .flatten()
+    .map(|row| FileRepresentation::from_value(row.get("representation").unwrap_or(&Value::Null)))
+    .filter(|representation| {
+        representation.has_level(RepresentationLevel::Metadata)
+            || representation.has_level(RepresentationLevel::Short)
+            || representation.has_level(RepresentationLevel::Long)
+    })
 }

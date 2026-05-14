@@ -105,4 +105,46 @@ describe('OrganizeSummary', () => {
     expect(html).toContain('摘要准备');
     expect(html).toContain('78 / 输入 60 / 输出 18');
   });
+
+  it('renders organize results without path-navigation controls', () => {
+    const snapshot: OrganizeViewSnapshot = {
+      id: 'org_tree',
+      status: 'completed',
+      rootPath: 'E:/Downloads',
+      totalFiles: 1,
+      processedFiles: 1,
+      totalBatches: 1,
+      processedBatches: 1,
+      summaryStrategy: 'local_summary',
+      useWebSearch: false,
+      webSearchEnabled: false,
+      progress: {
+        stage: 'completed',
+        label: 'Completed',
+        current: 1,
+        total: 1,
+        unit: 'batches',
+        indeterminate: false,
+      },
+      displayResults: [
+        {
+          index: 1,
+          itemId: 'item-1',
+          path: 'E:/Downloads/rent.pdf',
+          name: 'rent.pdf',
+          itemType: 'file',
+          categoryPath: ['文档', '合同'],
+          leafNodeId: 'leaf-contract',
+          reason: '合同文件',
+        },
+      ],
+      tree: { children: [] },
+    };
+
+    const html = renderToStaticMarkup(<OrganizeSummary snapshot={snapshot} state={stateStub()} />);
+
+    expect(html).toContain('文档');
+    expect(html).not.toContain('返回上级');
+    expect(html).not.toContain('当前位置');
+  });
 });

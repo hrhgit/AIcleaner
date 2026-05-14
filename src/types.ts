@@ -268,6 +268,7 @@ export type AdvisorSessionData = {
   sessionId?: string;
   rootPath?: string;
   timeline?: TimelineTurn[];
+  derivedTree?: TreeNode;
   workflowStage?: string;
   useWebSearch?: boolean;
   webSearchEnabled?: boolean;

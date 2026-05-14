@@ -7,6 +7,7 @@ use crate::llm_protocol::{
     build_llm_http_client, build_messages_url, parse_completion_response, ThinkingConfig,
     DEFAULT_MAX_TOKENS,
 };
+use crate::reasoning_policy;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -65,12 +66,10 @@ impl<'a> AdvisorLlm<'a> {
         endpoint_hint: Option<&str>,
         model_hint: Option<&str>,
     ) -> Result<AdvisorModelRoute, String> {
-        let (endpoint, model) =
-            {
-                let route =
-                    resolve_provider_endpoint_and_model(self.state, endpoint_hint, model_hint);
-                (route.endpoint, route.model)
-            };
+        let (endpoint, model) = {
+            let route = resolve_provider_endpoint_and_model(self.state, endpoint_hint, model_hint);
+            (route.endpoint, route.model)
+        };
         let route = resolve_provider_endpoint_and_model(self.state, Some(&endpoint), Some(&model));
         let api_key = resolve_provider_api_key(self.state, &route.endpoint)?;
         Ok(AdvisorModelRoute {
@@ -103,6 +102,7 @@ impl<'a> AdvisorLlm<'a> {
             Some(tools),
             &operation_id,
             session_id,
+            reasoning_policy::advisor_turn(&route.thinking_level),
         )
         .await
     }
@@ -153,10 +153,12 @@ fn parse_chat_completion_http_body(
     status: StatusCode,
     raw_body: &str,
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
-    let parsed = parse_completion_response(route.api_format, status, raw_body)
-        .map_err(|message| ChatCompletionError {
-            message,
-            raw_body: raw_body.to_string(),
+    let parsed =
+        parse_completion_response(route.api_format, status, raw_body).map_err(|message| {
+            ChatCompletionError {
+                message,
+                raw_body: raw_body.to_string(),
+            }
         })?;
 
     Ok(AdvisorCompletionOutput {
@@ -185,6 +187,7 @@ async fn chat_completion(
     tools: Option<&[Value]>,
     operation_id: &str,
     session_id: Option<&str>,
+    effective_thinking: reasoning_policy::EffectiveThinking<'_>,
 ) -> Result<AdvisorCompletionOutput, ChatCompletionError> {
     let api_format = route.api_format;
     let url = build_messages_url(&route.endpoint, api_format);
@@ -202,8 +205,8 @@ async fn chat_completion(
         0.0,
         DEFAULT_MAX_TOKENS,
         ThinkingConfig {
-            enabled: route.thinking_enabled,
-            level: &route.thinking_level,
+            enabled: effective_thinking.enabled,
+            level: effective_thinking.level,
         },
     )
     .map_err(|message| ChatCompletionError {
@@ -223,8 +226,9 @@ async fn chat_completion(
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
             "apiFormat": route.api_format.as_str(),
-            "thinkingEnabled": route.thinking_enabled,
-            "thinkingLevel": route.thinking_level.clone(),
+            "configuredThinkingEnabled": route.thinking_enabled,
+            "thinkingEnabled": effective_thinking.enabled,
+            "thinkingLevel": effective_thinking.level,
             "url": url.clone(),
             "messages": messages,
             "tools": tools.unwrap_or(&[]),
@@ -257,8 +261,9 @@ async fn chat_completion(
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
                     "apiFormat": route.api_format.as_str(),
-                    "thinkingEnabled": route.thinking_enabled,
-                    "thinkingLevel": route.thinking_level.clone(),
+                    "configuredThinkingEnabled": route.thinking_enabled,
+                    "thinkingEnabled": effective_thinking.enabled,
+                    "thinkingLevel": effective_thinking.level,
                     "url": url.clone(),
                 }),
                 Some(json!({ "message": e.to_string() })),
@@ -286,8 +291,9 @@ async fn chat_completion(
                     "endpoint": route.endpoint.clone(),
                     "model": route.model.clone(),
                     "apiFormat": route.api_format.as_str(),
-                    "thinkingEnabled": route.thinking_enabled,
-                    "thinkingLevel": route.thinking_level.clone(),
+                    "configuredThinkingEnabled": route.thinking_enabled,
+                    "thinkingEnabled": effective_thinking.enabled,
+                    "thinkingLevel": effective_thinking.level,
                     "status": status.as_u16(),
                 }),
                 Some(json!({ "message": e.to_string() })),
@@ -311,8 +317,9 @@ async fn chat_completion(
             "endpoint": route.endpoint.clone(),
             "model": route.model.clone(),
             "apiFormat": route.api_format.as_str(),
-            "thinkingEnabled": route.thinking_enabled,
-            "thinkingLevel": route.thinking_level.clone(),
+            "configuredThinkingEnabled": route.thinking_enabled,
+            "thinkingEnabled": effective_thinking.enabled,
+            "thinkingLevel": effective_thinking.level,
             "status": status.as_u16(),
             "rawBody": raw_body.clone(),
         }),

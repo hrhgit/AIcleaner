@@ -24,6 +24,7 @@ mod tests {
             parent_category_id: None,
             category_path: Vec::new(),
             representation: FileRepresentation::default(),
+            summary_representation: None,
             risk: risk.to_string(),
         }
     }
@@ -173,20 +174,74 @@ mod tests {
             &json!({
                 "categoryIds": ["n1"],
                 "request": {
-                    "change": {
+                    "changes": [{
+                        "type": "merge_category_into_category",
                         "sourceCategoryId": "n1",
                         "targetCategoryId": "n1"
-                    }
+                    }]
                 }
             }),
         );
         assert_eq!(expanded["categoryIds"][0], real_category_id);
         assert_eq!(
-            expanded["request"]["change"]["sourceCategoryId"],
+            expanded["request"]["changes"][0]["sourceCategoryId"],
             real_category_id
         );
         assert_eq!(
-            expanded["request"]["change"]["targetCategoryId"],
+            expanded["request"]["changes"][0]["targetCategoryId"],
+            real_category_id
+        );
+    }
+
+    #[test]
+    fn advisor_model_view_expands_batch_reclassification_category_args() {
+        let real_category_id = category_id_from_path(&["文档".to_string()]);
+        let session = json!({
+            "derivedTree": {
+                "nodeId": "root",
+                "categoryId": "root",
+                "categoryPath": [],
+                "name": "root",
+                "children": [{
+                    "nodeId": real_category_id,
+                    "categoryId": real_category_id,
+                    "categoryPath": ["文档"],
+                    "name": "文档",
+                    "children": []
+                }]
+            }
+        });
+
+        let expanded = expand_advisor_model_args(
+            &session,
+            &json!({
+                "request": {
+                    "changes": [
+                        {
+                            "type": "rename_category",
+                            "sourceCategoryId": "n1",
+                            "newCategoryName": "资料"
+                        },
+                        {
+                            "type": "merge_category_into_category",
+                            "sourceCategoryId": "n1",
+                            "targetCategoryId": "n1"
+                        }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(
+            expanded["request"]["changes"][0]["sourceCategoryId"],
+            real_category_id
+        );
+        assert_eq!(
+            expanded["request"]["changes"][1]["sourceCategoryId"],
+            real_category_id
+        );
+        assert_eq!(
+            expanded["request"]["changes"][1]["targetCategoryId"],
             real_category_id
         );
     }
@@ -227,11 +282,11 @@ mod tests {
             &session,
             &json!({
                 "request": {
-                    "change": {
+                    "changes": [{
                         "type": "rename_category",
                         "sourceCategoryId": "n1",
                         "newCategoryName": "资料"
-                    }
+                    }]
                 }
             }),
         );
@@ -247,6 +302,82 @@ mod tests {
         assert_eq!(
             session["sessionMeta"]["inventoryOverrides"][path_key],
             json!(["资料"])
+        );
+    }
+
+    #[test]
+    fn apply_reclassification_request_supports_batch_changes() {
+        let state = make_test_state();
+        let service = ToolService::new(&state);
+        let source_path = vec!["文档".to_string()];
+        let real_category_id = category_id_from_path(&source_path);
+        let path_key = persist::create_root_path_key(r"C:\test\report.pdf");
+        let mut session = json!({
+            "sessionId": "session_1",
+            "rootPath": r"C:\test",
+            "responseLanguage": "zh",
+            "derivedTree": {
+                "nodeId": "root",
+                "categoryId": "root",
+                "categoryPath": [],
+                "name": "root",
+                "children": [{
+                    "nodeId": real_category_id,
+                    "categoryId": real_category_id,
+                    "categoryPath": source_path,
+                    "name": "文档",
+                    "children": []
+                }]
+            },
+            "sessionMeta": {
+                "inventoryOverrides": {}
+            }
+        });
+        session["sessionMeta"]["inventoryOverrides"]
+            .as_object_mut()
+            .expect("inventory overrides object")
+            .insert(path_key.clone(), json!(["文档"]));
+        let backend_args = expand_advisor_model_args(
+            &session,
+            &json!({
+                "request": {
+                    "changes": [
+                        {
+                            "type": "rename_category",
+                            "sourceCategoryId": "n1",
+                            "newCategoryName": "资料"
+                        },
+                        {
+                            "type": "rename_category",
+                            "sourceCategoryId": "n1",
+                            "newCategoryName": "归档资料"
+                        }
+                    ]
+                }
+            }),
+        );
+
+        let job = service
+            .apply_reclassification_request(
+                &mut session,
+                backend_args.get("request").unwrap(),
+                false,
+            )
+            .expect("apply batch reclassification");
+
+        assert_eq!(
+            session["sessionMeta"]["inventoryOverrides"][path_key],
+            json!(["归档资料"])
+        );
+        assert_eq!(
+            job.pointer("/rollback/entries")
+                .and_then(Value::as_array)
+                .map(|rows| rows.len()),
+            Some(2)
+        );
+        assert_eq!(
+            job.pointer("/result/changeSummary"),
+            Some(&Value::String("2 changes applied: 2 items updated".to_string()))
         );
     }
 
@@ -340,5 +471,104 @@ mod tests {
         assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
         assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn derived_tree_exposes_summary_presence_and_types_from_cached_summaries() {
+        let state = make_test_state();
+        let service = ToolService::new(&state);
+        let root = std::env::temp_dir().join(format!(
+            "wipeout-advisor-tree-summary-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let report = root.join("report.pdf");
+        let note = root.join("note.txt");
+        fs::write(&report, "report").expect("write report");
+        fs::write(&note, "note").expect("write note");
+        let root_path = root.to_string_lossy().to_string();
+        let report_path = report.to_string_lossy().to_string();
+        let note_path = note.to_string_lossy().to_string();
+        let report_key = persist::create_root_path_key(&report_path);
+        let note_key = persist::create_root_path_key(&note_path);
+        let root_key = persist::create_root_path_key(&root_path);
+
+        persist::save_advisor_file_summary(
+            &state.db_path(),
+            &json!({
+                "rootPathKey": root_key,
+                "pathKey": report_key.clone(),
+                "path": report_path,
+                "name": "report.pdf",
+                "representation": {
+                    "metadata": "report.pdf",
+                    "short": "short report summary",
+                    "long": Value::Null,
+                    "source": "advisor",
+                    "degraded": false,
+                    "confidence": Value::Null,
+                    "keywords": [],
+                },
+                "summaryShort": "short report summary",
+                "summaryNormal": Value::Null,
+                "source": "advisor",
+                "representationLevel": "short",
+                "updatedAt": now_iso(),
+            }),
+        )
+        .expect("save short summary");
+        persist::save_advisor_file_summary(
+            &state.db_path(),
+            &json!({
+                "rootPathKey": root_key,
+                "pathKey": note_key.clone(),
+                "path": note_path,
+                "name": "note.txt",
+                "representation": {
+                    "metadata": "note.txt",
+                    "short": Value::Null,
+                    "long": Value::Null,
+                    "source": "advisor",
+                    "degraded": false,
+                    "confidence": Value::Null,
+                    "keywords": [],
+                },
+                "summaryShort": Value::Null,
+                "summaryNormal": Value::Null,
+                "source": "advisor",
+                "representationLevel": "metadata",
+                "updatedAt": now_iso(),
+            }),
+        )
+        .expect("save metadata summary");
+
+        let mut session = json!({
+            "sessionMeta": {
+                "inventoryOverrides": {}
+            }
+        });
+        session["sessionMeta"]["inventoryOverrides"]
+            .as_object_mut()
+            .expect("inventory overrides object")
+            .insert(report_key, json!(["文档"]));
+        session["sessionMeta"]["inventoryOverrides"]
+            .as_object_mut()
+            .expect("inventory overrides object")
+            .insert(note_key, json!(["文档"]));
+
+        let overview = service
+            .get_directory_overview(&root_path, None, Some(&session), "zh")
+            .expect("build overview");
+        let tree = overview.derived_tree.expect("derived tree");
+        let category = tree["children"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .expect("category node");
+        assert_eq!(category["hasSummary"], Value::Bool(true));
+        assert_eq!(category["summaryTypes"], json!(["metadata", "short"]));
+
+        let tree_text = build_tree_text(&tree);
+        assert!(tree_text.contains("[summary=metadata/short]"));
     }
 }

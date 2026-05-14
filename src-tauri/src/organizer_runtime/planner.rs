@@ -179,7 +179,10 @@ pub(super) fn prune_empty_dirs_upward(start_dir: &Path, stop_dir: &Path) {
 }
 
 pub(super) fn build_apply_plan(snapshot: &OrganizeSnapshot) -> Vec<Value> {
-    let preview_rows = build_preview(&snapshot.root_path, &persist::build_final_result_rows(snapshot));
+    let preview_rows = build_preview(
+        &snapshot.root_path,
+        &persist::build_final_result_rows(snapshot),
+    );
 
     let mut plan = preview_rows
         .into_iter()

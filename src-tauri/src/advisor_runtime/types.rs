@@ -6,7 +6,6 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub(crate) const CARD_TREE: &str = "tree";
 pub(crate) const CARD_RECLASS: &str = "reclassification_result";
 pub(crate) const CARD_PREFERENCE: &str = "preference_draft";
 pub(crate) const CARD_EXECUTION: &str = "execution_result";
@@ -57,6 +56,7 @@ pub(crate) struct InventoryItem {
     pub parent_category_id: Option<String>,
     pub category_path: Vec<String>,
     pub representation: FileRepresentation,
+    pub summary_representation: Option<FileRepresentation>,
     pub risk: String,
 }
 

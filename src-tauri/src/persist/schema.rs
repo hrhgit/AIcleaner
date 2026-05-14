@@ -113,8 +113,7 @@ fn ensure_advisor_schema_full(conn: &Connection) -> Result<(), String> {
         );
         drop_advisor_tables(conn)?;
     }
-    create_advisor_tables(conn)
-        .inspect_err(|e| log::warn!("create_advisor_tables failed: {e}"))?;
+    create_advisor_tables(conn).inspect_err(|e| log::warn!("create_advisor_tables failed: {e}"))?;
     conn.execute(
         "INSERT INTO app_meta(key, value) VALUES('advisor_schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

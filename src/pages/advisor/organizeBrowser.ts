@@ -1,4 +1,4 @@
-import type { OrganizeResultRow } from '../../types';
+import type { OrganizeResultRow, TreeNode } from '../../types';
 
 export const UNCATEGORIZED_FOLDER_NAME = '其他待定';
 export const CLASSIFICATION_ERROR_FOLDER_NAME = '分类错误';
@@ -147,6 +147,52 @@ export function buildOrganizeBrowserTree(rows: OrganizeResultRow[]): OrganizeBro
   });
 
   return sortFolder(root);
+}
+
+function normalizeTreeNodeName(node: TreeNode): string {
+  return String(node.name || '').trim() || '-';
+}
+
+function treeNodeItemCount(node: TreeNode): number {
+  const explicit = Number(node.itemCount);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const children = Array.isArray(node.children) ? node.children : [];
+  return children.reduce((sum, child) => sum + treeNodeItemCount(child), 0);
+}
+
+function treeNodeId(node: TreeNode, path: string[], index: number): string {
+  const rawId = String(node.nodeId || node.id || '').trim();
+  if (rawId) return `folder:${rawId}`;
+  const fallbackPath = [...path, normalizeTreeNodeName(node)].join('/');
+  return `folder:tree:${fallbackPath || index}`;
+}
+
+function treeNodeToFolder(node: TreeNode, path: string[], index: number): OrganizeBrowserFolder {
+  const name = normalizeTreeNodeName(node);
+  const nextPath = [...path, name];
+  const children = Array.isArray(node.children) ? node.children : [];
+  const folders = children.map((child, childIndex) => treeNodeToFolder(child, nextPath, childIndex));
+  return {
+    id: treeNodeId(node, path, index),
+    name,
+    path: nextPath,
+    folders,
+    files: [],
+    fileCount: treeNodeItemCount(node),
+    sampleItems: [],
+  };
+}
+
+export function buildOrganizeBrowserTreeFromTreeNodes(nodes: TreeNode[]): OrganizeBrowserFolder {
+  return {
+    id: 'folder:root',
+    name: '',
+    path: [],
+    folders: nodes.map((node, index) => treeNodeToFolder(node, [], index)),
+    files: [],
+    fileCount: nodes.reduce((sum, node) => sum + treeNodeItemCount(node), 0),
+    sampleItems: [],
+  };
 }
 
 export function findOrganizeBrowserFolder(

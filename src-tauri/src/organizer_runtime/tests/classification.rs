@@ -298,6 +298,126 @@ async fn classification_batch_without_required_tool_returns_error() {
     assert!(!output.raw_output.contains(CATEGORY_OTHER_PENDING));
 }
 
+#[tokio::test]
+async fn classification_batch_retries_after_malformed_tool_arguments() {
+    let mut tree = default_tree();
+    ensure_path(&mut tree, &["Documents".to_string()]);
+    let batch_rows = vec![json!({
+        "itemId": "batch1_1",
+        "name": "loose-note.txt",
+        "relativePath": "loose-note.txt",
+        "itemType": "file",
+        "modality": "text",
+        "representation": {
+            "metadata": "loose-note.txt",
+            "short": "Loose note",
+            "long": "Loose note with incomplete context.",
+            "source": "local_summary",
+            "degraded": false,
+            "keywords": []
+        },
+        "summaryWarnings": []
+    })];
+    let bad_response = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_submit_bad",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_classification_batch",
+                        "arguments": "{\"assignments\":[}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 5,
+            "total_tokens": 16
+        }
+    });
+    let good_response = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_submit_good",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_classification_batch",
+                        "arguments": json!({
+                            "baseTreeVersion": 3,
+                            "assignments": [{
+                                "itemId": "batch1_1",
+                                "leafNodeId": "n1",
+                                "reason": "plain text document"
+                            }],
+                            "treeProposals": [],
+                            "deferredAssignments": []
+                        }).to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 13,
+            "completion_tokens": 6,
+            "total_tokens": 19
+        }
+    });
+    let (endpoint, server) = start_mock_chat_server_sequence(vec![bad_response, good_response]);
+    let output = summary::classify_organize_batch(
+        &text_route(endpoint),
+        "en-US",
+        &AtomicBool::new(false),
+        &tree,
+        3,
+        &batch_rows,
+        &[],
+        None,
+        false,
+        "",
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+        "classification_batch_test",
+    )
+    .await
+    .expect("classify batch");
+
+    assert!(output.error.is_none());
+    assert_eq!(
+        output
+            .parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/assignments/0/itemId"))
+            .and_then(Value::as_str),
+        Some("batch1_1")
+    );
+
+    let requests = server.join().expect("mock server joined");
+    assert_eq!(requests.len(), 2);
+    let second_request = request_json_body(&requests[1]);
+    let second_messages = second_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("second messages");
+    assert!(second_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("original tool argument parse error")
+    }));
+}
+
 #[test]
 fn pending_reconcile_input_omits_confirmed_assignments() {
     let parsed = json!({
@@ -620,7 +740,10 @@ fn oversized_subtree_candidates_choose_deepest_only() {
 
     let candidates = select_oversized_subtree_candidates(&tree, &assignments, 20);
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].category_path, vec!["Documents", "Reports", "Invoices"]);
+    assert_eq!(
+        candidates[0].category_path,
+        vec!["Documents", "Reports", "Invoices"]
+    );
     assert_eq!(candidates[0].item_count, 21);
 }
 
@@ -667,7 +790,10 @@ fn oversized_subtree_candidates_are_fixed_before_refine() {
     }
 
     assert_eq!(initial_candidates.len(), 1);
-    assert_eq!(initial_candidates[0].category_path, vec!["Documents", "Reports"]);
+    assert_eq!(
+        initial_candidates[0].category_path,
+        vec!["Documents", "Reports"]
+    );
     let rescanned = select_oversized_subtree_candidates(&tree, &assignments, 20);
     assert!(rescanned.is_empty());
 }
@@ -677,7 +803,11 @@ fn local_refine_rejects_assignment_outside_subtree() {
     let mut tree = default_tree();
     let reports_leaf = ensure_path(
         &mut tree,
-        &["Documents".to_string(), "Reports".to_string(), "Invoices".to_string()],
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ],
     );
     let notes_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Notes".to_string()]);
     let candidate = OversizedSubtreeCandidate {
@@ -722,11 +852,19 @@ async fn local_refine_payload_and_writeback_stay_inside_subtree() {
     let mut tree = default_tree();
     let invoices_leaf = ensure_path(
         &mut tree,
-        &["Documents".to_string(), "Reports".to_string(), "Invoices".to_string()],
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Invoices".to_string(),
+        ],
     );
     let receipts_leaf = ensure_path(
         &mut tree,
-        &["Documents".to_string(), "Reports".to_string(), "Receipts".to_string()],
+        &[
+            "Documents".to_string(),
+            "Reports".to_string(),
+            "Receipts".to_string(),
+        ],
     );
     let notes_leaf = ensure_path(&mut tree, &["Documents".to_string(), "Notes".to_string()]);
 
@@ -904,14 +1042,8 @@ async fn local_refine_payload_and_writeback_stay_inside_subtree() {
         .unwrap_or_default();
     assert!(payload_text.contains("subtree_only"));
     assert!(!payload_text.contains("Notes"));
-    assert_eq!(
-        user_payload["items"].as_array().map(Vec::len),
-        Some(2)
-    );
-    assert_eq!(
-        user_payload["subtree"]["name"].as_str(),
-        Some("Reports")
-    );
+    assert_eq!(user_payload["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(user_payload["subtree"]["name"].as_str(), Some("Reports"));
 
     let parsed = output.parsed.expect("parsed local refine output");
     apply_local_refine_assignments(&candidate, &mut tree, &mut assignments, &parsed)

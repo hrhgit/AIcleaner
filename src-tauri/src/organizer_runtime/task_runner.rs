@@ -3190,8 +3190,10 @@ async fn run_organize_task<R: Runtime>(
 
     let final_snapshot = {
         let mut snap = task.snapshot.lock();
-        snap.display_results
-            .sort_by_key(|x| x.get("index").and_then(Value::as_u64).unwrap_or(0));
+        // Seed the final snapshot with the raw result rows, then rebuild category
+        // paths from the finalized tree and assignments.
+        snap.display_results = result_rows;
+        snap.display_results = persist::build_final_result_rows(&snap);
         snap.preview = planner::build_preview(&snap.root_path, &snap.display_results);
         snap.tree = snap.final_tree.clone();
         snap.status = "completed".to_string();

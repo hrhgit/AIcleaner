@@ -171,21 +171,26 @@
 
 输入：
 
-1. `sessionId`
-2. `viewType`
+1. `viewType`（可选）
    - `summaryTree`
    - `sizeTree`
    - `timeTree`
    - `executionTree`
    - `partialTree`
-3. `rootCategoryId`
-4. `maxDepth`
+2. `rootCategoryId`（可选）
+3. `maxDepth`（可选）
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. 所有参数都是可选的。
 
 输出：
 
 1. `message`
-2. `treeText`
-3. `viewType`
+2. `viewType`
+3. `treeText`
+4. `tree`
 
 ### 6.2 `find_files`
 
@@ -198,7 +203,7 @@
 1. 按文件维度从当前会话结果里取候选集。
 2. 支持按类别、大小、时间、名称等条件组合筛选。
 3. 支持排序。
-4. 支持把“搜索单个文件”作为按文件名筛选的一种调用。
+4. 支持把”搜索单个文件”作为按文件名筛选的一种调用。
 
 什么时候调：
 
@@ -209,24 +214,29 @@
 
 输入：
 
-1. `sessionId`
-2. `categoryIds`
-3. `nameQuery`
-4. `nameExact`
-5. `pathContains`
-6. `extensions`
-7. `minSizeBytes`
-8. `maxSizeBytes`
-9. `olderThanDays`
-10. `newerThanDays`
-11. `sortBy`
-   - `name`
-   - `size`
-   - `modifiedAt`
-12. `sortOrder`
-   - `asc`
-   - `desc`
-13. `limit`
+1. `categoryIds`（可选）
+2. `nameQuery`（可选）
+3. `nameExact`（可选）
+4. `pathContains`（可选）
+5. `extensions`（可选）
+6. `minSizeBytes`（可选）
+7. `maxSizeBytes`（可选）
+8. `olderThanDays`（可选）
+9. `newerThanDays`（可选）
+10. `sortBy`（可选）
+    - `name`
+    - `size`
+    - `modifiedAt`
+11. `sortOrder`（可选）
+    - `asc`
+    - `desc`
+12. `limit`（可选）
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. 所有参数都是可选的。
+3. `categoryIds` 使用 `get_directory_overview` 返回的 prompt-local 短分类 ID。
 
 输出：
 
@@ -236,7 +246,7 @@
 4. `querySummary`
 5. `sortBy`
 6. `sortOrder`
-7. `files`
+7. `items`
    - `path`
    - `name`
    - `categoryId`
@@ -257,6 +267,7 @@
 1. 每次筛选结果都要生成可复用的 `selectionId`。
 2. 后续计划、预览和执行都基于 `selectionId`，不直接基于类别执行。
 3. `querySummary` 用于帮助模型识别这次筛选到底是哪一批结果。
+4. 注意：代码中返回的字段名是 `items`，不是 `files`。
 
 ### 6.3 `summarize_files`
 
@@ -274,22 +285,27 @@
 什么时候调：
 
 1. 归类前需要为一批文件补摘要时。
-2. 用户要求“详细看看这些文件”时。
+2. 用户要求”详细看看这些文件”时。
 3. AI 判断当前信息不够，无法继续判断时。
 4. 某一批文件当前没有摘要，但后续决策需要摘要时。
 
 输入：
 
-1. `sessionId`
-2. `paths`
-3. `categoryIds`
-4. `representationLevel`
+1. `paths`（可选）
+2. `categoryIds`（可选）
+3. `representationLevel`（可选）
    - `metadata`
    - `short`
    - `long`
-5. `missingOnly`
-6. `batchSize`
-7. `maxConcurrency`
+4. `missingOnly`（可选）
+5. `batchSize`（可选）
+6. `maxConcurrency`（可选）
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. 所有参数都是可选的。
+3. `categoryIds` 使用 `get_directory_overview` 返回的 prompt-local 短分类 ID。
 
 输出：
 
@@ -301,26 +317,33 @@
 4. `total`
 5. `completed`
 6. `failed`
-7. `items`
-   - `path`
-   - `name`
-   - `representation`
-      - `metadata`
-      - `short`
-      - `long`
-      - `source`
-      - `degraded`
-      - `confidence`
-      - `keywords`
-   - `warning`
-8. `errors`
-   - `path`
-   - `reason`
-9. `scheduler`
-   - `initialConcurrency`
-   - `finalConcurrency`
-   - `retryRounds`
-   - `degradedConcurrency`
+7. `durationMs`
+8. `tokenUsage`
+   - `prompt`
+   - `completion`
+   - `total`
+9. `requestCount`
+10. `errorCount`
+11. `items`
+    - `path`
+    - `name`
+    - `representation`
+       - `metadata`
+       - `short`
+       - `long`
+       - `source`
+       - `degraded`
+       - `confidence`
+       - `keywords`
+    - `warning`
+12. `errors`
+    - `path`
+    - `reason`
+13. `scheduler`
+    - `initialConcurrency`
+    - `finalConcurrency`
+    - `retryRounds`
+    - `degradedConcurrency`
 
 说明：
 
@@ -349,20 +372,25 @@
 
 什么时候调：
 
-1. 用户明确说“只看已有摘要”时。
-2. 用户明确说“不要重新生成摘要”时。
+1. 用户明确说”只看已有摘要”时。
+2. 用户明确说”不要重新生成摘要”时。
 3. 后台只读展示已有摘要时。
 
 输入：
 
-1. `sessionId`
-2. `paths`
-3. `categoryIds`
-4. `representationLevel`
+1. `paths`（可选）
+2. `categoryIds`（可选）
+3. `representationLevel`（可选）
    - `metadata`
    - `short`
    - `long`
-5. `limit`
+4. `limit`（可选）
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. 所有参数都是可选的。
+3. `categoryIds` 使用 `get_directory_overview` 返回的 prompt-local 短分类 ID。
 
 输出：
 
@@ -401,19 +429,29 @@
 
 输入：
 
-1. `sessionId`
-2. `scope`
+1. `scope`（可选）
    - `session`
    - `global`
-3. `text`
-4. `sourceMessage`
+2. `text`
+3. `sourceMessage`
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. `scope` 默认为 `session`。
+3. `text` 和 `sourceMessage` 是必填字段。
 
 输出：
 
 1. `preferenceId`
 2. `scope`
 3. `text`
-4. `createdAt`
+4. `sourceMessage`
+5. `summary`
+6. `kind`
+7. `suggestedScope`
+8. `createdAt`
+9. `sessionId`
 
 ### 6.6 `list_preferences`
 
@@ -430,12 +468,12 @@
 什么时候调：
 
 1. 对话开始时。
-2. 用户提到“按之前习惯来”时。
+2. 用户提到”按之前习惯来”时。
 3. AI 需要确认当前偏好背景时。
 
 输入：
 
-1. `sessionId`
+1. 无参数（`sessionId` 从 session 上下文自动获取）
 
 输出：
 
@@ -494,21 +532,29 @@
 输入：
 
 1. `plan`
-   - `intentSummary`
+   - `intentSummary`（可选）
    - `targets`
      - `selectionId`
      - `action`
+2. `intentSummary`（可选）
+
+说明：
+
+1. `plan` 是必填字段。
+2. `plan.targets` 是必填字段，至少需要一个 target。
+3. 每个 target 必须包含 `selectionId` 和 `action`。
+4. `intentSummary` 可以在 `plan` 内部或顶层定义，用于结果卡展示。
 
 输出：
 
 1. `jobId`
-2. `summary`
-   - `total`
-   - `moved`
-   - `archived`
-   - `recycled`
-   - `failed`
-3. `entries`
+2. `result`
+3. `rollbackAvailable`
+
+说明：
+
+1. `result` 的具体结构由执行结果决定。
+2. `rollbackAvailable` 表示本次执行是否可以回滚。
 
 错误处理：
 
@@ -526,7 +572,7 @@
 
 1. 回滚上一次可回滚的执行计划。
 2. 返回回滚结果摘要。
-3. 让顾问页保留“先执行，再撤回”的能力。
+3. 让顾问页保留”先执行，再撤回”的能力。
 
 什么时候调：
 
@@ -535,19 +581,59 @@
 
 输入：
 
-1. `sessionId`
-2. `jobId`
+1. `jobId`
+
+说明：
+
+1. `sessionId` 从 session 上下文自动获取，不需要作为参数传入。
+2. `jobId` 是必填字段，通常来自 `execute_plan` 返回结果。
 
 输出：
 
-1. `rollbackId`
-2. `summary`
-   - `rolledBack`
-   - `notRollbackable`
-   - `failed`
-3. `entries`
+1. `jobId`
+2. `result`
+3. `rollbackAvailable`
 
-### 6.9 归类修订边界
+### 6.9 `apply_reclassification`
+
+模型描述：
+
+> 按结构化 reclassificationRequest 应用局部分类修正。使用 changes 数组批量提交一条或多条重命名、移动、拆分、合并或删除空分类操作，执行后会更新当前分类树。
+
+作用：
+
+1. 应用局部分类修正。
+2. 支持重命名、移动、拆分、合并或删除空分类操作。
+3. 执行后更新当前分类树。
+
+什么时候调：
+
+1. 用户要求调整分类结构时。
+2. 用户要求重命名分类时。
+3. 用户要求移动分类到其他位置时。
+4. 用户要求拆分或合并分类时。
+5. 用户要求删除空分类时。
+
+输入：
+
+1. `request`
+   - `intentSummary`（可选）
+   - `changes`
+     - `action`
+     - 其他字段取决于 `action` 类型
+2. `applyPreferenceCapture`（可选）
+
+说明：
+
+1. `request` 是必填字段。
+2. `request.changes` 是必填字段，至少需要一个 change。
+3. `applyPreferenceCapture` 默认为 `false`，只有用户明确确认相关偏好时才设为 `true`。
+
+输出：
+
+执行后会返回更新后的分类树。
+
+### 6.10 归类修订边界
 
 当前用户入口不提供”直接应用归类修订”或”回滚归类修订”的独立操作。用户如果想改变整理方式，应继续通过顾问对话缩小文件集合，并生成新的计划和执行卡片。
 
@@ -878,12 +964,8 @@
   "latestExecutionCard": {
     "jobId": "job_001",
     "intentSummary": "归档安装包并整理截图",
-    "summary": {
-      "total": 28,
-      "moved": 20,
-      "archived": 8,
-      "failed": 2
-    }
+    "result": {},
+    "rollbackAvailable": true
   }
 }
 ```

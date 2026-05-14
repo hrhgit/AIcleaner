@@ -265,7 +265,9 @@ mod tests {
         assert_eq!(loaded.display_results.len(), 2);
         assert!(loaded.preview.is_empty());
         assert_eq!(
-            loaded.display_results[1].get("path").and_then(Value::as_str),
+            loaded.display_results[1]
+                .get("path")
+                .and_then(Value::as_str),
             Some(r"C:\root\beta.txt")
         );
 
@@ -306,7 +308,10 @@ mod tests {
 
         let rows = build_final_result_rows(&snapshot);
         assert_eq!(
-            rows[0].get("categoryPath").and_then(Value::as_array).map(|items| items.len()),
+            rows[0]
+                .get("categoryPath")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
             Some(1)
         );
         assert_eq!(
@@ -363,7 +368,9 @@ mod tests {
             Some(2)
         );
         assert_eq!(
-            loaded.display_results[0].get("leafNodeId").and_then(Value::as_str),
+            loaded.display_results[0]
+                .get("leafNodeId")
+                .and_then(Value::as_str),
             Some("leaf-b")
         );
 

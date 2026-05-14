@@ -37,7 +37,29 @@ fn append_tree_text_lines(
     let indent = "  ".repeat(depth);
     let name = node.get("name").and_then(Value::as_str).unwrap_or("-");
     let count = node.get("itemCount").and_then(Value::as_u64).unwrap_or(0);
-    lines.push(format!("{indent}{name}: {count}"));
+    let summary_label = if node
+        .get("hasSummary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let mut types = node
+            .get("summaryTypes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        if types.is_empty() {
+            "summary=unknown".to_string()
+        } else {
+            types.sort();
+            format!("summary={}", types.join("/"))
+        }
+    } else {
+        "summary=none".to_string()
+    };
+    lines.push(format!("{indent}{name}: {count} [{summary_label}]"));
     if let Some(children) = node.get("children").and_then(Value::as_array) {
         for child in children.iter().take(12) {
             if let Some(child_obj) = child.as_object() {
@@ -322,6 +344,7 @@ fn value_to_inventory_item(value: &Value) -> InventoryItem {
         representation: FileRepresentation::from_value(
             value.get("representation").unwrap_or(&Value::Null),
         ),
+        summary_representation: None,
         risk: value
             .get("risk")
             .and_then(Value::as_str)

@@ -135,58 +135,27 @@ impl<'a> ToolService<'a> {
         request: &Value,
         apply_preference_capture: bool,
     ) -> Result<Value, String> {
-        let change = request.get("change").cloned().unwrap_or_else(|| json!({}));
-        let change_type = change
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-            })?;
-        let rollback_entries = match change_type {
-            "move_selection_to_category" => {
-                let selection_id = required_change_str(&change, "selectionId")?;
-                let target_category_id = required_change_str(&change, "targetCategoryId")?;
-                let selection = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
-                    .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
-                let items = selection
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let category_path = category_path_from_category_id(session, target_category_id)?
-                    .ok_or_else(|| {
-                        "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
-                    })?;
-                apply_reclassification_selection(session, &items, &category_path)?
+        let changes = collect_reclassification_changes(request)?;
+        let session_backup = session.clone();
+        let mut category_aliases: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        let mut rollback_entries = Vec::new();
+        let apply_result = (|| {
+            let db_path = self.state.db_path();
+            for change in &changes {
+                let rows = apply_reclassification_change(
+                    db_path.as_path(),
+                    session,
+                    change,
+                    &mut category_aliases,
+                )?;
+                rollback_entries.extend(rows);
             }
-            "split_selection_to_new_category" => {
-                let selection_id = required_change_str(&change, "selectionId")?;
-                let source_category_id = required_change_str(&change, "sourceCategoryId")?;
-                let new_category_name = required_change_str(&change, "newCategoryName")?;
-                let selection = persist::load_advisor_selection(&self.state.db_path(), selection_id)?
-                    .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
-                let items = selection
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut category_path =
-                    category_path_from_category_id(session, source_category_id)?
-                        .unwrap_or_default();
-                category_path.push(new_category_name.to_string());
-                apply_reclassification_selection(session, &items, &category_path)?
-            }
-            "rename_category" => rename_category(session, &change)?,
-            "merge_category_into_category" => merge_category_into_category(session, &change)?,
-            "delete_empty_category" => delete_empty_category(session, &change)?,
-            _ => {
-                return Err(
-                    "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string(),
-                )
-            }
-        };
+            Ok::<(), String>(())
+        })();
+        if let Err(err) = apply_result {
+            *session = session_backup;
+            return Err(err);
+        }
         if let Some(obj) = session.as_object_mut() {
             obj.insert("activeSelectionId".to_string(), Value::Null);
         }
@@ -227,7 +196,7 @@ impl<'a> ToolService<'a> {
                     "已应用归类修订。",
                     "Reclassification applied."
                 ),
-                "changeSummary": build_reclassification_change_summary(&change, &rollback_entries),
+                "changeSummary": build_reclassification_change_summary(&changes, &rollback_entries),
                 "updatedTreeText": build_tree_text(&overview.derived_tree.clone().unwrap_or(Value::Null)),
                 "tree": overview.derived_tree,
                 "invalidated": ["selection", "preview"],

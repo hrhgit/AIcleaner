@@ -268,17 +268,19 @@ pub fn resolve_paths(options: &ResolveOptions) -> Result<ResolvedPaths> {
     let env_data_dir = std::env::var_os("AICLEANER_DATA_DIR").map(PathBuf::from);
     let env_settings_path = std::env::var_os("AICLEANER_SETTINGS_PATH").map(PathBuf::from);
 
-    let settings_path = explicit_settings
-        .or(env_settings_path)
-        .or_else(|| {
-            env_data_dir
-                .as_ref()
-                .map(|dir| dir.join("settings.json"))
-                .filter(|candidate| candidate.exists())
-        });
+    let settings_path = explicit_settings.or(env_settings_path).or_else(|| {
+        env_data_dir
+            .as_ref()
+            .map(|dir| dir.join("settings.json"))
+            .filter(|candidate| candidate.exists())
+    });
 
     let base_data_dir = explicit_data_dir
-        .or_else(|| settings_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)))
+        .or_else(|| {
+            settings_path
+                .as_ref()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+        })
         .or(env_data_dir)
         .unwrap_or_else(default_data_dir);
 
@@ -304,7 +306,11 @@ pub fn discover_log_files(paths: &ResolvedPaths) -> Result<Vec<LogFileInfo>> {
         }
     }
 
-    files.sort_by(|a, b| b.modified_at.cmp(&a.modified_at).then_with(|| a.path.cmp(&b.path)));
+    files.sort_by(|a, b| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     Ok(files)
 }
 
@@ -327,8 +333,7 @@ fn collect_logs_from_dir(dir: &Path, source: &str, files: &mut Vec<LogFileInfo>)
         };
         let metadata = entry.metadata()?;
         let modified_at = metadata.modified().ok().map(|time| {
-            DateTime::<Utc>::from(time)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            DateTime::<Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
         files.push(LogFileInfo {
             correlation_id: infer_correlation_id(file_name, &family),
@@ -449,7 +454,10 @@ fn parse_record(file: &LogFileInfo, line: &str) -> Result<ParsedRecord> {
                 session_id: json_string_field(&json_value, "sessionId"),
                 job_id: json_string_field(&json_value, "jobId"),
                 details: json_value.get("details").cloned(),
-                error: json_value.get("error").cloned().filter(|value| !value.is_null()),
+                error: json_value
+                    .get("error")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
                 duration_ms: json_value.get("durationMs").and_then(Value::as_u64),
                 raw_json: Some(json_value),
             })
@@ -553,7 +561,9 @@ pub fn aggregate_runs(records: &[ParsedRecord]) -> Vec<AggregatedRun> {
         let key = format!("{:?}|{:?}|{}", record.family, id_kind, id);
         grouped
             .entry(key)
-            .or_insert_with(|| AggregatedRunBuilder::new(record.family.clone(), id_kind, id.clone()))
+            .or_insert_with(|| {
+                AggregatedRunBuilder::new(record.family.clone(), id_kind, id.clone())
+            })
             .push(record.clone());
     }
 
@@ -718,7 +728,11 @@ pub fn build_ai_task_package(
         .into_values()
         .map(ErrorDigestAccumulator::finish)
         .collect::<Vec<_>>();
-    error_digest.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.signature.cmp(&b.signature)));
+    error_digest.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
     error_digest.truncate(limit.max(1));
 
     let hotspots = collect_hotspots(
@@ -751,13 +765,25 @@ pub fn build_ai_task_package(
         hotspots,
         samples,
         raw_access_hints: RawAccessHints {
-            task_id: first_non_empty(run.records.iter().filter_map(|record| record.task_id.clone())),
-            session_id: first_non_empty(
-                run.records.iter().filter_map(|record| record.session_id.clone()),
+            task_id: first_non_empty(
+                run.records
+                    .iter()
+                    .filter_map(|record| record.task_id.clone()),
             ),
-            job_id: first_non_empty(run.records.iter().filter_map(|record| record.job_id.clone())),
+            session_id: first_non_empty(
+                run.records
+                    .iter()
+                    .filter_map(|record| record.session_id.clone()),
+            ),
+            job_id: first_non_empty(
+                run.records
+                    .iter()
+                    .filter_map(|record| record.job_id.clone()),
+            ),
             operation_id: first_non_empty(
-                run.records.iter().filter_map(|record| record.operation_id.clone()),
+                run.records
+                    .iter()
+                    .filter_map(|record| record.operation_id.clone()),
             ),
             source_files: run.source_files.clone(),
         },
@@ -825,7 +851,10 @@ fn summarize_request_stats(
     responses: &[ResponseObservation],
 ) -> RequestStats {
     let count = requests.len();
-    let total_payload_chars = requests.iter().map(|item| item.payload_chars).sum::<usize>();
+    let total_payload_chars = requests
+        .iter()
+        .map(|item| item.payload_chars)
+        .sum::<usize>();
     RequestStats {
         count,
         max_payload_chars: requests
@@ -848,7 +877,11 @@ fn summarize_request_stats(
             .map(|item| item.content_chars)
             .max()
             .unwrap_or(0),
-        max_tool_chars: requests.iter().map(|item| item.tool_chars).max().unwrap_or(0),
+        max_tool_chars: requests
+            .iter()
+            .map(|item| item.tool_chars)
+            .max()
+            .unwrap_or(0),
         max_raw_body_chars: responses
             .iter()
             .map(|item| item.raw_body_chars)
@@ -1012,7 +1045,10 @@ fn run_identity(record: &ParsedRecord) -> (AiRunIdKind, String) {
     if let Some(value) = &record.operation_id {
         return (AiRunIdKind::Operation, value.clone());
     }
-    (AiRunIdKind::File, record.source_path.to_string_lossy().to_string())
+    (
+        AiRunIdKind::File,
+        record.source_path.to_string_lossy().to_string(),
+    )
 }
 
 #[derive(Default)]
@@ -1108,9 +1144,10 @@ fn is_request_record(record: &ParsedRecord) -> bool {
 }
 
 fn is_response_record(record: &ParsedRecord) -> bool {
-    record.event.as_deref().is_some_and(|event| {
-        event.ends_with("_model_response") || event.ends_with("_model_error")
-    })
+    record
+        .event
+        .as_deref()
+        .is_some_and(|event| event.ends_with("_model_response") || event.ends_with("_model_error"))
 }
 
 fn is_error_record(record: &ParsedRecord) -> bool {
@@ -1265,7 +1302,11 @@ fn extract_error_message(record: &ParsedRecord) -> Option<String> {
 }
 
 fn normalize_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -1348,8 +1389,12 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
                 .map(|dt| dt.with_timezone(&Utc))
         })
         .or_else(|_| {
-            NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .map(|date| DateTime::<Utc>::from_naive_utc_and_offset(date.and_hms_opt(0, 0, 0).expect("midnight"), Utc))
+            NaiveDate::parse_from_str(value, "%Y-%m-%d").map(|date| {
+                DateTime::<Utc>::from_naive_utc_and_offset(
+                    date.and_hms_opt(0, 0, 0).expect("midnight"),
+                    Utc,
+                )
+            })
         })
         .ok()
 }
@@ -1639,7 +1684,10 @@ mod tests {
         let serialized = serde_json::to_string(&package).expect("serialize");
         assert_eq!(package.error_digest.len(), 1);
         assert_eq!(package.error_digest[0].count, 2);
-        assert!(package.samples.iter().any(|sample| sample.preview.preview.ends_with("...")));
+        assert!(package
+            .samples
+            .iter()
+            .any(|sample| sample.preview.preview.ends_with("...")));
         assert!(!serialized.contains(&long_payload));
         assert!(!serialized.contains(&long_body));
     }

@@ -2,7 +2,7 @@ use super::llm::AdvisorLlm;
 use super::types::{local_text, now_iso, WORKFLOW_UNDERSTAND};
 use crate::agent_runtime::{
     AgentCompletion, AgentLlmError, AgentLoopTrace, AgentToolPolicy, AgentTurnLoop, AgentTurnSpec,
-    ToolCallErrorOutcome, ToolCallOutcome,
+    NoToolCallOutcome, ToolCallErrorOutcome, ToolCallOutcome,
 };
 use crate::backend::AppState;
 use crate::llm_protocol::ParsedToolCall;
@@ -449,12 +449,12 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
 
     fn on_no_tool_calls(
         &mut self,
-        completion: AgentCompletion,
+        completion: &AgentCompletion,
         trace: &AgentLoopTrace,
-    ) -> Result<AgentTurnResult, String> {
+    ) -> Result<NoToolCallOutcome<AgentTurnResult>, String> {
         let reply = completion.assistant_text.trim().to_string();
         if reply.is_empty() {
-            return Ok(AgentTurnResult {
+            return Ok(NoToolCallOutcome::Finish(AgentTurnResult {
                 reply: local_text(
                     &self.lang,
                     "顾问返回了空回复，请重试。",
@@ -463,13 +463,13 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
                 .to_string(),
                 cards: std::mem::take(&mut self.cards),
                 trace: trace.as_json(),
-            });
+            }));
         }
-        Ok(AgentTurnResult {
+        Ok(NoToolCallOutcome::Finish(AgentTurnResult {
             reply,
             cards: std::mem::take(&mut self.cards),
             trace: trace.as_json(),
-        })
+        }))
     }
 
     fn on_tool_success(
@@ -672,7 +672,6 @@ impl<'a, 's> AgentTurnSpec for AdvisorTurnSpec<'a, 's> {
         );
     }
 }
-
 
 pub(super) fn materialize_card(session_id: &str, turn_id: &str, card: &Value) -> Value {
     json!({

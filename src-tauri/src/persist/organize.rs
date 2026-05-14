@@ -28,8 +28,17 @@ fn tree_path_by_node_id(node: &Value, target_id: &str, path: &mut Vec<String>) -
     if node.get("nodeId").and_then(Value::as_str).map(str::trim) == Some(target_id) {
         return true;
     }
-    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
-        let name = child.get("name").and_then(Value::as_str).unwrap_or("").trim();
+    for child in node
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = child
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if !name.is_empty() {
             path.push(name.to_string());
         }
@@ -71,7 +80,11 @@ pub(crate) fn build_final_result_rows(snapshot: &OrganizeSnapshot) -> Vec<Value>
 
     let mut assignment_by_item_id = HashMap::<String, Value>::new();
     for assignment in final_assignments {
-        let item_id = assignment.get("itemId").and_then(Value::as_str).unwrap_or("").trim();
+        let item_id = assignment
+            .get("itemId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if !item_id.is_empty() {
             assignment_by_item_id.insert(item_id.to_string(), assignment);
         }
@@ -115,12 +128,19 @@ pub(crate) fn build_final_result_rows(snapshot: &OrganizeSnapshot) -> Vec<Value>
                 raw_category_path
             };
             let display_category = display_category_from_path(&resolved_path);
-            let index_value = row.get("index").and_then(Value::as_u64).unwrap_or(index as u64 + 1);
+            let index_value = row
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(index as u64 + 1);
             let reason = assignment
                 .and_then(|value| value.get("reason"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .or_else(|| row.get("reason").and_then(Value::as_str).map(str::to_string));
+                .or_else(|| {
+                    row.get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("index".to_string(), json!(index_value));
                 obj.insert("leafNodeId".to_string(), Value::String(leaf_node_id));

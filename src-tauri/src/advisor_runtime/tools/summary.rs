@@ -146,6 +146,7 @@ fn collect_inventory_from_fs(
                 parent_category_id,
                 category_path,
                 representation: FileRepresentation::default(),
+                summary_representation: None,
                 risk: "unknown".to_string(),
             };
             item.representation = metadata_representation(&item);
@@ -254,45 +255,146 @@ fn summary_row_to_read_item(row: &Value, level: RepresentationLevel) -> Value {
     })
 }
 
-fn rename_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
-    let source_category_id = required_change_str(change, "sourceCategoryId")?;
+fn collect_reclassification_changes(request: &Value) -> Result<Vec<Value>, String> {
+    let changes = request
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "当前归类修改缺少必填字段，请提供非空 changes 数组后重试。".to_string())?;
+    if changes.is_empty() {
+        return Err("当前归类修改缺少必填字段，请提供非空 changes 数组后重试。".to_string());
+    }
+    Ok(changes.clone())
+}
+
+fn apply_reclassification_change(
+    db_path: &Path,
+    session: &mut Value,
+    change: &Value,
+    category_aliases: &mut HashMap<String, Option<Vec<String>>>,
+) -> Result<Vec<Value>, String> {
+    let change_type = change
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+        })?;
+    match change_type {
+        "move_selection_to_category" => {
+            let selection_id = required_change_str(change, "selectionId")?;
+            let selection = persist::load_advisor_selection(db_path, selection_id)?
+                .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
+            let items = selection
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let category_path = resolve_reclassification_category_path(
+                session,
+                required_change_str(change, "targetCategoryId")?,
+                category_aliases,
+            )?
+                .ok_or_else(|| {
+                    "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
+                })?;
+            apply_reclassification_selection(session, &items, &category_path)
+        }
+        "split_selection_to_new_category" => {
+            let selection_id = required_change_str(change, "selectionId")?;
+            let new_category_name = required_change_str(change, "newCategoryName")?;
+            let selection = persist::load_advisor_selection(db_path, selection_id)?
+                .ok_or_else(|| "当前筛选结果已失效，请先重新调用 find_files 生成新的 selection，再继续分类修正。".to_string())?;
+            let items = selection
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut category_path = resolve_reclassification_category_path(
+                session,
+                required_change_str(change, "sourceCategoryId")?,
+                category_aliases,
+            )?
+            .unwrap_or_default();
+            category_path.push(new_category_name.to_string());
+            apply_reclassification_selection(session, &items, &category_path)
+        }
+        "rename_category" => rename_category(session, change, category_aliases),
+        "merge_category_into_category" => {
+            merge_category_into_category(session, change, category_aliases)
+        }
+        "delete_empty_category" => delete_empty_category(session, change, category_aliases),
+        _ => Err("当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()),
+    }
+}
+
+fn rename_category(
+    session: &mut Value,
+    change: &Value,
+    category_aliases: &mut HashMap<String, Option<Vec<String>>>,
+) -> Result<Vec<Value>, String> {
+    let source_input_id = required_change_str(change, "sourceCategoryId")?;
     let new_category_name = required_change_str(change, "newCategoryName")?;
-    let source_path =
-        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+    let source_path = resolve_reclassification_category_path(session, source_input_id, category_aliases)?
+        .ok_or_else(|| {
             "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
         })?;
     let mut target_path = source_path.clone();
     if let Some(last) = target_path.last_mut() {
         *last = new_category_name.to_string();
     }
-    reclass_by_category_path(session, &source_path, &target_path)
+    let result = reclass_by_category_path(session, &source_path, &target_path)?;
+    category_aliases.insert(source_input_id.to_string(), Some(target_path));
+    Ok(result)
 }
 
-fn merge_category_into_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
-    let source_category_id = required_change_str(change, "sourceCategoryId")?;
-    let target_category_id = required_change_str(change, "targetCategoryId")?;
-    let source_path =
-        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+fn merge_category_into_category(
+    session: &mut Value,
+    change: &Value,
+    category_aliases: &mut HashMap<String, Option<Vec<String>>>,
+) -> Result<Vec<Value>, String> {
+    let source_input_id = required_change_str(change, "sourceCategoryId")?;
+    let target_input_id = required_change_str(change, "targetCategoryId")?;
+    let source_path = resolve_reclassification_category_path(session, source_input_id, category_aliases)?
+        .ok_or_else(|| {
             "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
         })?;
-    let target_path =
-        category_path_from_category_id(session, target_category_id)?.ok_or_else(|| {
+    let target_path = resolve_reclassification_category_path(session, target_input_id, category_aliases)?
+        .ok_or_else(|| {
             "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
         })?;
-    reclass_by_category_path(session, &source_path, &target_path)
+    let result = reclass_by_category_path(session, &source_path, &target_path)?;
+    category_aliases.insert(source_input_id.to_string(), Some(target_path));
+    Ok(result)
 }
 
-fn delete_empty_category(session: &mut Value, change: &Value) -> Result<Vec<Value>, String> {
-    let source_category_id = required_change_str(change, "sourceCategoryId")?;
-    let source_path =
-        category_path_from_category_id(session, source_category_id)?.ok_or_else(|| {
+fn delete_empty_category(
+    session: &mut Value,
+    change: &Value,
+    category_aliases: &mut HashMap<String, Option<Vec<String>>>,
+) -> Result<Vec<Value>, String> {
+    let source_input_id = required_change_str(change, "sourceCategoryId")?;
+    let source_path = resolve_reclassification_category_path(session, source_input_id, category_aliases)?
+        .ok_or_else(|| {
             "当前归类修改缺少必填字段，请补齐 change.type 对应参数后重试。".to_string()
         })?;
     let overrides = super::types::inventory_overrides(session);
     if overrides.values().any(|path| path == &source_path) {
         return Err("当前分类下仍有文件，不能删除非空分类。".to_string());
     }
+    category_aliases.insert(source_input_id.to_string(), None);
     Ok(Vec::new())
+}
+
+fn resolve_reclassification_category_path(
+    session: &Value,
+    category_id: &str,
+    category_aliases: &HashMap<String, Option<Vec<String>>>,
+) -> Result<Option<Vec<String>>, String> {
+    if let Some(path) = category_aliases.get(category_id) {
+        return Ok(path.clone());
+    }
+    category_path_from_category_id(session, category_id)
 }
 
 fn reclass_by_category_path(
@@ -309,13 +411,19 @@ fn reclass_by_category_path(
     apply_reclassification_selection(session, &matched, target_path)
 }
 
-fn build_reclassification_change_summary(change: &Value, rollback_entries: &[Value]) -> String {
-    let change_type = change
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+fn build_reclassification_change_summary(changes: &[Value], rollback_entries: &[Value]) -> String {
     let file_count = rollback_entries.len();
-    format!("{change_type}: {file_count} items updated")
+    match changes.len() {
+        0 => format!("unknown: {file_count} items updated"),
+        1 => format!(
+            "{}: {file_count} items updated",
+            changes[0]
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ),
+        count => format!("{count} changes applied: {file_count} items updated"),
+    }
 }
 
 fn supports_content_summarization(path: &str) -> bool {
@@ -419,9 +527,12 @@ async fn summarize_item_with_model(
         Some(&tools),
         0.0,
         DEFAULT_MAX_TOKENS,
-        ThinkingConfig {
-            enabled: route.thinking_enabled,
-            level: &route.thinking_level,
+        {
+            let thinking = reasoning_policy::advisor_summary_tool(&route.thinking_level);
+            ThinkingConfig {
+                enabled: thinking.enabled,
+                level: thinking.level,
+            }
         },
     )
     .map_err(|reason| SummaryErrorRow {

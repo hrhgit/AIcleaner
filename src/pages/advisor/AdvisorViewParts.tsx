@@ -19,38 +19,12 @@ import {
 import { SUMMARY_MODES } from './constants';
 import {
   buildOrganizeBrowserTree,
-  findOrganizeBrowserFolder,
+  buildOrganizeBrowserTreeFromTreeNodes,
   type OrganizeBrowserFile,
   type OrganizeBrowserFolder,
 } from './organizeBrowser';
 
-export function TreeList({ childrenNodes, limit = 12 }: { childrenNodes: TreeNode[]; limit?: number }) {
-  if (!childrenNodes.length) return null;
-  return (
-    <ul className="advisor-tree-list">
-      {childrenNodes.slice(0, limit).map((node, index) => (
-        <TreeNodeView key={`${node.nodeId || node.id || node.name || 'node'}-${index}`} node={node} />
-      ))}
-    </ul>
-  );
-}
-
-function TreeNodeView({ node }: { node: TreeNode }) {
-  const children = Array.isArray(node.children) ? node.children : [];
-  return (
-    <li>
-      <span>{node.name || '-'}</span>
-      <span className="advisor-tree-count">{node.itemCount || 0}</span>
-      {children.length ? <TreeList childrenNodes={children} /> : null}
-    </li>
-  );
-}
-
 function summarizeCard(card: AdvisorCard): string {
-  if (card.cardType === 'tree') {
-    const count = Number((card.body?.stats as JsonRecord | undefined)?.itemCount || 0);
-    return text(`当前树覆盖 ${count} 个项目。`, `Tree covers ${count} items.`);
-  }
   if (card.cardType === 'execution_result') {
     const result = (card.body?.result || {}) as JsonRecord;
     const summary = (result.summary || {}) as JsonRecord;
@@ -68,10 +42,10 @@ function AdvisorCardView({
   acting: boolean;
   onAction: (cardId: string, action: string) => void;
 }) {
+  if (card.cardType === 'tree') {
+    return null;
+  }
   const actions = Array.isArray(card.actions) ? card.actions : [];
-  const treeChildren = Array.isArray(((card.body?.tree || {}) as { children?: TreeNode[] }).children)
-    ? ((card.body?.tree || {}) as { children?: TreeNode[] }).children || []
-    : [];
 
   return (
     <article className={`advisor-card advisor-card-${card.cardType || 'generic'}`}>
@@ -83,12 +57,6 @@ function AdvisorCardView({
         <span className="badge badge-info">{card.status || 'ready'}</span>
       </div>
 
-      {card.cardType === 'tree' ? (
-        <>
-          <div className="advisor-card-copy">{summarizeCard(card)}</div>
-          <div className="advisor-tree-shell"><TreeList childrenNodes={treeChildren} /></div>
-        </>
-      ) : null}
       {['preference_draft', 'reclassification_result'].includes(card.cardType || '') ? (
         <>
           <div className="advisor-card-copy">{String(card.body?.summary || summarizeCard(card))}</div>
@@ -260,13 +228,20 @@ function countLabel(count: number): string {
   return text(`${count} 项`, `${count} item${count === 1 ? '' : 's'}`);
 }
 
-function FolderRow({ folder, onOpen }: { folder: OrganizeBrowserFolder; onOpen: (path: string[]) => void }) {
+function FolderRow({ folder, depth = 0 }: { folder: OrganizeBrowserFolder; depth?: number }) {
   const [expanded, setExpanded] = useState(false);
+  const hasChildren = folder.folders.length > 0 || folder.files.length > 0;
   const hasSamples = folder.sampleItems.length > 0;
   return (
     <div className="advisor-browser-folder-group">
       <div className="advisor-browser-row advisor-browser-folder-row">
-        <button className="advisor-browser-folder-nav" type="button" onClick={() => onOpen(folder.path)}>
+        <button
+          className={`advisor-browser-folder-nav ${expanded ? 'expanded' : ''}`}
+          type="button"
+          disabled={!hasChildren}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
           <span className="advisor-browser-icon advisor-browser-icon-folder" aria-hidden="true" />
           <span className="advisor-browser-row-copy">
             <span className="advisor-browser-row-title">{folder.name || '-'}</span>
@@ -280,12 +255,22 @@ function FolderRow({ folder, onOpen }: { folder: OrganizeBrowserFolder; onOpen: 
             type="button"
             aria-expanded={expanded}
             aria-label={text('查看分类详情', 'View classification details')}
-            onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+            onClick={(e) => { e.stopPropagation(); setExpanded((value) => !value); }}
           >
             {text('详情', 'Info')}
           </button>
         ) : null}
       </div>
+      {expanded && hasChildren ? (
+        <div className="advisor-browser-folder-children" style={{ paddingLeft: `${depth > 0 ? 14 : 18}px` }}>
+          {folder.folders.map((child) => (
+            <FolderRow key={child.id} folder={child} depth={depth + 1} />
+          ))}
+          {folder.files.map((file) => (
+            <FileRow key={file.id} file={file} />
+          ))}
+        </div>
+      ) : null}
       {expanded && hasSamples ? (
         <div className="advisor-browser-folder-detail">
           <div className="advisor-browser-detail-header">
@@ -301,6 +286,31 @@ function FolderRow({ folder, onOpen }: { folder: OrganizeBrowserFolder; onOpen: 
           </ul>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function turnUsedTool(turn: TimelineTurn, toolName: string): boolean {
+  const steps = Array.isArray(turn.agentTrace?.steps) ? turn.agentTrace.steps : [];
+  return steps.some((step) => {
+    const calls = Array.isArray(step.toolCalls) ? step.toolCalls : [];
+    const results = Array.isArray(step.toolResults) ? step.toolResults : [];
+    return [...calls, ...results].some((tool) => String(tool?.name || '').trim() === toolName);
+  });
+}
+
+function DerivedTreePanel({ tree }: { tree: TreeNode | undefined }) {
+  const childrenNodes = Array.isArray(tree?.children) ? tree.children : [];
+  const browserTree = useMemo(() => buildOrganizeBrowserTreeFromTreeNodes(childrenNodes), [childrenNodes]);
+  return (
+    <div className="advisor-turn-tree-panel">
+      <div className="advisor-turn-tree-head">
+        <div className="card-title">{text('当前分类树', 'Current Tree')}</div>
+        <div className="form-hint">{text('本轮已更新分类树，下面按归类结果的文件夹形式展示。', 'This turn updated the category tree, shown below in the organize-result folder style.')}</div>
+      </div>
+      {childrenNodes.length ? (
+        <FolderBrowserShell root={browserTree} className="advisor-tree-folder-shell" emptyText={text('当前没有可展示的分类树。', 'No category tree is available right now.')} />
+      ) : <div className="form-hint">{text('当前没有可展示的分类树。', 'No category tree is available right now.')}</div>}
     </div>
   );
 }
@@ -335,50 +345,36 @@ function FileRow({ file }: { file: OrganizeBrowserFile }) {
   );
 }
 
-function OrganizeResultBrowser({ rows }: { rows: OrganizeResultRow[] }) {
-  const root = useMemo(() => buildOrganizeBrowserTree(rows), [rows]);
-  const [activePath, setActivePath] = useState<string[]>([]);
-  const current = findOrganizeBrowserFolder(root, activePath) || root;
-  const crumbs = [
-    { label: text('根目录', 'Root'), path: [] as string[] },
-    ...current.path.map((segment, index) => ({
-      label: segment,
-      path: current.path.slice(0, index + 1),
-    })),
-  ];
-  const parentPath = current.path.slice(0, Math.max(0, current.path.length - 1));
-  const empty = current.folders.length === 0 && current.files.length === 0;
+function FolderBrowserShell({
+  root,
+  className = '',
+  emptyText,
+}: {
+  root: OrganizeBrowserFolder;
+  className?: string;
+  emptyText: string;
+}) {
+  const empty = root.folders.length === 0 && root.files.length === 0;
 
   return (
-    <section className="advisor-browser-shell" aria-label={text('归类结果浏览', 'Organize result browser')}>
-      <div className="advisor-browser-toolbar">
-        <button className="btn btn-secondary advisor-browser-back" type="button" disabled={!current.path.length} onClick={() => setActivePath(parentPath)}>
-          {text('返回上级', 'Back')}
-        </button>
-        <nav className="advisor-browser-breadcrumbs" aria-label={text('当前位置', 'Current location')}>
-          {crumbs.map((crumb, index) => (
-            <button
-              className={`advisor-browser-crumb ${index === crumbs.length - 1 ? 'active' : ''}`}
-              type="button"
-              key={crumb.path.join('/') || 'root'}
-              onClick={() => setActivePath(crumb.path)}
-            >
-              {crumb.label}
-            </button>
-          ))}
-        </nav>
-      </div>
+    <section className={`advisor-browser-shell ${className}`.trim()} aria-label={text('归类结果浏览', 'Organize result browser')}>
       <div className="advisor-browser-list">
-        {current.folders.map((folder) => (
-          <FolderRow key={folder.id} folder={folder} onOpen={setActivePath} />
+        {root.folders.map((folder) => (
+          <FolderRow key={folder.id} folder={folder} />
         ))}
-        {current.files.map((file) => (
+        {root.files.map((file) => (
           <FileRow key={file.id} file={file} />
         ))}
-        {empty ? <div className="advisor-browser-empty">{text('当前层级没有文件。', 'No files in this level.')}</div> : null}
+        {empty ? <div className="advisor-browser-empty">{emptyText}</div> : null}
       </div>
     </section>
   );
+}
+
+function OrganizeResultBrowser({ rows }: { rows: OrganizeResultRow[] }) {
+  const root = useMemo(() => buildOrganizeBrowserTree(rows), [rows]);
+
+  return <FolderBrowserShell root={root} emptyText={text('当前层级没有文件。', 'No files in this level.')} />;
 }
 
 const ORGANIZE_STAGE_FLOW = [
@@ -427,6 +423,7 @@ export function AdvisorTimeline({
   onCardAction: (cardId: string, action: string) => void;
 }) {
   const timeline = Array.isArray(state.sessionData?.timeline) ? state.sessionData.timeline : [];
+  const derivedTree = state.sessionData?.derivedTree as TreeNode | undefined;
   const snapshot = getCurrentSnapshot(state);
   if (!timeline.length) {
     const finished = isOrganizeFinished(snapshot);
@@ -462,7 +459,7 @@ export function AdvisorTimeline({
               </div>
             )}
             <div className="advisor-turn-cards">
-              {(turn.cards || []).map((card, cardIndex) => (
+              {(turn.cards || []).filter((card) => card.cardType !== 'tree').map((card, cardIndex) => (
                 <AdvisorCardView
                   key={card.cardId || `${turn.turnId || index}-${cardIndex}`}
                   card={card}
@@ -471,6 +468,9 @@ export function AdvisorTimeline({
                 />
               ))}
             </div>
+            {index === timeline.length - 1 && turn.role === 'assistant' && turnUsedTool(turn, 'apply_reclassification') ? (
+              <DerivedTreePanel tree={derivedTree} />
+            ) : null}
             <ToolCallDetails turn={turn} />
           </div>
         </section>
@@ -540,6 +540,7 @@ export function OrganizeSummary({
   const progressValue = getOrganizeProgress(snapshot);
   const determinate = hasDeterminateOrganizeProgress(snapshot);
   const treeChildren = Array.isArray(snapshot.tree?.children) ? snapshot.tree.children : [];
+  const treeBrowserRoot = buildOrganizeBrowserTreeFromTreeNodes(treeChildren);
   const resultRows = Array.isArray(snapshot.displayResults) ? snapshot.displayResults : [];
   const timingMs = metricRecord(snapshot.timingMs);
   const tokenUsage = snapshot.tokenUsage;
@@ -604,7 +605,7 @@ export function OrganizeSummary({
       ) : treeChildren.length ? (
         <div className="advisor-browser-readonly">
           <div className="form-hint">{text('当前只有分类树，文件列表会在结果明细返回后显示。', 'Only the category tree is available now. Files appear after result details load.')}</div>
-          <div className="advisor-tree-shell"><TreeList childrenNodes={treeChildren} limit={18} /></div>
+          <FolderBrowserShell root={treeBrowserRoot} className="advisor-tree-folder-shell" emptyText={text('当前没有可展示的分类树。', 'No category tree is available right now.')} />
         </div>
       ) : null}
     </section>

@@ -56,32 +56,41 @@ pub(crate) fn build_context_bar(
     })
 }
 
-pub(crate) fn build_tree_card(
-    session_id: &str,
-    turn_id: &str,
-    tree: &Value,
-    inventory: &[InventoryItem],
-    lang: &str,
-) -> Value {
-    json!({
-        "cardId": Uuid::new_v4().to_string(),
-        "sessionId": session_id,
-        "turnId": turn_id,
-        "cardType": super::types::CARD_TREE,
-        "status": "ready",
-        "title": local_text(lang, "当前分类树", "Current Tree"),
-        "body": {
-            "tree": tree,
-            "stats": tree_stats(inventory),
-        },
-        "actions": [],
-        "createdAt": now_iso(),
-        "updatedAt": now_iso(),
-    })
+fn summary_state_from_representation(
+    representation: Option<&FileRepresentation>,
+) -> TreeSummaryState {
+    let mut state = TreeSummaryState::default();
+    if let Some(representation) = representation {
+        state.metadata = representation.has_level(RepresentationLevel::Metadata);
+        state.short = representation.has_level(RepresentationLevel::Short);
+        state.long = representation.has_level(RepresentationLevel::Long);
+    }
+    state
 }
 
-fn tree_insert(node: &mut TreeDraftNode, path: &[String]) {
+fn merge_summary_state(target: &mut TreeSummaryState, source: TreeSummaryState) {
+    target.metadata |= source.metadata;
+    target.short |= source.short;
+    target.long |= source.long;
+}
+
+fn summary_types_value(state: TreeSummaryState) -> Value {
+    let mut types = Vec::new();
+    if state.metadata {
+        types.push("metadata");
+    }
+    if state.short {
+        types.push("short");
+    }
+    if state.long {
+        types.push("long");
+    }
+    json!(types)
+}
+
+fn tree_insert(node: &mut TreeDraftNode, path: &[String], summary_state: TreeSummaryState) {
     node.item_count += 1;
+    merge_summary_state(&mut node.summary_state, summary_state);
     if let Some(head) = path.first() {
         let child = node
             .children
@@ -90,7 +99,7 @@ fn tree_insert(node: &mut TreeDraftNode, path: &[String]) {
                 name: head.clone(),
                 ..Default::default()
             });
-        tree_insert(child, &path[1..]);
+        tree_insert(child, &path[1..], summary_state);
     }
 }
 
@@ -128,6 +137,8 @@ fn tree_to_value(prefix: &str, path: &[String], node: &TreeDraftNode) -> Value {
         "categoryPath": path,
         "name": node.name,
         "itemCount": node.item_count,
+        "hasSummary": node.summary_state.metadata || node.summary_state.short || node.summary_state.long,
+        "summaryTypes": summary_types_value(node.summary_state),
         "children": children,
     })
 }
@@ -146,20 +157,13 @@ fn build_derived_tree(root_path: &str, inventory: &[InventoryItem]) -> Option<Va
         } else {
             item.category_path.clone()
         };
-        tree_insert(&mut root, &category_path);
+        tree_insert(
+            &mut root,
+            &category_path,
+            summary_state_from_representation(item.summary_representation.as_ref()),
+        );
     }
     Some(tree_to_value(root_path, &[], &root))
-}
-
-fn tree_stats(inventory: &[InventoryItem]) -> Value {
-    let mut kinds = HashMap::<String, u64>::new();
-    for item in inventory {
-        *kinds.entry(item.kind.clone()).or_default() += 1;
-    }
-    json!({
-        "itemCount": inventory.len(),
-        "kinds": kinds,
-    })
 }
 
 fn infer_kind(path: &str, summary: &str, fallback: &str) -> String {

@@ -1,8 +1,7 @@
 use super::payload::build_session_payload;
-use super::tools::{build_tree_card, ToolService};
+use super::tools::ToolService;
 use super::types::{now_iso, AdvisorSessionStartInput, WORKFLOW_UNDERSTAND};
 use crate::backend::AppState;
-use crate::persist;
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -87,45 +86,6 @@ impl<'a> SessionBootstrap<'a> {
             .get("sessionId")
             .and_then(Value::as_str)
             .ok_or_else(|| "sessionId missing after creation".to_string())?;
-        let tree_turn =
-            persist::create_advisor_turn(&self.state.db_path(), session_id, "assistant", "")?;
-
-        if let Some(tree) = session
-            .get("derivedTree")
-            .cloned()
-            .filter(|value| !value.is_null())
-        {
-            persist::save_advisor_card(
-                &self.state.db_path(),
-                &build_tree_card(
-                    session_id,
-                    tree_turn
-                        .get("turnId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    &tree,
-                    &overview.inventory,
-                    session
-                        .get("responseLanguage")
-                        .and_then(Value::as_str)
-                        .unwrap_or("zh"),
-                ),
-            )?;
-            crate::diagnostics::record_state_event(
-                self.state,
-                "info",
-                "advisor",
-                "advisor_tree_card_created",
-                None,
-                "tree card created",
-                json!({
-                    "sessionId": session_id,
-                }),
-                None,
-                None,
-            );
-        }
-
         crate::diagnostics::record_state_event(
             self.state,
             "info",
@@ -179,10 +139,10 @@ mod tests {
         assert!(payload["sessionId"].as_str().is_some());
         assert_eq!(payload["session"]["workflowStage"], WORKFLOW_UNDERSTAND);
         let timeline = payload["timeline"].as_array().expect("timeline");
-        assert!(timeline.iter().any(|turn| {
+        assert!(timeline.iter().all(|turn| {
             turn["cards"]
                 .as_array()
-                .is_some_and(|cards| !cards.is_empty())
+                .is_some_and(|cards| cards.is_empty())
         }));
     }
 }

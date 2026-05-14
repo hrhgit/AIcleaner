@@ -11,12 +11,13 @@ use crate::llm_protocol::{
 };
 use crate::llm_tools::{ToolContext, ToolExecutionContext, ToolId, ToolRegistry, ToolWorkflow};
 use crate::model_boundary::ModelIdMap;
+use crate::organizer_runtime::summary::extract_unit_content_for_summary_with_tools;
 use crate::organizer_runtime::{
     ensure_tika_server_running, extraction_tool_config_from_settings,
     force_enable_tika_for_summary_mode, ExtractionToolConfig, OrganizeUnit,
 };
-use crate::organizer_runtime::summary::extract_unit_content_for_summary_with_tools;
 use crate::persist;
+use crate::reasoning_policy;
 use crate::system_ops;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -47,7 +48,15 @@ const FS_FALLBACK_SKIP_DIRS: &[&str] = &[
 struct TreeDraftNode {
     name: String,
     item_count: u64,
+    summary_state: TreeSummaryState,
     children: BTreeMap<String, TreeDraftNode>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TreeSummaryState {
+    metadata: bool,
+    short: bool,
+    long: bool,
 }
 
 #[derive(Clone, Debug, Default)]

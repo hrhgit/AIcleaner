@@ -179,7 +179,10 @@ fn migrate_legacy_settings_fields(value: &mut Value) {
                     );
                 }
                 if value_as_non_empty_string(config.get("name")).is_none() {
-                    config.insert("name".to_string(), Value::String(normalized_endpoint.clone()));
+                    config.insert(
+                        "name".to_string(),
+                        Value::String(normalized_endpoint.clone()),
+                    );
                 }
                 if value_as_non_empty_string(config.get("apiFormat")).is_none() {
                     config.insert(
@@ -284,11 +287,7 @@ fn normalize_settings_shape(value: &mut Value) -> Result<(), String> {
     }
 
     if !provider_configs.contains_key(&default_provider_endpoint) {
-        default_provider_endpoint = provider_configs
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_default();
+        default_provider_endpoint = provider_configs.keys().next().cloned().unwrap_or_default();
     }
 
     obj.insert(

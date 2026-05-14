@@ -30,7 +30,7 @@ export function normalizeProviders(settings: Settings | null | undefined): {
       apiKey: '',
       apiFormat: normalizeProviderApiFormat(rawConfig?.apiFormat || matchedTemplate?.defaultApiFormat),
       model: String(rawConfig?.model || ''),
-      thinkingEnabled: !!rawConfig?.thinking?.enabled,
+      thinkingEnabled: true,
       thinkingLevel: normalizeThinkingLevel(rawConfig?.thinking?.level),
       preset: false,
     });
@@ -89,7 +89,7 @@ export function buildProviderSettingsPayload(
           apiFormat: provider.apiFormat,
           model: String(provider.model || ''),
           thinking: {
-            enabled: !!provider.thinkingEnabled,
+            enabled: true,
             level: normalizeThinkingLevel(provider.thinkingLevel),
           },
         }];

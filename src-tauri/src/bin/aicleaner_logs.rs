@@ -129,9 +129,8 @@ fn main() {
             };
             eprintln!(
                 "{}",
-                serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| {
-                    "{\"error\":\"failed to encode error\"}".to_string()
-                })
+                serde_json::to_string_pretty(&envelope)
+                    .unwrap_or_else(|_| { "{\"error\":\"failed to encode error\"}".to_string() })
             );
         } else {
             eprintln!("{}", err);
@@ -168,7 +167,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Show(args) => {
             let selected_files = select_files(&files, args.file, args.filter.family.as_deref())?;
-            let (records, _) = read_records_lossy(&selected_files, &build_record_filter(&args.filter)?)?;
+            let (records, _) =
+                read_records_lossy(&selected_files, &build_record_filter(&args.filter)?)?;
             let records = if let Some(tail) = args.tail {
                 records
                     .into_iter()
@@ -185,15 +185,13 @@ fn run(cli: Cli) -> Result<()> {
             write_or_print_content(cli.json, &content, args.output)
         }
         Command::Summary(args) => {
-            let (runs, parse_errors) =
-                load_selected_runs_lossy(&files, args.file, &args.filter)?;
+            let (runs, parse_errors) = load_selected_runs_lossy(&files, args.file, &args.filter)?;
             let run = newest_run(&runs).ok_or_else(|| anyhow!("no matching runs found"))?;
             let package = build_ai_task_package(run, parse_errors.len(), args.limit.max(1));
             print_output(cli.json, &package)
         }
         Command::Export(args) => {
-            let (runs, parse_errors) =
-                load_selected_runs_lossy(&files, args.file, &args.filter)?;
+            let (runs, parse_errors) = load_selected_runs_lossy(&files, args.file, &args.filter)?;
             let run = newest_run(&runs).ok_or_else(|| anyhow!("no matching runs found"))?;
             let package = build_ai_task_package(run, parse_errors.len(), args.limit.max(1));
             let content = serialize_ai_package(&package, &args.format)?;
@@ -245,9 +243,13 @@ fn load_selected_runs_lossy(
     files: &[aicleaner_lib::log_cli_support::LogFileInfo],
     file: Option<PathBuf>,
     filter: &FilterArgs,
-) -> Result<(Vec<aicleaner_lib::log_cli_support::AggregatedRun>, Vec<String>)> {
+) -> Result<(
+    Vec<aicleaner_lib::log_cli_support::AggregatedRun>,
+    Vec<String>,
+)> {
     let selected_files = select_files(files, file, filter.family.as_deref())?;
-    let (records, parse_errors) = read_records_lossy(&selected_files, &build_record_filter(filter)?)?;
+    let (records, parse_errors) =
+        read_records_lossy(&selected_files, &build_record_filter(filter)?)?;
     Ok((aggregate_runs(&records), parse_errors))
 }
 
@@ -257,11 +259,9 @@ fn select_files(
     family: Option<&str>,
 ) -> Result<Vec<aicleaner_lib::log_cli_support::LogFileInfo>> {
     if let Some(path) = file {
-        return Ok(vec![
-            find_file_by_path(files, &path)
-                .cloned()
-                .ok_or_else(|| anyhow!("log file not found: {}", path.display()))?,
-        ]);
+        return Ok(vec![find_file_by_path(files, &path).cloned().ok_or_else(
+            || anyhow!("log file not found: {}", path.display()),
+        )?]);
     }
 
     let family = match family {
@@ -270,7 +270,12 @@ fn select_files(
     };
     Ok(files
         .iter()
-        .filter(|entry| family.as_ref().map(|item| &entry.family == item).unwrap_or(true))
+        .filter(|entry| {
+            family
+                .as_ref()
+                .map(|item| &entry.family == item)
+                .unwrap_or(true)
+        })
         .cloned()
         .collect())
 }
@@ -303,7 +308,10 @@ fn build_record_filter(args: &FilterArgs) -> Result<RecordFilter> {
 
 fn available_families(files: &[aicleaner_lib::log_cli_support::LogFileInfo]) -> Vec<&'static str> {
     let mut families = Vec::new();
-    if files.iter().any(|file| file.family == LogFamily::Diagnostics) {
+    if files
+        .iter()
+        .any(|file| file.family == LogFamily::Diagnostics)
+    {
         families.push("diagnostics");
     }
     if files.iter().any(|file| file.family == LogFamily::WebSearch) {

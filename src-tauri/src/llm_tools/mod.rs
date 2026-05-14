@@ -2,11 +2,11 @@ use crate::advisor_runtime::tools::{
     compact_advisor_model_value, compact_value_with_tree, expand_advisor_model_args, ToolService,
 };
 use crate::advisor_runtime::types::{
-    local_text, CARD_EXECUTION, CARD_PREFERENCE, CARD_RECLASS, CARD_TREE,
-    WORKFLOW_EXECUTE_READY, WORKFLOW_UNDERSTAND,
+    local_text, CARD_EXECUTION, CARD_PREFERENCE, CARD_RECLASS, WORKFLOW_EXECUTE_READY,
+    WORKFLOW_UNDERSTAND,
 };
 use crate::backend::{resolve_search_api_key, AppState};
-use crate::llm_protocol::ParsedToolCall;
+use crate::llm_protocol::{tool_arguments_parse_error, ParsedToolCall};
 use crate::organizer_runtime::OrganizerDiagnostics;
 use crate::persist;
 use crate::web_search::{format_web_search_context, parse_web_search_request, tavily_search};
@@ -113,11 +113,6 @@ impl ToolResult {
 
     pub(crate) fn with_card(mut self, card: Value) -> Self {
         self.card = Some(card);
-        self
-    }
-
-    pub(crate) fn with_cards(mut self, cards: Vec<Value>) -> Self {
-        self.cards = cards;
         self
     }
 
@@ -655,6 +650,39 @@ fn reconciled_assignment_schema() -> Value {
     })
 }
 
+fn reclassification_change_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "单条分类修正变更。需要一次完成多步调整时，优先在 changes 数组里批量提交多条变更，而不是分多次调用工具。",
+        "properties": {
+            "type": {
+                "type": "string",
+                "description": "分类修改类型。根据用户意图选择一个最小动作。",
+                "enum": ["rename_category", "move_selection_to_category", "split_selection_to_new_category", "merge_category_into_category", "delete_empty_category"]
+            },
+            "selectionId": {
+                "type": "string",
+                "description": "需要移动或拆分的候选集 ID，通常来自 find_files。"
+            },
+            "sourceCategoryId": {
+                "type": "string",
+                "description": "源分类节点短 ID，用于重命名、合并或删除空分类。"
+            },
+            "targetCategoryId": {
+                "type": "string",
+                "description": "目标分类节点短 ID，用于移动或合并。"
+            },
+            "newCategoryName": {
+                "type": "string",
+                "description": "新分类名称或重命名后的名称，应简短实用。",
+                "maxLength": 120
+            }
+        },
+        "required": ["type"],
+        "additionalProperties": false
+    })
+}
+
 fn tree_proposal_schema() -> Value {
     json!({
         "type": "object",
@@ -662,14 +690,54 @@ fn tree_proposal_schema() -> Value {
         "properties": {
             "proposalId": { "type": "string", "description": "当前 batch 内稳定 proposal ID。" },
             "operation": { "type": "string", "description": "建议操作。", "enum": ["add_node", "merge_nodes", "split_node", "rename_node"] },
-            "targetNodeId": { "type": "string", "description": "被修改或作为父节点的现有 prompt-local 短 nodeId，可为空。" },
-            "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的现有 prompt-local 短节点 ID。", "maxItems": 20, "items": { "type": "string" } },
-            "suggestedName": { "type": "string", "description": "建议节点名称，纯文本，禁止 emoji 或装饰性符号。" },
+            "targetNodeId": { "type": "string", "description": "现有 prompt-local 短 nodeId。merge_nodes 时必填，表示要保留并重命名的目标节点；add_node 时可省略并默认挂到 root。", "minLength": 1 },
+            "sourceNodeIds": { "type": "array", "description": "merge_nodes 时填写要并入并删除的现有 prompt-local 短节点 ID；split_node 时填写被拆分的现有节点 ID。", "maxItems": 20, "items": { "type": "string" } },
+            "suggestedName": { "type": "string", "description": "建议节点名称，纯文本，禁止 emoji 或装饰性符号。", "minLength": 1 },
             "suggestedPath": category_path_schema("建议的新路径。"),
             "evidenceItemIds": { "type": "array", "description": "支持该建议的当前 itemId。", "maxItems": 200, "items": { "type": "string" } },
             "reason": { "type": "string", "description": "简短说明建议原因。", "maxLength": 500 }
         },
         "required": ["proposalId", "operation", "reason"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": { "operation": { "const": "add_node" } },
+                    "required": ["operation"]
+                },
+                "then": { "required": ["suggestedName"] }
+            },
+            {
+                "if": {
+                    "properties": { "operation": { "const": "merge_nodes" } },
+                    "required": ["operation"]
+                },
+                "then": {
+                    "required": ["targetNodeId", "sourceNodeIds"],
+                    "properties": {
+                        "sourceNodeIds": { "minItems": 1 }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": { "operation": { "const": "split_node" } },
+                    "required": ["operation"]
+                },
+                "then": {
+                    "required": ["sourceNodeIds"],
+                    "properties": {
+                        "sourceNodeIds": { "minItems": 1 }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": { "operation": { "const": "rename_node" } },
+                    "required": ["operation"]
+                },
+                "then": { "required": ["targetNodeId", "suggestedName"] }
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -683,24 +751,37 @@ fn string_array_schema(description: &str) -> Value {
     })
 }
 
+fn tool_argument_validation_error(value: &Value, message: impl Into<String>) -> String {
+    let message = message.into();
+    if let Some(parse_error) = tool_arguments_parse_error(value) {
+        format!("{message}; original tool argument parse error: {parse_error}")
+    } else {
+        message
+    }
+}
+
 fn ensure_object_field(value: &Value, field: &str, tool: &str) -> Result<Value, String> {
-    let field_value = value
-        .get(field)
-        .cloned()
-        .ok_or_else(|| format!("{tool} is missing {field}"))?;
+    let field_value = value.get(field).cloned().ok_or_else(|| {
+        tool_argument_validation_error(value, format!("{tool} is missing {field}"))
+    })?;
     if !field_value.is_object() {
-        return Err(format!("{tool} {field} must be an object"));
+        return Err(tool_argument_validation_error(
+            value,
+            format!("{tool} {field} must be an object"),
+        ));
     }
     Ok(field_value)
 }
 
 fn ensure_array_field(value: &Value, field: &str, tool: &str) -> Result<Value, String> {
-    let field_value = value
-        .get(field)
-        .cloned()
-        .ok_or_else(|| format!("{tool} is missing {field}"))?;
+    let field_value = value.get(field).cloned().ok_or_else(|| {
+        tool_argument_validation_error(value, format!("{tool} is missing {field}"))
+    })?;
     if !field_value.is_array() {
-        return Err(format!("{tool} {field} must be an array"));
+        return Err(tool_argument_validation_error(
+            value,
+            format!("{tool} {field} must be an array"),
+        ));
     }
     Ok(field_value)
 }
@@ -725,9 +806,17 @@ fn parse_local_reclassification_arguments(value: &Value) -> Result<Value, String
     let assignments = value
         .get("assignments")
         .and_then(Value::as_array)
-        .ok_or_else(|| "submit_local_reclassification is missing assignments".to_string())?;
+        .ok_or_else(|| {
+            tool_argument_validation_error(
+                value,
+                "submit_local_reclassification is missing assignments",
+            )
+        })?;
     if assignments.is_empty() {
-        return Err("submit_local_reclassification assignments must be a non-empty array".to_string());
+        return Err(tool_argument_validation_error(
+            value,
+            "submit_local_reclassification assignments must be a non-empty array",
+        ));
     }
 
     let parsed = assignments
@@ -851,9 +940,14 @@ fn parse_submit_file_summaries_arguments(value: &Value) -> Result<Value, String>
     let items = value
         .get("items")
         .and_then(Value::as_array)
-        .ok_or_else(|| "submit_file_summaries is missing items".to_string())?;
+        .ok_or_else(|| {
+            tool_argument_validation_error(value, "submit_file_summaries is missing items")
+        })?;
     if items.is_empty() {
-        return Err("submit_file_summaries items must be a non-empty array".to_string());
+        return Err(tool_argument_validation_error(
+            value,
+            "submit_file_summaries items must be a non-empty array",
+        ));
     }
     let parsed = items
         .iter()
@@ -867,19 +961,28 @@ fn parse_submit_file_summaries_arguments(value: &Value) -> Result<Value, String>
 
 fn parse_revise_tree_draft_arguments(value: &Value) -> Result<Value, String> {
     let draft_tree = value.get("draftTree").cloned().filter(|v| !v.is_null());
-    let operations = value.get("operations").cloned().filter(Value::is_array)
+    let operations = value
+        .get("operations")
+        .cloned()
+        .filter(Value::is_array)
         .filter(|arr| !arr.as_array().map(|a| a.is_empty()).unwrap_or(true));
 
     if let Some(ref v) = draft_tree {
         if !v.is_object() {
-            return Err("revise_tree_draft draftTree must be an object".to_string());
+            return Err(tool_argument_validation_error(
+                value,
+                "revise_tree_draft draftTree must be an object",
+            ));
         }
     }
 
     let has_draft = draft_tree.iter().any(|v| v.is_object());
     let has_ops = operations.is_some();
     if !has_draft && !has_ops {
-        return Err("revise_tree_draft requires draftTree or operations".to_string());
+        return Err(tool_argument_validation_error(
+            value,
+            "revise_tree_draft requires draftTree or operations",
+        ));
     }
 
     Ok(json!({
@@ -925,12 +1028,45 @@ fn adjustment_operation_schema() -> Value {
         "description": "单个树调整操作。",
         "properties": {
             "type": { "type": "string", "description": "操作类型。", "enum": ["merge_nodes", "split_node", "rename_node"] },
-            "targetNodeId": { "type": "string", "description": "目标节点的 prompt-local 短 nodeId。" },
+            "targetNodeId": { "type": "string", "description": "目标节点的 prompt-local 短 nodeId。", "minLength": 1 },
             "sourceNodeIds": { "type": "array", "description": "merge/split 涉及的节点 ID。", "maxItems": 20, "items": { "type": "string" } },
-            "newName": { "type": "string", "description": "rename_node 时的新名称，纯文本，禁止 emoji 或装饰性符号。" },
+            "newName": { "type": "string", "description": "rename_node 时的新名称，纯文本，禁止 emoji 或装饰性符号。", "minLength": 1 },
             "reason": { "type": "string", "description": "操作原因。", "maxLength": 500 }
         },
         "required": ["type", "reason"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": { "type": { "const": "merge_nodes" } },
+                    "required": ["type"]
+                },
+                "then": {
+                    "required": ["targetNodeId", "sourceNodeIds"],
+                    "properties": {
+                        "sourceNodeIds": { "minItems": 1 }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": { "type": { "const": "split_node" } },
+                    "required": ["type"]
+                },
+                "then": {
+                    "required": ["sourceNodeIds"],
+                    "properties": {
+                        "sourceNodeIds": { "minItems": 1 }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": { "type": { "const": "rename_node" } },
+                    "required": ["type"]
+                },
+                "then": { "required": ["targetNodeId", "newName"] }
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -1057,13 +1193,27 @@ organizer_submit_tool!(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "itemId": { "type": "string", "description": "当前局部输入中的 itemId，必须原样填写。" },
-                        "leafNodeId": { "type": "string", "description": "当前子树中已有叶子节点的 prompt-local 短 nodeId。若提供 categoryPath 可留空。" },
+                        "itemId": { "type": "string", "description": "当前局部输入中的 itemId，必须原样填写。", "minLength": 1 },
+                        "leafNodeId": { "type": "string", "description": "当前子树中已有叶子节点的 prompt-local 短 nodeId。若提供 categoryPath 可留空。", "minLength": 1 },
                         "categoryPath": category_path_schema("相对当前节点的后代分类路径。提供时必须是非空相对路径，且不能表示外部节点。"),
-                        "reason": { "type": "string", "description": "极短分类依据。", "maxLength": 300 },
+                        "reason": { "type": "string", "description": "极短分类依据。", "minLength": 1, "maxLength": 300 },
                         "confidence": { "type": "string", "description": "分类置信度。", "enum": ["high", "medium", "low"] }
                     },
                     "required": ["itemId", "reason"],
+                    "anyOf": [
+                        { "required": ["leafNodeId"] },
+                        { "required": ["categoryPath"] }
+                    ],
+                    "allOf": [
+                        {
+                            "if": { "required": ["categoryPath"] },
+                            "then": {
+                                "properties": {
+                                    "categoryPath": { "minItems": 1 }
+                                }
+                            }
+                        }
+                    ],
                     "additionalProperties": false
                 }
             },
@@ -1138,11 +1288,15 @@ organizer_submit_tool!(
         "description": "树结构草稿修订结果。",
         "properties": {
             "draftTree": category_tree_schema(),
-            "operations": { "type": "array", "description": "增量修改操作。提供 operations 时无需重复提供无变化的节点。", "maxItems": 100, "items": tree_proposal_schema() },
+            "operations": { "type": "array", "description": "增量修改操作。提供 operations 时无需重复提供无变化的节点。", "minItems": 1, "maxItems": 100, "items": tree_proposal_schema() },
             "proposalMappings": { "type": "array", "description": "proposalId 到最终 leafNodeId/path 的映射。", "maxItems": 500, "items": { "type": "object", "description": "单个 proposal 映射。", "properties": { "proposalId": { "type": "string", "description": "被处理的 proposalId。" }, "leafNodeId": { "type": "string", "description": "映射后的 leafNodeId。" }, "categoryPath": category_path_schema("映射后的分类路径。") }, "required": ["proposalId"], "additionalProperties": false } },
             "rejectedProposalIds": string_array_schema("明确拒绝的 proposalId。"),
             "notes": { "type": "string", "description": "本轮调整说明。", "maxLength": 1000 }
         },
+        "anyOf": [
+            { "required": ["draftTree"] },
+            { "required": ["operations"] }
+        ],
         "additionalProperties": false
     }),
     "reconcile_tree",
@@ -1297,19 +1451,7 @@ impl LlmTool for GetDirectoryOverviewTool {
         )?;
         let tree = backend_result.get("tree").cloned().unwrap_or(Value::Null);
         let result = compact_value_with_tree(&tree, &backend_result);
-        let card = json!({
-            "cardType": CARD_TREE,
-            "status": "ready",
-            "title": local_text(ctx.response_language, "当前分类树", "Current Tree"),
-            "body": {
-                "tree": tree,
-                "stats": {
-                    "itemCount": session.pointer("/contextBar/directorySummary/itemCount").cloned().unwrap_or(Value::from(0))
-                }
-            },
-            "actions": []
-        });
-        Ok(ToolResult::result(result).with_card(card))
+        Ok(ToolResult::result(result))
     }
 }
 
@@ -1970,52 +2112,29 @@ impl LlmTool for ApplyReclassificationTool {
         tool_spec(
             self.id(),
             "apply_reclassification",
-            "按结构化 reclassificationRequest 应用局部分类修正。用于重命名、移动、拆分、合并或删除空分类，执行后会更新当前分类树。",
+            "按结构化 reclassificationRequest 应用局部分类修正。使用 changes 数组批量提交一条或多条重命名、移动、拆分、合并或删除空分类操作，执行后会更新当前分类树。",
             json!({
                 "type": "object",
                 "description": "局部分类修正请求。只修改分类结构或选中项归类，不执行文件移动。",
                 "properties": {
                     "request": {
                         "type": "object",
-                        "description": "重分类请求主体。",
+                        "description": "重分类请求主体。必须使用 changes 一次提交一条或多条按顺序执行的修改。",
                         "properties": {
                             "intentSummary": {
                                 "type": "string",
                                 "description": "用户希望调整分类的简短意图摘要。",
                                 "maxLength": 300
                             },
-                            "change": {
-                                "type": "object",
-                                "description": "具体分类修改动作及其必要目标。",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "description": "分类修改类型。根据用户意图选择一个最小动作。",
-                                        "enum": ["rename_category", "move_selection_to_category", "split_selection_to_new_category", "merge_category_into_category", "delete_empty_category"]
-                                    },
-                                    "selectionId": {
-                                        "type": "string",
-                                        "description": "需要移动或拆分的候选集 ID，通常来自 find_files。"
-                                    },
-                                    "sourceCategoryId": {
-                                        "type": "string",
-                                        "description": "源分类节点短 ID，用于重命名、合并或删除空分类。"
-                                    },
-                                    "targetCategoryId": {
-                                        "type": "string",
-                                        "description": "目标分类节点短 ID，用于移动或合并。"
-                                    },
-                                    "newCategoryName": {
-                                        "type": "string",
-                                        "description": "新分类名称或重命名后的名称，应简短实用。",
-                                        "maxLength": 120
-                                    }
-                                },
-                                "required": ["type"],
-                                "additionalProperties": false
+                            "changes": {
+                                "type": "array",
+                                "description": "分类修正动作列表。按数组顺序执行；即使只有一步也使用这个字段。",
+                                "minItems": 1,
+                                "maxItems": 50,
+                                "items": reclassification_change_schema()
                             }
                         },
-                        "required": ["change"],
+                        "required": ["changes"],
                         "additionalProperties": false
                     },
                     "applyPreferenceCapture": {
@@ -2086,37 +2205,25 @@ impl LlmTool for ApplyReclassificationTool {
                 }
             }
         }
-        let cards = vec![
-            json!({
-                "cardType": CARD_RECLASS,
-                "status": "done",
-                "title": local_text(ctx.response_language, "分类修改结果", "Reclassification Result"),
-                "body": {
-                    "jobId": job.get("jobId").cloned().unwrap_or(Value::Null),
-                    "reclassificationJobId": job.get("jobId").cloned().unwrap_or(Value::Null),
-                    "summary": job.pointer("/result/message").cloned().unwrap_or(Value::String(String::new())),
-                    "message": job.pointer("/result/message").cloned().unwrap_or(Value::String(String::new())),
-                    "changeSummary": job.pointer("/result/changeSummary").cloned().unwrap_or(Value::String(String::new())),
-                    "updatedTreeText": job.pointer("/result/updatedTreeText").cloned().unwrap_or(Value::String(String::new())),
-                    "invalidated": job.pointer("/result/invalidated").cloned().unwrap_or_else(|| json!([])),
-                },
-                "actions": []
-            }),
-            json!({
-                "cardType": CARD_TREE,
-                "status": "ready",
-                "title": local_text(ctx.response_language, "当前分类树", "Current Tree"),
-                "body": {
-                    "tree": new_tree
-                },
-                "actions": []
-            }),
-        ];
         Ok(ToolResult::result(compact_advisor_model_value(
             session,
             &job.pointer("/result").cloned().unwrap_or(Value::Null),
         ))
-        .with_cards(cards))
+        .with_card(json!({
+            "cardType": CARD_RECLASS,
+            "status": "done",
+            "title": local_text(ctx.response_language, "分类修改结果", "Reclassification Result"),
+            "body": {
+                "jobId": job.get("jobId").cloned().unwrap_or(Value::Null),
+                "reclassificationJobId": job.get("jobId").cloned().unwrap_or(Value::Null),
+                "summary": job.pointer("/result/message").cloned().unwrap_or(Value::String(String::new())),
+                "message": job.pointer("/result/message").cloned().unwrap_or(Value::String(String::new())),
+                "changeSummary": job.pointer("/result/changeSummary").cloned().unwrap_or(Value::String(String::new())),
+                "updatedTreeText": job.pointer("/result/updatedTreeText").cloned().unwrap_or(Value::String(String::new())),
+                "invalidated": job.pointer("/result/invalidated").cloned().unwrap_or_else(|| json!([])),
+            },
+            "actions": []
+        })))
     }
 }
 
@@ -2132,7 +2239,7 @@ impl LlmTool for RollbackReclassificationTool {
         tool_spec(
             self.id(),
             "rollback_reclassification",
-            "回滚最近一次可回滚的分类修正。执行后会恢复分类树并返回更新后的树结果卡。",
+            "回滚最近一次可回滚的分类修正。执行后会恢复当前分类树。",
             json!({
                 "type": "object",
                 "description": "分类修正回滚请求。",
@@ -2193,31 +2300,29 @@ impl LlmTool for RollbackReclassificationTool {
                 }
             }
         }
-        let cards = vec![
-            json!({
-                "cardType": CARD_RECLASS,
-                "status": "rolled_back",
-                "title": local_text(ctx.response_language, "分类回滚结果", "Reclassification Rollback"),
-                "body": {
-                    "jobId": job_id,
-                    "message": result.get("message").cloned().unwrap_or(Value::String(String::new())),
-                    "updatedTreeText": result.get("updatedTreeText").cloned().unwrap_or(Value::String(String::new())),
-                    "rolledBack": result.get("rolledBack").cloned().unwrap_or(Value::Bool(true)),
-                    "invalidated": result.get("invalidated").cloned().unwrap_or_else(|| json!([])),
-                },
-                "actions": []
-            }),
-            json!({
-                "cardType": CARD_TREE,
-                "status": "ready",
-                "title": local_text(ctx.response_language, "当前分类树", "Current Tree"),
-                "body": {
-                    "tree": overview.get("tree").cloned().unwrap_or(Value::Null)
-                },
-                "actions": []
-            }),
-        ];
-        Ok(ToolResult::result(result).with_cards(cards))
+        let card_message = result
+            .get("message")
+            .cloned()
+            .unwrap_or(Value::String(String::new()));
+        let card_updated_tree_text = result
+            .get("updatedTreeText")
+            .cloned()
+            .unwrap_or(Value::String(String::new()));
+        let card_rolled_back = result.get("rolledBack").cloned().unwrap_or(Value::Bool(true));
+        let card_invalidated = result.get("invalidated").cloned().unwrap_or_else(|| json!([]));
+        Ok(ToolResult::result(result).with_card(json!({
+            "cardType": CARD_RECLASS,
+            "status": "rolled_back",
+            "title": local_text(ctx.response_language, "分类回滚结果", "Reclassification Rollback"),
+            "body": {
+                "jobId": job_id,
+                "message": card_message,
+                "updatedTreeText": card_updated_tree_text,
+                "rolledBack": card_rolled_back,
+                "invalidated": card_invalidated,
+            },
+            "actions": []
+        })))
     }
 }
 
@@ -2418,6 +2523,169 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn tree_proposal_schema_uses_conditional_operation_requirements() {
+        let schema = tree_proposal_schema();
+        let branches = schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .expect("tree proposal conditional branches");
+        assert_eq!(branches.len(), 4);
+
+        let merge_then = branches[1].get("then").expect("merge_nodes then branch");
+        assert_eq!(
+            merge_then.get("required").cloned().unwrap_or(Value::Null),
+            json!(["targetNodeId", "sourceNodeIds"])
+        );
+        assert_eq!(
+            merge_then.pointer("/properties/sourceNodeIds/minItems"),
+            Some(&Value::from(1))
+        );
+
+        let rename_then = branches[3].get("then").expect("rename_node then branch");
+        assert_eq!(
+            rename_then.get("required").cloned().unwrap_or(Value::Null),
+            json!(["targetNodeId", "suggestedName"])
+        );
+    }
+
+    #[test]
+    fn revise_tree_draft_schema_requires_draft_tree_or_non_empty_operations() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext {
+            workflow: ToolWorkflow::Organizer,
+            stage: "reconcile_tree",
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let definition = registry
+            .definitions(&ctx)
+            .into_iter()
+            .find(|definition| {
+                definition.pointer("/function/name").and_then(Value::as_str)
+                    == Some("revise_tree_draft")
+            })
+            .expect("revise_tree_draft is available");
+        let parameters = definition
+            .pointer("/function/parameters")
+            .expect("revise_tree_draft parameters");
+        assert_eq!(
+            parameters.pointer("/properties/operations/minItems"),
+            Some(&Value::from(1))
+        );
+        let any_of = parameters
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .expect("revise_tree_draft anyOf");
+        assert_eq!(
+            any_of,
+            &vec![
+                json!({"required": ["draftTree"]}),
+                json!({"required": ["operations"]})
+            ]
+        );
+    }
+
+    #[test]
+    fn local_reclassification_assignment_schema_requires_leaf_or_path() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext {
+            workflow: ToolWorkflow::Organizer,
+            stage: "local_refine_subtree",
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let definition = registry
+            .definitions(&ctx)
+            .into_iter()
+            .find(|definition| {
+                definition.pointer("/function/name").and_then(Value::as_str)
+                    == Some("submit_local_reclassification")
+            })
+            .expect("submit_local_reclassification is available");
+        let item_schema = definition
+            .pointer("/function/parameters/properties/assignments/items")
+            .expect("assignment item schema");
+        let any_of = item_schema
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .expect("assignment anyOf");
+        assert_eq!(
+            any_of,
+            &vec![
+                json!({ "required": ["leafNodeId"] }),
+                json!({ "required": ["categoryPath"] })
+            ]
+        );
+        assert_eq!(
+            item_schema.pointer("/properties/leafNodeId/minLength"),
+            Some(&Value::from(1))
+        );
+        assert_eq!(
+            item_schema.pointer("/allOf/0/then/properties/categoryPath/minItems"),
+            Some(&Value::from(1))
+        );
+    }
+
+    #[test]
+    fn apply_reclassification_schema_exposes_batch_changes() {
+        let registry = ToolRegistry::new();
+        let ctx = ToolContext {
+            workflow: ToolWorkflow::Advisor,
+            stage: "advisor_understand",
+            session: None,
+            bootstrap_turn: false,
+            response_language: "zh",
+            web_search_allowed: false,
+            search_remaining: 0,
+        };
+        let definition = registry
+            .definitions(&ctx)
+            .into_iter()
+            .find(|definition| {
+                definition.pointer("/function/name").and_then(Value::as_str)
+                    == Some("apply_reclassification")
+            })
+            .expect("apply_reclassification is available");
+        let request_schema = definition
+            .pointer("/function/parameters/properties/request")
+            .expect("request schema");
+        assert_eq!(
+            request_schema.pointer("/properties/changes/minItems"),
+            Some(&Value::from(1))
+        );
+        assert_eq!(
+            request_schema.pointer("/properties/changes/maxItems"),
+            Some(&Value::from(50))
+        );
+        assert_eq!(
+            request_schema.get("required").cloned().unwrap_or(Value::Null),
+            json!(["changes"])
+        );
+    }
+
+    #[test]
+    fn adjustment_operation_schema_uses_conditional_type_requirements() {
+        let schema = adjustment_operation_schema();
+        let branches = schema
+            .get("allOf")
+            .and_then(Value::as_array)
+            .expect("adjustment operation conditional branches");
+        assert_eq!(branches.len(), 3);
+
+        let rename_then = branches[2].get("then").expect("rename_node then branch");
+        assert_eq!(
+            rename_then.get("required").cloned().unwrap_or(Value::Null),
+            json!(["targetNodeId", "newName"])
+        );
+    }
+
     fn assert_object_schemas_are_closed(schema: &Value, path: &str) {
         if schema.get("type").and_then(Value::as_str) == Some("object") {
             assert_eq!(
@@ -2438,6 +2706,18 @@ mod tests {
         if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
             for (name, value) in defs {
                 assert_object_schemas_are_closed(value, &format!("{path}.$defs.{name}"));
+            }
+        }
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            if let Some(values) = schema.get(keyword).and_then(Value::as_array) {
+                for (idx, value) in values.iter().enumerate() {
+                    assert_object_schemas_are_closed(value, &format!("{path}.{keyword}[{idx}]"));
+                }
+            }
+        }
+        for keyword in ["if", "then", "else"] {
+            if let Some(value) = schema.get(keyword) {
+                assert_object_schemas_are_closed(value, &format!("{path}.{keyword}"));
             }
         }
     }
